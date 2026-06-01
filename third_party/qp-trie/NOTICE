@@ -1,0 +1,16 @@
+qp-trie — quadbit popcount patricia tries
+Written by Tony Finch <dot@dotat.at>
+Upstream: https://dotat.at/prog/qp/  (git://dotat.at/qp.git)
+
+Dedicated to the public domain under CC0 1.0:
+  http://creativecommons.org/publicdomain/zero/1.0/
+"You may do anything with this. It has no warranty."
+
+Vendored subset (the files needed to benchmark the qp-trie backend):
+  Tbl.h, Tbl.c   — generic table API + dispatch layer
+  qp.h,  qp.c    — the qp-trie backend
+  README.md      — upstream description
+
+NOTE: Tbl.c must be linked with exactly one backend implementation (here, qp.o).
+Other backends in the upstream repo (fn, fp, wp, rc, cb, ...) export the same
+Tbl symbols; linking the wrong one silently benchmarks a different structure.

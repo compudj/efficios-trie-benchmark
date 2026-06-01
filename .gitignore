@@ -1,0 +1,13 @@
+# Our own out-of-tree liburcu build (the Fractal Trie); rebuild with `make urcu`
+/urcu-build/
+
+# Build artifacts
+*.o
+*.lo
+
+# Benchmark binaries (built from src/)
+/bench_one_st
+
+# Benchmark output / results
+/results/
+*.data
