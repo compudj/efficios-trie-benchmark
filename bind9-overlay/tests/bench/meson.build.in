@@ -1,0 +1,137 @@
+# Copyright (C) Internet Systems Consortium, Inc. ("ISC")
+#
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0.  If a copy of the MPL was not distributed with this
+# file, you can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# See the COPYRIGHT file distributed with this work for additional
+# information regarding copyright ownership.
+#
+# --- efficios-trie-benchmark overlay -------------------------------------
+# This file is rendered from meson.build.in by scripts/build-bind9.sh, which
+# substitutes the @URCU_*@ placeholders with paths to our own out-of-tree
+# liburcu build (the Fractal Trie).  It replaces bind9's upstream
+# tests/bench/meson.build to add the FT-vs-others benchmark executables:
+#   load-names           (bind9 "lookup names" MT scaling test, FT_PRIME priming)
+#   qpmulti_ft           (FT integration into bind9's qpmulti bench)
+#   bench_scale_rw_bind9 (FT vs vendored Judy/qp-trie/ART vs BIND9 QP, rw scaling)
+# -------------------------------------------------------------------------
+
+foreach bench : [
+    'ascii',
+    'compress',
+    'iterated_hash',
+    'qp-dump',
+    'qplookups',
+    'qpmulti',
+    'siphash',
+]
+    executable(
+        bench,
+        files(fs.replace_suffix(bench, '.c')),
+        export_dynamic: true,
+        install: false,
+        sources: default_sanitize_options,
+        dependencies: [
+            libisc_dep,
+            libdns_dep,
+            libns_dep,
+            libtest_dep,
+        ],
+    )
+endforeach
+
+# Our own in-tree liburcu clone build (the Fractal Trie).  Headers and the
+# library both live under our clone, so a single include dir suffices.
+#
+# NOTE: bind9's own libs (libdns/libisc) link the system liburcu-cds found via
+# pkg-config, and pull it in transitively, so at *run time* you must put our
+# build's .libs first on the library path, otherwise an older system
+# liburcu-cds wins and FT symbols go missing:
+#   LD_LIBRARY_PATH=@URCU_LIBDIR@ ./tests/bench/load-names <names.csv>
+urcu_cds_dep = declare_dependency(
+    include_directories: include_directories('@URCU_INC@'),
+    link_args: [
+        '-L@URCU_LIBDIR@',
+        '-Wl,-rpath,@URCU_LIBDIR@',
+        '@URCU_LIBDIR@/liburcu-cds.so',
+    ],
+)
+
+executable(
+    'load-names',
+    files('load-names.c'),
+    export_dynamic: true,
+    install: false,
+    sources: default_sanitize_options,
+    dependencies: [
+        urcu_cds_dep,
+        libisc_dep,
+        libdns_dep,
+        libns_dep,
+        libtest_dep,
+    ],
+)
+executable(
+    'qpmulti_ft',
+    files('qpmulti_ft.c'),
+    export_dynamic: true,
+    install: false,
+    sources: default_sanitize_options,
+    dependencies: [
+        urcu_cds_dep,
+        libisc_dep,
+        libdns_dep,
+        libns_dep,
+        libtest_dep,
+    ],
+)
+
+# EfficiOS standalone read/write scaling benchmark.  It also compares against
+# the vendored Judy / qp-trie / ART engines, so it compiles the vendored
+# qp-trie (Tbl.c + qp.c) and libart (art.c) sources, which build-bind9.sh
+# copies into this directory alongside the benchmark.  Warnings in the vendored
+# code are silenced (-w) so they don't trip any -Werror.
+executable(
+    'bench_scale_rw_bind9',
+    files(
+        'bench_scale_rw_bind9.c',
+        'Tbl.c',
+        'qp.c',
+        'art.c',
+    ),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
+    c_args: ['-w'],
+    override_options: ['werror=false'],
+    dependencies: [
+        urcu_cds_dep,
+        libisc_dep,
+        libdns_dep,
+        libns_dep,
+        libtest_dep,
+    ],
+    link_args: ['-lJudy'],
+)
+
+executable(
+    'dns_name_fromwire',
+    files(
+        'dns_name_fromwire.c',
+        meson.project_source_root() / 'fuzz' / 'old.c',
+    ),
+    export_dynamic: true,
+    include_directories: '..' / '..' / 'fuzz',
+    install: false,
+    sources: default_sanitize_options,
+    dependencies: [
+        libisc_dep,
+        libdns_dep,
+        libns_dep,
+        libtest_dep,
+    ],
+)

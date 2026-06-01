@@ -5,23 +5,25 @@
 #   src/                single- and multi-threaded benchmark harnesses
 #   third_party/qp-trie vendored Tony Finch qp-trie (CC0) — Tbl dispatch + qp backend
 #   third_party/libart  vendored libart ART (BSD-2-Clause)
-#   urcu-build/         our own out-of-tree liburcu build (the Fractal Trie)
+#   urcu-build/         our liburcu clone (fractal-trie-dev), built in-tree
 #   config.mk           local paths / feature flags (edit this, not the Makefile)
 #
 # Quick start:
-#   make urcu      # build our own liburcu (Fractal Trie) from $(URCU_SRC)
-#   make           # build the benchmarks
+#   make urcu      # clone (or fetch) our FT checkout and build liburcu in-tree
+#   make           # build the single-threaded benchmark
 #   ./bench_one_st dns ft
+#
+# urcu-build/ is a git clone of userspace-rcu on the fractal-trie-dev branch,
+# built in-tree.  `make urcu` clones it if absent, otherwise fetches + fast-
+# forwards $(URCU_BRANCH) from $(URCU_UPSTREAM) and rebuilds.
 
 include config.mk
 
-URCU_INC_BUILD := $(URCU_BUILD)/include
-URCU_INC_SRC   := $(URCU_SRC)/include
-URCU_LIB       := $(URCU_BUILD)/src/.libs
+# In-tree clone build: headers and libraries both live under $(URCU_BUILD).
+URCU_INC := $(URCU_BUILD)/include
+URCU_LIB := $(URCU_BUILD)/src/.libs
 
-# Include both the build-tree include (generated config.h) and the source-tree
-# include (public API headers) — same convention as liburcu's own AM_CPPFLAGS.
-URCU_CPPFLAGS := -I$(URCU_INC_BUILD) -I$(URCU_INC_SRC)
+URCU_CPPFLAGS := -I$(URCU_INC)
 
 # The harnesses define _GNU_SOURCE / _LGPL_SOURCE / the RCU flavor themselves,
 # so we only add the FT feature flags and include paths here.
@@ -49,7 +51,7 @@ ART_OBJS := third_party/libart/art.o
 
 BENCHES := bench_one_st
 
-.PHONY: all clean clean-urcu urcu check-urcu
+.PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9
 all: $(BENCHES)
 
 # Single-threaded, single-engine benchmark: FT / ft_skip / ft_cand / judy / qp / art.
@@ -65,25 +67,50 @@ third_party/libart/%.o: third_party/libart/%.c
 	$(CC) $(CFLAGS) -Ithird_party/libart -c -o $@ $<
 
 # ---------------------------------------------------------------------------
-# Build our own out-of-tree liburcu (the Fractal Trie) from $(URCU_SRC).
-# This reads the source tree but writes only into $(URCU_BUILD); it never
-# modifies the userspace-rcu source.  Re-run after the FT source changes.
+# Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
+# built in-tree under $(URCU_BUILD).  Clones if absent, otherwise fetches and
+# fast-forwards the branch, then (re)bootstraps/configures as needed and builds
+# the libraries.  Re-run `make urcu` to pull the latest FT and rebuild.
 # ---------------------------------------------------------------------------
 urcu:
-	@test -x "$(URCU_SRC)/configure" || { \
-	  echo "ERROR: $(URCU_SRC)/configure not found. Set URCU_SRC in config.mk"; exit 1; }
-	mkdir -p "$(URCU_BUILD)"
-	cd "$(URCU_BUILD)" && CFLAGS="$(URCU_CFLAGS)" "$(URCU_SRC)/configure"
+	@if [ ! -d "$(URCU_BUILD)/.git" ]; then \
+	  echo ">> cloning $(URCU_UPSTREAM) -> $(URCU_BUILD)"; \
+	  git clone --no-hardlinks "$(URCU_UPSTREAM)" "$(URCU_BUILD)"; \
+	else \
+	  echo ">> fetching $(URCU_BRANCH) from origin"; \
+	  git -C "$(URCU_BUILD)" fetch origin "$(URCU_BRANCH)"; \
+	fi
+	git -C "$(URCU_BUILD)" checkout "$(URCU_BRANCH)"
+	git -C "$(URCU_BUILD)" merge --ff-only "origin/$(URCU_BRANCH)"
+	@test -x "$(URCU_BUILD)/configure" || ( cd "$(URCU_BUILD)" && ./bootstrap )
+	@test -f "$(URCU_BUILD)/config.status" || \
+	  ( cd "$(URCU_BUILD)" && CFLAGS="$(URCU_CFLAGS)" ./configure )
 	$(MAKE) -C "$(URCU_BUILD)/src"
 
 clean-urcu:
 	rm -rf "$(URCU_BUILD)"
 
+# ---------------------------------------------------------------------------
+# Multithreaded bind9 benchmarks: load-names (FT_PRIME priming MT scaling),
+# qpmulti_ft, and bench_scale_rw_bind9.  Builds inside a clean bind9 clone with
+# our tests/bench overlay; links our own liburcu (run `make urcu` first).
+# Binaries land in $(BIND9_SRC)/build/tests/bench/.
+# ---------------------------------------------------------------------------
+bind9: | check-urcu
+	REPO="$(CURDIR)" \
+	BIND9_UPSTREAM="$(BIND9_UPSTREAM)" \
+	BIND9_COMMIT="$(BIND9_COMMIT)" \
+	BIND9_SRC="$(BIND9_SRC)" \
+	URCU_BUILD="$(URCU_BUILD)" \
+	sh scripts/build-bind9.sh
+
+clean-bind9:
+	rm -rf "$(BIND9_SRC)"
+
 check-urcu:
 	@test -f "$(URCU_LIB)/liburcu-cds.so" || { \
 	  echo "ERROR: liburcu-cds not found under $(URCU_LIB)"; \
-	  echo "       Run 'make urcu' to build our own liburcu (the Fractal Trie),"; \
-	  echo "       or set URCU_SRC / URCU_BUILD in config.mk."; \
+	  echo "       Run 'make urcu' to clone + build our liburcu (the Fractal Trie)."; \
 	  exit 1; }
 
 clean:
