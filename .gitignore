@@ -12,6 +12,7 @@
 /bench_one_st
 /bench_wormhole_gpl
 /bench_scale_hotrowex
+/bench_scale_masstree
 
 # Benchmark output / results
 /results/
