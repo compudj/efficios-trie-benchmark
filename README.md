@@ -139,6 +139,13 @@ Cache priming is **on by default** — an untimed warm pass of ~N_KEYS lookups,
 identical for every engine, so the timed window reflects steady state rather
 than cold-start misses. Set `BENCH_NO_PRIME=1` to disable it.
 
+`FT_BENCH_COMPACT=1` (FT engine only) recompacts the trie after each
+thread-count run's churn via `cds_ft_compact()` — a copying GC-style recompact
+that restores descent locality, so each subsequent point measures a
+freshly-shaped trie rather than one progressively fragmented by churn (closer
+to BIND9-QP, which stays compact via `dns_qp_compact`). It affects
+throughput/shape, not the reported RSS (sampled once after build).
+
 ### Why one process per engine
 
 BIND9's libisc ELF constructor (`isc__lib_initialize`) calls

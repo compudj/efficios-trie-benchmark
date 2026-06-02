@@ -211,6 +211,22 @@ static void ft_cleanup_churn(void)
 	}
 	pthread_mutex_unlock(&g_ft_mutex);
 	cds_ft_iter_destroy(cleanup_iter);
+
+	/*
+	 * Opt-in (FT_BENCH_COMPACT): restore the trie's descent locality after
+	 * this run's insert/remove churn.  cds_ft_compact() is a copying GC-style
+	 * recompact; it permits concurrent RCU readers but excludes writers, and
+	 * here the run's threads have already joined, so the trie is quiescent.
+	 * Leaves the next thread-count point measuring a freshly-compacted shape
+	 * (closer to how BIND9-QP stays compact via dns_qp_compact during churn).
+	 * rcu_barrier() flushes the deferred node frees so the drained ranges are
+	 * reclaimed before the next run.  Note: the reported RSS is sampled once
+	 * after build (pre-sweep), so this affects throughput/shape, not that RSS.
+	 */
+	if (getenv("FT_BENCH_COMPACT") != NULL) {
+		cds_ft_compact(g_ft);
+		rcu_barrier();
+	}
 }
 
 static const struct bench_engine ft_engine = {
