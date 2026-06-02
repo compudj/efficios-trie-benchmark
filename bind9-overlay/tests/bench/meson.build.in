@@ -90,6 +90,9 @@ urcu_ft_qsbr_dep = declare_dependency(
 )
 
 bench_threads_dep = dependency('threads')
+# bench_scale_common.c can interleave allocations across NUMA nodes
+# (BENCH_NUMA_INTERLEAVE); every bench_scale_* engine links it, so all need libnuma.
+bench_numa_dep = meson.get_compiler('c').find_library('numa')
 
 executable(
     'load-names',
@@ -141,7 +144,7 @@ executable(
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
-    dependencies: [urcu_ft_dep, bench_threads_dep],
+    dependencies: [urcu_ft_dep, bench_threads_dep, bench_numa_dep],
 )
 
 # QSBR build of the very same FT engine source — only the RCU flavor differs
@@ -155,7 +158,7 @@ executable(
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     c_args: ['-DBENCH_FT_QSBR'],
-    dependencies: [urcu_ft_qsbr_dep, bench_threads_dep],
+    dependencies: [urcu_ft_qsbr_dep, bench_threads_dep, bench_numa_dep],
 )
 
 executable(
@@ -165,7 +168,7 @@ executable(
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
-    dependencies: [bench_threads_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep],
     link_args: ['-lJudy'],
 )
 
@@ -178,7 +181,7 @@ executable(
     sources: default_sanitize_options,
     c_args: ['-w'],
     override_options: ['werror=false'],
-    dependencies: [bench_threads_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep],
 )
 
 executable(
@@ -190,7 +193,7 @@ executable(
     sources: default_sanitize_options,
     c_args: ['-w'],
     override_options: ['werror=false'],
-    dependencies: [bench_threads_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep],
 )
 
 executable(
@@ -206,6 +209,7 @@ executable(
         libdns_dep,
         libns_dep,
         libtest_dep,
+        bench_numa_dep,
     ],
 )
 

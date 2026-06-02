@@ -141,7 +141,7 @@ src/bench_scale_hotrowex.o: src/bench_scale_hotrowex.cpp
 bench_scale_common.o: $(SCALE_COMMON_SRC)
 	$(CC) $(CFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
 bench_scale_hotrowex: src/bench_scale_hotrowex.o bench_scale_common.o
-	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
 
 # ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),

@@ -19,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sched.h>
+#include <numa.h>
 #include <sys/mman.h>
 
 char  *str_keys[N_KEYS];
@@ -275,6 +276,27 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 		max_threads = atoi(argv[1]);
 
 	g_eng = eng;
+
+	/*
+	 * Optional NUMA interleaving (BENCH_NUMA_INTERLEAVE): spread every
+	 * allocation this main thread faults in -- the query-key set AND the
+	 * structure built below -- across all NUMA nodes, so at high reader
+	 * counts spanning multiple sockets no single node's memory bandwidth
+	 * bottlenecks the shared read set.  Applied uniformly to whatever engine
+	 * is under test.  (load-names' ft_spec_il achieves the same with an
+	 * mbind'd arena; this is the cross-engine equivalent.)  Set before
+	 * bench_gen_keys() so the query keys are interleaved too.
+	 */
+	if (getenv("BENCH_NUMA_INTERLEAVE") != NULL) {
+		if (numa_available() != -1) {
+			numa_set_interleave_mask(numa_all_nodes_ptr);
+			fprintf(stderr,
+				"NUMA: interleaving allocations across all nodes\n");
+		} else {
+			fprintf(stderr,
+				"NUMA: BENCH_NUMA_INTERLEAVE set but libnuma unavailable\n");
+		}
+	}
 
 	bench_gen_keys();
 	eng->build();

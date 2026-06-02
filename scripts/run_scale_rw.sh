@@ -19,6 +19,9 @@
 #                  (default: "ft judy qp art b9qp")
 #   BENCH_NO_PRIME if set, disables the (default-on) cache-priming pass;
 #                  passed through to each engine.
+#   BENCH_NUMA_INTERLEAVE if set, each engine interleaves its keys + structure
+#                  across all NUMA nodes (numa_set_interleave_mask); passed
+#                  through to each engine.
 set -eu
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -29,6 +32,7 @@ MAXT=${1:-384}
 
 export LD_LIBRARY_PATH="$URCU_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 [ -n "${BENCH_NO_PRIME:-}" ] && export BENCH_NO_PRIME
+[ -n "${BENCH_NUMA_INTERLEAVE:-}" ] && export BENCH_NUMA_INTERLEAVE
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
