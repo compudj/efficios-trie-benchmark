@@ -100,6 +100,13 @@ executable(
     export_dynamic: true,
     install: false,
     sources: default_sanitize_options,
+    # Link the prebuilt HOTRowex shim object (compiled by build-bind9.sh with
+    # g++ + the header-only HOT) plus its C++/oneTBB runtime, for the hotrowex
+    # engine.  The .o lives next to this meson.build in the overlay dest dir.
+    link_args: [
+        meson.current_source_dir() / 'load_names_hotrowex.o',
+        '-ltbb', '-lstdc++',
+    ],
     dependencies: [
         urcu_cds_dep,
         libisc_dep,

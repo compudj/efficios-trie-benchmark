@@ -46,6 +46,9 @@ fi
 # 2. Overlay our tests/bench files + the vendored competitor sources.
 echo ">> applying tests/bench overlay"
 cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$DEST/"
+# HOTRowex engine for load-names: C++ shim (HOT is header-only C++14 + oneTBB),
+# compiled separately below and linked into load-names.
+cp "$REPO/src/load_names_hotrowex.cpp" "$DEST/"
 # Per-engine read/write scaling benchmark: shared driver + one file per engine.
 cp "$OV/bench_scale_common.h" "$OV/bench_scale_common.c" \
    "$OV/bench_scale_ft.c"   "$OV/bench_scale_judy.c" "$OV/bench_scale_qp.c" \
@@ -66,6 +69,18 @@ else
 	echo ">> reconfiguring existing build dir"
 	meson setup --reconfigure "$BUILD" "$BIND9_SRC" >/dev/null
 fi
+
+# Compile the HOTRowex shim (header-only HOT + oneTBB) with g++ into an object
+# load-names links against (meson links it + -ltbb -lstdc++).  HOT needs
+# AVX2+BMI2 (covered by -march=native).  Must precede the load-names link.
+echo ">> compiling HOTRowex shim for load-names"
+HOT_INC="-I$REPO/third_party/hot/rowex-include \
+         -I$REPO/third_party/hot/single-threaded-include \
+         -I$REPO/third_party/hot/commons-include \
+         -I$REPO/third_party/hot/content-helpers-include \
+         -I$REPO/third_party/hot/utils-include"
+g++ -std=c++14 -O2 -DNDEBUG -march=native -w $HOT_INC \
+    -c "$DEST/load_names_hotrowex.cpp" -o "$DEST/load_names_hotrowex.o"
 
 # load-names is the primary, up-to-date MT scaling test — it must build.
 echo ">> building load-names (primary MT scaling test)"

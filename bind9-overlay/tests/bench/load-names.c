@@ -1868,6 +1868,101 @@ thread_qp_local(void *arg0) {
  *   _il    — mmap + MPOL_INTERLEAVE across all NUMA nodes.
  *   _local — mmap with default first-touch policy → local NUMA node.
  */
+/* ───────────────────────────────────────────────────────────────────
+ * HOTRowex engine — HOT's concurrent ROWEX trie, via the extern "C" shim
+ * src/load_names_hotrowex.cpp (compiled by g++, linked with -ltbb -lstdc++).
+ *
+ * Keys on a NUL-terminated copy of the qpkey: every qpkey byte is
+ * >= SHIFT_NOBYTE (== 2), so the bytes never contain 0x00 and a trailing 0
+ * terminates them cleanly (the query buffer is already 0-terminated by its
+ * memset).  The copies live in a NUMA-interleaved bump arena, so HOTRowex's
+ * value points at cold, separate memory: its contentEquals validation and the
+ * benchmark's force-read pay the same leaf-touch the FT _il engines do, rather
+ * than re-reading the (NUMA-local, already-hot) query buffer.
+ *
+ * Reuses _thread_ft_alloc: HOT inserts run under ft_writer_mutex (serialized,
+ * so the bump arena needs no locking), reads are concurrent and self-guarded by
+ * HOT's epoch.  add_hotrowex stashes the copy pointer in ft_alloc_index[] so
+ * the shared loop's correctness assert (pval == ft_alloc_index[n]) still holds.
+ * ─────────────────────────────────────────────────────────────────── */
+void *hotrowex_create(void);
+void hotrowex_destroy(void *h);
+int hotrowex_insert(void *h, const char *key);
+const char *hotrowex_lookup(void *h, const char *key);
+
+static char *hot_il_arena = NULL;
+static size_t hot_il_arena_off = 0;
+static size_t hot_il_arena_cap = 0;
+
+static void
+hot_il_arena_create(size_t n) {
+	/* One max-size qpkey + NUL per key; lazily faulted, so only the bytes
+	 * actually written become resident. */
+	hot_il_arena_cap = n * (sizeof(dns_qpkey_t) + 1);
+	hot_il_arena = mmap(NULL, hot_il_arena_cap, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (hot_il_arena == MAP_FAILED) {
+		perror("mmap(hot_il_arena)");
+		abort();
+	}
+	unsigned long mask = (1UL << 24) - 1;
+	if (sys_mbind(hot_il_arena, hot_il_arena_cap,
+		      MPOL_INTERLEAVE, &mask, 25, 0) < 0) {
+		perror("mbind(hot_il_arena)");
+	}
+	hot_il_arena_off = 0;
+}
+
+static char *
+hot_il_arena_alloc(size_t sz) {
+	size_t off = (hot_il_arena_off + 7) & ~(size_t)7;
+	if (off + sz > hot_il_arena_cap)
+		abort();
+	hot_il_arena_off = off + sz;
+	return hot_il_arena + off;
+}
+
+static isc_result_t
+add_hotrowex(void *map, size_t count) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	dns_qpkey_t key;
+	size_t len = dns_qpkey_fromname(key, &item[count].fixed.name,
+					DNS_DBNAMESPACE_NORMAL);
+	char *copy = hot_il_arena_alloc(len + 1);
+	memcpy(copy, key, len);
+	copy[len] = '\0';
+	memcpy(qk->bytes, key, len);
+	qk->len = len;
+	ft_alloc_index[count] = (struct ft_arena_slot *)copy;
+	(void) hotrowex_insert(map, copy);	/* dup == already present == OK */
+	return ISC_R_SUCCESS;
+}
+
+static isc_result_t
+get_hotrowex(void *map, size_t count, void **pval) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	const char *v = hotrowex_lookup(map, (const char *)qk->bytes);
+	if (v == NULL)
+		return ISC_R_NOTFOUND;
+	*pval = (void *)v;
+	return ISC_R_SUCCESS;
+}
+
+static void *
+new_hotrowex(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	return hotrowex_create();
+}
+
+static void
+destroy_hotrowex(void *map) {
+	hotrowex_destroy(map);
+}
+
+static void *
+thread_hotrowex(void *arg0) {
+	return _thread_ft_alloc(arg0, add_hotrowex, get_hotrowex, true);
+}
+
 static struct fun fun_list[] = {
 	{ "qp_il",                new_qp_il,              thread_qp_il,              destroy_qp },
 	{ "qp_local",             new_qp_local,           thread_qp_local,           destroy_qp },
@@ -1891,6 +1986,8 @@ static struct fun fun_list[] = {
 	{ "ft_spec_on_eager_local", new_ft_eager_local,  thread_ft_spec_local,  destroy_ft },
 	{ "ft_cand_il",            new_ft_cand,          thread_ft_cand_il,     destroy_ft },
 	{ "ft_cand_local",         new_ft_cand,          thread_ft_cand_local,  destroy_ft },
+	/* HOT concurrent ROWEX trie (NUMA-interleaved key-copy arena). */
+	{ "hotrowex",              new_hotrowex,         thread_hotrowex,       destroy_hotrowex },
 	{ NULL, NULL, NULL, NULL },
 };
 
@@ -1982,6 +2079,7 @@ main(int argc, char *argv[]) {
 	ft_alloc_index_create(sizeof(item) / sizeof(item[0]));
 	query_keys_create(sizeof(item) / sizeof(item[0]));
 	user_payload_create(sizeof(item) / sizeof(item[0]));
+	hot_il_arena_create(sizeof(item) / sizeof(item[0]));
 	isc_rwlock_init(&rwl);
 
 	if (argc != 2) {
