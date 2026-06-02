@@ -115,6 +115,35 @@ bench_wormhole_gpl: src/bench_wormhole_gpl.c $(WORMHOLE_SRC)
 	$(CC) $(CFLAGS) -w -Ithird_party/wormhole -o $@ $^ -lpthread -lm
 
 # ---------------------------------------------------------------------------
+# HOTRowex MT engine — concurrent (ROWEX) HOT for the read/write scaling sweep.
+#
+# Self-contained: links neither bind9 nor liburcu, only the header-only HOT
+# (ISC) + oneTBB (libtbb-dev, for HOT's epoch-based reclamation).  It shares
+# the engine-agnostic bench_scale_common.c driver with the bind9-built MT
+# engines but is compiled here standalone into the repo root, so the sweep
+# script finds it next to the rest.  ROWEX has no delete: its writer churns by
+# upsert (see src/bench_scale_hotrowex.cpp).  Needs AVX2+BMI2 (covered by
+# OPTFLAGS' -march=native).  Not part of `all` (extra TBB dep); build explicitly:
+#     make bench_scale_hotrowex
+#     ENGINES="ft hotrowex" scripts/run_scale_rw.sh   # ROWEX-vs-RCU comparison
+# ---------------------------------------------------------------------------
+SCALE_COMMON_SRC := bind9-overlay/tests/bench/bench_scale_common.c
+HOTROWEX_INC := -Ithird_party/hot/rowex-include \
+                -Ithird_party/hot/single-threaded-include \
+                -Ithird_party/hot/commons-include \
+                -Ithird_party/hot/content-helpers-include \
+                -Ithird_party/hot/utils-include \
+                -Ibind9-overlay/tests/bench
+
+src/bench_scale_hotrowex.o: src/bench_scale_hotrowex.cpp
+	$(CXX) $(OPTFLAGS) -std=c++14 -w $(HOTROWEX_INC) -c -o $@ $<
+# Compiled as C (gcc), not as C++ (g++ would treat the .c source as C++).
+bench_scale_common.o: $(SCALE_COMMON_SRC)
+	$(CC) $(CFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
+bench_scale_hotrowex: src/bench_scale_hotrowex.o bench_scale_common.o
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread
+
+# ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
 # built in-tree under $(URCU_BUILD).  Clones if absent, otherwise fetches and
 # fast-forwards the branch, then (re)bootstraps/configures as needed and builds

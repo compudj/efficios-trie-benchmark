@@ -35,6 +35,9 @@ trap 'rm -rf "$tmp"' EXIT
 
 for e in $ENGINES; do
 	exe="$BENCH_DIR/bench_scale_$e"
+	# hotrowex (and any other non-bind9 MT engine) is built standalone into
+	# the repo root by the top-level Makefile; fall back to it there.
+	[ -x "$exe" ] || exe="$REPO/bench_scale_$e"
 	if [ ! -x "$exe" ]; then
 		echo "WARNING: $exe not found — skipping '$e'" >&2
 		: > "$tmp/$e.out"

@@ -74,6 +74,21 @@ urcu_ft_dep = declare_dependency(
     ],
 )
 
+# As urcu_ft_dep, but links the QSBR flavor (liburcu-qsbr, providing
+# urcu_qsbr_*) instead of the membarrier liburcu.  Used by bench_scale_ft_qsbr,
+# the QSBR build of the same FT engine source (-DBENCH_FT_QSBR): QSBR's read
+# side is free (rcu_read_lock/unlock compile to nothing), trading a stricter
+# quiescent-state/offline discipline for lower reader overhead at scale.
+urcu_ft_qsbr_dep = declare_dependency(
+    include_directories: include_directories('@URCU_INC@'),
+    link_args: [
+        '-L@URCU_LIBDIR@',
+        '-Wl,-rpath,@URCU_LIBDIR@',
+        '@URCU_LIBDIR@/liburcu-cds.so',
+        '@URCU_LIBDIR@/liburcu-qsbr.so',
+    ],
+)
+
 bench_threads_dep = dependency('threads')
 
 executable(
@@ -127,6 +142,20 @@ executable(
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     dependencies: [urcu_ft_dep, bench_threads_dep],
+)
+
+# QSBR build of the very same FT engine source — only the RCU flavor differs
+# (-DBENCH_FT_QSBR selects <urcu/urcu-qsbr.h> + the offline discipline), so
+# this isolates read-side flavor cost: ft (membarrier) vs ft_qsbr (QSBR).
+executable(
+    'bench_scale_ft_qsbr',
+    files('bench_scale_ft.c', 'bench_scale_common.c'),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
+    c_args: ['-DBENCH_FT_QSBR'],
+    dependencies: [urcu_ft_qsbr_dep, bench_threads_dep],
 )
 
 executable(

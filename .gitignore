@@ -11,6 +11,7 @@
 # Benchmark binaries (built from src/)
 /bench_one_st
 /bench_wormhole_gpl
+/bench_scale_hotrowex
 
 # Benchmark output / results
 /results/

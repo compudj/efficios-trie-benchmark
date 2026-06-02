@@ -12,8 +12,24 @@
 #define _GNU_SOURCE
 #endif
 #define _LGPL_SOURCE
+/*
+ * RCU flavor is the ONLY thing -DBENCH_FT_QSBR changes: it picks liburcu-qsbr
+ * (the lowest-overhead read side — rcu_read_lock/unlock compile to nothing,
+ * readers instead report a quiescent state periodically) over the membarrier
+ * liburcu.  Everything else below is identical: the quiescent_state() and
+ * thread_online()/thread_offline() calls are real, valid operations under both
+ * flavors, so they stay unconditional.  They matter most under QSBR — there an
+ * online thread that neither reports a quiescent state nor goes offline stalls
+ * every grace period — but are harmless under membarrier (whose grace periods
+ * wait on read-side sections, not quiescent states).
+ */
+#ifdef BENCH_FT_QSBR
+#define URCU_API_MAP		/* map generic rcu_* names onto urcu_qsbr_* */
+#include <urcu/urcu-qsbr.h>
+#else
 #define RCU_MEMBARRIER
 #include <urcu.h>
+#endif
 #include <urcu/fractal-trie.h>
 
 #include "bench_scale_common.h"
@@ -72,6 +88,14 @@ static void ft_build(void)
 			rcu_quiescent_state();
 	}
 	rcu_quiescent_state();
+	/*
+	 * Drop the main thread offline for the remainder of the sweep.  It does
+	 * RCU work only here (build) and in ft_cleanup_churn (which briefly
+	 * brings it back online); in between it sleeps through each timed window,
+	 * where (under QSBR) an online idle thread would block the writer's grace
+	 * periods.
+	 */
+	rcu_thread_offline();
 }
 
 static void *ft_reader_setup(void)
@@ -195,6 +219,8 @@ static void ft_cleanup_churn(void)
 	 * register again here.
 	 */
 	struct cds_ft_iter *cleanup_iter;
+	/* Back online: ft_build / the previous cleanup left main offline. */
+	rcu_thread_online();
 	cds_ft_iter_create(g_ft, &cleanup_iter);
 	pthread_mutex_lock(&g_ft_mutex);
 	for (int i = 0; i < CHURN_KEYS; i++) {
@@ -223,15 +249,27 @@ static void ft_cleanup_churn(void)
 	 * reclaimed before the next run.  Note: the reported RSS is sampled once
 	 * after build (pre-sweep), so this affects throughput/shape, not that RSS.
 	 */
-	if (getenv("FT_BENCH_COMPACT") != NULL) {
-		cds_ft_compact(g_ft);
+	int do_compact = (getenv("FT_BENCH_COMPACT") != NULL);
+	if (do_compact)
+		cds_ft_compact(g_ft);		/* an online RCU writer op */
+	/*
+	 * Return main to its sweep-long offline state — and crucially do so
+	 * BEFORE the blocking rcu_barrier() below: under QSBR a thread that
+	 * blocks while online would stall the very grace period it waits on.
+	 */
+	rcu_thread_offline();
+	if (do_compact)
 		rcu_barrier();
-	}
 }
 
 static const struct bench_engine ft_engine = {
+#ifdef BENCH_FT_QSBR
+	.name		= "ft_qsbr",
+	.label		= "FT cand+v (QSBR)",
+#else
 	.name		= "ft",
 	.label		= "FT cand+v",
+#endif
 	.build		= ft_build,
 	.reader_setup	= ft_reader_setup,
 	.reader_batch	= ft_reader_batch,
@@ -253,6 +291,8 @@ int main(int argc, char **argv)
 	 */
 	rcu_register_thread();
 	int ret = bench_scale_main(argc, argv, &ft_engine);
+	/* ft_build / ft_cleanup_churn leave main offline; balance before unregister. */
+	rcu_thread_online();
 	rcu_unregister_thread();
 	return ret;
 }

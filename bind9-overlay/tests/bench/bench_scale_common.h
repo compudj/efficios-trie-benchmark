@@ -22,6 +22,10 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define N_KEYS		1000000
 #define DURATION_SEC	3
 #define BATCH_SIZE	1000
@@ -99,5 +103,9 @@ struct bench_engine {
  * Optional arg: argv[1] caps the max thread count (default 384).
  */
 int bench_scale_main(int argc, char **argv, const struct bench_engine *eng);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BENCH_SCALE_COMMON_H */

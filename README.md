@@ -175,16 +175,37 @@ process holds exactly one trie:
 
 | Executable          | Engine                          | Links             |
 |---------------------|---------------------------------|-------------------|
-| `bench_scale_ft`    | Fractal Trie (candidate+memcmp) | liburcu           |
+| `bench_scale_ft`    | Fractal Trie (candidate+memcmp) | liburcu (membarrier) |
+| `bench_scale_ft_qsbr` | Fractal Trie, same engine, QSBR flavor | liburcu-qsbr |
 | `bench_scale_judy`  | JudySL, rwlock                  | libJudy           |
 | `bench_scale_qp`    | qp-trie, rwlock                 | vendored qp-trie  |
 | `bench_scale_art`   | ART, rwlock                     | vendored libart   |
 | `bench_scale_b9qp`  | BIND9 `dns_qpmulti`, RCU        | liburcu + bind9   |
+| `bench_scale_hotrowex` | HOT (concurrent **ROWEX**)   | HOT + oneTBB      |
 
 They share `bench_scale_common.c` (key generation, RSS sampling, the
 thread-sweep driver); each `bench_scale_<engine>.c` supplies that engine's
 build / lookup / churn callbacks and a thin `main`. **Only `bench_scale_b9qp`
 links bind9.**
+
+`bench_scale_hotrowex` is built separately by the **top-level Makefile** (it
+links neither bind9 nor liburcu — only the header-only HOT and oneTBB
+[`libtbb-dev`], for HOT's epoch-based node reclamation), and lands in the repo
+root rather than `bind9-src/build/`. `run_scale_rw.sh` looks there too:
+
+```sh
+make bench_scale_hotrowex
+ENGINES="ft hotrowex" scripts/run_scale_rw.sh 192   # ROWEX vs RCU
+```
+
+It is the lone **ROWEX** engine here — readers are optimistic and lock-free
+(they restart on a concurrent structural change) and self-guard HOT's epoch on
+every operation, so unlike the FT/Judy/qp/ART threads they need no explicit
+registration. One asymmetry: **ROWEX has no delete** upstream, so its writer
+churns by `upsert()` (point value-updates that still drive the full ROWEX write
+path) rather than the insert/remove toggling the other engines do — its
+`*_wr` column therefore measures a cheaper operation and is not directly
+comparable; the read columns are.
 
 Run one engine directly — it prints its RSS (sampled after build) and per
 thread-count throughput; the argument caps the reader thread count:
@@ -210,6 +231,50 @@ that restores descent locality, so each subsequent point measures a
 freshly-shaped trie rather than one progressively fragmented by churn (closer
 to BIND9-QP, which stays compact via `dns_qp_compact`). It affects
 throughput/shape, not the reported RSS (sampled once after build).
+
+### Result — FT (RCU) vs HOTRowex (ROWEX) at scale
+
+Read throughput (1M DNS keys, 1 writer + N readers, priming on, one 3 s timed
+window per point) on the same 2× EPYC 9654 / 192-physical-core box as the
+`load-names` result above, worker `i` pinned to core `i`:
+
+| Readers | `ft` read (Mops/s) | `hotrowex` read (Mops/s) † | ROWEX vs RCU |
+|--------:|-------------------:|---------------------------:|-------------:|
+| 1       | 3.7                | 4.1                        | 1.1×         |
+| 32      | 82.6               | 110.9                      | 1.3×         |
+| 128     | 314.9              | 416.1                      | 1.3×         |
+| 192     | **431.4**          | **699.2**                  | **≈ 1.6×**   |
+| RSS     | 245 MB             | **79 MB**                  | ⅓ the memory |
+
+> **† HOTRowex (ROWEX) does not support `remove`.** Upstream HOT's concurrent
+> ROWEX variant implements lookup / scan / insert / `upsert` only — there is no
+> concurrent delete. It is therefore **not a drop-in replacement** for a trie
+> that must delete keys (DNS zones, routing tables, caches with eviction…). In
+> this benchmark its writer churns by `upsert` instead of the insert/remove
+> toggling every other engine does, so its read numbers are directly comparable
+> but its workload is strictly easier on the write path. The Fractal Trie
+> supports full concurrent insert **and** remove under RCU.
+
+Both scale to 192 cores with no collapse; HOTRowex's lock-free optimistic reads
+scale a little better at the top (≈ ×170 over the range vs FT's ≈ ×116) and in
+roughly one-third the memory — but for a lookup/insert/`upsert` workload only
+(see the footnote). So this is a read-scaling-and-footprint comparison against a
+deletion-incapable structure, not an all-operations one.
+
+**RCU flavor is not the variable.** `bench_scale_ft` uses liburcu's membarrier
+flavor; `bench_scale_ft_qsbr` is the identical engine built `-DBENCH_FT_QSBR`
+against the QSBR flavor (its only diff — see `bench_scale_ft.c`). QSBR has the
+cheapest possible read side (`rcu_read_lock`/`rcu_read_unlock` compile to
+nothing), yet across the whole sweep the two are equal within run-to-run noise
+(192 cores: ≈ 432 vs ≈ 429 Mops/s). Expected: the reader brackets one
+`rcu_read_lock`/`unlock` pair around a whole 1000-lookup batch, so the read-side
+cost is already amortized to ~nothing under membarrier too, and the `call_rcu`
+writer makes grace periods (and membarrier's broadcast IPIs) infrequent. So
+FT's ~430 Mops/s is its real ceiling here regardless of flavor — the gap to
+HOTRowex is not a membarrier artifact. (QSBR does demand a stricter discipline:
+its otherwise-idle main thread must go `rcu_thread_offline()` across each timed
+window or it would stall every grace period — handled in `ft_build` /
+`ft_cleanup_churn`.)
 
 ### Why one process per engine
 
@@ -237,8 +302,11 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
                                    load-names.c, qpmulti_ft.c,
                                    bench_scale_common.[ch] (shared driver),
                                    bench_scale_{ft,judy,qp,art,b9qp}.c
+src/bench_scale_hotrowex.cpp     concurrent (ROWEX) HOT MT engine; same driver,
+                                   built standalone by the top-level Makefile
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
-third_party/hot/                 vendored HOT, header-only C++14 (ISC)
+third_party/hot/                 vendored HOT, header-only C++14 (ISC);
+                                   single-threaded + rowex (concurrent) headers
 src/bench_hot.cpp                C++ shim exposing HOT to bench_one_st
 third_party/cuckoo-trie/         vendored Cuckoo Trie, C (Unlicense)
 src/bench_cuckoo.c               C shim exposing Cuckoo Trie to bench_one_st

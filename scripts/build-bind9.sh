@@ -74,8 +74,8 @@ ninja -C "$BUILD" tests/bench/load-names
 # Per-engine read/write scaling benchmarks (one structure per process for
 # isolated RSS).  These track the current fractal-trie-dev API.
 echo ">> building per-engine read/write scaling benchmarks"
-for b in bench_scale_ft bench_scale_judy bench_scale_qp bench_scale_art \
-	 bench_scale_b9qp; do
+for b in bench_scale_ft bench_scale_ft_qsbr bench_scale_judy bench_scale_qp \
+	 bench_scale_art bench_scale_b9qp; do
 	ninja -C "$BUILD" "tests/bench/$b"
 done
 
@@ -90,8 +90,8 @@ fi
 
 echo ""
 echo "Built binaries under $BUILD/tests/bench/ :"
-for b in load-names bench_scale_ft bench_scale_judy bench_scale_qp \
-	 bench_scale_art bench_scale_b9qp qpmulti_ft; do
+for b in load-names bench_scale_ft bench_scale_ft_qsbr bench_scale_judy \
+	 bench_scale_qp bench_scale_art bench_scale_b9qp qpmulti_ft; do
 	[ -x "$BUILD/tests/bench/$b" ] && echo "  $b"
 done
 echo ""
