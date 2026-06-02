@@ -166,6 +166,27 @@ bench_scale_masstree: src/bench_scale_masstree.o $(MASSTREE_OBJS) bench_scale_co
 	$(CXX) $(OPTFLAGS) -o $@ $^ -lpthread -lnuma
 
 # ---------------------------------------------------------------------------
+# ART-OLC MT engine — concurrent adaptive radix tree, Optimistic Lock Coupling
+# (flode/ARTSynchronized, Apache-2.0) for the read/write scaling sweep.  Needs
+# oneTBB (its epoch reclamation uses tbb::enumerable_thread_specific).  The
+# vendored sources are a unity build: OptimisticLockCoupling/Tree.cpp #includes
+# N.cpp (-> N4/N16/N48/N256.cpp) and Epoche.cpp, so only Tree.cpp is compiled.
+# Not in `all`; build explicitly:
+#     make bench_scale_artolc
+#     ENGINES="ft hotrowex masstree artolc" scripts/run_scale_rw.sh 192
+# ---------------------------------------------------------------------------
+ARTOLC_DIR := third_party/artolc
+ARTOLC_CXXFLAGS := $(OPTFLAGS) -std=c++14 -w -I$(ARTOLC_DIR)
+ARTOLC_OBJS := $(ARTOLC_DIR)/OptimisticLockCoupling/Tree.o
+
+$(ARTOLC_DIR)/OptimisticLockCoupling/Tree.o: $(ARTOLC_DIR)/OptimisticLockCoupling/Tree.cpp
+	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
+src/bench_scale_artolc.o: src/bench_scale_artolc.cpp
+	$(CXX) $(ARTOLC_CXXFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
+bench_scale_artolc: src/bench_scale_artolc.o $(ARTOLC_OBJS) bench_scale_common.o
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
+
+# ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
 # built in-tree under $(URCU_BUILD).  Clones if absent, otherwise fetches and
 # fast-forwards the branch, then (re)bootstraps/configures as needed and builds
