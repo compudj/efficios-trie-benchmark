@@ -86,13 +86,16 @@ make bind9     # clone bind9 @ pinned commit, apply overlay, build the benches
 Run it (note the `LD_LIBRARY_PATH` — see below):
 
 ```sh
-LD_LIBRARY_PATH=urcu-build/src/.libs \
-  BENCH_THREADS='1 2 4 8 16' FT_PRIME=1 \
+LD_LIBRARY_PATH=urcu-build/src/.libs FT_PRIME=1 \
   bind9-src/build/tests/bench/load-names datasets/names-1M-shuf.csv
 ```
 
-`load-names` takes the CSV as its single argument; the thread counts come from
-`BENCH_THREADS`. Other env vars: `QUERY_LOOPS`, `BENCH_ENGINE` (filter),
+`load-names` takes the CSV as its single argument and, by default, sweeps the
+thread counts `1 2 4 8 16 32 64 96 128 192`, pinning worker `i` to CPU `i`
+(distinct physical cores up to 192 on a 2×96-core EPYC). `BENCH_THREADS=N`
+restricts the sweep to a **single** thread count `N` (it is parsed as one
+integer, not a list — handy with a high `QUERY_LOOPS` for clean perf-stat
+runs). Other env vars: `QUERY_LOOPS`, `BENCH_ENGINE` (filter),
 `BENCH_CACHE_FLUSH_MB`, `FT_BENCH_CHURN`, `FT_BENCH_COMPACT`.
 
 **Why `LD_LIBRARY_PATH`:** bind9's own libraries link the system `liburcu-cds`
