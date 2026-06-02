@@ -72,9 +72,13 @@ silently benchmarking a different structure under the `qp` label.)
 ## Multithreaded benchmark — bind9 `load-names`
 
 The MT scaling test is bind9's "lookup names" benchmark (`load-names.c`), which
-compares the Fractal Trie (`ft_specv_*`, `ft_precise_*`, `ft_cand_*`) against
-BIND9's own QP-trie (`qp_il`, `qp_local`) under a reader/writer thread sweep,
-with an optional `FT_PRIME` cache-priming phase. It builds *inside* bind9, so we
+compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`)
+under a reader/writer thread sweep, with an optional `FT_PRIME` cache-priming
+phase. The FT engines form the 2×2 of build attr × lookup — `ft_eager`
+(EAGER attr + eager lookup), `ft_spec` (SPEC attr + speculative lookup), and the
+crosses `ft_eager_on_spec` / `ft_spec_on_eager` — plus `ft_cand` (pure candidate,
+no memcmp); each with `_il` / `_local` leaf-arena placement (and `ft_spec` also
+`_extarena`), matching the engine naming used by `bench_one_st`. It builds *inside* bind9, so we
 clone a clean upstream bind9 at a pinned commit and overlay our `tests/bench`
 files (in `bind9-overlay/`), linking our own liburcu:
 

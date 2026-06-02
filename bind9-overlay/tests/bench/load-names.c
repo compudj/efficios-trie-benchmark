@@ -101,9 +101,10 @@ static size_t ft_alloc_index_total_bytes = 0;
  * Separate query-key buffer used as the lookup input.  Mirrors how
  * a DNS server feeds a query key from the wire packet — the input
  * key does NOT come from the trie's external slot.  This lets us
- * measure ft_precise faithfully: the lookup walks on these bytes,
- * never touching the external slot, while ft_specv still reads the
- * external slot during SIMD validation.  NUMA-interleaved.
+ * measure the eager-lookup engines (ft_eager*) faithfully: the lookup
+ * walks on these bytes, never touching the external slot, while the
+ * speculative-lookup engines (ft_spec*) still read the external slot
+ * during SIMD validation.  NUMA-interleaved.
  */
 struct query_key {
 	size_t len;
@@ -911,10 +912,10 @@ enum ft_mode {
 static struct cds_ft_group *g_ft_group_for_destroy;
 
 /*
- * External-node arena for the ft_specv_extarena engine: leaves are
+ * External-node arena for the ft_spec_extarena engine: leaves are
  * allocated from the FT library's own external arena
  * (cds_ft_external_arena_*) instead of the bench-owned ft_*_arena.
- * Set by new_ft_specv_extarena(), consumed by add_ft_specv_extarena()
+ * Set by new_ft_spec_extarena(), consumed by add_ft_specv_extarena()
  * and destroy_ft_extarena().  Single slot for the same serial-sweep
  * reason as g_ft_group_for_destroy.  This exercises the library
  * allocator's MADV_HUGEPAGE + 2 MiB-interleave path for external
@@ -1016,7 +1017,7 @@ destroy_ft(void *map) {
  * interleaved variant, plain for first-touch-local.
  */
 static void *
-new_ft_specv_extarena(isc_mem_t *mem ISC_ATTR_UNUSED) {
+new_ft_spec_extarena(isc_mem_t *mem ISC_ATTR_UNUSED) {
 	struct cds_ft *ft = _new_ft(FT_MODE_SPECV_CALLOC);
 
 	{
@@ -1085,22 +1086,26 @@ new_ft_specv(isc_mem_t *mem ISC_ATTR_UNUSED) {
 }
 
 static void *
-new_ft_specv_il(isc_mem_t *mem ISC_ATTR_UNUSED) {
+new_ft_spec_il(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	/* SPECULATIVE-optimized trie, NUMA-interleaved leaf arena. */
 	return _new_ft(FT_MODE_SPECV_CALLOC);
 }
 
 static void *
-new_ft_specv_calloc(isc_mem_t *mem ISC_ATTR_UNUSED) {
+new_ft_spec_local(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	/* SPECULATIVE-optimized trie, local-node leaf arena. */
 	return _new_ft(FT_MODE_SPECV_CALLOC);
 }
 
 static void *
-new_ft_precise_il(isc_mem_t *mem ISC_ATTR_UNUSED) {
+new_ft_eager_il(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	/* EAGER-optimized trie, NUMA-interleaved leaf arena. */
 	return _new_ft(FT_MODE_PRECISE);
 }
 
 static void *
-new_ft_precise_calloc(isc_mem_t *mem ISC_ATTR_UNUSED) {
+new_ft_eager_local(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	/* EAGER-optimized trie, local-node leaf arena. */
 	return _new_ft(FT_MODE_PRECISE);
 }
 
@@ -1204,6 +1209,24 @@ get_ft_specv_alloc(void *ft, size_t count, void **pval) {
 	return ISC_R_SUCCESS;
 }
 
+/*
+ * Eager lookup: exact in-trie descent (cds_ft_eager_lookup_key), no
+ * candidate/speculative step and no caller-side memcmp.  Same arena-slot
+ * result as get_ft_specv_alloc; used by the ft_eager / ft_eager_on_spec
+ * engines (the EAGER-attr vs SPECULATIVE-attr trie is selected by the
+ * new_ft_* builder, independent of this lookup).
+ */
+static isc_result_t
+get_ft_eager_alloc(void *ft, size_t count, void **pval) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	struct cds_ft_node *found;
+	cds_ft_eager_lookup_key(ft, qk->bytes, qk->len, 32, &found);
+	if (!found)
+		return ISC_R_NOTFOUND;
+	*pval = caa_container_of(found, struct ft_arena_slot, node);
+	return ISC_R_SUCCESS;
+}
+
 
 static isc_result_t
 add_ft(void *ft, size_t count) {
@@ -1227,8 +1250,8 @@ add_ft(void *ft, size_t count) {
  * the returned candidate is a phantom.  Useful only as a "what's the
  * raw descent cost" lower bound — not safe for real workloads.
  *
- * External slot is calloc'd (no FT super-arena), matching
- * ft_specv_calloc / ft_precise_calloc allocator placement.
+ * External slot is calloc'd (no FT super-arena), matching the
+ * *_local engines' allocator placement.
  */
 static isc_result_t
 get_ft_cand(void *ft, size_t count, void **pval) {
@@ -1238,30 +1261,6 @@ get_ft_cand(void *ft, size_t count, void **pval) {
 	if (!found)
 		return ISC_R_NOTFOUND;
 	*pval = caa_container_of(found, struct ft_arena_slot, node);
-	return ISC_R_SUCCESS;
-}
-
-/*
- * Candidate lookup with an explicit user-side memcmp() against the
- * candidate's stored key bytes.  Matches what a real "speculative"
- * application would do — descent skips library validation, but the
- * caller verifies before using the result.  Forces a full key-length
- * read of the leaf key (vs the 1-byte asm volatile load), so this is
- * the realistic cost when validation isn't free.
- */
-static isc_result_t
-get_ft_cand_memcmp(void *ft, size_t count, void **pval) {
-	struct query_key *qk = &tls_local_keys[count - tls_local_start];
-	struct cds_ft_node *found;
-	cds_ft_lookup_candidate_key(ft, qk->bytes, qk->len, 32, &found);
-	if (!found)
-		return ISC_R_NOTFOUND;
-	struct ft_arena_slot *slot =
-		caa_container_of(found, struct ft_arena_slot, node);
-	if (slot->key_len != qk->len ||
-	    memcmp(slot->key, qk->bytes, qk->len) != 0)
-		return ISC_R_NOTFOUND;
-	*pval = slot;
 	return ISC_R_SUCCESS;
 }
 
@@ -1360,7 +1359,7 @@ extern void cds_ft_debug_arena_resident(const struct cds_ft *ft,
  * is what a churning workload actually produces.  A grace period between the
  * remove batch and the reinsert batch lets the freed internal nodes return to
  * the freelist, so the reinserts allocate from the holes (= scatter) and the
- * removed leaf nodes are safe to reuse.  Operates on the ft_specv_extarena
+ * removed leaf nodes are safe to reuse.  Operates on the ft_spec_extarena
  * slot table (ft_alloc_index[]); run it only with that engine.
  */
 static void
@@ -1616,31 +1615,43 @@ _thread_ft_alloc(void *arg0, ft_add_fn add, ft_get_fn get, bool force_read) {
 	return NULL;
 }
 
+/*
+ * Thread wrappers compose an allocator (add_ft_specv_{il,local,extarena} =
+ * leaf-slot placement) with a lookup (get_ft_*).  The trie's optimization
+ * attr (EAGER vs SPECULATIVE) is selected by the paired new_ft_* builder in
+ * fun_list, independent of the lookup — so thread_ft_spec_il backs both
+ * ft_spec_il (SPEC attr) and ft_spec_on_eager_il (EAGER attr), and
+ * thread_ft_eager_il backs both ft_eager_il and ft_eager_on_spec_il.
+ */
+
+/* Speculative lookup (library-side memcmp via key offset). */
 static void *
-thread_ft_specv_il(void *arg0) {
+thread_ft_spec_il(void *arg0) {
 	return _thread_ft_alloc(arg0, add_ft_specv_il, get_ft_specv_alloc, true);
 }
 
 static void *
-thread_ft_specv_local(void *arg0) {
+thread_ft_spec_local(void *arg0) {
 	return _thread_ft_alloc(arg0, add_ft_specv_local, get_ft_specv_alloc, true);
 }
 
 static void *
-thread_ft_specv_extarena(void *arg0) {
+thread_ft_spec_extarena(void *arg0) {
 	return _thread_ft_alloc(arg0, add_ft_specv_extarena, get_ft_specv_alloc, true);
 }
 
+/* Eager lookup (exact in-trie descent). */
 static void *
-thread_ft_precise_il(void *arg0) {
-	return _thread_ft_alloc(arg0, add_ft_specv_il, get_ft_specv_alloc, true);
+thread_ft_eager_il(void *arg0) {
+	return _thread_ft_alloc(arg0, add_ft_specv_il, get_ft_eager_alloc, true);
 }
 
 static void *
-thread_ft_precise_local(void *arg0) {
-	return _thread_ft_alloc(arg0, add_ft_specv_local, get_ft_specv_alloc, true);
+thread_ft_eager_local(void *arg0) {
+	return _thread_ft_alloc(arg0, add_ft_specv_local, get_ft_eager_alloc, true);
 }
 
+/* Pure candidate lookup (no caller-side memcmp). */
 static void *
 thread_ft_cand_il(void *arg0) {
 	return _thread_ft_alloc(arg0, add_ft_specv_il, get_ft_cand, false);
@@ -1649,26 +1660,6 @@ thread_ft_cand_il(void *arg0) {
 static void *
 thread_ft_cand_local(void *arg0) {
 	return _thread_ft_alloc(arg0, add_ft_specv_local, get_ft_cand, false);
-}
-
-static void *
-thread_ft_cand_memcmp_il(void *arg0) {
-	return _thread_ft_alloc(arg0, add_ft_specv_il, get_ft_cand_memcmp, true);
-}
-
-static void *
-thread_ft_cand_memcmp_local(void *arg0) {
-	return _thread_ft_alloc(arg0, add_ft_specv_local, get_ft_cand_memcmp, true);
-}
-
-static void *
-new_ft_cand_memcmp_il(isc_mem_t *mem ISC_ATTR_UNUSED) {
-	return _new_ft(FT_MODE_CAND);
-}
-
-static void *
-new_ft_cand_memcmp_local(isc_mem_t *mem ISC_ATTR_UNUSED) {
-	return _new_ft(FT_MODE_CAND);
 }
 
 /*
@@ -1862,15 +1853,26 @@ thread_qp_local(void *arg0) {
 static struct fun fun_list[] = {
 	{ "qp_il",                new_qp_il,              thread_qp_il,              destroy_qp },
 	{ "qp_local",             new_qp_local,           thread_qp_local,           destroy_qp },
-	{ "ft_specv_il",          new_ft_specv_il,        thread_ft_specv_il,        destroy_ft },
-	{ "ft_specv_local",       new_ft_specv_calloc,    thread_ft_specv_local,     destroy_ft },
-	{ "ft_specv_extarena",    new_ft_specv_extarena,  thread_ft_specv_extarena,  destroy_ft_extarena },
-	{ "ft_precise_il",        new_ft_precise_il,      thread_ft_precise_il,      destroy_ft },
-	{ "ft_precise_local",     new_ft_precise_calloc,  thread_ft_precise_local,   destroy_ft },
-	{ "ft_cand_il",           new_ft_cand,            thread_ft_cand_il,         destroy_ft },
-	{ "ft_cand_local",        new_ft_cand,            thread_ft_cand_local,      destroy_ft },
-	{ "ft_cand_memcmp_il",    new_ft_cand_memcmp_il,    thread_ft_cand_memcmp_il,    destroy_ft },
-	{ "ft_cand_memcmp_local", new_ft_cand_memcmp_local, thread_ft_cand_memcmp_local, destroy_ft },
+	/*
+	 * FT engines: 2x2 of build attr (EAGER/SPEC) x lookup (eager/spec),
+	 * named with the matched diagonal as the base and the off-diagonal
+	 * suffixed _on_<attr>; plus pure candidate.  Suffix _il/_local/_extarena
+	 * is leaf-slot allocator placement.
+	 *   builder  = attr:   new_ft_eager_* (EAGER)  / new_ft_spec_* (SPEC)
+	 *   thread   = lookup: thread_ft_eager_* (eager) / thread_ft_spec_*
+	 *              (speculative) / thread_ft_cand_* (candidate)
+	 */
+	{ "ft_eager_il",           new_ft_eager_il,      thread_ft_eager_il,    destroy_ft },
+	{ "ft_eager_local",        new_ft_eager_local,   thread_ft_eager_local, destroy_ft },
+	{ "ft_eager_on_spec_il",   new_ft_spec_il,       thread_ft_eager_il,    destroy_ft },
+	{ "ft_eager_on_spec_local", new_ft_spec_local,   thread_ft_eager_local, destroy_ft },
+	{ "ft_spec_il",            new_ft_spec_il,       thread_ft_spec_il,     destroy_ft },
+	{ "ft_spec_local",         new_ft_spec_local,    thread_ft_spec_local,  destroy_ft },
+	{ "ft_spec_extarena",      new_ft_spec_extarena, thread_ft_spec_extarena, destroy_ft_extarena },
+	{ "ft_spec_on_eager_il",   new_ft_eager_il,      thread_ft_spec_il,     destroy_ft },
+	{ "ft_spec_on_eager_local", new_ft_eager_local,  thread_ft_spec_local,  destroy_ft },
+	{ "ft_cand_il",            new_ft_cand,          thread_ft_cand_il,     destroy_ft },
+	{ "ft_cand_local",         new_ft_cand,          thread_ft_cand_local,  destroy_ft },
 	{ NULL, NULL, NULL, NULL },
 };
 
