@@ -108,8 +108,9 @@ silently benchmarking a different structure under the `qp` label.)
 ## Multithreaded benchmark — bind9 `load-names`
 
 The MT scaling test is bind9's "lookup names" benchmark (`load-names.c`), which
-compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`) and
-HOT's concurrent ROWEX trie (`hotrowex`) under a lookup-scaling thread sweep
+compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`),
+HOT's concurrent ROWEX trie (`hotrowex`), and Masstree (`masstree`) under a
+lookup-scaling thread sweep
 (cache priming on by default — set `BENCH_NO_PRIME` to skip; `BENCH_ENGINE=<name>`
 runs one engine). The FT engines form the 2×2 of build attr × lookup — `ft_eager`
 (EAGER attr + eager lookup), `ft_spec` (SPEC attr + speculative lookup), and the
@@ -178,34 +179,42 @@ benchmark pins worker `i` to CPU `i` (CPUs 0–191 = one thread per physical
 core), so the 192-thread point runs one worker per physical core (private
 L1/L2/FPU, no SMT-sibling contention).
 
-### Result — FT spec vs HOTRowex (ROWEX) on this workload
+### Result — FT spec vs HOTRowex vs Masstree on this workload
 
-HOT's concurrent ROWEX trie is also wired into load-names as the `hotrowex`
-engine (`BENCH_ENGINE=hotrowex`), so the same read-only, sequential-access,
-real-names sweep compares it against `ft_spec_il` on equal footing — both
-validate every lookup and store key copies in a NUMA-interleaved arena (HOT keys
-on a NUL-terminated copy of the qpkey; qpkey bytes are all ≥ `SHIFT_NOBYTE`, so
-never contain `0x00`). Median of 4 runs, query Mops/s:
+HOT's concurrent ROWEX trie (`BENCH_ENGINE=hotrowex`) and Masstree
+(`BENCH_ENGINE=masstree`) are also wired into load-names, so the same read-only,
+sequential-access, real-names sweep compares them against `ft_spec_il` on equal
+footing — all validate every lookup and store key copies in a NUMA-interleaved
+arena (HOT keys on a NUL-terminated qpkey copy; Masstree keys on the binary
+qpkey bytes directly). Median of 4 runs, query Mops/s:
 
-| Threads | `ft_spec_il` | `hotrowex` | winner |
-|--------:|-------------:|-----------:|--------|
-| 64      | 317          | **359**    | HOTRowex ≈ 1.13×       |
-| 128     | **754**      | 720        | ft_spec ≈ even (1.05×) |
-| 192     | **1219**     | 1048       | **ft_spec ≈ 1.16×**    |
+| Threads | `ft_spec_il` | `hotrowex` | `masstree` |
+|--------:|-------------:|-----------:|-----------:|
+| 64      | 317          | **359**    | 165        |
+| 128     | **754**      | 720        | 262        |
+| 192     | **1219**     | 1048       | 189        |
 
-A clean **crossover at ~128 threads** (the ordering is robust across reps):
+**FT-spec and HOTRowex cross over at ~128 threads** (robust across reps):
 HOTRowex wins at lower core counts, FT-spec scales better and leads ~16% at 192.
 This is the **inverse** of the random-access read/write `bench_scale` result
 (where HOTRowex leads at 192) — load-names does *sequential* lookups
 (prefetch-friendly) on real qpkeys with FT's leaf slots round-robin
 **interleaved** across NUMA nodes.
 
-> **Caveat:** HOT's *internal nodes* are first-touched by their building thread
-> (HOT exposes no allocator hook, so unlike FT's leaf arena they cannot be
-> `mbind`-interleaved). The key copies HOT validates against *are* interleaved,
-> but the node placement is not — which plausibly costs HOTRowex some of its
-> 192-core scaling. So the ~16% at 192 is partly the algorithm, partly this
-> integration limit.
+**Masstree does not scale to 192 here** — it peaks at 128 (~262) and *drops* at
+192 (~189), while FT and HOT keep climbing past 1000. Since HOT's internal nodes
+are *also* first-touched (not interleaved) yet HOT scales fine, the cause is
+likely not NUMA placement but Masstree's **optimistic, version-validated reads**
+contending on hot shared B+tree internal nodes once readers span both sockets —
+RCU (FT) and ROWEX (HOT) readers don't re-read shared version counters. On the
+random-access `bench_scale` sweep Masstree was competitive (~330 @ 192), so this
+collapse is specific to the sequential, correlated-descent load-names pattern.
+
+> **Caveat:** HOT's and Masstree's *internal nodes* are first-touched by their
+> building thread (neither exposes an allocator hook, so unlike FT's leaf arena
+> they cannot be `mbind`-interleaved). The key copies they validate against *are*
+> interleaved, but the node placement is not — plausibly part of HOTRowex's ~16%
+> gap at 192 (though, per above, not the main factor in Masstree's collapse).
 
 ## Multithreaded benchmark — read/write scaling (per engine)
 
