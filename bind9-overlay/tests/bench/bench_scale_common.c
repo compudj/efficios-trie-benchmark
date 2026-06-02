@@ -189,6 +189,14 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 	struct writer_arg warg = { .writes = 0 };
 	struct timespec ts;
 	unsigned long total_reads = 0;
+	/*
+	 * BENCH_NO_WRITER: drop the writer thread and run a pure read-only
+	 * lookup-scaling sweep (the load-names workload character) instead of the
+	 * read/write churn — no concurrent mutation, no grace periods, so this
+	 * isolates lookup throughput with the engines on the same fair footing
+	 * (validated lookups, key copies in the dense arena).
+	 */
+	int no_writer = (getenv("BENCH_NO_WRITER") != NULL);
 
 	start_flag = 0;
 	stop_flag = 0;
@@ -202,7 +210,8 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 		rargs[i].seed = 42 + (uint64_t)i * 1000;
 		pthread_create(&threads[i], NULL, reader_thread, &rargs[i]);
 	}
-	pthread_create(&threads[nr_readers], NULL, writer_thread, &warg);
+	if (!no_writer)
+		pthread_create(&threads[nr_readers], NULL, writer_thread, &warg);
 
 	/*
 	 * Wait until every reader has finished any cache-priming warm-up pass
@@ -219,7 +228,7 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 	usleep(DURATION_SEC * 1000000);
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
 
-	for (int i = 0; i <= nr_readers; i++)
+	for (int i = 0; i < nr_readers + (no_writer ? 0 : 1); i++)
 		pthread_join(threads[i], NULL);
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -230,7 +239,7 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 		total_reads += rargs[i].count;
 
 	*read_mops = (double)total_reads / elapsed / 1e6;
-	*write_kops = (double)warg.writes / elapsed / 1e3;
+	*write_kops = no_writer ? 0.0 : (double)warg.writes / elapsed / 1e3;
 
 	if (g_eng->cleanup_churn)
 		g_eng->cleanup_churn();
