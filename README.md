@@ -63,6 +63,28 @@ for e in ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot; do printf '%
 Useful env vars (see `src/bench_one_st.c`): `FT_BENCH_COMPACT` (compact between
 build and query), `FT_DUMP_STATS`, `N_KEYS` / `WARMUP` / `RUNS` (compile-time).
 
+### Representative results (`dns`, 1M keys, single thread)
+
+Lookup time (best of `RUNS` timed passes after `WARMUP`) and post-build RSS, on
+the hardware below (2× EPYC 9654; `cuckoo` run with reserved 2 MiB hugepages and
+built `-O3 -flto`). Sorted fastest first:
+
+| Engine     | ns/op | RSS (MB) | Notes |
+|------------|------:|---------:|-------|
+| `hot`      |    98 |       71 | Height Optimized Trie — fastest **and** smallest |
+| `ft_cand`  |   113 |      252 | FT, pure candidate (no validation) |
+| `qp`       |   116 |      160 | qp-trie (Tony Finch) |
+| `ft_spec`  |   119 |      252 | FT reference (speculative + lib-side memcmp) |
+| `wormhole` |   132 |      143 | separate **GPL** binary (`bench_wormhole_gpl`) |
+| `judy`     |   201 |      107 | JudySL |
+| `art`      |   220 |      226 | ART (libart) |
+| `cuckoo`   |   337 |      104 | Cuckoo Trie — slowest here (hashes whole keys; see below) |
+
+Single snapshot (best-of-`RUNS` filters most noise; figures move a few % run to
+run). Takeaway: short DNS keys with heavy shared prefixes favor prefix-exploiting
+tries; **HOT is the bar to beat** — it matches the fastest lookups at ~3.5× less
+memory than the FT here.
+
 ### The qp-trie `qp` vs `fn` gotcha
 
 qp-trie dispatches through `Tbl.o`, which links with **exactly one** backend
