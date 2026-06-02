@@ -237,13 +237,18 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
   `bench_one_st`'s `hot` engine via the `src/bench_hot.cpp` shim. See `LICENSE`.
 - `third_party/cuckoo-trie` — Unlicense / public domain (Zeitak & Morrison). C;
   linked into `bench_one_st`'s `cuckoo` engine via `src/bench_cuckoo.c`. See
-  `UNLICENSE`. **Local change:** `util.c`'s `mmap_hugepage` falls back to a plain
-  `mmap` + `MADV_HUGEPAGE` when reserved 2 MiB hugepages are unavailable
-  (upstream requires them and aborts). ⚠ Cuckoo is built around hugepage-backed
-  buckets; on the THP fallback it is **far slower** (~580 vs ~100 ns/op on dns),
-  so that number is *not* its designed performance. For Cuckoo's intended
-  numbers, reserve hugepages first: `echo N | sudo tee /proc/sys/vm/nr_hugepages`
-  (a few hundred 2 MiB pages for 1M keys).
+  `UNLICENSE`. Built with Cuckoo's own recommended `-O3 -flto
+  -fno-strict-aliasing` — **LTO matters**: at `-O2` without LTO it is ~1.7×
+  slower (~580 vs ~337 ns/op on dns). **Local change:** `util.c`'s
+  `mmap_hugepage` falls back to a plain `mmap` + `MADV_HUGEPAGE` when reserved
+  2 MiB hugepages are unavailable (upstream requires them and aborts); reserving
+  hugepages (`echo N | sudo tee /proc/sys/vm/nr_hugepages`, a few hundred 2 MiB
+  pages for 1M keys) mainly improves its **footprint** (~106 vs ~143 MB RSS),
+  not its speed. Note: even built optimally and hugepage-backed, Cuckoo is the
+  slowest engine on this workload (~337 ns/op vs ~100–120 for the radix/FT
+  engines) — short DNS keys with heavy shared prefixes favor prefix-exploiting
+  radix tries, whereas Cuckoo hashes whole keys and its memory-level-parallelism
+  design targets a different regime.
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,
