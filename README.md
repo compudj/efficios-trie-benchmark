@@ -71,19 +71,31 @@ built `-O3 -flto`). Sorted fastest first:
 
 | Engine     | ns/op | RSS (MB) | Notes |
 |------------|------:|---------:|-------|
-| `hot`      |    98 |       71 | Height Optimized Trie — fastest **and** smallest |
-| `ft_cand`  |   113 |      252 | FT, pure candidate (no validation) |
+| `hot`      |   100 |      110 | Height Optimized Trie — fastest lookups |
+| `ft_cand`  |   112 |      252 | FT, pure candidate (no validation) |
 | `qp`       |   116 |      160 | qp-trie (Tony Finch) |
-| `ft_spec`  |   119 |      252 | FT reference (speculative + lib-side memcmp) |
-| `wormhole` |   132 |      143 | separate **GPL** binary (`bench_wormhole_gpl`) |
-| `judy`     |   201 |      107 | JudySL |
-| `art`      |   220 |      226 | ART (libart) |
-| `cuckoo`   |   337 |      104 | Cuckoo Trie — slowest here (hashes whole keys; see below) |
+| `ft_spec`  |   118 |      252 | FT reference (speculative + lib-side memcmp) |
+| `wormhole` |   118 |      125 | separate **GPL** binary (`bench_wormhole_gpl`) |
+| `judy`     |   205 |      107 | JudySL |
+| `art`      |   207 |      226 | ART (libart) |
+| `cuckoo`   |   336 |      104 | Cuckoo Trie — slowest here (hashes whole keys; see below) |
 
 Single snapshot (best-of-`RUNS` filters most noise; figures move a few % run to
 run). Takeaway: short DNS keys with heavy shared prefixes favor prefix-exploiting
-tries; **HOT is the bar to beat** — it matches the fastest lookups at ~3.5× less
-memory than the FT here.
+tries; **HOT still has the fastest lookups**, but at ~2.3× less memory than the
+FT here rather than being the outright smallest — `judy` and `cuckoo` are now
+slightly smaller (see the fairness note).
+
+> **Validation fairness (why these differ from earlier numbers).** Every engine
+> here stores its own **copy** of each key (FT/qp/ART in a dense
+> `cds_ft_external_arena`; Judy/Cuckoo/Wormhole internally) and the timed loop
+> both consumes the lookup status and force-reads the returned leaf
+> (`FORCE_READ_LEAF`), so each pays a real validating compare against cold
+> memory and no validation is dead-code-eliminated. HOT originally stored a
+> pointer straight into the shared query buffer, so its `contentEquals`
+> validated against already-hot memory — near-free, and ~71 MB because it kept
+> no copies. Putting HOT on the same key-copy arena as the others is what moves
+> it to ~100 ns / 110 MB (the lookup cost barely changes; the memory does).
 
 ### The qp-trie `qp` vs `fn` gotcha
 
@@ -175,7 +187,7 @@ process holds exactly one trie:
 
 | Executable          | Engine                          | Links             |
 |---------------------|---------------------------------|-------------------|
-| `bench_scale_ft`    | Fractal Trie (candidate+memcmp) | liburcu (membarrier) |
+| `bench_scale_ft`    | Fractal Trie (`ft_spec`: speculative + lib-side memcmp) | liburcu (membarrier) |
 | `bench_scale_ft_qsbr` | Fractal Trie, same engine, QSBR flavor | liburcu-qsbr |
 | `bench_scale_judy`  | JudySL, rwlock                  | libJudy           |
 | `bench_scale_qp`    | qp-trie, rwlock                 | vendored qp-trie  |
@@ -184,9 +196,13 @@ process holds exactly one trie:
 | `bench_scale_hotrowex` | HOT (concurrent **ROWEX**)   | HOT + oneTBB      |
 
 They share `bench_scale_common.c` (key generation, RSS sampling, the
-thread-sweep driver); each `bench_scale_<engine>.c` supplies that engine's
-build / lookup / churn callbacks and a thin `main`. **Only `bench_scale_b9qp`
-links bind9.**
+thread-sweep driver, and a dense `bench_arena` bump allocator); each
+`bench_scale_<engine>.c` supplies that engine's build / lookup / churn callbacks
+and a thin `main`. **Only `bench_scale_b9qp` links bind9.** For a fair lookup
+comparison every engine stores its keys as **copies in the arena** (so the
+validating compare each lookup does hits cold, separate memory — not the shared
+query buffer, which would make validation almost free), and each reader
+force-reads the returned leaf so that compare is real and not optimized away.
 
 `bench_scale_hotrowex` is built separately by the **top-level Makefile** (it
 links neither bind9 nor liburcu — only the header-only HOT and oneTBB
@@ -234,17 +250,44 @@ throughput/shape, not the reported RSS (sampled once after build).
 
 ### Result — FT (RCU) vs HOTRowex (ROWEX) at scale
 
-Read throughput (1M DNS keys, 1 writer + N readers, priming on, one 3 s timed
-window per point) on the same 2× EPYC 9654 / 192-physical-core box as the
-`load-names` result above, worker `i` pinned to core `i`:
+Read throughput (1M DNS keys, 1 writer + N readers, priming on, **median of 10
+runs** per point) on the same 2× EPYC 9654 / 192-physical-core box as the
+`load-names` result above, worker `i` pinned to core `i`. Both engines are on
+**equal footing**: each stores its lookup keys as copies in a dense
+`bench_arena` external-node region (FT: the `ft_entry` embedding the
+`cds_ft_node`; HOTRowex: the byte copies its values point at — *not* pointers
+into the shared query buffer), the FT reader uses the validating
+`cds_ft_speculative_lookup_key` (`ft_spec`), and both force-read the returned
+leaf, so each lookup pays a real validating compare against cold memory that is
+never dead-code-eliminated.
 
-| Readers | `ft` read (Mops/s) | `hotrowex` read (Mops/s) † | ROWEX vs RCU |
-|--------:|-------------------:|---------------------------:|-------------:|
-| 1       | 3.7                | 4.1                        | 1.1×         |
-| 32      | 82.6               | 110.9                      | 1.3×         |
-| 128     | 314.9              | 416.1                      | 1.3×         |
-| 192     | **431.4**          | **699.2**                  | **≈ 1.6×**   |
-| RSS     | 245 MB             | **79 MB**                  | ⅓ the memory |
+| Readers | `ft` (FT spec) Mops/s | `hotrowex` Mops/s † | HOTRowex vs FT |
+|--------:|----------------------:|--------------------:|---------------:|
+| 64      | 152                   | 194                 | ≈ 1.3×         |
+| 128     | 244                   | 336                 | ≈ 1.4×         |
+| 192     | 287 ‡                 | 446                 | ≈ 1.55×        |
+| RSS     | 245 MB                | **110 MB**          | ≈ ½ the memory |
+
+HOTRowex's lock-free optimistic reads pull further ahead as cores climb
+(1.3× → 1.55×); on top of that it runs in ≈ half the RSS.
+
+‡ Medians of 10 runs. HOTRowex (192-core reps 431–453) and FT-QSBR (252–262) are
+tight and well-converged; **FT under membarrier stays noisy** (267–354, median
+287) — its occasional highs are luck, not capability, so best-of would flatter
+it. FT-QSBR's median is 256, so HOTRowex leads it by ≈ 1.7× at 192.
+
+> **Earlier drafts of this result were built on unfair measurements.** Two bugs,
+> both now fixed: (1) the FT reader left its result unused, so the compiler
+> dead-code-eliminated the validating memcmp — it was really timing `ft_cand`,
+> the *unvalidated* candidate lookup (it read ~431 Mops/s); and (2) HOTRowex
+> stored pointers straight into the shared query buffer, so its `contentEquals`
+> validated against already-hot memory for free and kept no key copies (79 MB,
+> ~699 Mops/s). The intermediate half-fix (FT validated but in *scattered*
+> calloc, HOTRowex still zero-copy) swung the other way to ~2.5×. With both
+> engines validated **and** both storing key copies in a dense arena, FT-spec
+> settled at ≈ 287 Mops/s and HOTRowex at ≈ 446 (RSS 79 → 110 MB): an honest
+> ≈ 1.55× read gap plus ≈ ½ the RSS. (The original 1.6× ratio was coincidentally
+> close — both numbers were inflated by roughly the same factor.)
 
 > **† HOTRowex (ROWEX) does not support `remove`.** Upstream HOT's concurrent
 > ROWEX variant implements lookup / scan / insert / `upsert` only — there is no
@@ -255,26 +298,28 @@ window per point) on the same 2× EPYC 9654 / 192-physical-core box as the
 > but its workload is strictly easier on the write path. The Fractal Trie
 > supports full concurrent insert **and** remove under RCU.
 
-Both scale to 192 cores with no collapse; HOTRowex's lock-free optimistic reads
-scale a little better at the top (≈ ×170 over the range vs FT's ≈ ×116) and in
-roughly one-third the memory — but for a lookup/insert/`upsert` workload only
-(see the footnote). So this is a read-scaling-and-footprint comparison against a
-deletion-incapable structure, not an all-operations one.
-
 **RCU flavor is not the variable.** `bench_scale_ft` uses liburcu's membarrier
 flavor; `bench_scale_ft_qsbr` is the identical engine built `-DBENCH_FT_QSBR`
 against the QSBR flavor (its only diff — see `bench_scale_ft.c`). QSBR has the
 cheapest possible read side (`rcu_read_lock`/`rcu_read_unlock` compile to
-nothing), yet across the whole sweep the two are equal within run-to-run noise
-(192 cores: ≈ 432 vs ≈ 429 Mops/s). Expected: the reader brackets one
+nothing), yet the two are within ~12% (192-core medians of 10: memb ≈ 287, QSBR
+≈ 256) — membarrier slightly higher but much noisier (reps 267–354), QSBR tight
+(252–262) and more reproducible. Expected: the reader brackets one
 `rcu_read_lock`/`unlock` pair around a whole 1000-lookup batch, so the read-side
-cost is already amortized to ~nothing under membarrier too, and the `call_rcu`
-writer makes grace periods (and membarrier's broadcast IPIs) infrequent. So
-FT's ~430 Mops/s is its real ceiling here regardless of flavor — the gap to
-HOTRowex is not a membarrier artifact. (QSBR does demand a stricter discipline:
-its otherwise-idle main thread must go `rcu_thread_offline()` across each timed
-window or it would stall every grace period — handled in `ft_build` /
+cost is amortized to ~nothing under membarrier too, and the `call_rcu` writer
+makes grace periods (and membarrier's broadcast IPIs) infrequent — so flavor
+barely moves the throughput, it mostly affects the variance. (QSBR does demand a stricter
+discipline: its otherwise-idle main thread must go `rcu_thread_offline()` across
+each timed window or it would stall every grace period — handled in `ft_build` /
 `ft_cleanup_churn`.)
+
+**NUMA interleaving does not help this benchmark.** `BENCH_NUMA_INTERLEAVE`
+spreads each engine's keys + arena across all NUMA nodes
+(`numa_set_interleave_mask`); at 192 cores it is a wash and at low thread counts
+it *hurts*, because this writer-contended workload is latency-bound
+pointer-chasing, not bandwidth-bound — the opposite of `load-names`' read-only
+`ft_spec_il`, where an interleaved arena wins at ≥128 threads. Left off by
+default; the numbers above are non-interleaved.
 
 ### Why one process per engine
 
