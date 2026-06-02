@@ -112,6 +112,8 @@ executable(
         meson.current_source_dir() / 'mt_string.o',
         meson.current_source_dir() / 'mt_straccum.o',
         meson.current_source_dir() / 'mt_kvthread.o',
+        meson.current_source_dir() / 'load_names_artolc.o',
+        meson.current_source_dir() / 'artolc_tree.o',
         '-ltbb', '-lstdc++',
     ],
     dependencies: [

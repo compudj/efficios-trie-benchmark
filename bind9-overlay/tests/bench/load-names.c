@@ -2064,6 +2064,117 @@ thread_masstree(void *arg0) {
 	return _thread_ft_alloc(arg0, add_masstree, get_masstree, true);
 }
 
+/* ───────────────────────────────────────────────────────────────────
+ * ART-OLC engine — concurrent ART, Optimistic Lock Coupling
+ * (flode/ARTSynchronized, Apache-2.0), via the extern "C" shim
+ * src/load_names_artolc.cpp (g++ + the vendored ART-OLC unity source, linked
+ * with -ltbb -lstdc++).
+ *
+ * ART stores only a TID per leaf and validates via a loadKey(TID) callback, so
+ * the value is a pointer to an artolc_kv copy of the qpkey in a NUMA-interleaved
+ * arena -- loadKey (validation) and the force-read hit cold memory.  Read-only
+ * after build: ops open the epoch guard internally, so each worker just makes
+ * its own ART::ThreadInfo lazily.  Run one thread count per process.
+ * ─────────────────────────────────────────────────────────────────── */
+void *artolc_create(void);
+void *artolc_thread_init(void *tree);
+void artolc_insert(void *tree, void *ti, const char *key, int len, uint64_t tid_val);
+uint64_t artolc_lookup(void *tree, void *ti, const char *key, int len);
+void artolc_destroy(void *tree);
+
+struct artolc_kv {		/* must match src/load_names_artolc.cpp */
+	uint32_t len;
+	uint8_t bytes[];
+};
+
+static __thread void *tls_artolc_ti = NULL;
+static inline void *artolc_ti(void *map) {
+	if (tls_artolc_ti == NULL)
+		tls_artolc_ti = artolc_thread_init(map);
+	return tls_artolc_ti;
+}
+
+static char *artolc_il_arena = NULL;
+static size_t artolc_il_arena_off = 0;
+static size_t artolc_il_arena_cap = 0;
+
+static void
+artolc_il_arena_create(size_t n) {
+	artolc_il_arena_cap = n * (sizeof(struct artolc_kv) + sizeof(dns_qpkey_t));
+	artolc_il_arena = mmap(NULL, artolc_il_arena_cap, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (artolc_il_arena == MAP_FAILED) {
+		perror("mmap(artolc_il_arena)");
+		abort();
+	}
+	unsigned long mask = (1UL << 24) - 1;
+	if (sys_mbind(artolc_il_arena, artolc_il_arena_cap,
+		      MPOL_INTERLEAVE, &mask, 25, 0) < 0) {
+		perror("mbind(artolc_il_arena)");
+	}
+	artolc_il_arena_off = 0;
+}
+
+static char *
+artolc_il_arena_alloc(size_t sz) {
+	size_t off = (artolc_il_arena_off + 7) & ~(size_t)7;
+	if (off + sz > artolc_il_arena_cap)
+		abort();
+	artolc_il_arena_off = off + sz;
+	return artolc_il_arena + off;
+}
+
+static isc_result_t
+add_artolc(void *map, size_t count) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	dns_qpkey_t key;
+	size_t len = dns_qpkey_fromname(key, &item[count].fixed.name,
+					DNS_DBNAMESPACE_NORMAL);
+	/*
+	 * ART is a byte radix tree, so keys must be byte-prefix-free -- but a
+	 * parent domain's qpkey is a byte-prefix of its child's.  Every qpkey
+	 * byte is >= SHIFT_NOBYTE (2), so append a 0 terminator (unique) and key
+	 * on len+1.  (len+1 <= sizeof(dns_qpkey_t), so qk->bytes has room.)
+	 */
+	memcpy(qk->bytes, key, len);
+	qk->bytes[len] = 0;
+	qk->len = len + 1;
+	struct artolc_kv *kv = (struct artolc_kv *)artolc_il_arena_alloc(
+		sizeof(struct artolc_kv) + len + 1);
+	kv->len = (uint32_t)(len + 1);
+	memcpy(kv->bytes, qk->bytes, len + 1);
+	ft_alloc_index[count] = (struct ft_arena_slot *)kv;
+	artolc_insert(map, artolc_ti(map), (const char *)qk->bytes,
+		      (int)(len + 1), (uint64_t)(uintptr_t)kv);
+	return ISC_R_SUCCESS;
+}
+
+static isc_result_t
+get_artolc(void *map, size_t count, void **pval) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	uint64_t tid = artolc_lookup(map, artolc_ti(map),
+				     (const char *)qk->bytes, (int)qk->len);
+	if (tid == 0)
+		return ISC_R_NOTFOUND;
+	*pval = (void *)(uintptr_t)tid;
+	return ISC_R_SUCCESS;
+}
+
+static void *
+new_artolc(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	return artolc_create();
+}
+
+static void
+destroy_artolc(void *map) {
+	artolc_destroy(map);
+}
+
+static void *
+thread_artolc(void *arg0) {
+	return _thread_ft_alloc(arg0, add_artolc, get_artolc, true);
+}
+
 static struct fun fun_list[] = {
 	{ "qp_il",                new_qp_il,              thread_qp_il,              destroy_qp },
 	{ "qp_local",             new_qp_local,           thread_qp_local,           destroy_qp },
@@ -2091,6 +2202,8 @@ static struct fun fun_list[] = {
 	{ "hotrowex",              new_hotrowex,         thread_hotrowex,       destroy_hotrowex },
 	/* Masstree concurrent B+tree-of-tries. */
 	{ "masstree",              new_masstree,         thread_masstree,       destroy_masstree },
+	/* ART-OLC concurrent adaptive radix tree (Optimistic Lock Coupling). */
+	{ "artolc",                new_artolc,           thread_artolc,         destroy_artolc },
 	{ NULL, NULL, NULL, NULL },
 };
 
@@ -2184,6 +2297,7 @@ main(int argc, char *argv[]) {
 	user_payload_create(sizeof(item) / sizeof(item[0]));
 	hot_il_arena_create(sizeof(item) / sizeof(item[0]));
 	mt_il_arena_create(sizeof(item) / sizeof(item[0]));
+	artolc_il_arena_create(sizeof(item) / sizeof(item[0]));
 	isc_rwlock_init(&rwl);
 
 	if (argc != 2) {

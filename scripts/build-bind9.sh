@@ -46,9 +46,10 @@ fi
 # 2. Overlay our tests/bench files + the vendored competitor sources.
 echo ">> applying tests/bench overlay"
 cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$DEST/"
-# HOTRowex + Masstree engines for load-names: C++ shims compiled separately
-# below and linked into load-names.
-cp "$REPO/src/load_names_hotrowex.cpp" "$REPO/src/load_names_masstree.cpp" "$DEST/"
+# HOTRowex + Masstree + ART-OLC engines for load-names: C++ shims compiled
+# separately below and linked into load-names.
+cp "$REPO/src/load_names_hotrowex.cpp" "$REPO/src/load_names_masstree.cpp" \
+   "$REPO/src/load_names_artolc.cpp" "$DEST/"
 # Per-engine read/write scaling benchmark: shared driver + one file per engine.
 cp "$OV/bench_scale_common.h" "$OV/bench_scale_common.c" \
    "$OV/bench_scale_ft.c"   "$OV/bench_scale_judy.c" "$OV/bench_scale_qp.c" \
@@ -92,6 +93,15 @@ for f in compiler str string straccum kvthread; do
 	$MT_CXX -c "$MT_DIR/$f.cc" -o "$DEST/mt_$f.o"
 done
 $MT_CXX -c "$DEST/load_names_masstree.cpp" -o "$DEST/load_names_masstree.o"
+
+# Compile the ART-OLC shim + its vendored unity source (Apache-2.0) for
+# load-names' artolc engine.  Tree.cpp #includes the node + Epoche sources, so
+# only it is compiled; needs oneTBB (its epoch reclamation uses TBB).
+echo ">> compiling ART-OLC shim + core for load-names"
+AO_DIR="$REPO/third_party/artolc"
+AO_CXX="g++ -std=c++14 -O2 -DNDEBUG -march=native -w -I$AO_DIR"
+$AO_CXX -c "$AO_DIR/OptimisticLockCoupling/Tree.cpp" -o "$DEST/artolc_tree.o"
+$AO_CXX -c "$DEST/load_names_artolc.cpp" -o "$DEST/load_names_artolc.o"
 
 # load-names is the primary, up-to-date MT scaling test — it must build.
 echo ">> building load-names (primary MT scaling test)"
