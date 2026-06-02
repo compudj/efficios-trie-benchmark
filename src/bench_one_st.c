@@ -4,7 +4,7 @@
  *
  * Usage: bench_one <dataset> <engine>
  *   dataset: u32d u32s u64d u64s dns dict paths
- *   engine:  ft ft_skip ft_cand judy qp art
+ *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art
  *
  * Output: <ns/op> <RSS_kB>
  */
@@ -322,25 +322,27 @@ static void run_ft(int skip, int candidate, int spec_validated)
 	else
 		cds_ft_group_attr_set_max_key_len(attr, 256);
 	/*
-	 * Engine modes (explicit optimization, post-default-flip):
+	 * Engine modes (explicit optimization, post-default-flip).
+	 * Two independent knobs: the group's lookup-optimization attr
+	 * (EAGER vs SPECULATIVE) and the lookup query function.
 	 *
-	 *   ft (none of the flags):  EAGER attr + cds_ft_eager_
-	 *                            lookup_key ("optimized eager
-	 *                            trie": no skip-compressed
-	 *                            encoding, per-step exact
-	 *                            compare on compressed bytes).
-	 *   ft_skip   (skip=1):     SPECULATIVE attr + cds_ft_eager_
-	 *                            lookup_key ("spec-eager":
-	 *                            speculative descent but eager
-	 *                            per-step exact compare —
-	 *                            measures the cost a caller
-	 *                            using the new default attr +
-	 *                            the old lookup API pays).
-	 *   ft_cand   (cand=1):     SPECULATIVE attr + cds_ft_lookup_
-	 *                            candidate_key + caller memcmp.
-	 *   ft_specv  (specv=1):    SPECULATIVE attr + cds_ft_
-	 *                            speculative_lookup_key (lib-side
-	 *                            memcmp via @key_offset).
+	 *   ft_eager (no flags):       EAGER attr + cds_ft_eager_lookup_key
+	 *                              ("optimized eager trie": no skip-
+	 *                              compressed encoding, per-step exact
+	 *                              compare on compressed bytes).
+	 *   ft_eager_on_spec (skip=1): SPECULATIVE attr + cds_ft_eager_
+	 *                              lookup_key — eager lookup run on the
+	 *                              speculative/skip-encoded trie (the cost
+	 *                              a caller using the new default attr but
+	 *                              the old eager lookup API pays).
+	 *   ft_cand   (cand=1):        SPECULATIVE attr + cds_ft_lookup_
+	 *                              candidate_key returned as-is, with NO
+	 *                              caller-side validation — a pure
+	 *                              candidate fetch.  (Adding a memcmp here
+	 *                              would just reproduce ft_spec.)
+	 *   ft_spec   (specv=1):       SPECULATIVE attr + cds_ft_speculative_
+	 *                              lookup_key (lib-side memcmp via
+	 *                              @key_offset).
 	 */
 	cds_ft_group_attr_set_lookup_optimization(attr,
 		(skip || spec_validated || candidate)
@@ -383,13 +385,8 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				else
 					cds_ft_u64_to_key(ft, int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				if (candidate) {
+					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
-					if (found) {
-						struct ft_entry_int *e = cds_ft_entry(found,
-							struct ft_entry_int, ft_node);
-						if (memcmp(e->key, k, key_len_bytes) != 0)
-							found = NULL;
-					}
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft, k,
 						CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
@@ -415,13 +412,8 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				else
 					cds_ft_u64_to_key(ft, int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				if (candidate) {
+					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
-					if (found) {
-						struct ft_entry_int *e = cds_ft_entry(found,
-							struct ft_entry_int, ft_node);
-						if (memcmp(e->key, k, key_len_bytes) != 0)
-							found = NULL;
-					}
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft, k,
 						CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
@@ -532,16 +524,10 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			for (unsigned int i = 0; i < n_keys; i++) {
 				struct cds_ft_node *found;
 				if (candidate) {
+					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft,
 						(const uint8_t *)str_keys[i],
 						str_lens[i], STR_KEYS_READABLE_PAD, &found);
-					if (found) {
-						struct ft_entry *e = cds_ft_entry(found,
-							struct ft_entry, ft_node);
-						if (e->key_len != str_lens[i] ||
-						    memcmp(e->key, str_keys[i], e->key_len) != 0)
-							found = NULL;
-					}
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft,
 						(const uint8_t *)str_keys[i],
@@ -766,7 +752,7 @@ int main(int argc, char **argv)
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft ft_skip ft_cand judy qp art\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art\n", argv[0]);
 		return 1;
 	}
 
@@ -786,10 +772,10 @@ int main(int argc, char **argv)
 	g_dataset_label = argv[1];
 	gen_keys(argv[1]);
 
-	if (strcmp(argv[2], "ft") == 0)          run_ft(0, 0, 0);
-	else if (strcmp(argv[2], "ft_skip") == 0) run_ft(1, 0, 0);
-	else if (strcmp(argv[2], "ft_cand") == 0) run_ft(1, 1, 0);
-	else if (strcmp(argv[2], "ft_specv") == 0) run_ft(0, 0, 1);
+	if (strcmp(argv[2], "ft_eager") == 0)          run_ft(0, 0, 0);
+	else if (strcmp(argv[2], "ft_eager_on_spec") == 0) run_ft(1, 0, 0);
+	else if (strcmp(argv[2], "ft_cand") == 0)      run_ft(1, 1, 0);
+	else if (strcmp(argv[2], "ft_spec") == 0)      run_ft(0, 0, 1);
 	else if (strcmp(argv[2], "judy") == 0)    run_judy();
 	else if (strcmp(argv[2], "qp") == 0)      run_qp();
 	else if (strcmp(argv[2], "art") == 0)     run_art();

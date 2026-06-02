@@ -5,9 +5,10 @@ implementations:
 
 | Engine     | Implementation                                  | Source                          |
 |------------|-------------------------------------------------|---------------------------------|
-| `ft`       | Fractal Trie (eager)                            | our liburcu clone (`urcu-build/`)|
-| `ft_skip`  | Fractal Trie, speculative skip                  | our liburcu clone               |
-| `ft_cand`  | Fractal Trie, candidate (memcmp-verified)       | our liburcu clone               |
+| `ft_eager` | Fractal Trie, eager attr + eager lookup         | our liburcu clone (`urcu-build/`)|
+| `ft_eager_on_spec` | Fractal Trie, eager lookup on speculative trie | our liburcu clone        |
+| `ft_cand`  | Fractal Trie, pure candidate lookup (no memcmp) | our liburcu clone               |
+| `ft_spec`  | Fractal Trie, speculative lookup (lib-side memcmp) | our liburcu clone            |
 | `qp`       | qp-trie (quadbit popcount), Tony Finch          | `third_party/qp-trie` (vendored)|
 | `art`      | Adaptive Radix Tree (libart), Armon Dadgar      | `third_party/libart` (vendored) |
 | `judy`     | JudyL / JudySL                                  | system `libJudy`                |
@@ -47,14 +48,14 @@ Single dataset, single engine, run in its own process for accurate RSS:
 ```sh
 ./bench_one_st <dataset> <engine>
 #   dataset: u32d u32s u64d u64s dns dict paths   (all generated synthetically)
-#   engine:  ft ft_skip ft_cand judy qp art
+#   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art
 # output: <ns/op> <RSS_kB>      ('-' for string engines on integer datasets)
 ```
 
 Example sweep:
 
 ```sh
-for e in ft ft_skip ft_cand judy qp art; do printf '%-9s ' "$e"; ./bench_one_st dns "$e"; done
+for e in ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art; do printf '%-17s ' "$e"; ./bench_one_st dns "$e"; done
 ```
 
 Useful env vars (see `src/bench_one_st.c`): `FT_BENCH_COMPACT` (compact between
