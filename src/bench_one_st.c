@@ -763,8 +763,23 @@ static void run_hot(void)
 	double best = 1e18;
 	void *hot = hot_create();
 
-	for (unsigned int i = 0; i < n_keys; i++)
-		hot_insert(hot, str_keys[i]);
+	/*
+	 * Store key COPIES from a dense cds_ft_external_arena and hand HOT a
+	 * pointer into that arena (not into str_keys[]).  HOT's value IS its key,
+	 * so without this its contentEquals + the FORCE_READ_LEAF below would hit
+	 * the already-hot query buffer (near-free) -- unfair vs FT/qp/ART, which
+	 * validate/touch a cold key copy.  Same arena the FT/qp/ART engines use,
+	 * so HOT now pays the identical leaf-layout cost.
+	 */
+	struct cds_ft_external_arena *key_arena =
+		cds_ft_external_arena_create(NULL);
+	for (unsigned int i = 0; i < n_keys; i++) {
+		char *copy = cds_ft_external_arena_alloc(key_arena,
+			str_lens[i] + 1);
+		memcpy(copy, str_keys[i], str_lens[i]);
+		copy[str_lens[i]] = '\0';
+		hot_insert(hot, copy);
+	}
 	rss = get_rss_kb();
 
 	for (int w = 0; w < WARMUP; w++)
@@ -785,6 +800,7 @@ static void run_hot(void)
 	}
 	printf("%.1f %ld\n", best, rss);
 	hot_destroy(hot);
+	cds_ft_external_arena_destroy(key_arena);
 }
 
 /*

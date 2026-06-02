@@ -28,7 +28,16 @@ void hot_destroy(void *h)
 	delete static_cast<HotTrie *>(h);
 }
 
-/* Insert a NUL-terminated key; the key string is also the stored value. */
+/*
+ * Insert a key; the stored value is the passed pointer.  The caller
+ * (bench_one_st run_hot) MUST pass a pointer to a key COPY it owns (a dense
+ * cds_ft_external_arena slot), not a pointer into the shared query buffer:
+ * HOT's value is its key, so storing the query buffer would let the lookup's
+ * contentEquals (and FORCE_READ_LEAF) validate against already-hot memory --
+ * near-free, and unfair vs every other engine, which stores the key in its own
+ * (cold, dense-arena or internal) nodes.  Keeping the copy caller-side puts
+ * HOT on the exact same arena/layout as the FT/qp/ART engines.
+ */
 int hot_insert(void *h, const char *key)
 {
 	return static_cast<HotTrie *>(h)->insert(key) ? 1 : 0;
