@@ -1569,13 +1569,15 @@ _thread_ft_alloc(void *arg0, ft_add_fn add, ft_get_fn get, bool force_read) {
 	flush_thread_caches();
 	isc_barrier_wait(&barrier);
 	/*
-	 * Optional cache-priming phase (FT_PRIME): each querying thread runs one
-	 * untimed lookup pass over its key range to warm its caches to the
-	 * post-build/post-compact steady state BEFORE timing, so a preceding
-	 * compaction's cold-start eviction does not bias the measurement.
-	 * Applied identically to the base and compact arms.
+	 * Cache-priming phase: ON BY DEFAULT, set BENCH_NO_PRIME to skip it.
+	 * Each querying thread runs one untimed lookup pass over its key range
+	 * to warm its caches/TLB to the post-build/post-compact steady state
+	 * BEFORE timing, so cold-start (or a preceding compaction's eviction)
+	 * does not bias the measurement.  Applied identically to EVERY engine —
+	 * FT here and qp in _thread_qp_arena() — so cross-engine comparisons are
+	 * fair (otherwise FT would be timed warm and qp cold).
 	 */
-	if (getenv("FT_PRIME") != NULL) {
+	if (getenv("BENCH_NO_PRIME") == NULL) {
 		rcu_read_lock();
 		for (size_t n = arg->start; n < arg->end; n++) {
 			void *pval = NULL;
@@ -1804,6 +1806,22 @@ _thread_qp_arena(void *arg0, qp_add_fn add) {
 	isc_barrier_wait(&barrier);
 	flush_thread_caches();
 	isc_barrier_wait(&barrier);
+	/*
+	 * Cache-priming phase, identical to the FT path (_thread_ft_alloc): on
+	 * by default, BENCH_NO_PRIME to skip.  One untimed lookup pass over this
+	 * thread's key range, before t1b, so the timed window measures the
+	 * warmed steady state — keeping FT vs qp comparisons fair.
+	 */
+	if (getenv("BENCH_NO_PRIME") == NULL) {
+		dns_qpread_t pqpr;
+		dns_qpmulti_query(arg->map, &pqpr);
+		for (size_t n = arg->start; n < arg->end; n++) {
+			void *pval = NULL;
+			(void) get_qp_arena(&pqpr, n, &pval);
+		}
+		dns_qpread_destroy(arg->map, &pqpr);
+		isc_barrier_wait(&barrier);
+	}
 	isc_time_t t1b = isc_time_now_hires();
 
 	dns_qpread_t qpr;
