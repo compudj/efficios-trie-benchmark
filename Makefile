@@ -67,6 +67,22 @@ third_party/libart/%.o: third_party/libart/%.c
 	$(CC) $(CFLAGS) -Ithird_party/libart -c -o $@ $<
 
 # ---------------------------------------------------------------------------
+# Wormhole (GPL-3.0) — SEPARATE, GPL-licensed binary.
+#
+# Wormhole (third_party/wormhole/) is GPL-3.0, so it is built into its OWN
+# executable and is NEVER linked into bench_one_st (which stays permissively
+# licensed — that is the whole point of keeping it separate).  The resulting
+# bench_wormhole_gpl binary is therefore GPL-3.0.  It is intentionally NOT part
+# of `all`; build it explicitly for the Wormhole datapoint:
+#     make bench_wormhole_gpl
+#     ./bench_wormhole_gpl        # output: <ns/op> <RSS_kB> on the dns key set
+# ---------------------------------------------------------------------------
+WORMHOLE_SRC := third_party/wormhole/wh.c third_party/wormhole/lib.c \
+                third_party/wormhole/kv.c
+bench_wormhole_gpl: src/bench_wormhole_gpl.c $(WORMHOLE_SRC)
+	$(CC) $(CFLAGS) -w -Ithird_party/wormhole -o $@ $^ -lpthread -lm
+
+# ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
 # built in-tree under $(URCU_BUILD).  Clones if absent, otherwise fetches and
 # fast-forwards the branch, then (re)bootstraps/configures as needed and builds

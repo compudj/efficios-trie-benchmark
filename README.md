@@ -213,7 +213,9 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
                                    load-names.c, qpmulti_ft.c,
                                    bench_scale_common.[ch] (shared driver),
                                    bench_scale_{ft,judy,qp,art,b9qp}.c
-third_party/{qp-trie,libart}/    vendored competitors
+third_party/{qp-trie,libart}/    vendored competitors (permissive)
+third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl only)
+src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
 urcu-build/                      our liburcu clone (fractal-trie-dev), gitignored
 bind9-src/                       our bind9 clone + overlay + build, gitignored
@@ -225,3 +227,19 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
 
 - `third_party/qp-trie` — CC0 / public domain (Tony Finch). See `NOTICE`.
 - `third_party/libart` — BSD-2-Clause (Armon Dadgar). See `LICENSE`.
+- `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
+  Because it is GPL-3.0, Wormhole is **never** linked into the permissively
+  licensed benchmarks. It is built only into its own executable,
+  `bench_wormhole_gpl` (which is therefore GPL-3.0), via `make bench_wormhole_gpl`
+  — kept out of `make all`. This isolates the copyleft to one opt-in binary.
+
+### Wormhole — separate GPL benchmark
+
+`bench_wormhole_gpl` measures Wormhole (a "trie of hash tables" ordered index)
+single-threaded on the same `dns` 1M-key set and identical harness as
+`bench_one_st`, so its `<ns/op> <RSS_kB>` output is directly comparable:
+
+```sh
+make bench_wormhole_gpl     # GPL-3.0 binary; not built by `make all`
+./bench_wormhole_gpl
+```
