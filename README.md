@@ -108,9 +108,10 @@ silently benchmarking a different structure under the `qp` label.)
 ## Multithreaded benchmark — bind9 `load-names`
 
 The MT scaling test is bind9's "lookup names" benchmark (`load-names.c`), which
-compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`)
-under a reader/writer thread sweep, with an optional `FT_PRIME` cache-priming
-phase. The FT engines form the 2×2 of build attr × lookup — `ft_eager`
+compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`) and
+HOT's concurrent ROWEX trie (`hotrowex`) under a lookup-scaling thread sweep
+(cache priming on by default — set `BENCH_NO_PRIME` to skip; `BENCH_ENGINE=<name>`
+runs one engine). The FT engines form the 2×2 of build attr × lookup — `ft_eager`
 (EAGER attr + eager lookup), `ft_spec` (SPEC attr + speculative lookup), and the
 crosses `ft_eager_on_spec` / `ft_spec_on_eager` — plus `ft_cand` (pure candidate,
 no memcmp); each with `_il` / `_local` leaf-arena placement (and `ft_spec` also
@@ -176,6 +177,35 @@ physical cores**, SMT2 = 384 logical CPUs, 2 sockets, 24 NUMA nodes. The
 benchmark pins worker `i` to CPU `i` (CPUs 0–191 = one thread per physical
 core), so the 192-thread point runs one worker per physical core (private
 L1/L2/FPU, no SMT-sibling contention).
+
+### Result — FT spec vs HOTRowex (ROWEX) on this workload
+
+HOT's concurrent ROWEX trie is also wired into load-names as the `hotrowex`
+engine (`BENCH_ENGINE=hotrowex`), so the same read-only, sequential-access,
+real-names sweep compares it against `ft_spec_il` on equal footing — both
+validate every lookup and store key copies in a NUMA-interleaved arena (HOT keys
+on a NUL-terminated copy of the qpkey; qpkey bytes are all ≥ `SHIFT_NOBYTE`, so
+never contain `0x00`). Median of 4 runs, query Mops/s:
+
+| Threads | `ft_spec_il` | `hotrowex` | winner |
+|--------:|-------------:|-----------:|--------|
+| 64      | 317          | **359**    | HOTRowex ≈ 1.13×       |
+| 128     | **754**      | 720        | ft_spec ≈ even (1.05×) |
+| 192     | **1219**     | 1048       | **ft_spec ≈ 1.16×**    |
+
+A clean **crossover at ~128 threads** (the ordering is robust across reps):
+HOTRowex wins at lower core counts, FT-spec scales better and leads ~16% at 192.
+This is the **inverse** of the random-access read/write `bench_scale` result
+(where HOTRowex leads at 192) — load-names does *sequential* lookups
+(prefetch-friendly) on real qpkeys with FT's leaf slots round-robin
+**interleaved** across NUMA nodes.
+
+> **Caveat:** HOT's *internal nodes* are first-touched by their building thread
+> (HOT exposes no allocator hook, so unlike FT's leaf arena they cannot be
+> `mbind`-interleaved). The key copies HOT validates against *are* interleaved,
+> but the node placement is not — which plausibly costs HOTRowex some of its
+> 192-core scaling. So the ~16% at 192 is partly the algorithm, partly this
+> integration limit.
 
 ## Multithreaded benchmark — read/write scaling (per engine)
 
