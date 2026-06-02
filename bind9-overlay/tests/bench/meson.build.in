@@ -60,6 +60,22 @@ urcu_cds_dep = declare_dependency(
     ],
 )
 
+# Standalone FT/B9QP dep: also links liburcu.so (the membarrier flavor that
+# provides urcu_memb_*), which liburcu-cds.so does NOT pull in.  The
+# bind9-linked benches get the base liburcu transitively via libdns/libisc, but
+# the per-engine FT executable links no bind9, so it needs it explicitly.
+urcu_ft_dep = declare_dependency(
+    include_directories: include_directories('@URCU_INC@'),
+    link_args: [
+        '-L@URCU_LIBDIR@',
+        '-Wl,-rpath,@URCU_LIBDIR@',
+        '@URCU_LIBDIR@/liburcu-cds.so',
+        '@URCU_LIBDIR@/liburcu.so',
+    ],
+)
+
+bench_threads_dep = dependency('threads')
+
 executable(
     'load-names',
     files('load-names.c'),
@@ -89,33 +105,79 @@ executable(
     ],
 )
 
-# EfficiOS standalone read/write scaling benchmark.  It also compares against
-# the vendored Judy / qp-trie / ART engines, so it compiles the vendored
-# qp-trie (Tbl.c + qp.c) and libart (art.c) sources, which build-bind9.sh
-# copies into this directory alongside the benchmark.  Warnings in the vendored
-# code are silenced (-w) so they don't trip any -Werror.
+# EfficiOS read/write scaling benchmark, split one engine per executable so
+# each structure's RSS can be measured in isolation (one process = one trie).
+# scripts/run_scale_rw.sh runs them all and assembles the combined table.
+#
+# Only bench_scale_b9qp links bind9 (libisc/libdns); the other four engines
+# link neither bind9 nor (for the rwlock engines) liburcu.  This is also why
+# the hang is gone: libisc's constructor registers the main thread with RCU, so
+# pulling it into only one executable removes the double-registration that
+# corrupted the RCU registry.  bench_scale_common.c is shared by all five.
+#
+# The qp/art executables compile the vendored qp-trie (Tbl.c + qp.c) and libart
+# (art.c) sources that build-bind9.sh copies here; their warnings are silenced
+# (-w) and werror disabled so they don't trip bind9's -Werror.
+
 executable(
-    'bench_scale_rw_bind9',
-    files(
-        'bench_scale_rw_bind9.c',
-        'Tbl.c',
-        'qp.c',
-        'art.c',
-    ),
+    'bench_scale_ft',
+    files('bench_scale_ft.c', 'bench_scale_common.c'),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
+    dependencies: [urcu_ft_dep, bench_threads_dep],
+)
+
+executable(
+    'bench_scale_judy',
+    files('bench_scale_judy.c', 'bench_scale_common.c'),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
+    dependencies: [bench_threads_dep],
+    link_args: ['-lJudy'],
+)
+
+executable(
+    'bench_scale_qp',
+    files('bench_scale_qp.c', 'bench_scale_common.c', 'Tbl.c', 'qp.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     c_args: ['-w'],
     override_options: ['werror=false'],
+    dependencies: [bench_threads_dep],
+)
+
+executable(
+    'bench_scale_art',
+    files('bench_scale_art.c', 'bench_scale_common.c', 'art.c'),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
+    c_args: ['-w'],
+    override_options: ['werror=false'],
+    dependencies: [bench_threads_dep],
+)
+
+executable(
+    'bench_scale_b9qp',
+    files('bench_scale_b9qp.c', 'bench_scale_common.c'),
+    export_dynamic: true,
+    install: false,
+    include_directories: include_directories('.'),
+    sources: default_sanitize_options,
     dependencies: [
-        urcu_cds_dep,
+        urcu_ft_dep,
         libisc_dep,
         libdns_dep,
         libns_dep,
         libtest_dep,
     ],
-    link_args: ['-lJudy'],
 )
 
 executable(

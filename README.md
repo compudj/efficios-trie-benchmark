@@ -99,25 +99,77 @@ LD_LIBRARY_PATH=urcu-build/src/.libs \
 first on the library path, an older system `liburcu-cds` is loaded and the
 newest FT symbols are missing. `make bind9` prints the exact command to use.
 
-### Status of the other two MT benchmarks
+## Multithreaded benchmark — read/write scaling (per engine)
 
-`make bind9` also overlays `bench_scale_rw_bind9.c` (the standalone FT vs
-Judy/qp-trie/ART vs BIND9-QP read/write scaling test) and `qpmulti_ft.c`, but
-these track an **older Fractal Trie API** than the current `fractal-trie-dev`
-(e.g. `cds_ft_iter_invalidate_path` → `cds_ft_iter_invalidate_cache`,
-`cds_ft_group_attr_set_speculative_validated` and `cds_ft_lookup_key` removed).
-They are attempted and **skipped on failure** until updated to the current API.
+This test runs **one writer** doing continuous insert/remove churn while **N
+reader** threads look up keys, comparing the Fractal Trie against Judy,
+qp-trie, ART, and BIND9's QP-trie. So each structure's resident-set size (RSS)
+can be measured in isolation, **each engine is its own executable** — one
+process holds exactly one trie:
+
+| Executable          | Engine                          | Links             |
+|---------------------|---------------------------------|-------------------|
+| `bench_scale_ft`    | Fractal Trie (candidate+memcmp) | liburcu           |
+| `bench_scale_judy`  | JudySL, rwlock                  | libJudy           |
+| `bench_scale_qp`    | qp-trie, rwlock                 | vendored qp-trie  |
+| `bench_scale_art`   | ART, rwlock                     | vendored libart   |
+| `bench_scale_b9qp`  | BIND9 `dns_qpmulti`, RCU        | liburcu + bind9   |
+
+They share `bench_scale_common.c` (key generation, RSS sampling, the
+thread-sweep driver); each `bench_scale_<engine>.c` supplies that engine's
+build / lookup / churn callbacks and a thin `main`. **Only `bench_scale_b9qp`
+links bind9.**
+
+Run one engine directly — it prints its RSS (sampled after build) and per
+thread-count throughput; the argument caps the reader thread count:
+
+```sh
+LD_LIBRARY_PATH=urcu-build/src/.libs \
+  bind9-src/build/tests/bench/bench_scale_ft 16
+```
+
+Or run all five (each its own process) and assemble the combined table:
+
+```sh
+scripts/run_scale_rw.sh 16        # arg = max thread count (default 384)
+```
+
+Cache priming is **on by default** — an untimed warm pass of ~N_KEYS lookups,
+identical for every engine, so the timed window reflects steady state rather
+than cold-start misses. Set `BENCH_NO_PRIME=1` to disable it.
+
+### Why one process per engine
+
+BIND9's libisc ELF constructor (`isc__lib_initialize`) calls
+`rcu_register_thread()` for the main thread and leaves it registered. The old
+single-process benchmark *also* registered the main thread, adding the same
+`urcu_reader` to liburcu's registry twice; under the release build (asserts
+compiled out) that corrupted the registry's circular list, so the first
+`call_rcu` grace period spun forever in `wait_for_readers()` and the program
+deadlocked. Splitting the engines means only `bench_scale_b9qp` links libisc —
+the other four register the main thread once themselves, and the
+double-registration cannot happen.
+
+### Status of qpmulti_ft
+
+`make bind9` also overlays `qpmulti_ft.c`, which still tracks an **older
+Fractal Trie API** than the current `fractal-trie-dev`. It is attempted and
+**skipped on failure** until updated to the current API.
 
 ## Layout
 
 ```
 src/bench_one_st.c               single-threaded benchmark
-bind9-overlay/tests/bench/       MT benchmark sources + meson.build template
+bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
+                                   load-names.c, qpmulti_ft.c,
+                                   bench_scale_common.[ch] (shared driver),
+                                   bench_scale_{ft,judy,qp,art,b9qp}.c
 third_party/{qp-trie,libart}/    vendored competitors
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
 urcu-build/                      our liburcu clone (fractal-trie-dev), gitignored
 bind9-src/                       our bind9 clone + overlay + build, gitignored
 scripts/build-bind9.sh           clones/overlays/builds the bind9 MT benches
+scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined table
 ```
 
 ## Licensing of vendored code

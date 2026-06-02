@@ -45,7 +45,11 @@ fi
 
 # 2. Overlay our tests/bench files + the vendored competitor sources.
 echo ">> applying tests/bench overlay"
-cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$OV/bench_scale_rw_bind9.c" "$DEST/"
+cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$DEST/"
+# Per-engine read/write scaling benchmark: shared driver + one file per engine.
+cp "$OV/bench_scale_common.h" "$OV/bench_scale_common.c" \
+   "$OV/bench_scale_ft.c"   "$OV/bench_scale_judy.c" "$OV/bench_scale_qp.c" \
+   "$OV/bench_scale_art.c"  "$OV/bench_scale_b9qp.c"  "$DEST/"
 cp "$REPO/third_party/qp-trie/Tbl.c" "$REPO/third_party/qp-trie/Tbl.h" \
    "$REPO/third_party/qp-trie/qp.c"  "$REPO/third_party/qp-trie/qp.h"  \
    "$REPO/third_party/libart/art.c"  "$REPO/third_party/libart/art.h"  "$DEST/"
@@ -67,23 +71,33 @@ fi
 echo ">> building load-names (primary MT scaling test)"
 ninja -C "$BUILD" tests/bench/load-names
 
-# bench_scale_rw_bind9 and qpmulti_ft track an older FT API and may not build
-# against the current fractal-trie-dev; attempt them but don't fail the target.
-echo ">> attempting bench_scale_rw_bind9 and qpmulti_ft"
-for b in bench_scale_rw_bind9 qpmulti_ft; do
-	if ninja -C "$BUILD" "tests/bench/$b" >/dev/null 2>&1; then
-		echo "  built:   $b"
-	else
-		echo "  SKIPPED: $b (build failed — likely stale FT API; see README)"
-	fi
+# Per-engine read/write scaling benchmarks (one structure per process for
+# isolated RSS).  These track the current fractal-trie-dev API.
+echo ">> building per-engine read/write scaling benchmarks"
+for b in bench_scale_ft bench_scale_judy bench_scale_qp bench_scale_art \
+	 bench_scale_b9qp; do
+	ninja -C "$BUILD" "tests/bench/$b"
 done
+
+# qpmulti_ft still tracks an older FT API and may not build against the current
+# fractal-trie-dev; attempt it but don't fail the target.
+echo ">> attempting qpmulti_ft"
+if ninja -C "$BUILD" tests/bench/qpmulti_ft >/dev/null 2>&1; then
+	echo "  built:   qpmulti_ft"
+else
+	echo "  SKIPPED: qpmulti_ft (build failed — likely stale FT API; see README)"
+fi
 
 echo ""
 echo "Built binaries under $BUILD/tests/bench/ :"
-for b in load-names bench_scale_rw_bind9 qpmulti_ft; do
+for b in load-names bench_scale_ft bench_scale_judy bench_scale_qp \
+	 bench_scale_art bench_scale_b9qp qpmulti_ft; do
 	[ -x "$BUILD/tests/bench/$b" ] && echo "  $b"
 done
 echo ""
 echo "Run with our liburcu on the library path, e.g.:"
 echo "  LD_LIBRARY_PATH=$URCU_LIBDIR BENCH_THREADS='1 2 4 8' FT_PRIME=1 \\"
 echo "    $BUILD/tests/bench/load-names $REPO/datasets/names-1M-shuf.csv"
+echo ""
+echo "Read/write scaling sweep (per-engine processes, combined table):"
+echo "  sh $REPO/scripts/run_scale_rw.sh 16"
