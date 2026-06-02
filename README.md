@@ -12,6 +12,7 @@ implementations:
 | `qp`       | qp-trie (quadbit popcount), Tony Finch          | `third_party/qp-trie` (vendored)|
 | `art`      | Adaptive Radix Tree (libart), Armon Dadgar      | `third_party/libart` (vendored) |
 | `hot`      | Height Optimized Trie (Binna et al., SIGMOD'18) | `third_party/hot` (ISC, vendored) |
+| `cuckoo`   | Cuckoo Trie (Zeitak & Morrison, SOSP'21)        | `third_party/cuckoo-trie` (Unlicense) |
 | `judy`     | JudyL / JudySL                                  | system `libJudy`                |
 | BIND9 QP   | `dns_qpmulti` (multithreaded test only)         | our bind9 clone (`bind9-src/`)  |
 
@@ -217,6 +218,8 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
 third_party/hot/                 vendored HOT, header-only C++14 (ISC)
 src/bench_hot.cpp                C++ shim exposing HOT to bench_one_st
+third_party/cuckoo-trie/         vendored Cuckoo Trie, C (Unlicense)
+src/bench_cuckoo.c               C shim exposing Cuckoo Trie to bench_one_st
 third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl only)
 src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
@@ -232,6 +235,15 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
 - `third_party/libart` — BSD-2-Clause (Armon Dadgar). See `LICENSE`.
 - `third_party/hot` — ISC (Robert Binna et al.). Header-only C++14; linked into
   `bench_one_st`'s `hot` engine via the `src/bench_hot.cpp` shim. See `LICENSE`.
+- `third_party/cuckoo-trie` — Unlicense / public domain (Zeitak & Morrison). C;
+  linked into `bench_one_st`'s `cuckoo` engine via `src/bench_cuckoo.c`. See
+  `UNLICENSE`. **Local change:** `util.c`'s `mmap_hugepage` falls back to a plain
+  `mmap` + `MADV_HUGEPAGE` when reserved 2 MiB hugepages are unavailable
+  (upstream requires them and aborts). ⚠ Cuckoo is built around hugepage-backed
+  buckets; on the THP fallback it is **far slower** (~580 vs ~100 ns/op on dns),
+  so that number is *not* its designed performance. For Cuckoo's intended
+  numbers, reserve hugepages first: `echo N | sudo tee /proc/sys/vm/nr_hugepages`
+  (a few hundred 2 MiB pages for 1M keys).
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,

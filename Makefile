@@ -66,10 +66,23 @@ HOT_OBJS := src/bench_hot.o
 src/bench_hot.o: src/bench_hot.cpp
 	$(CXX) $(OPTFLAGS) -std=c++14 -w $(HOT_INC) -c -o $@ $<
 
+# Cuckoo Trie (third_party/cuckoo-trie, Unlicense / public domain): a C library
+# + a C shim (src/bench_cuckoo.c).  -D_GNU_SOURCE for MADV_HUGEPAGE in util.c's
+# hugepage-mmap fallback; -march=native (in OPTFLAGS) covers its Haswell baseline.
+CUCKOO_DIR  := third_party/cuckoo-trie
+CUCKOO_CF   := $(OPTFLAGS) -std=gnu11 -w -D_GNU_SOURCE -I$(CUCKOO_DIR)
+CUCKOO_OBJS := $(addprefix $(CUCKOO_DIR)/,main.o util.o verify_trie.o random.o \
+               atomics.o mt_debug.o) src/bench_cuckoo.o
+
+$(CUCKOO_DIR)/%.o: $(CUCKOO_DIR)/%.c
+	$(CC) $(CUCKOO_CF) -c -o $@ $<
+src/bench_cuckoo.o: src/bench_cuckoo.c
+	$(CC) $(CUCKOO_CF) -c -o $@ $<
+
 # Single-threaded, single-engine benchmark:
-#   ft_eager / ft_eager_on_spec / ft_cand / ft_spec / judy / qp / art / hot.
-bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) | check-urcu
-	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++
+#   ft_eager / ft_eager_on_spec / ft_cand / ft_spec / judy / qp / art / hot / cuckoo.
+bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) $(CUCKOO_OBJS) | check-urcu
+	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++ -lm
 
 # Vendored competitor sources: compile with the same opt flags, but only their
 # own include dir (they are independent of urcu/FT).

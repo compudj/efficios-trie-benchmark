@@ -4,7 +4,7 @@
  *
  * Usage: bench_one <dataset> <engine>
  *   dataset: u32d u32s u64d u64s dns dict paths
- *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot
+ *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo
  *
  * Output: <ns/op> <RSS_kB>
  */
@@ -787,12 +787,58 @@ static void run_hot(void)
 	hot_destroy(hot);
 }
 
+/*
+ * Cuckoo Trie engine — implemented in src/bench_cuckoo.c, a C shim over the
+ * Unlicense (public domain) Cuckoo Trie (third_party/cuckoo-trie).
+ */
+void *cuckoo_create(unsigned long num_keys);
+int cuckoo_insert(void *t, const void *key, unsigned int len);
+const void *cuckoo_lookup(void *t, const void *key, unsigned int len);
+
+static void run_cuckoo(void)
+{
+	if (key_len_bytes) { printf("- 0\n"); return; }	/* string-key engine */
+	long rss;
+	double best = 1e18;
+	void *ct = cuckoo_create(n_keys);
+	if (!ct) { fprintf(stderr, "cuckoo alloc failed\n"); printf("- 0\n"); return; }
+
+	for (unsigned int i = 0; i < n_keys; i++) {
+		int r = cuckoo_insert(ct, str_keys[i], str_lens[i]);
+		if (r != 0) {
+			fprintf(stderr, "cuckoo_insert status %d at i=%u "
+				"(2=overflow,3=keytoolong)\n", r, i);
+			printf("- 0\n");
+			return;
+		}
+	}
+	rss = get_rss_kb();
+
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			const void *sink = cuckoo_lookup(ct, str_keys[i], str_lens[i]);
+			FORCE_READ_LEAF(sink);
+		}
+
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			const void *sink = cuckoo_lookup(ct, str_keys[i], str_lens[i]);
+			FORCE_READ_LEAF(sink);
+		}
+		uint64_t t1 = now_ns();
+		double ns = (double)(t1 - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+	printf("%.1f %ld\n", best, rss);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo\n", argv[0]);
 		return 1;
 	}
 
@@ -820,6 +866,7 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[2], "qp") == 0)      run_qp();
 	else if (strcmp(argv[2], "art") == 0)     run_art();
 	else if (strcmp(argv[2], "hot") == 0)     run_hot();
+	else if (strcmp(argv[2], "cuckoo") == 0)  run_cuckoo();
 	else { fprintf(stderr, "Unknown engine: %s\n", argv[2]); return 1; }
 
 	rcu_unregister_thread();
