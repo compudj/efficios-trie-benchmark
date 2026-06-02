@@ -1,8 +1,12 @@
 /*
  * Fractal Trie (FT) engine for the read/write scaling benchmark.
  *
- * Candidate lookup mode: the reader gets a candidate node back and validates
- * the key caller-side with memcmp (CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE).
+ * Speculative reference lookup mode (FT's recommended "ft_spec" path):
+ * cds_ft_speculative_lookup_key() does a speculative descent and validates the
+ * candidate with a library-side memcmp at a fixed key offset
+ * (CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE).  This matches the engine the
+ * load-names benchmark reports as ft_spec, so the two benchmarks compare the
+ * same FT lookup path.
  *
  * Links liburcu only (no bind9), so nothing registers the main thread with
  * RCU on our behalf — main() does it once.  Reader/writer threads are raw
@@ -45,8 +49,28 @@ struct ft_entry {
 	char key[];
 };
 
+/*
+ * Byte offset from the (struct cds_ft_node *) stored in the trie to the user
+ * key bytes, for cds_ft_speculative_lookup_key()'s library-side validation.
+ */
+#define FT_KEY_OFFSET \
+	(offsetof(struct ft_entry, key) - offsetof(struct ft_entry, ft_node))
+
 static struct cds_ft *g_ft;
 static pthread_mutex_t g_ft_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Compact arena holding the N_KEYS lookup-set external nodes (the ft_entry
+ * that embeds each cds_ft_node + a copy of its key).  The reader's speculative
+ * memcmp validates against the key copy here, so packing them contiguously
+ * keeps that validating read TLB/cache-friendly (see struct bench_arena).
+ * The churn keys are NOT placed here — they are inserted/removed dynamically,
+ * so they keep their own malloc'd, RCU-freed ft_entry.
+ */
+static struct bench_arena ft_str_arena;
+
+/* 16-byte alignment keeps each ft_entry's embedded cds_ft_node aligned. */
+#define FT_ENTRY_ALIGN 16
 
 /* Which churn keys are currently inserted, and the live entry for each. */
 static struct ft_entry *churn_entries[CHURN_KEYS];
@@ -67,9 +91,9 @@ static void ft_build(void)
 	cds_ft_group_attr_set_max_key_len(attr, 256);
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	/*
-	 * Speculative is the default lookup optimization; the reader validates
-	 * each candidate caller-side via memcmp (see ft_reader_batch), so the
-	 * library needs no key offsets.
+	 * Speculative lookup optimization; the reader uses
+	 * cds_ft_speculative_lookup_key (ft_spec), which validates the candidate
+	 * with a library-side memcmp at FT_KEY_OFFSET (see ft_reader_batch).
 	 */
 	cds_ft_group_attr_set_lookup_optimization(attr,
 		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
@@ -77,9 +101,18 @@ static void ft_build(void)
 	cds_ft_group_attr_destroy(attr);
 	cds_ft_create(group, NULL, &g_ft);
 
+	/* Size the arena exactly: one aligned ft_entry (+ key) per lookup key. */
+	size_t arena_bytes = 0;
+	for (unsigned int i = 0; i < N_KEYS; i++) {
+		size_t slot = sizeof(struct ft_entry) + str_lens[i];
+		arena_bytes += (slot + (FT_ENTRY_ALIGN - 1)) & ~(size_t)(FT_ENTRY_ALIGN - 1);
+	}
+	bench_arena_init(&ft_str_arena, arena_bytes);
+
 	for (unsigned int i = 0; i < N_KEYS; i++) {
 		struct cds_ft_node *result;
-		struct ft_entry *e = calloc(1, sizeof(*e) + str_lens[i]);
+		struct ft_entry *e = bench_arena_alloc(&ft_str_arena,
+			sizeof(*e) + str_lens[i], FT_ENTRY_ALIGN);
 		memcpy(e->key, str_keys[i], str_lens[i]);
 		e->key_len = str_lens[i];
 		cds_ft_insert_unique(g_ft, (const uint8_t *)str_keys[i],
@@ -88,6 +121,26 @@ static void ft_build(void)
 			rcu_quiescent_state();
 	}
 	rcu_quiescent_state();
+
+	/*
+	 * Self-check: a present key must resolve via the speculative path, i.e.
+	 * FT_KEY_OFFSET must correctly locate the stored key for the library-side
+	 * memcmp.  A wrong offset would silently turn every lookup into a miss
+	 * (no crash, plausible throughput), so guard it here once.
+	 */
+	{
+		struct cds_ft_node *probe = NULL;
+		rcu_read_lock();
+		cds_ft_speculative_lookup_key(g_ft, (const uint8_t *)str_keys[0],
+			str_lens[0], str_lens[0], FT_KEY_OFFSET, &probe);
+		rcu_read_unlock();
+		if (probe == NULL) {
+			fprintf(stderr, "FT spec self-check FAILED: present key "
+				"str_keys[0] not found (bad FT_KEY_OFFSET?)\n");
+			abort();
+		}
+	}
+
 	/*
 	 * Drop the main thread offline for the remainder of the sweep.  It does
 	 * RCU work only here (build) and in ft_cleanup_churn (which briefly
@@ -110,25 +163,39 @@ static void ft_reader_teardown(void *ctx)
 	rcu_unregister_thread();
 }
 
+/* Sink so the optimizer cannot drop the validating memcmp (result unused). */
+static volatile unsigned long ft_reader_sink;
+
 static void ft_reader_batch(void *ctx, uint64_t *seed)
 {
 	(void)ctx;
+	unsigned long acc = 0;
 	rcu_read_lock();
 	for (unsigned int b = 0; b < BATCH_SIZE; b++) {
 		unsigned int idx = xorshift64(seed) % N_KEYS;
-		struct cds_ft_node *found;
-		cds_ft_lookup_candidate_key(g_ft,
+		struct cds_ft_node *found = NULL;
+		/*
+		 * Speculative descent + library-side memcmp validation (ft_spec).
+		 * key_readable_pad = str_lens[idx] matches the prior candidate
+		 * call's descent behavior; FT_KEY_OFFSET locates the stored key.
+		 */
+		cds_ft_speculative_lookup_key(g_ft,
 			(const uint8_t *)str_keys[idx],
-			str_lens[idx], str_lens[idx], &found);
+			str_lens[idx], str_lens[idx], FT_KEY_OFFSET, &found);
 		if (found) {
-			struct ft_entry *e = cds_ft_entry(found,
-				struct ft_entry, ft_node);
-			if (e->key_len != str_lens[idx] ||
-			    memcmp(e->key, str_keys[idx], e->key_len) != 0)
-				found = NULL;
+			/*
+			 * Force-read the validated leaf's first byte: prevents
+			 * DCE of the speculative memcmp and pays the same
+			 * post-lookup cache-line touch as load-names' force_read
+			 * and HOTRowex's contentEquals.
+			 */
+			asm volatile("" :: "r"(*(const volatile uint8_t *)found)
+				: "memory");
+			acc++;
 		}
 	}
 	rcu_read_unlock();
+	ft_reader_sink = acc;
 	rcu_quiescent_state();
 }
 
@@ -265,10 +332,10 @@ static void ft_cleanup_churn(void)
 static const struct bench_engine ft_engine = {
 #ifdef BENCH_FT_QSBR
 	.name		= "ft_qsbr",
-	.label		= "FT cand+v (QSBR)",
+	.label		= "FT spec (QSBR)",
 #else
 	.name		= "ft",
-	.label		= "FT cand+v",
+	.label		= "FT spec",
 #endif
 	.build		= ft_build,
 	.reader_setup	= ft_reader_setup,

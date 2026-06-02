@@ -59,6 +59,32 @@ extern pthread_rwlock_t g_rwlock;
 void bench_init_rwlock(void);
 
 /*
+ * Compact bump-allocator arena for an engine's external-node storage.
+ *
+ * Every engine packs its N_KEYS lookup external nodes (FT: the ft_entry that
+ * embeds the cds_ft_node + a copy of the key; HOTRowex: a copy of the key the
+ * stored value points at) into one contiguous mmap'd region rather than
+ * scattering them across the heap with per-entry malloc.  This matters for a
+ * fair lookup comparison: the validating read each lookup does (FT's
+ * library-side memcmp at the stored key, HOTRowex's contentEquals) then hits a
+ * compact, TLB-friendly region instead of a cold random cache line — and,
+ * crucially, neither engine validates against the shared query-key buffer
+ * (storing a pointer straight into the input would make validation almost
+ * free and unfairly favour that engine).  Pages fault in under the caller's
+ * NUMA policy, so BENCH_NUMA_INTERLEAVE interleaves the arena too.
+ *
+ * Bump-only: no per-slot free (the N_KEYS lookup set is never deleted; the
+ * writer's churn keys use their own short-lived allocations).
+ */
+struct bench_arena {
+	char  *base;
+	size_t off;
+	size_t cap;
+};
+void  bench_arena_init(struct bench_arena *a, size_t cap_bytes);
+void *bench_arena_alloc(struct bench_arena *a, size_t sz, size_t align);
+
+/*
  * Per-engine operations.  Callbacks marked "optional" may be NULL.
  *
  * Threading model (driven by bench_scale_common.c):

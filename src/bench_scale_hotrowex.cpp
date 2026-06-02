@@ -29,6 +29,7 @@
 #include "bench_scale_common.h"
 
 #include <cstdio>
+#include <cstring>
 
 using HotRowex =
 	hot::rowex::HOTRowex<const char *, idx::contenthelpers::IdentityKeyExtractor>;
@@ -38,11 +39,32 @@ static HotRowex *g_hr;
 /* Sink so the optimizer cannot elide the lookup loop. */
 static volatile uint64_t g_sink;
 
+/*
+ * External nodes: a compact arena of key COPIES that the stored values point
+ * at -- NOT pointers into the shared query-key buffer.  Storing input pointers
+ * would let contentEquals validate against the very bytes the query already
+ * touched (near-free) and unfairly favour HOTRowex; copies make it pay a read
+ * to separate memory, the same handicap FT's stored-key memcmp pays.  Compact
+ * + NUMA-interleavable for the same reasons as FT's arena.
+ */
+static struct bench_arena hot_arena;
+
 extern "C" void hotrowex_build(void)
 {
 	g_hr = new HotRowex();
+
+	size_t arena_bytes = 0;
 	for (unsigned int i = 0; i < N_KEYS; i++)
-		g_hr->insert(str_keys[i]);
+		arena_bytes += (str_lens[i] + 1 + 7) & ~(size_t)7;
+	bench_arena_init(&hot_arena, arena_bytes);
+
+	for (unsigned int i = 0; i < N_KEYS; i++) {
+		char *copy = (char *)bench_arena_alloc(&hot_arena,
+			str_lens[i] + 1, 8);
+		memcpy(copy, str_keys[i], str_lens[i]);
+		copy[str_lens[i]] = '\0';
+		g_hr->insert(copy);
+	}
 }
 
 extern "C" void hotrowex_reader_batch(void *ctx, uint64_t *seed)
@@ -52,7 +74,17 @@ extern "C" void hotrowex_reader_batch(void *ctx, uint64_t *seed)
 	for (unsigned int b = 0; b < BATCH_SIZE; b++) {
 		unsigned int idx = xorshift64(seed) % N_KEYS;
 		/* lookup() opens its own MemoryGuard (epoch enter/leave). */
-		acc += g_hr->lookup(str_keys[idx]).mIsValid;
+		auto r = g_hr->lookup(str_keys[idx]);
+		if (r.mIsValid) {
+			/*
+			 * Force-read the validated leaf (the stored key copy):
+			 * prevents DCE of contentEquals and pays the same
+			 * post-lookup cache-line touch as FT's force-read.
+			 */
+			asm volatile("" :: "r"(*(const volatile uint8_t *)r.mValue)
+				: "memory");
+			acc++;
+		}
 	}
 	g_sink = acc;
 }

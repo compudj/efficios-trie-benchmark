@@ -19,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sched.h>
+#include <sys/mman.h>
 
 char  *str_keys[N_KEYS];
 size_t str_lens[N_KEYS];
@@ -235,6 +236,35 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 
 	free(threads);
 	free(rargs);
+}
+
+void bench_arena_init(struct bench_arena *a, size_t cap_bytes)
+{
+	long pg = sysconf(_SC_PAGESIZE);
+	if (pg <= 0)
+		pg = 4096;
+	cap_bytes = (cap_bytes + (size_t)pg - 1) & ~((size_t)pg - 1);
+	void *p = mmap(NULL, cap_bytes, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("mmap(bench_arena)");
+		exit(1);
+	}
+	a->base = p;
+	a->off = 0;
+	a->cap = cap_bytes;
+}
+
+void *bench_arena_alloc(struct bench_arena *a, size_t sz, size_t align)
+{
+	size_t off = (a->off + (align - 1)) & ~(align - 1);
+	if (off + sz > a->cap) {
+		fprintf(stderr, "bench_arena_alloc: out of space "
+			"(cap=%zu off=%zu sz=%zu)\n", a->cap, off, sz);
+		abort();
+	}
+	a->off = off + sz;
+	return a->base + off;
 }
 
 int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
