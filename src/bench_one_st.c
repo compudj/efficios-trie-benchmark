@@ -4,7 +4,7 @@
  *
  * Usage: bench_one <dataset> <engine>
  *   dataset: u32d u32s u64d u64s dns dict paths
- *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art
+ *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot
  *
  * Output: <ns/op> <RSS_kB>
  */
@@ -747,12 +747,52 @@ static void run_art(void)
 	free(entries);
 }
 
+/*
+ * HOT (Height Optimized Trie) engine — implemented in src/bench_hot.cpp, a
+ * C++ shim over the ISC-licensed header-only HOT library (third_party/hot).
+ */
+void *hot_create(void);
+void hot_destroy(void *h);
+int hot_insert(void *h, const char *key);
+const char *hot_lookup(void *h, const char *key);
+
+static void run_hot(void)
+{
+	if (key_len_bytes) { printf("- 0\n"); return; }	/* string-key engine */
+	long rss;
+	double best = 1e18;
+	void *hot = hot_create();
+
+	for (unsigned int i = 0; i < n_keys; i++)
+		hot_insert(hot, str_keys[i]);
+	rss = get_rss_kb();
+
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			const char *sink = hot_lookup(hot, str_keys[i]);
+			FORCE_READ_LEAF(sink);
+		}
+
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			const char *sink = hot_lookup(hot, str_keys[i]);
+			FORCE_READ_LEAF(sink);
+		}
+		uint64_t t1 = now_ns();
+		double ns = (double)(t1 - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+	printf("%.1f %ld\n", best, rss);
+	hot_destroy(hot);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot\n", argv[0]);
 		return 1;
 	}
 
@@ -779,6 +819,7 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[2], "judy") == 0)    run_judy();
 	else if (strcmp(argv[2], "qp") == 0)      run_qp();
 	else if (strcmp(argv[2], "art") == 0)     run_art();
+	else if (strcmp(argv[2], "hot") == 0)     run_hot();
 	else { fprintf(stderr, "Unknown engine: %s\n", argv[2]); return 1; }
 
 	rcu_unregister_thread();

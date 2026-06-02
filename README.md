@@ -11,6 +11,7 @@ implementations:
 | `ft_spec`  | Fractal Trie, speculative lookup (lib-side memcmp) | our liburcu clone            |
 | `qp`       | qp-trie (quadbit popcount), Tony Finch          | `third_party/qp-trie` (vendored)|
 | `art`      | Adaptive Radix Tree (libart), Armon Dadgar      | `third_party/libart` (vendored) |
+| `hot`      | Height Optimized Trie (Binna et al., SIGMOD'18) | `third_party/hot` (ISC, vendored) |
 | `judy`     | JudyL / JudySL                                  | system `libJudy`                |
 | BIND9 QP   | `dns_qpmulti` (multithreaded test only)         | our bind9 clone (`bind9-src/`)  |
 
@@ -48,14 +49,14 @@ Single dataset, single engine, run in its own process for accurate RSS:
 ```sh
 ./bench_one_st <dataset> <engine>
 #   dataset: u32d u32s u64d u64s dns dict paths   (all generated synthetically)
-#   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art
+#   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot
 # output: <ns/op> <RSS_kB>      ('-' for string engines on integer datasets)
 ```
 
 Example sweep:
 
 ```sh
-for e in ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art; do printf '%-17s ' "$e"; ./bench_one_st dns "$e"; done
+for e in ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot; do printf '%-17s ' "$e"; ./bench_one_st dns "$e"; done
 ```
 
 Useful env vars (see `src/bench_one_st.c`): `FT_BENCH_COMPACT` (compact between
@@ -214,6 +215,8 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
                                    bench_scale_common.[ch] (shared driver),
                                    bench_scale_{ft,judy,qp,art,b9qp}.c
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
+third_party/hot/                 vendored HOT, header-only C++14 (ISC)
+src/bench_hot.cpp                C++ shim exposing HOT to bench_one_st
 third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl only)
 src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
@@ -227,6 +230,8 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
 
 - `third_party/qp-trie` — CC0 / public domain (Tony Finch). See `NOTICE`.
 - `third_party/libart` — BSD-2-Clause (Armon Dadgar). See `LICENSE`.
+- `third_party/hot` — ISC (Robert Binna et al.). Header-only C++14; linked into
+  `bench_one_st`'s `hot` engine via the `src/bench_hot.cpp` shim. See `LICENSE`.
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,

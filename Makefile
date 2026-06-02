@@ -54,9 +54,22 @@ BENCHES := bench_one_st
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9
 all: $(BENCHES)
 
-# Single-threaded, single-engine benchmark: FT / ft_skip / ft_cand / judy / qp / art.
-bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) | check-urcu
-	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+# HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
+# via a small extern "C" shim (src/bench_hot.cpp).  Needs AVX2+BMI2 (covered by
+# OPTFLAGS' -march=native).  bench_one_st links it + libstdc++.
+HOT_INC  := -Ithird_party/hot/single-threaded-include \
+            -Ithird_party/hot/commons-include \
+            -Ithird_party/hot/content-helpers-include \
+            -Ithird_party/hot/utils-include
+HOT_OBJS := src/bench_hot.o
+
+src/bench_hot.o: src/bench_hot.cpp
+	$(CXX) $(OPTFLAGS) -std=c++14 -w $(HOT_INC) -c -o $@ $<
+
+# Single-threaded, single-engine benchmark:
+#   ft_eager / ft_eager_on_spec / ft_cand / ft_spec / judy / qp / art / hot.
+bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) | check-urcu
+	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++
 
 # Vendored competitor sources: compile with the same opt flags, but only their
 # own include dir (they are independent of urcu/FT).
