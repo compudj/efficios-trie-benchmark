@@ -109,8 +109,8 @@ silently benchmarking a different structure under the `qp` label.)
 
 The MT scaling test is bind9's "lookup names" benchmark (`load-names.c`), which
 compares the Fractal Trie against BIND9's own QP-trie (`qp_il`, `qp_local`),
-HOT's concurrent ROWEX trie (`hotrowex`), and Masstree (`masstree`) under a
-lookup-scaling thread sweep
+HOT's concurrent ROWEX trie (`hotrowex`), Masstree (`masstree`), and ART-OLC
+(`artolc`) under a lookup-scaling thread sweep
 (cache priming on by default — set `BENCH_NO_PRIME` to skip; `BENCH_ENGINE=<name>`
 runs one engine). The FT engines form the 2×2 of build attr × lookup — `ft_eager`
 (EAGER attr + eager lookup), `ft_spec` (SPEC attr + speculative lookup), and the
@@ -179,42 +179,45 @@ benchmark pins worker `i` to CPU `i` (CPUs 0–191 = one thread per physical
 core), so the 192-thread point runs one worker per physical core (private
 L1/L2/FPU, no SMT-sibling contention).
 
-### Result — FT spec vs HOTRowex vs Masstree on this workload
+### Result — FT spec vs HOTRowex vs Masstree vs ART-OLC on this workload
 
-HOT's concurrent ROWEX trie (`BENCH_ENGINE=hotrowex`) and Masstree
-(`BENCH_ENGINE=masstree`) are also wired into load-names, so the same read-only,
+HOT's concurrent ROWEX trie (`hotrowex`), Masstree (`masstree`), and ART-OLC
+(`artolc`) are all wired into load-names, so the same read-only,
 sequential-access, real-names sweep compares them against `ft_spec_il` on equal
 footing — all validate every lookup and store key copies in a NUMA-interleaved
-arena (HOT keys on a NUL-terminated qpkey copy; Masstree keys on the binary
-qpkey bytes directly). Median of 4 runs, query Mops/s:
+arena (HOT keys on a NUL-terminated qpkey copy; Masstree on the binary qpkey
+bytes; ART-OLC on a `\0`-terminated qpkey, since ART needs byte-prefix-free
+keys). Median of 4 runs, query Mops/s:
 
-| Threads | `ft_spec_il` | `hotrowex` | `masstree` |
-|--------:|-------------:|-----------:|-----------:|
-| 64      | 317          | **359**    | 165        |
-| 128     | **754**      | 720        | 262        |
-| 192     | **1219**     | 1048       | 189        |
+| Threads | `ft_spec_il` | `hotrowex` | `artolc` | `masstree` |
+|--------:|-------------:|-----------:|---------:|-----------:|
+| 64      | 317          | **355**    | 208      | 166        |
+| 128     | **758**      | 719        | 428      | 262        |
+| 192     | **1212**     | 1021       | 685      | 267        |
 
 **FT-spec and HOTRowex cross over at ~128 threads** (robust across reps):
-HOTRowex wins at lower core counts, FT-spec scales better and leads ~16% at 192.
+HOTRowex wins at lower core counts, FT-spec scales better and leads ~19% at 192.
 This is the **inverse** of the random-access read/write `bench_scale` result
 (where HOTRowex leads at 192) — load-names does *sequential* lookups
 (prefetch-friendly) on real qpkeys with FT's leaf slots round-robin
-**interleaved** across NUMA nodes.
+**interleaved** across NUMA nodes. ART-OLC scales smoothly (208 → 428 → 685) but
+trails the two radix tries, landing third.
 
-**Masstree does not scale to 192 here** — it peaks at 128 (~262) and *drops* at
-192 (~189), while FT and HOT keep climbing past 1000. Since HOT's internal nodes
-are *also* first-touched (not interleaved) yet HOT scales fine, the cause is
-likely not NUMA placement but Masstree's **optimistic, version-validated reads**
-contending on hot shared B+tree internal nodes once readers span both sockets —
-RCU (FT) and ROWEX (HOT) readers don't re-read shared version counters. On the
-random-access `bench_scale` sweep Masstree was competitive (~330 @ 192), so this
-collapse is specific to the sequential, correlated-descent load-names pattern.
+**Masstree does not scale here** — it plateaus at ~128 (~262) and does not climb
+to 192 (~267), while the other three keep going. ART-OLC is the telling control:
+it *also* uses optimistic, version-validated reads (and also first-touch nodes),
+yet it scales cleanly to 192. So Masstree's stall is **not** optimistic
+concurrency per se, but something specific to its wide B+tree-of-tries — heavy
+version-counter contention on the shared upper nodes under correlated sequential
+descent once readers span both sockets. (On the random-access `bench_scale`
+sweep Masstree did scale, ~330 @ 192, so the stall is workload-specific.)
 
-> **Caveat:** HOT's and Masstree's *internal nodes* are first-touched by their
-> building thread (neither exposes an allocator hook, so unlike FT's leaf arena
-> they cannot be `mbind`-interleaved). The key copies they validate against *are*
-> interleaved, but the node placement is not — plausibly part of HOTRowex's ~16%
-> gap at 192 (though, per above, not the main factor in Masstree's collapse).
+> **Caveat:** the HOT, Masstree, and ART-OLC *internal nodes* are first-touched
+> by their building thread (none exposes an allocator hook, so unlike FT's leaf
+> arena they cannot be `mbind`-interleaved). The key copies they validate against
+> *are* interleaved, but the node placement is not — plausibly part of HOTRowex's
+> gap behind `ft_spec_il` at 192. That ART-OLC (also first-touch) still scales is
+> further evidence it is not the main factor in Masstree's stall.
 
 ## Multithreaded benchmark — read/write scaling (per engine)
 
@@ -234,6 +237,7 @@ engine is its own executable** — one process holds exactly one trie:
 | `bench_scale_b9qp`  | BIND9 `dns_qpmulti`, RCU        | liburcu + bind9   |
 | `bench_scale_hotrowex` | HOT (concurrent **ROWEX**)   | HOT + oneTBB      |
 | `bench_scale_masstree` | **Masstree** (B+tree-of-tries) | Masstree (MIT)  |
+| `bench_scale_artolc` | **ART-OLC** (concurrent ART, Opt. Lock Coupling) | ART-OLC + oneTBB |
 
 They share `bench_scale_common.c` (key generation, RSS sampling, the
 thread-sweep driver, and a dense `bench_arena` bump allocator); each
@@ -244,15 +248,15 @@ validating compare each lookup does hits cold, separate memory — not the share
 query buffer, which would make validation almost free), and each reader
 force-reads the returned leaf so that compare is real and not optimized away.
 
-`bench_scale_hotrowex` and `bench_scale_masstree` are built separately by the
-**top-level Makefile** (they link neither bind9 nor liburcu — HOTRowex links the
-header-only HOT + oneTBB [`libtbb-dev`] for its epoch reclamation; Masstree links
-its own vendored sources), and land in the repo root rather than
-`bind9-src/build/`. `run_scale_rw.sh` looks there too:
+`bench_scale_hotrowex`, `bench_scale_masstree`, and `bench_scale_artolc` are
+built separately by the **top-level Makefile** (they link neither bind9 nor
+liburcu — HOTRowex and ART-OLC use oneTBB [`libtbb-dev`] for their epoch
+reclamation; Masstree links its own vendored sources), and land in the repo root
+rather than `bind9-src/build/`. `run_scale_rw.sh` looks there too:
 
 ```sh
-make bench_scale_hotrowex bench_scale_masstree
-ENGINES="ft hotrowex masstree" scripts/run_scale_rw.sh 192
+make bench_scale_hotrowex bench_scale_masstree bench_scale_artolc
+ENGINES="ft hotrowex masstree artolc" scripts/run_scale_rw.sh 192
 ```
 
 It is the lone **ROWEX** engine here — readers are optimistic and lock-free
@@ -362,30 +366,38 @@ pointer-chasing, not bandwidth-bound — the opposite of `load-names`' read-only
 `ft_spec_il`, where an interleaved arena wins at ≥128 threads. Left off by
 default; the numbers above are non-interleaved.
 
-### Adding Masstree (concurrent B+tree-of-tries)
+### Adding Masstree and ART-OLC
 
-`bench_scale_masstree` adds Masstree (Mao/Kohler/Morris, EuroSys'12;
-kohler/masstree-beta, MIT) as a third concurrent structure — optimistic
-version-validated readers, fine-grained-locked writers, epoch-reclaimed removes.
-Same fair footing (key copies in the dense arena, validated descent, force-read
-leaf); its per-thread `threadinfo` follows Masstree's RCU-like epoch discipline
-(`rcu_start`/`rcu_quiesce`/`rcu_stop`, writer advances `globalepoch` +
-`active_epoch`). Medians of 6, reads (Mops/s):
+Two more concurrent structures join the sweep on the same fair footing (key
+copies in the dense arena, validated descent, force-read leaf):
 
-| Readers | `ft_spec` | `masstree` | `hotrowex` |
-|--------:|----------:|-----------:|-----------:|
-| 64      | **154**   | 126        | **181**    |
-| 128     | **254**   | 232        | **344**    |
-| 192     | 277       | **330**    | **449**    |
+- `bench_scale_masstree` — **Masstree** (Mao/Kohler/Morris, EuroSys'12;
+  kohler/masstree-beta, MIT): a B+tree of tries, optimistic version-validated
+  readers, epoch-reclaimed removes. Its per-thread `threadinfo` follows
+  Masstree's RCU-like epoch discipline (`rcu_start`/`rcu_quiesce`/`rcu_stop`).
+- `bench_scale_artolc` — **ART-OLC** (Leis et al., DaMoN'16;
+  flode/ARTSynchronized, Apache-2.0): a concurrent adaptive radix tree, readers
+  optimistically validate per-node versions and restart, writers lock-couple.
+  ART stores only a TID per leaf and validates via a `loadKey(TID)` callback, so
+  we point the TID at the arena key copy. **ART needs byte-prefix-free keys**, so
+  we key on the NUL terminator too (`len+1`) — without it ART mis-stores
+  prefix-colliding keys (this bench doesn't check results, so it tolerated that
+  silently; load-names' `CHECKN` caught it).
 
-Masstree slots **between FT-spec and HOTRowex**: ft_spec edges it at 64–128, but
-Masstree scales more smoothly and overtakes the (membarrier-noisy) ft_spec at
-192, while HOTRowex leads throughout. Its insert/remove **churn is the fastest**
-of the set (~5000 Kops/s vs FT's ~500), and RSS (184 MB) sits between HOTRowex
-(110) and FT (245). So on this random-access read/write workload the order at
-192 is HOTRowex > Masstree ≈ FT-spec — none dominates on every axis (HOTRowex:
-reads + footprint; Masstree: write throughput; FT: full RCU insert *and* remove
-with the lowest read-side cost).
+Medians of 5, reads (Mops/s):
+
+| Readers | `ft_spec` | `masstree` | `artolc` | `hotrowex` |
+|--------:|----------:|-----------:|---------:|-----------:|
+| 64      | 157       | 118        | 132      | **179**    |
+| 128     | 236       | 232        | 255      | **328**    |
+| 192     | 280       | 330        | **376**  | **439**    |
+
+At 192 the order is **HOTRowex (439) > ART-OLC (376) > Masstree (330) >
+FT-spec (280)** — all four scale, none dominates every axis. HOTRowex leads reads
+and footprint (110 MB); ART-OLC and Masstree slot above ft_spec on reads at the
+top (RSS 144 and 184 MB); Masstree has the fastest insert/remove churn (~5000
+vs ART-OLC ~1850 vs FT ~500 Kops/s); FT alone does full concurrent insert **and**
+remove under RCU with the lowest read-side cost.
 
 ### Why one process per engine
 
@@ -416,7 +428,9 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
 src/bench_scale_hotrowex.cpp     concurrent (ROWEX) HOT MT engine; same driver,
                                    built standalone by the top-level Makefile
 src/bench_scale_masstree.cpp     Masstree (B+tree-of-tries) MT engine; same driver
+src/bench_scale_artolc.cpp       ART-OLC (concurrent ART) MT engine; same driver
 third_party/masstree/            vendored Masstree, C++ (MIT) + generated config.h
+third_party/artolc/              vendored ART-OLC, C++ (Apache-2.0)
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
 third_party/hot/                 vendored HOT, header-only C++14 (ISC);
                                    single-threaded + rowex (concurrent) headers
@@ -457,6 +471,10 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
   `src/bench_scale_masstree.cpp`. `config.h` is vendored as generated by
   Masstree's `./configure` — regenerate with `autoreconf -i && ./configure` if
   building on a materially different host. See `LICENSE` / `AUTHORS`.
+- `third_party/artolc` — **Apache-2.0** (Florian Scheibner; ART of Leis et al.).
+  Concurrent ART (Optimistic Lock Coupling); the `bench_scale_artolc` /
+  load-names `artolc` engines. Unity build (`OptimisticLockCoupling/Tree.cpp`
+  `#include`s the rest), needs oneTBB. See `LICENSE`.
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,
