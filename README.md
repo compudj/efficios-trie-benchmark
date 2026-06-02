@@ -107,6 +107,30 @@ runs). Other env vars: `QUERY_LOOPS`, `BENCH_ENGINE` (filter),
 first on the library path, an older system `liburcu-cds` is loaded and the
 newest FT symbols are missing. `make bind9` prints the exact command to use.
 
+### Result — FT vs BIND9 QP-trie at 192 cores
+
+Lookup throughput on 1M DNS names (`datasets/names-1M-shuf.csv`), comparing the
+Fractal Trie reference engine `ft_spec_il` (speculative descent + library-side
+memcmp validation) against BIND9's `dns_qpmulti` (`qp_il`), apples-to-apples:
+both use the same NUMA-interleaved (`il`) leaf/payload placement.
+
+| Engine        | Query throughput @ 192 cores | vs BIND9-QP |
+|---------------|------------------------------|-------------|
+| `ft_spec_il`  | **≈ 1257 Mops/s** (1072–1279) | **≈ 3.1×**  |
+| `qp_il`       | ≈ 405 Mops/s (391–419)        | 1×          |
+
+Median of 5 runs (min–max in parentheses); `QUERY_LOOPS=1`, `FT_PRIME=1`.
+`qp_il` and `qp_local` are statistically tied at this scale (≈ 405 vs 410 Mops/s
+median, overlapping ranges). The FT lead grows with core count — ≈ 1.3× at 1
+thread, ≈ 3× at 192 — because the FT RCU read path dirties no shared memory,
+while BIND9-QP's read path write-shares and stops scaling past ~96 threads.
+
+**Hardware:** 2× AMD EPYC 9654 (Zen 4 "Genoa"), 96 cores/socket = **192
+physical cores**, SMT2 = 384 logical CPUs, 2 sockets, 24 NUMA nodes. The
+benchmark pins worker `i` to CPU `i` (CPUs 0–191 = one thread per physical
+core), so the 192-thread point runs one worker per physical core (private
+L1/L2/FPU, no SMT-sibling contention).
+
 ## Multithreaded benchmark — read/write scaling (per engine)
 
 This test runs **one writer** doing continuous insert/remove churn while **N
