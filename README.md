@@ -211,9 +211,9 @@ This is the **inverse** of the random-access read/write `bench_scale` result
 
 This test runs **one writer** doing continuous insert/remove churn while **N
 reader** threads look up keys, comparing the Fractal Trie against Judy,
-qp-trie, ART, and BIND9's QP-trie. So each structure's resident-set size (RSS)
-can be measured in isolation, **each engine is its own executable** — one
-process holds exactly one trie:
+qp-trie, ART, BIND9's QP-trie, HOT's concurrent ROWEX trie, and Masstree. So
+each structure's resident-set size (RSS) can be measured in isolation, **each
+engine is its own executable** — one process holds exactly one trie:
 
 | Executable          | Engine                          | Links             |
 |---------------------|---------------------------------|-------------------|
@@ -224,6 +224,7 @@ process holds exactly one trie:
 | `bench_scale_art`   | ART, rwlock                     | vendored libart   |
 | `bench_scale_b9qp`  | BIND9 `dns_qpmulti`, RCU        | liburcu + bind9   |
 | `bench_scale_hotrowex` | HOT (concurrent **ROWEX**)   | HOT + oneTBB      |
+| `bench_scale_masstree` | **Masstree** (B+tree-of-tries) | Masstree (MIT)  |
 
 They share `bench_scale_common.c` (key generation, RSS sampling, the
 thread-sweep driver, and a dense `bench_arena` bump allocator); each
@@ -234,14 +235,15 @@ validating compare each lookup does hits cold, separate memory — not the share
 query buffer, which would make validation almost free), and each reader
 force-reads the returned leaf so that compare is real and not optimized away.
 
-`bench_scale_hotrowex` is built separately by the **top-level Makefile** (it
-links neither bind9 nor liburcu — only the header-only HOT and oneTBB
-[`libtbb-dev`], for HOT's epoch-based node reclamation), and lands in the repo
-root rather than `bind9-src/build/`. `run_scale_rw.sh` looks there too:
+`bench_scale_hotrowex` and `bench_scale_masstree` are built separately by the
+**top-level Makefile** (they link neither bind9 nor liburcu — HOTRowex links the
+header-only HOT + oneTBB [`libtbb-dev`] for its epoch reclamation; Masstree links
+its own vendored sources), and land in the repo root rather than
+`bind9-src/build/`. `run_scale_rw.sh` looks there too:
 
 ```sh
-make bench_scale_hotrowex
-ENGINES="ft hotrowex" scripts/run_scale_rw.sh 192   # ROWEX vs RCU
+make bench_scale_hotrowex bench_scale_masstree
+ENGINES="ft hotrowex masstree" scripts/run_scale_rw.sh 192
 ```
 
 It is the lone **ROWEX** engine here — readers are optimistic and lock-free
@@ -351,6 +353,31 @@ pointer-chasing, not bandwidth-bound — the opposite of `load-names`' read-only
 `ft_spec_il`, where an interleaved arena wins at ≥128 threads. Left off by
 default; the numbers above are non-interleaved.
 
+### Adding Masstree (concurrent B+tree-of-tries)
+
+`bench_scale_masstree` adds Masstree (Mao/Kohler/Morris, EuroSys'12;
+kohler/masstree-beta, MIT) as a third concurrent structure — optimistic
+version-validated readers, fine-grained-locked writers, epoch-reclaimed removes.
+Same fair footing (key copies in the dense arena, validated descent, force-read
+leaf); its per-thread `threadinfo` follows Masstree's RCU-like epoch discipline
+(`rcu_start`/`rcu_quiesce`/`rcu_stop`, writer advances `globalepoch` +
+`active_epoch`). Medians of 6, reads (Mops/s):
+
+| Readers | `ft_spec` | `masstree` | `hotrowex` |
+|--------:|----------:|-----------:|-----------:|
+| 64      | **154**   | 126        | **181**    |
+| 128     | **254**   | 232        | **344**    |
+| 192     | 277       | **330**    | **449**    |
+
+Masstree slots **between FT-spec and HOTRowex**: ft_spec edges it at 64–128, but
+Masstree scales more smoothly and overtakes the (membarrier-noisy) ft_spec at
+192, while HOTRowex leads throughout. Its insert/remove **churn is the fastest**
+of the set (~5000 Kops/s vs FT's ~500), and RSS (184 MB) sits between HOTRowex
+(110) and FT (245). So on this random-access read/write workload the order at
+192 is HOTRowex > Masstree ≈ FT-spec — none dominates on every axis (HOTRowex:
+reads + footprint; Masstree: write throughput; FT: full RCU insert *and* remove
+with the lowest read-side cost).
+
 ### Why one process per engine
 
 BIND9's libisc ELF constructor (`isc__lib_initialize`) calls
@@ -379,6 +406,8 @@ bind9-overlay/tests/bench/       MT benchmark sources + meson.build template:
                                    bench_scale_{ft,judy,qp,art,b9qp}.c
 src/bench_scale_hotrowex.cpp     concurrent (ROWEX) HOT MT engine; same driver,
                                    built standalone by the top-level Makefile
+src/bench_scale_masstree.cpp     Masstree (B+tree-of-tries) MT engine; same driver
+third_party/masstree/            vendored Masstree, C++ (MIT) + generated config.h
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
 third_party/hot/                 vendored HOT, header-only C++14 (ISC);
                                    single-threaded + rowex (concurrent) headers
@@ -414,6 +443,11 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
   engines) — short DNS keys with heavy shared prefixes favor prefix-exploiting
   radix tries, whereas Cuckoo hashes whole keys and its memory-level-parallelism
   design targets a different regime.
+- `third_party/masstree` — **MIT** (Harvard / MIT / UC Regents; Mao, Kohler,
+  Morris). Concurrent B+tree-of-tries; the `bench_scale_masstree` MT engine via
+  `src/bench_scale_masstree.cpp`. `config.h` is vendored as generated by
+  Masstree's `./configure` — regenerate with `autoreconf -i && ./configure` if
+  building on a materially different host. See `LICENSE` / `AUTHORS`.
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,
