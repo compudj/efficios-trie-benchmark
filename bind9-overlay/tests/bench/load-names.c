@@ -1963,6 +1963,107 @@ thread_hotrowex(void *arg0) {
 	return _thread_ft_alloc(arg0, add_hotrowex, get_hotrowex, true);
 }
 
+/* ───────────────────────────────────────────────────────────────────
+ * Masstree engine — concurrent B+tree-of-tries (kohler/masstree-beta, MIT),
+ * via the extern "C" shim src/load_names_masstree.cpp (compiled by g++ with
+ * the vendored Masstree sources, linked with -lstdc++).
+ *
+ * Masstree keys on arbitrary binary lcdf::Str, so it takes the dns_qpkey bytes
+ * directly.  Read-only after build, so no concurrent removes / no epoch GC to
+ * drive at query time; each worker just makes its own threadinfo lazily (there
+ * is no teardown hook in _thread_ft_alloc).  The stored value is a copy of the
+ * qpkey in a NUMA-interleaved arena, so the benchmark's force-read hits cold,
+ * separate memory (Masstree validates the full key during descent).
+ *
+ * Run one thread count per process (BENCH_THREADS=N): Masstree's build-time
+ * split garbage / per-point table is only best-effort reclaimed, so a single
+ * build per process keeps any residual leak bounded.
+ * ─────────────────────────────────────────────────────────────────── */
+void *masstree_create(void);
+void *masstree_thread_init(void);
+void masstree_insert(void *table, void *ti, const char *key, int len, void *val);
+void *masstree_lookup(void *table, void *ti, const char *key, int len);
+void masstree_destroy(void *table);
+
+/* Per-worker threadinfo, created lazily (no teardown hook in _thread_ft_alloc). */
+static __thread void *tls_mt_ti = NULL;
+static inline void *mt_ti(void) {
+	if (tls_mt_ti == NULL)
+		tls_mt_ti = masstree_thread_init();
+	return tls_mt_ti;
+}
+
+static char *mt_il_arena = NULL;
+static size_t mt_il_arena_off = 0;
+static size_t mt_il_arena_cap = 0;
+
+static void
+mt_il_arena_create(size_t n) {
+	mt_il_arena_cap = n * sizeof(dns_qpkey_t);
+	mt_il_arena = mmap(NULL, mt_il_arena_cap, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mt_il_arena == MAP_FAILED) {
+		perror("mmap(mt_il_arena)");
+		abort();
+	}
+	unsigned long mask = (1UL << 24) - 1;
+	if (sys_mbind(mt_il_arena, mt_il_arena_cap,
+		      MPOL_INTERLEAVE, &mask, 25, 0) < 0) {
+		perror("mbind(mt_il_arena)");
+	}
+	mt_il_arena_off = 0;
+}
+
+static char *
+mt_il_arena_alloc(size_t sz) {
+	size_t off = (mt_il_arena_off + 7) & ~(size_t)7;
+	if (off + sz > mt_il_arena_cap)
+		abort();
+	mt_il_arena_off = off + sz;
+	return mt_il_arena + off;
+}
+
+static isc_result_t
+add_masstree(void *map, size_t count) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	dns_qpkey_t key;
+	size_t len = dns_qpkey_fromname(key, &item[count].fixed.name,
+					DNS_DBNAMESPACE_NORMAL);
+	char *copy = mt_il_arena_alloc(len);
+	memcpy(copy, key, len);
+	memcpy(qk->bytes, key, len);
+	qk->len = len;
+	ft_alloc_index[count] = (struct ft_arena_slot *)copy;
+	masstree_insert(map, mt_ti(), (const char *)key, (int)len, copy);
+	return ISC_R_SUCCESS;
+}
+
+static isc_result_t
+get_masstree(void *map, size_t count, void **pval) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	void *v = masstree_lookup(map, mt_ti(), (const char *)qk->bytes,
+				  (int)qk->len);
+	if (v == NULL)
+		return ISC_R_NOTFOUND;
+	*pval = v;
+	return ISC_R_SUCCESS;
+}
+
+static void *
+new_masstree(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	return masstree_create();
+}
+
+static void
+destroy_masstree(void *map) {
+	masstree_destroy(map);
+}
+
+static void *
+thread_masstree(void *arg0) {
+	return _thread_ft_alloc(arg0, add_masstree, get_masstree, true);
+}
+
 static struct fun fun_list[] = {
 	{ "qp_il",                new_qp_il,              thread_qp_il,              destroy_qp },
 	{ "qp_local",             new_qp_local,           thread_qp_local,           destroy_qp },
@@ -1988,6 +2089,8 @@ static struct fun fun_list[] = {
 	{ "ft_cand_local",         new_ft_cand,          thread_ft_cand_local,  destroy_ft },
 	/* HOT concurrent ROWEX trie (NUMA-interleaved key-copy arena). */
 	{ "hotrowex",              new_hotrowex,         thread_hotrowex,       destroy_hotrowex },
+	/* Masstree concurrent B+tree-of-tries. */
+	{ "masstree",              new_masstree,         thread_masstree,       destroy_masstree },
 	{ NULL, NULL, NULL, NULL },
 };
 
@@ -2080,6 +2183,7 @@ main(int argc, char *argv[]) {
 	query_keys_create(sizeof(item) / sizeof(item[0]));
 	user_payload_create(sizeof(item) / sizeof(item[0]));
 	hot_il_arena_create(sizeof(item) / sizeof(item[0]));
+	mt_il_arena_create(sizeof(item) / sizeof(item[0]));
 	isc_rwlock_init(&rwl);
 
 	if (argc != 2) {

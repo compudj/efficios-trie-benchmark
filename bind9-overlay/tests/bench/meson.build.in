@@ -100,11 +100,18 @@ executable(
     export_dynamic: true,
     install: false,
     sources: default_sanitize_options,
-    # Link the prebuilt HOTRowex shim object (compiled by build-bind9.sh with
-    # g++ + the header-only HOT) plus its C++/oneTBB runtime, for the hotrowex
-    # engine.  The .o lives next to this meson.build in the overlay dest dir.
+    # Link the prebuilt HOTRowex and Masstree shim objects (compiled by
+    # build-bind9.sh with g++) + their C++ runtime, for the hotrowex/masstree
+    # engines.  The .o files live next to this meson.build in the overlay dest
+    # dir.  HOTRowex needs oneTBB; Masstree brings its own vendored core.
     link_args: [
         meson.current_source_dir() / 'load_names_hotrowex.o',
+        meson.current_source_dir() / 'load_names_masstree.o',
+        meson.current_source_dir() / 'mt_compiler.o',
+        meson.current_source_dir() / 'mt_str.o',
+        meson.current_source_dir() / 'mt_string.o',
+        meson.current_source_dir() / 'mt_straccum.o',
+        meson.current_source_dir() / 'mt_kvthread.o',
         '-ltbb', '-lstdc++',
     ],
     dependencies: [
