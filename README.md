@@ -90,7 +90,7 @@ make bind9     # clone bind9 @ pinned commit, apply overlay, build the benches
 Run it (note the `LD_LIBRARY_PATH` — see below):
 
 ```sh
-LD_LIBRARY_PATH=urcu-build/src/.libs FT_PRIME=1 \
+LD_LIBRARY_PATH=urcu-build/src/.libs \
   bind9-src/build/tests/bench/load-names datasets/names-1M-shuf.csv
 ```
 
@@ -99,8 +99,11 @@ thread counts `1 2 4 8 16 32 64 96 128 192`, pinning worker `i` to CPU `i`
 (distinct physical cores up to 192 on a 2×96-core EPYC). `BENCH_THREADS=N`
 restricts the sweep to a **single** thread count `N` (it is parsed as one
 integer, not a list — handy with a high `QUERY_LOOPS` for clean perf-stat
-runs). Other env vars: `QUERY_LOOPS`, `BENCH_ENGINE` (filter),
-`BENCH_CACHE_FLUSH_MB`, `FT_BENCH_CHURN`, `FT_BENCH_COMPACT`.
+runs). Cache priming is **on by default** for **every** engine (an untimed warm
+pass before the timed window, applied identically to FT and qp so comparisons
+are fair); set `BENCH_NO_PRIME=1` to measure cold-start instead. Other env
+vars: `QUERY_LOOPS`, `BENCH_ENGINE` (filter), `BENCH_CACHE_FLUSH_MB`,
+`FT_BENCH_CHURN`, `FT_BENCH_COMPACT`.
 
 **Why `LD_LIBRARY_PATH`:** bind9's own libraries link the system `liburcu-cds`
 (found via pkg-config) and pull it in transitively; without our build's `.libs`
@@ -112,18 +115,25 @@ newest FT symbols are missing. `make bind9` prints the exact command to use.
 Lookup throughput on 1M DNS names (`datasets/names-1M-shuf.csv`), comparing the
 Fractal Trie reference engine `ft_spec_il` (speculative descent + library-side
 memcmp validation) against BIND9's `dns_qpmulti` (`qp_il`), apples-to-apples:
-both use the same NUMA-interleaved (`il`) leaf/payload placement.
+both use the same NUMA-interleaved (`il`) leaf/payload placement, and **both are
+cache-primed** (priming is on by default for every engine — see above).
 
 | Engine        | Query throughput @ 192 cores | vs BIND9-QP |
 |---------------|------------------------------|-------------|
-| `ft_spec_il`  | **≈ 1257 Mops/s** (1072–1279) | **≈ 3.1×**  |
-| `qp_il`       | ≈ 405 Mops/s (391–419)        | 1×          |
+| `ft_spec_il`  | **≈ 1246 Mops/s** (1227–1273) | **≈ 1.3×** |
+| `qp_il`       | ≈ 938 Mops/s (804–976)        | 1×          |
 
-Median of 5 runs (min–max in parentheses); `QUERY_LOOPS=1`, `FT_PRIME=1`.
-`qp_il` and `qp_local` are statistically tied at this scale (≈ 405 vs 410 Mops/s
-median, overlapping ranges). The FT lead grows with core count — ≈ 1.3× at 1
-thread, ≈ 3× at 192 — because the FT RCU read path dirties no shared memory,
-while BIND9-QP's read path write-shares and stops scaling past ~96 threads.
+Median of 5 runs (min–max in parentheses), `QUERY_LOOPS=1`, priming on. Across
+the thread sweep the FT lead is a steady **~1.1–1.3×** (≈ 1.2× at 1 thread,
+≈ 1.3× at 192) — FT scales a bit better at the top because its RCU read path
+dirties no shared memory while BIND9-QP's read path write-shares, but the gap is
+modest. `qp_il` and `qp_local` are close at this scale with high run-to-run
+variance; medians slightly favor `qp_il`.
+
+> Note: cache priming must be applied to *all* engines or the comparison is
+> badly skewed — with priming on FT only (the old `FT_PRIME` default), `qp_il`
+> measured ~405 Mops/s cold vs ~938 warm, inflating the FT lead to a spurious
+> ~3.1×. Always compare warm-vs-warm (or cold-vs-cold).
 
 **Hardware:** 2× AMD EPYC 9654 (Zen 4 "Genoa"), 96 cores/socket = **192
 physical cores**, SMT2 = 384 logical CPUs, 2 sockets, 24 NUMA nodes. The
