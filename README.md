@@ -83,6 +83,7 @@ fastest-first by `dns`:
 |------------|------:|-------:|--------:|
 | `hot`      |    98 |    109 |      77 |
 | `ft_cand`  |   114 |    106 |     143 |
+| `wormhole`†|   117 |    102 |     118 |
 | `qp`       |   119 |    129 |     180 |
 | `ft_spec`  |   120 |    111 |     142 |
 | `judyhs`   |   145 |    120 |     142 |
@@ -91,8 +92,6 @@ fastest-first by `dns`:
 | `artolc`   |   214 |    208 |     249 |
 | `masstree` |   241 |    196 |     210 |
 | `cuckoo`   |   337 |    313 |     333 |
-
-(`wormhole`, the separate GPL binary, is ~118 ns on `dns`.)
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
@@ -107,8 +106,14 @@ fastest-first by `u64d`:
 | `hot`      |     20 |     49 |     20 |     50 |
 | `artolc`   |     22 |     97 |     23 |    100 |
 | `judyhs`   |     24 |     46 |     38 |     79 |
+| `wormhole`†|     35 |     90 |     39 |     91 |
 | `masstree` |     48 |    171 |     46 |    169 |
 | `cuckoo`   |     95 |     98 |    118 |     98 |
+
+† `wormhole` is the separate **GPL-3.0** binary (`bench_wormhole_gpl [dataset]`),
+never linked into `bench_one_st`; shown here for comparison. A trie of hash
+tables — distribution-sensitive like the hashes (dense ints ~35–39 ns, sparse
+~90), mid-pack on strings.
 
 Takeaways:
 - **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
