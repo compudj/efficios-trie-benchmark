@@ -81,48 +81,48 @@ fastest-first by `dns`:
 
 | Engine     | `dns` | `dict` | `paths` |
 |------------|------:|-------:|--------:|
-| `hot`      |    98 |    109 |      77 |
-| `ft_cand`  |   114 |    106 |     143 |
-| `wormhole`†|   117 |    102 |     118 |
-| `qp`       |   119 |    129 |     180 |
-| `ft_spec`  |   120 |    111 |     142 |
-| `judyhs`   |   145 |    120 |     142 |
-| `judysl`   |   201 |    259 |     264 |
-| `art`      |   209 |    181 |     231 |
-| `artolc`   |   214 |    208 |     249 |
-| `masstree` |   241 |    196 |     210 |
-| `cuckoo`   |   337 |    313 |     333 |
+| `hot`      |    99 |    106 |      77 |
+| `ft_cand`  |   113 |    108 |     137 |
+| `wormhole`†|   113 |    101 |     114 |
+| `qp`       |   118 |    127 |     177 |
+| `ft_spec`  |   119 |    112 |     143 |
+| `judyhs`   |   145 |    121 |     149 |
+| `judysl`   |   202 |    250 |     263 |
+| `artolc`   |   218 |    212 |     238 |
+| `art`      |   219 |    186 |     233 |
+| `masstree` |   238 |    196 |     209 |
+| `cuckoo`   |   335 |    301 |     332 |
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
 
 | Engine     | `u32d` | `u32s` | `u64d` | `u64s` |
 |------------|-------:|-------:|-------:|-------:|
-| `judyl`    |     11 |     37 |     11 |     65 |
-| `qp`       |     12 |     12 |     13 |     13 |
-| `ft_cand`  |     15 |     32 |     15 |     32 |
-| `art`      |     15 |     49 |     17 |     54 |
-| `ft_spec`  |     16 |     36 |     17 |     36 |
-| `hot`      |     20 |     49 |     20 |     50 |
-| `artolc`   |     22 |     97 |     23 |    100 |
-| `judyhs`   |     24 |     46 |     38 |     79 |
-| `wormhole`†|     35 |     90 |     39 |     91 |
-| `masstree` |     48 |    171 |     46 |    169 |
-| `cuckoo`   |     95 |     98 |    118 |     98 |
+| `judyl`    |     11 |     38 |     11 |     64 |
+| `qp`       |     13 |     13 |     13 |     13 |
+| `ft_cand`  |     14 |     33 |     15 |     33 |
+| `art`      |     13 |     49 |     16 |     54 |
+| `ft_spec`  |     16 |     35 |     17 |     35 |
+| `hot`      |     20 |     49 |     20 |     49 |
+| `artolc`   |     22 |     96 |     24 |     98 |
+| `judyhs`   |     24 |     46 |     38 |     78 |
+| `wormhole`†|     34 |     88 |     38 |     92 |
+| `masstree` |     48 |    172 |     48 |    168 |
+| `cuckoo`   |     96 |    114 |    118 |    117 |
 
 † `wormhole` is the separate **GPL-3.0** binary (`bench_wormhole_gpl [dataset]`),
 never linked into `bench_one_st`; shown here for comparison. A trie of hash
-tables — distribution-sensitive like the hashes (dense ints ~35–39 ns, sparse
+tables — distribution-sensitive like the hashes (dense ints ~34–38 ns, sparse
 ~90), mid-pack on strings.
 
 Takeaways:
 - **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
   four* sets, including the sparse random ones where everything else degrades 2–6×
-  (`judyl` 11→65, `ft` 15→36, `art` 17→54). Its bit-popcount nodes don't care
+  (`judyl` 11→64, `ft` 15→35, `art` 16→54). Its bit-popcount nodes don't care
   whether keys cluster.
-- **`judyl` wins dense integers** (11 ns) but collapses on sparse (65); **`judyhs`
+- **`judyl` wins dense integers** (11 ns) but collapses on sparse (64); **`judyhs`
   beats `judysl` on strings** (hash suits these distributions better than the
-  radix tree), and **`hot` has the fastest string lookups** (77–109 ns).
+  radix tree), and **`hot` has the fastest string lookups** (77–106 ns).
 - **`cuckoo` is slowest throughout** (it hashes whole keys, no prefix sharing);
   **Masstree and ART-OLC carry their concurrency machinery** even single-threaded,
   so they trail the dedicated ST engines (ART-OLC the closer of the two).
@@ -135,17 +135,6 @@ Takeaways:
 > real validating compare against cold memory and no validation is dead-code-
 > eliminated. HOT (integer) uses map-mode (value = a pointer to the key record),
 > not its cheaper set-mode, so it touches a cold value like the others.
-
-> **Validation fairness (why these differ from earlier numbers).** Every engine
-> here stores its own **copy** of each key (FT/qp/ART in a dense
-> `cds_ft_external_arena`; Judy/Cuckoo/Wormhole internally) and the timed loop
-> both consumes the lookup status and force-reads the returned leaf
-> (`FORCE_READ_LEAF`), so each pays a real validating compare against cold
-> memory and no validation is dead-code-eliminated. HOT originally stored a
-> pointer straight into the shared query buffer, so its `contentEquals`
-> validated against already-hot memory — near-free, and ~71 MB because it kept
-> no copies. Putting HOT on the same key-copy arena as the others is what moves
-> it to ~100 ns / 110 MB (the lookup cost barely changes; the memory does).
 
 ### The qp-trie `qp` vs `fn` gotcha
 
