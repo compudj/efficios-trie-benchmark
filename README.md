@@ -93,7 +93,7 @@ fastest-first by `dns`:
 | `judysl`   |   202 |    250 |     263 |
 | `artolc`   |   218 |    212 |     238 |
 | `masstree` |   231 |    193 |     207 |
-| `cuckoo`‡  |   335 |    301 |     332 |
+| `cuckoo`   |   335 |    301 |     332 |
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
@@ -110,19 +110,19 @@ fastest-first by `u64d`:
 | `judyhs`‡  |     24 |     46 |     38 |     78 |
 | `wormhole`†|     34 |     88 |     38 |     92 |
 | `masstree` |     46 |    172 |     46 |    168 |
-| `cuckoo`‡  |     96 |    114 |    118 |    117 |
+| `cuckoo`   |     96 |    114 |    118 |    117 |
 
 † `wormhole` is the separate **GPL-3.0** binary (`bench_wormhole_gpl [dataset]`),
 never linked into `bench_one_st`; shown here for comparison. A trie of hash
 tables — distribution-sensitive like the hashes (dense ints ~34–38 ns, sparse
-~90), mid-pack on strings. (Despite the internal hashing, `wormhole` *is*
-order-preserving — it supports ordered iteration / range queries.)
+~90), mid-pack on strings.
 
-‡ **hash-based, not order-preserving.** `judyhs` (Judy hash array) and `cuckoo`
-(Cuckoo Trie, whole-key hashed) are point-lookup structures with no ordered
-iteration or range queries. Every other engine here is an ordered trie / radix
-structure (or, for `wormhole`, an ordered trie-of-hashes), so a key-ordered scan
-is O(n) in sorted order — a capability these two trade away for hash speed.
+‡ **`judyhs` is hash-based — not order-preserving** (no ordered iteration or
+range queries). Every other engine here keeps keys ordered and supports an O(n)
+in-order scan, which `judyhs` trades away for hash speed — including `wormhole`
+(an ordered trie-of-hashes) and even `cuckoo` (the Cuckoo Trie holds its leaves
+in a sorted linked list and exposes `ct_iter_goto` lower-bound seek +
+`ct_iter_next` forward iteration).
 
 Takeaways:
 - **FT's two validating modes**: `ft_spec` (speculative — skip-compressed
@@ -139,7 +139,8 @@ Takeaways:
 - **`judyl` wins dense integers** (11 ns) but collapses on sparse (64); **`judyhs`
   beats `judysl` on strings** (hash suits these distributions better than the
   radix tree), and **`hot` has the fastest string lookups** (77–106 ns).
-- **`cuckoo` is slowest throughout** (it hashes whole keys, no prefix sharing);
+- **`cuckoo` is slowest throughout** (its trie nodes live in a cuckoo hash
+  table — extra hashing and bucket probes per descent step);
   **Masstree and ART-OLC carry their concurrency machinery** even single-threaded,
   so they trail the dedicated ST engines (ART-OLC the closer of the two).
 - **Opt level: only `art` profits from `-O3`** (~11% on strings, ~18% on dense
