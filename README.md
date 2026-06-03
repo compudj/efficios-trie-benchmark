@@ -61,7 +61,7 @@ Single dataset, single engine, run in its own process for accurate RSS:
 Example sweep (all engines that apply, on one dataset):
 
 ```sh
-for e in ft_cand ft_spec judyl judysl judyhs qp art hot cuckoo masstree artolc; do \
+for e in ft_eager ft_spec judyl judysl judyhs qp art hot cuckoo masstree artolc; do \
   printf '%-10s ' "$e"; ./bench_one_st dns "$e"; done
 ```
 
@@ -71,7 +71,9 @@ build and query), `FT_DUMP_STATS`, `N_KEYS` / `WARMUP` / `RUNS` (compile-time).
 ### Results across datasets (1M keys, single thread)
 
 Lookup time, ns/op (best of `RUNS` timed passes after `WARMUP`), on the hardware
-below (2× EPYC 9654; `cuckoo` run with reserved 2 MiB hugepages, `-O3 -flto`).
+below (2× EPYC 9654; `cuckoo`, `art`, `masstree` built `-O3` — `cuckoo` also
+`-flto` + 2 MiB hugepages; every other engine, including FT, is `-O2`, which it
+saturates: `-O3`/LTO move them <2% — see opt-level note below).
 Every engine now runs on every dataset — the byte-keyed engines key integers as
 big-endian bytes; `judysl` (string radix) and `judyl` (integer array) are the
 two split-out Judy variants, `judyhs` is Judy's hash array.
@@ -82,16 +84,16 @@ fastest-first by `dns`:
 | Engine     | `dns` | `dict` | `paths` |
 |------------|------:|-------:|--------:|
 | `hot`      |    99 |    106 |      77 |
-| `ft_cand`  |   113 |    108 |     137 |
 | `wormhole`†|   113 |    101 |     114 |
 | `qp`       |   118 |    127 |     177 |
 | `ft_spec`  |   119 |    112 |     143 |
-| `judyhs`   |   145 |    121 |     149 |
+| `judyhs`‡  |   145 |    121 |     149 |
+| `art`      |   183 |    167 |     223 |
+| `ft_eager` |   185 |    158 |     202 |
 | `judysl`   |   202 |    250 |     263 |
 | `artolc`   |   218 |    212 |     238 |
-| `art`      |   219 |    186 |     233 |
-| `masstree` |   238 |    196 |     209 |
-| `cuckoo`   |   335 |    301 |     332 |
+| `masstree` |   231 |    193 |     207 |
+| `cuckoo`‡  |   335 |    301 |     332 |
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
@@ -99,26 +101,40 @@ fastest-first by `u64d`:
 | Engine     | `u32d` | `u32s` | `u64d` | `u64s` |
 |------------|-------:|-------:|-------:|-------:|
 | `judyl`    |     11 |     38 |     11 |     64 |
+| `art`      |     11 |     46 |     12 |     47 |
 | `qp`       |     13 |     13 |     13 |     13 |
-| `ft_cand`  |     14 |     33 |     15 |     33 |
-| `art`      |     13 |     49 |     16 |     54 |
+| `ft_eager` |     13 |     42 |     16 |     44 |
 | `ft_spec`  |     16 |     35 |     17 |     35 |
 | `hot`      |     20 |     49 |     20 |     49 |
 | `artolc`   |     22 |     96 |     24 |     98 |
-| `judyhs`   |     24 |     46 |     38 |     78 |
+| `judyhs`‡  |     24 |     46 |     38 |     78 |
 | `wormhole`†|     34 |     88 |     38 |     92 |
-| `masstree` |     48 |    172 |     48 |    168 |
-| `cuckoo`   |     96 |    114 |    118 |    117 |
+| `masstree` |     46 |    172 |     46 |    168 |
+| `cuckoo`‡  |     96 |    114 |    118 |    117 |
 
 † `wormhole` is the separate **GPL-3.0** binary (`bench_wormhole_gpl [dataset]`),
 never linked into `bench_one_st`; shown here for comparison. A trie of hash
 tables — distribution-sensitive like the hashes (dense ints ~34–38 ns, sparse
-~90), mid-pack on strings.
+~90), mid-pack on strings. (Despite the internal hashing, `wormhole` *is*
+order-preserving — it supports ordered iteration / range queries.)
+
+‡ **hash-based, not order-preserving.** `judyhs` (Judy hash array) and `cuckoo`
+(Cuckoo Trie, whole-key hashed) are point-lookup structures with no ordered
+iteration or range queries. Every other engine here is an ordered trie / radix
+structure (or, for `wormhole`, an ordered trie-of-hashes), so a key-ordered scan
+is O(n) in sorted order — a capability these two trade away for hash speed.
 
 Takeaways:
+- **FT's two validating modes**: `ft_spec` (speculative — skip-compressed
+  encoding, one end-of-walk `memcmp`) is the better default, beating `ft_eager`
+  (eager-optimized — per-step exact compares on compressed bytes) on strings
+  (`dns` 119 vs 185) and on sparse integers (`u64s` 35 vs 44); they tie on dense
+  integers (~16 ns). Both return validated results — `ft_cand` (the raw,
+  *unvalidated* candidate primitive) is excluded from these tables since it skips
+  the compare every other engine pays.
 - **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
   four* sets, including the sparse random ones where everything else degrades 2–6×
-  (`judyl` 11→64, `ft` 15→35, `art` 16→54). Its bit-popcount nodes don't care
+  (`judyl` 11→64, `ft` 17→35, `art` 12→47). Its bit-popcount nodes don't care
   whether keys cluster.
 - **`judyl` wins dense integers** (11 ns) but collapses on sparse (64); **`judyhs`
   beats `judysl` on strings** (hash suits these distributions better than the
@@ -126,6 +142,14 @@ Takeaways:
 - **`cuckoo` is slowest throughout** (it hashes whole keys, no prefix sharing);
   **Masstree and ART-OLC carry their concurrency machinery** even single-threaded,
   so they trail the dedicated ST engines (ART-OLC the closer of the two).
+- **Opt level: only `art` profits from `-O3`** (~11% on strings, ~18% on dense
+  integers — its node-256 scan and path-compression loops unroll/vectorize), so
+  it's built `-O3` like `cuckoo`; at `-O3` it even edges past FT on dense ints
+  (`u64d` 12 vs FT's 16–17). `masstree` gains a marginal ~3% (also `-O3`).
+  `qp`, `hot`, ART-OLC, **and FT** are flat (<2% across `-O2`/`-O3`/`-flto`,
+  measured interleaved 30×) — pointer-chasing radix walks are latency/cache-bound
+  and already saturated at `-O2`; FT additionally hand-codes its `popcnt`/`bmi`
+  hot path. LTO buys nothing (each engine is effectively a single TU).
 - Single snapshot, best-of-`RUNS` (figures move a few % run to run).
 
 > **Validation fairness.** Every engine stores its own **copy** of each key

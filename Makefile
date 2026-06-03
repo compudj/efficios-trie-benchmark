@@ -49,6 +49,12 @@ LDLIBS  := -lurcu-qsbr -lurcu-cds -lurcu -lJudy -lpthread
 QP_OBJS  := third_party/qp-trie/Tbl.o third_party/qp-trie/qp.o
 ART_OBJS := third_party/libart/art.o
 
+# libart measurably benefits from -O3 (~-11% on string lookups, ~-18% on dense
+# integers — its node-256 scan and path-compression loops unroll/vectorize),
+# whereas qp/HOT/ART-OLC/FT all saturate at -O2.  So, like Cuckoo, it gets its
+# own opt level instead of the global -O2 OPTFLAGS.  LTO adds nothing (single TU).
+ART_CF   := -O3 -DNDEBUG -march=native -mpopcnt -Wall
+
 BENCHES := bench_one_st
 
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9
@@ -110,7 +116,7 @@ third_party/qp-trie/%.o: third_party/qp-trie/%.c
 	$(CC) $(CFLAGS) -std=gnu99 -Ithird_party/qp-trie -c -o $@ $<
 
 third_party/libart/%.o: third_party/libart/%.c
-	$(CC) $(CFLAGS) -Ithird_party/libart -c -o $@ $<
+	$(CC) $(ART_CF) -Ithird_party/libart -c -o $@ $<
 
 # ---------------------------------------------------------------------------
 # Wormhole (GPL-3.0) — SEPARATE, GPL-licensed binary.
@@ -167,7 +173,9 @@ bench_scale_hotrowex: src/bench_scale_hotrowex.o bench_scale_common.o
 #     ENGINES="ft masstree hotrowex" scripts/run_scale_rw.sh 192
 # ---------------------------------------------------------------------------
 MASSTREE_DIR := third_party/masstree
-MASSTREE_CXXFLAGS := $(OPTFLAGS) -std=gnu++14 -w \
+# Masstree gains a marginal ~3-4% on dense-integer lookups at -O3 (the rest is
+# flat), so it uses -O3 rather than the global -O2 OPTFLAGS (like libart / Cuckoo).
+MASSTREE_CXXFLAGS := -O3 -DNDEBUG -march=native -mpopcnt -std=gnu++14 -w \
                      -I$(MASSTREE_DIR) -include $(MASSTREE_DIR)/config.h
 MASSTREE_OBJS := $(addprefix $(MASSTREE_DIR)/, \
                  compiler.o str.o string.o straccum.o kvthread.o)
