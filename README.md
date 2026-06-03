@@ -610,6 +610,17 @@ and mutation strength: `cds_ft_next` pays a per-step descent through the fractal
 trie where a B+tree or HOT just follows a leaf link. FT is tuned for point
 operations, not bulk ordered scans.
 
+**Note — FT uses its *cached* iterator, the fast path.** The traversal runs
+under one continuous RCU read lock with the default `CDS_FT_ITER_CACHED` mode,
+so each `cds_ft_next` advances from the current position by backtracking up the
+*live parent chain* to the nearest ancestor with an unexplored child rather than
+re-descending from the root. The alternative `CDS_FT_ITER_UNCACHED` mode does a
+fresh top-down descent from the root *per step* (so the RCU read lock may be
+dropped between keys, e.g. for blocking work) and is substantially slower. FT's
+last-place numbers here are therefore already its *best* ordered-scan case, not a
+pessimal one — so the cursor-vs-leaf-scan gap above is not an artifact of an
+unfavorable iterator mode.
+
 (All engines visit the same ~995,830 unique keys — the generated DNS set has
 ~4,170 duplicates the dedup'ing tries collapse; ART keeps all 1,000,000 inserts,
 a <0.5% difference, immaterial to throughput.)
