@@ -244,25 +244,27 @@ benchmark pins worker `i` to CPU `i` (CPUs 0–191 = one thread per physical
 core), so the 192-thread point runs one worker per physical core (private
 L1/L2/FPU, no SMT-sibling contention).
 
-### Result — FT spec vs HOTRowex vs Masstree vs ART-OLC on this workload
+### Result — FT spec vs HOTRowex vs Masstree vs ART-OLC/ROWEX on this workload
 
-HOT's concurrent ROWEX trie (`hotrowex`), Masstree (`masstree`), and ART-OLC
-(`artolc`) are all wired into load-names, so the same read-only,
-sequential-access, real-names sweep compares them against `ft_spec_il` on equal
-footing — all validate every lookup and store key copies in a NUMA-interleaved
-arena (HOT keys on a NUL-terminated qpkey copy; Masstree on the binary qpkey
-bytes; ART-OLC on a `\0`-terminated qpkey, since ART needs byte-prefix-free
-keys). Median of 4 runs, query Mops/s:
+HOT's concurrent ROWEX trie (`hotrowex`), Masstree (`masstree`), ART-OLC
+(`artolc`), and ART-ROWEX (`artrowex`) are all wired into load-names, so the same
+read-only, sequential-access, real-names sweep compares them against `ft_spec_il`
+on equal footing — all validate every lookup and store key copies in a
+NUMA-interleaved arena (HOT keys on a NUL-terminated qpkey copy; Masstree on the
+binary qpkey bytes; both ARTs on a `\0`-terminated qpkey, since ART needs
+byte-prefix-free keys). Median of 4 runs, query Mops/s (fresh process per thread
+count):
 
-| Threads | `ft_spec_il` | `hotrowex` | `artolc` | `masstree` |
-|--------:|-------------:|-----------:|---------:|-----------:|
-| 64      | 317          | **355**    | 208      | 166        |
-| 128     | **758**      | 719        | 428      | 262        |
-| 192     | **1212**     | 1021       | 685      | 267        |
+| Threads | `ft_spec_il` | `hotrowex` | `artolc` | `artrowex` | `masstree` |
+|--------:|-------------:|-----------:|---------:|-----------:|-----------:|
+| 64      | 317          | **355**    | 208      | 203        | 166        |
+| 128     | **758**      | 719        | 428      | 424        | 262        |
+| 192     | **1212**     | 1021       | 685      | 701        | 267        |
 
-(ART-ROWEX, `artrowex`, is wired into load-names on the same footing — a peer to
-`artolc` — but not swept into this median table yet; add it with
-`BENCH_ENGINE=artrowex`.)
+**ART-ROWEX tracks ART-OLC closely and edges ahead at 192** (701 vs 685) — its
+read-optimized write exclusion costs a hair at low counts (readers wait on a
+node only while a writer holds it) but avoids OLC's optimistic-read restarts as
+contention rises. Both ARTs still trail `ft_spec_il` and `hotrowex` here.
 
 **FT-spec and HOTRowex cross over at ~128 threads** (robust across reps):
 HOTRowex wins at lower core counts, FT-spec scales better and leads ~19% at 192.
@@ -471,18 +473,22 @@ copies in the dense arena, validated descent, force-read leaf):
 
 Medians of 5, reads (Mops/s):
 
-| Readers | `ft_spec` | `masstree` | `artolc` | `hotrowex` |
-|--------:|----------:|-----------:|---------:|-----------:|
-| 64      | 157       | 118        | 132      | **179**    |
-| 128     | 236       | 232        | 255      | **328**    |
-| 192     | 280       | 330        | **376**  | **439**    |
+| Readers | `ft_spec` | `masstree` | `artolc` | `artrowex` | `hotrowex` |
+|--------:|----------:|-----------:|---------:|-----------:|-----------:|
+| 64      | 157       | 118        | 132      | 123        | **179**    |
+| 128     | 236       | 232        | 255      | 242        | **328**    |
+| 192     | 280       | 330        | 376      | 356        | **439**    |
 
-At 192 the order is **HOTRowex (439) > ART-OLC (376) > Masstree (330) >
-FT-spec (280)** — all four scale, none dominates every axis. HOTRowex leads reads
-and footprint (110 MB); ART-OLC and Masstree slot above ft_spec on reads at the
-top (RSS 144 and 184 MB); Masstree has the fastest insert/remove churn (~5000
-vs ART-OLC ~1850 vs FT ~500 Kops/s); FT alone does full concurrent insert **and**
-remove under RCU with the lowest read-side cost.
+At 192 the order is **HOTRowex (439) > ART-OLC (376) > ART-ROWEX (356) >
+Masstree (330) > FT-spec (280)** — all five scale, none dominates every axis.
+(Unlike load-names, here ART-ROWEX trails ART-OLC slightly: this random-access
+write/read churn keeps a writer constantly touching nodes, so ROWEX readers pay
+the node-exclusion wait more often than they save on avoided restarts.) HOTRowex
+leads reads and footprint (110 MB); ART-OLC, ART-ROWEX and Masstree slot above
+ft_spec on reads (RSS ~144 MB for both ARTs, 184 for Masstree); Masstree has the
+fastest insert/remove churn (~5000 vs ART-OLC ~1850 vs FT ~500 Kops/s); FT alone
+does full concurrent insert **and** remove under RCU with the lowest read-side
+cost.
 
 ### Why one process per engine
 
