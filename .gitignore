@@ -14,6 +14,7 @@
 /bench_scale_hotrowex
 /bench_scale_masstree
 /bench_scale_artolc
+/bench_scale_artrowex
 
 # Benchmark output / results
 /results/

@@ -46,10 +46,10 @@ fi
 # 2. Overlay our tests/bench files + the vendored competitor sources.
 echo ">> applying tests/bench overlay"
 cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$DEST/"
-# HOTRowex + Masstree + ART-OLC engines for load-names: C++ shims compiled
-# separately below and linked into load-names.
+# HOTRowex + Masstree + ART-OLC + ART-ROWEX engines for load-names: C++ shims
+# compiled separately below and linked into load-names.
 cp "$REPO/src/load_names_hotrowex.cpp" "$REPO/src/load_names_masstree.cpp" \
-   "$REPO/src/load_names_artolc.cpp" "$DEST/"
+   "$REPO/src/load_names_artolc.cpp" "$REPO/src/load_names_artrowex.cpp" "$DEST/"
 # Per-engine read/write scaling benchmark: shared driver + one file per engine.
 cp "$OV/bench_scale_common.h" "$OV/bench_scale_common.c" \
    "$OV/bench_scale_ft.c"   "$OV/bench_scale_judy.c" "$OV/bench_scale_qp.c" \
@@ -102,6 +102,14 @@ AO_DIR="$REPO/third_party/artolc"
 AO_CXX="g++ -std=c++14 -O2 -DNDEBUG -march=native -w -I$AO_DIR"
 $AO_CXX -c "$AO_DIR/OptimisticLockCoupling/Tree.cpp" -o "$DEST/artolc_tree.o"
 $AO_CXX -c "$DEST/load_names_artolc.cpp" -o "$DEST/load_names_artolc.o"
+
+# Compile the ART-ROWEX shim + its vendored unity source (same repo, Apache-2.0)
+# for load-names' artrowex engine.  Like OLC, ROWEX/Tree.cpp #includes its node +
+# Epoche sources; ART::Epoche's out-of-line symbols are weak/local, so this
+# object and artolc_tree.o each carry their own and coexist without clashing.
+echo ">> compiling ART-ROWEX shim + core for load-names"
+$AO_CXX -c "$AO_DIR/ROWEX/Tree.cpp" -o "$DEST/artrowex_tree.o"
+$AO_CXX -c "$DEST/load_names_artrowex.cpp" -o "$DEST/load_names_artrowex.o"
 
 # load-names is the primary, up-to-date MT scaling test — it must build.
 echo ">> building load-names (primary MT scaling test)"

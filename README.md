@@ -16,6 +16,7 @@ implementations:
 | `judy` / `judyl` / `judysl` / `judyhs` | Judy — combined, JudyL (int), JudySL (string radix), JudyHS (hash) | system `libJudy` |
 | `masstree` | Masstree, B+tree-of-tries (Mao/Kohler/Morris)   | `third_party/masstree` (MIT); ST + MT |
 | `artolc`   | ART-OLC, concurrent ART OLC (Leis et al.)       | `third_party/artolc` (Apache-2.0); ST + MT |
+| `artrowex` | ART-ROWEX, concurrent ART (Read-Opt. Write Excl.) | `third_party/artolc/ROWEX` (Apache-2.0); MT |
 | BIND9 QP   | `dns_qpmulti` (multithreaded test only)         | our bind9 clone (`bind9-src/`)  |
 
 ## Dependency model (hybrid)
@@ -259,6 +260,10 @@ keys). Median of 4 runs, query Mops/s:
 | 128     | **758**      | 719        | 428      | 262        |
 | 192     | **1212**     | 1021       | 685      | 267        |
 
+(ART-ROWEX, `artrowex`, is wired into load-names on the same footing — a peer to
+`artolc` — but not swept into this median table yet; add it with
+`BENCH_ENGINE=artrowex`.)
+
 **FT-spec and HOTRowex cross over at ~128 threads** (robust across reps):
 HOTRowex wins at lower core counts, FT-spec scales better and leads ~19% at 192.
 This is the **inverse** of the random-access read/write `bench_scale` result
@@ -307,6 +312,7 @@ engine is its own executable** — one process holds exactly one trie:
 | `bench_scale_hotrowex` | HOT (concurrent **ROWEX**)   | HOT + oneTBB      |
 | `bench_scale_masstree` | **Masstree** (B+tree-of-tries) | Masstree (MIT)  |
 | `bench_scale_artolc` | **ART-OLC** (concurrent ART, Opt. Lock Coupling) | ART-OLC + oneTBB |
+| `bench_scale_artrowex` | **ART-ROWEX** (concurrent ART, Read-Opt. Write Excl.) | ART-ROWEX + oneTBB |
 
 They share `bench_scale_common.c` (key generation, RSS sampling, the
 thread-sweep driver, and a dense `bench_arena` bump allocator); each
@@ -317,15 +323,16 @@ validating compare each lookup does hits cold, separate memory — not the share
 query buffer, which would make validation almost free), and each reader
 force-reads the returned leaf so that compare is real and not optimized away.
 
-`bench_scale_hotrowex`, `bench_scale_masstree`, and `bench_scale_artolc` are
-built separately by the **top-level Makefile** (they link neither bind9 nor
-liburcu — HOTRowex and ART-OLC use oneTBB [`libtbb-dev`] for their epoch
-reclamation; Masstree links its own vendored sources), and land in the repo root
-rather than `bind9-src/build/`. `run_scale_rw.sh` looks there too:
+`bench_scale_hotrowex`, `bench_scale_masstree`, `bench_scale_artolc`, and
+`bench_scale_artrowex` are built separately by the **top-level Makefile** (they
+link neither bind9 nor liburcu — HOTRowex, ART-OLC and ART-ROWEX use oneTBB
+[`libtbb-dev`] for their epoch reclamation; Masstree links its own vendored
+sources), and land in the repo root rather than `bind9-src/build/`.
+`run_scale_rw.sh` looks there too:
 
 ```sh
-make bench_scale_hotrowex bench_scale_masstree bench_scale_artolc
-ENGINES="ft hotrowex masstree artolc" scripts/run_scale_rw.sh 192
+make bench_scale_hotrowex bench_scale_masstree bench_scale_artolc bench_scale_artrowex
+ENGINES="ft hotrowex masstree artolc artrowex" scripts/run_scale_rw.sh 192
 ```
 
 It is the lone **ROWEX** engine here — readers are optimistic and lock-free
@@ -435,9 +442,9 @@ pointer-chasing, not bandwidth-bound — the opposite of `load-names`' read-only
 `ft_spec_il`, where an interleaved arena wins at ≥128 threads. Left off by
 default; the numbers above are non-interleaved.
 
-### Adding Masstree and ART-OLC
+### Adding Masstree, ART-OLC and ART-ROWEX
 
-Two more concurrent structures join the sweep on the same fair footing (key
+More concurrent structures join the sweep on the same fair footing (key
 copies in the dense arena, validated descent, force-read leaf):
 
 - `bench_scale_masstree` — **Masstree** (Mao/Kohler/Morris, EuroSys'12;
@@ -452,6 +459,15 @@ copies in the dense arena, validated descent, force-read leaf):
   we key on the NUL terminator too (`len+1`) — without it ART mis-stores
   prefix-colliding keys (this bench doesn't check results, so it tolerated that
   silently; load-names' `CHECKN` caught it).
+- `bench_scale_artrowex` — **ART-ROWEX** (Leis et al., DaMoN'16; same
+  flode/ARTSynchronized repo, Apache-2.0): the Read-Optimized Write EXclusion
+  ART. Same loadKey-validated, prefix-free-key footing as ART-OLC; the
+  difference is the read discipline — ROWEX readers never restart (writers take
+  per-node write locks that *exclude* concurrent readers from that node), and
+  unlike HOT's ROWEX it supports `remove`, so its writer churns insert/remove
+  like the others. Wired into both `bench_scale_artrowex` and load-names
+  (`artrowex`); its vendored sources are byte-identical to upstream, and its
+  Epoche object coexists with ART-OLC's via weak/COMDAT symbols.
 
 Medians of 5, reads (Mops/s):
 
@@ -498,8 +514,9 @@ src/bench_scale_hotrowex.cpp     concurrent (ROWEX) HOT MT engine; same driver,
                                    built standalone by the top-level Makefile
 src/bench_scale_masstree.cpp     Masstree (B+tree-of-tries) MT engine; same driver
 src/bench_scale_artolc.cpp       ART-OLC (concurrent ART) MT engine; same driver
+src/bench_scale_artrowex.cpp     ART-ROWEX (concurrent ART) MT engine; same driver
 third_party/masstree/            vendored Masstree, C++ (MIT) + generated config.h
-third_party/artolc/              vendored ART-OLC, C++ (Apache-2.0)
+third_party/artolc/              vendored ART-OLC + ART-ROWEX, C++ (Apache-2.0)
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
 third_party/hot/                 vendored HOT, header-only C++14 (ISC);
                                    single-threaded + rowex (concurrent) headers
@@ -541,9 +558,12 @@ scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined t
   Masstree's `./configure` — regenerate with `autoreconf -i && ./configure` if
   building on a materially different host. See `LICENSE` / `AUTHORS`.
 - `third_party/artolc` — **Apache-2.0** (Florian Scheibner; ART of Leis et al.).
-  Concurrent ART (Optimistic Lock Coupling); the `bench_scale_artolc` /
-  load-names `artolc` engines. Unity build (`OptimisticLockCoupling/Tree.cpp`
-  `#include`s the rest), needs oneTBB. See `LICENSE`.
+  Concurrent ART, both variants vendored byte-identical to upstream: Optimistic
+  Lock Coupling (`OptimisticLockCoupling/`, the `bench_scale_artolc` / load-names
+  `artolc` engines) and Read-Optimized Write EXclusion (`ROWEX/`, the
+  `bench_scale_artrowex` / load-names `artrowex` engines). Each is a unity build
+  (`<variant>/Tree.cpp` `#include`s the rest, incl. the shared `Epoche.cpp`) and
+  needs oneTBB; the two share `Key.h`/`Epoche`. See `LICENSE`.
 - `third_party/wormhole` — **GPL-3.0** (Xingbo Wu). See `third_party/wormhole/LICENSE`.
   Because it is GPL-3.0, Wormhole is **never** linked into the permissively
   licensed benchmarks. It is built only into its own executable,

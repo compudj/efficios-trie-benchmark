@@ -2175,6 +2175,105 @@ thread_artolc(void *arg0) {
 	return _thread_ft_alloc(arg0, add_artolc, get_artolc, true);
 }
 
+/* ───────────────────────────────────────────────────────────────────
+ * ART-ROWEX engine — concurrent ART, Read-Optimized Write EXclusion (same
+ * flode/ARTSynchronized repo as ART-OLC, Apache-2.0), via the extern "C" shim
+ * src/load_names_artrowex.cpp.  Wiring is identical to ART-OLC -- same
+ * TID-is-a-key-copy validation, same NUMA-interleaved arena, same prefix-free
+ * len+1 keys; only the lookup-side concurrency discipline differs (ROWEX
+ * readers never restart).  Its own arena (the engine sweep can run both ART
+ * variants in one process, so they must not share a bump allocator).  The kv
+ * layout is identical to artolc_kv, so it is reused.
+ * ─────────────────────────────────────────────────────────────────── */
+void *artrowex_create(void);
+void *artrowex_thread_init(void *tree);
+void artrowex_insert(void *tree, void *ti, const char *key, int len, uint64_t tid_val);
+uint64_t artrowex_lookup(void *tree, void *ti, const char *key, int len);
+void artrowex_destroy(void *tree);
+
+static __thread void *tls_artrowex_ti = NULL;
+static inline void *artrowex_ti(void *map) {
+	if (tls_artrowex_ti == NULL)
+		tls_artrowex_ti = artrowex_thread_init(map);
+	return tls_artrowex_ti;
+}
+
+static char *artrowex_il_arena = NULL;
+static size_t artrowex_il_arena_off = 0;
+static size_t artrowex_il_arena_cap = 0;
+
+static void
+artrowex_il_arena_create(size_t n) {
+	artrowex_il_arena_cap = n * (sizeof(struct artolc_kv) + sizeof(dns_qpkey_t));
+	artrowex_il_arena = mmap(NULL, artrowex_il_arena_cap, PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (artrowex_il_arena == MAP_FAILED) {
+		perror("mmap(artrowex_il_arena)");
+		abort();
+	}
+	unsigned long mask = (1UL << 24) - 1;
+	if (sys_mbind(artrowex_il_arena, artrowex_il_arena_cap,
+		      MPOL_INTERLEAVE, &mask, 25, 0) < 0) {
+		perror("mbind(artrowex_il_arena)");
+	}
+	artrowex_il_arena_off = 0;
+}
+
+static char *
+artrowex_il_arena_alloc(size_t sz) {
+	size_t off = (artrowex_il_arena_off + 7) & ~(size_t)7;
+	if (off + sz > artrowex_il_arena_cap)
+		abort();
+	artrowex_il_arena_off = off + sz;
+	return artrowex_il_arena + off;
+}
+
+static isc_result_t
+add_artrowex(void *map, size_t count) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	dns_qpkey_t key;
+	size_t len = dns_qpkey_fromname(key, &item[count].fixed.name,
+					DNS_DBNAMESPACE_NORMAL);
+	/* len+1 with a 0 terminator: byte-prefix-free keys for ART (see add_artolc). */
+	memcpy(qk->bytes, key, len);
+	qk->bytes[len] = 0;
+	qk->len = len + 1;
+	struct artolc_kv *kv = (struct artolc_kv *)artrowex_il_arena_alloc(
+		sizeof(struct artolc_kv) + len + 1);
+	kv->len = (uint32_t)(len + 1);
+	memcpy(kv->bytes, qk->bytes, len + 1);
+	ft_alloc_index[count] = (struct ft_arena_slot *)kv;
+	artrowex_insert(map, artrowex_ti(map), (const char *)qk->bytes,
+			(int)(len + 1), (uint64_t)(uintptr_t)kv);
+	return ISC_R_SUCCESS;
+}
+
+static isc_result_t
+get_artrowex(void *map, size_t count, void **pval) {
+	struct query_key *qk = &tls_local_keys[count - tls_local_start];
+	uint64_t tid = artrowex_lookup(map, artrowex_ti(map),
+				       (const char *)qk->bytes, (int)qk->len);
+	if (tid == 0)
+		return ISC_R_NOTFOUND;
+	*pval = (void *)(uintptr_t)tid;
+	return ISC_R_SUCCESS;
+}
+
+static void *
+new_artrowex(isc_mem_t *mem ISC_ATTR_UNUSED) {
+	return artrowex_create();
+}
+
+static void
+destroy_artrowex(void *map) {
+	artrowex_destroy(map);
+}
+
+static void *
+thread_artrowex(void *arg0) {
+	return _thread_ft_alloc(arg0, add_artrowex, get_artrowex, true);
+}
+
 static struct fun fun_list[] = {
 	{ "qp_il",                new_qp_il,              thread_qp_il,              destroy_qp },
 	{ "qp_local",             new_qp_local,           thread_qp_local,           destroy_qp },
@@ -2204,6 +2303,8 @@ static struct fun fun_list[] = {
 	{ "masstree",              new_masstree,         thread_masstree,       destroy_masstree },
 	/* ART-OLC concurrent adaptive radix tree (Optimistic Lock Coupling). */
 	{ "artolc",                new_artolc,           thread_artolc,         destroy_artolc },
+	/* ART-ROWEX concurrent adaptive radix tree (Read-Optimized Write EXclusion). */
+	{ "artrowex",              new_artrowex,         thread_artrowex,       destroy_artrowex },
 	{ NULL, NULL, NULL, NULL },
 };
 
@@ -2298,6 +2399,7 @@ main(int argc, char *argv[]) {
 	hot_il_arena_create(sizeof(item) / sizeof(item[0]));
 	mt_il_arena_create(sizeof(item) / sizeof(item[0]));
 	artolc_il_arena_create(sizeof(item) / sizeof(item[0]));
+	artrowex_il_arena_create(sizeof(item) / sizeof(item[0]));
 	isc_rwlock_init(&rwl);
 
 	if (argc != 2) {

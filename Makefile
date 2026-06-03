@@ -208,6 +208,21 @@ src/bench_scale_artolc.o: src/bench_scale_artolc.cpp
 bench_scale_artolc: src/bench_scale_artolc.o $(ARTOLC_OBJS) bench_scale_common.o
 	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
 
+# ART-ROWEX: same vendored repo (third_party/artolc), the Read-Optimized Write
+# EXclusion variant.  Unity build like OLC: ROWEX/Tree.cpp #includes N.cpp
+# (-> N4/N16/N48/N256.cpp) and -- unless ART_ROWEX_SKIP_EPOCHE -- Epoche.cpp.
+# Standalone here, so it compiles its own Epoche (no -DART_ROWEX_SKIP_EPOCHE).
+#     make bench_scale_artrowex
+#     ENGINES="ft artolc artrowex" scripts/run_scale_rw.sh 192
+ARTROWEX_OBJS := $(ARTOLC_DIR)/ROWEX/Tree.o
+
+$(ARTOLC_DIR)/ROWEX/Tree.o: $(ARTOLC_DIR)/ROWEX/Tree.cpp
+	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
+src/bench_scale_artrowex.o: src/bench_scale_artrowex.cpp
+	$(CXX) $(ARTOLC_CXXFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
+bench_scale_artrowex: src/bench_scale_artrowex.o $(ARTROWEX_OBJS) bench_scale_common.o
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
+
 # ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
 # built in-tree under $(URCU_BUILD).  Clones if absent, otherwise fetches and

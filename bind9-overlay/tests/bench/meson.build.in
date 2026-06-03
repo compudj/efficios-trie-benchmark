@@ -114,6 +114,8 @@ executable(
         meson.current_source_dir() / 'mt_kvthread.o',
         meson.current_source_dir() / 'load_names_artolc.o',
         meson.current_source_dir() / 'artolc_tree.o',
+        meson.current_source_dir() / 'load_names_artrowex.o',
+        meson.current_source_dir() / 'artrowex_tree.o',
         '-ltbb', '-lstdc++',
     ],
     dependencies: [
