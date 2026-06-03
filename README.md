@@ -103,8 +103,8 @@ fastest-first by `u64d`:
 | `judyl`    |     11 |     38 |     11 |     64 |
 | `art`      |     11 |     46 |     12 |     47 |
 | `qp`       |     13 |     13 |     13 |     13 |
+| `ft_spec`  |     14 |     33 |     15 |     33 |
 | `ft_eager` |     13 |     42 |     16 |     44 |
-| `ft_spec`  |     16 |     35 |     17 |     35 |
 | `hot`      |     20 |     49 |     20 |     49 |
 | `artolc`   |     22 |     96 |     24 |     98 |
 | `judyhs`‡  |     24 |     46 |     38 |     78 |
@@ -128,13 +128,13 @@ Takeaways:
 - **FT's two validating modes**: `ft_spec` (speculative — skip-compressed
   encoding, one end-of-walk `memcmp`) is the better default, beating `ft_eager`
   (eager-optimized — per-step exact compares on compressed bytes) on strings
-  (`dns` 119 vs 185) and on sparse integers (`u64s` 35 vs 44); they tie on dense
-  integers (~16 ns). Both return validated results — `ft_cand` (the raw,
+  (`dns` 119 vs 185), sparse integers (`u64s` 33 vs 44) and dense integers
+  (`u64d` 15 vs 16). Both return validated results — `ft_cand` (the raw,
   *unvalidated* candidate primitive) is excluded from these tables since it skips
   the compare every other engine pays.
 - **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
   four* sets, including the sparse random ones where everything else degrades 2–6×
-  (`judyl` 11→64, `ft` 17→35, `art` 12→47). Its bit-popcount nodes don't care
+  (`judyl` 11→64, `ft` 15→33, `art` 12→47). Its bit-popcount nodes don't care
   whether keys cluster.
 - **`judyl` wins dense integers** (11 ns) but collapses on sparse (64); **`judyhs`
   beats `judysl` on strings** (hash suits these distributions better than the
@@ -146,7 +146,7 @@ Takeaways:
 - **Opt level: only `art` profits from `-O3`** (~11% on strings, ~18% on dense
   integers — its node-256 scan and path-compression loops unroll/vectorize), so
   it's built `-O3` like `cuckoo`; at `-O3` it even edges past FT on dense ints
-  (`u64d` 12 vs FT's 16–17). `masstree` gains a marginal ~3% (also `-O3`).
+  (`u64d` 12 vs FT's 15–16). `masstree` gains a marginal ~3% (also `-O3`).
   `qp`, `hot`, ART-OLC, **and FT** are flat (<2% across `-O2`/`-O3`/`-flto`,
   measured interleaved 30×) — pointer-chasing radix walks are latency/cache-bound
   and already saturated at `-O2`; FT additionally hand-codes its `popcnt`/`bmi`

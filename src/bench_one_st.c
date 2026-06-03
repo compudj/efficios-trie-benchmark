@@ -386,6 +386,15 @@ static void run_ft(int skip, int candidate, int spec_validated)
 
 	if (key_len_bytes) {
 		struct ft_entry_int *entries = calloc(n_keys, sizeof(struct ft_entry_int));
+		/*
+		 * ft_spec validates caller-side, so its key length must be the
+		 * resolved byte count -- and we pass it as a compile-time constant
+		 * (4/8) at each call site below, so cds_ft_speculative_lookup_key's
+		 * memcmp folds into an inlined fixed-width integer compare instead
+		 * of a memcmp() call with a runtime length.  Passing
+		 * CDS_FT_LEN_DEFAULT (== SIZE_MAX) here would make that memcmp
+		 * over-read and spuriously miss every key.
+		 */
 		for (unsigned int i = 0; i < n_keys; i++) {
 			if (key_len_bytes == 4)
 				cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], entries[i].key, CDS_FT_LEN_DEFAULT);
@@ -416,9 +425,12 @@ static void run_ft(int skip, int candidate, int spec_validated)
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				} else if (spec_validated) {
-					cds_ft_speculative_lookup_key(ft, k,
-						CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
-						offsetof(struct ft_entry_int, key), &found);
+					if (key_len_bytes == 4)
+						cds_ft_speculative_lookup_key(ft, k, 4, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
+					else
+						cds_ft_speculative_lookup_key(ft, k, 8, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				}
@@ -443,9 +455,12 @@ static void run_ft(int skip, int candidate, int spec_validated)
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				} else if (spec_validated) {
-					cds_ft_speculative_lookup_key(ft, k,
-						CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
-						offsetof(struct ft_entry_int, key), &found);
+					if (key_len_bytes == 4)
+						cds_ft_speculative_lookup_key(ft, k, 4, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
+					else
+						cds_ft_speculative_lookup_key(ft, k, 8, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				}
@@ -474,9 +489,12 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				} else if (spec_validated) {
-					cds_ft_speculative_lookup_key(ft, k,
-						CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT,
-						offsetof(struct ft_entry_int, key), &found);
+					if (key_len_bytes == 4)
+						cds_ft_speculative_lookup_key(ft, k, 4, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
+					else
+						cds_ft_speculative_lookup_key(ft, k, 8, CDS_FT_LEN_DEFAULT,
+							offsetof(struct ft_entry_int, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				}
