@@ -931,12 +931,119 @@ static void run_cuckoo(void)
 	printf("%.1f %ld\n", best, rss);
 }
 
+/*
+ * Masstree (kohler/masstree-beta, MIT) — single-threaded, via
+ * src/bench_masstree_st.cpp.  Keys on arbitrary bytes; value = a cold kv_entry.
+ */
+void *masstree_st_create(void);
+void masstree_st_insert(const void *key, int len, void *val);
+void *masstree_st_lookup(const void *key, int len);
+
+static void run_masstree(void)
+{
+	long rss;
+	double best = 1e18;
+	uint8_t ibuf[8];
+	masstree_st_create();
+	struct kv_entry **entries = calloc(n_keys, sizeof(struct kv_entry *));
+	struct cds_ft_external_arena *arena = cds_ft_external_arena_create(NULL);
+
+	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		entries[i] = cds_ft_external_arena_alloc(arena,
+			sizeof(struct kv_entry) + kl);
+		entries[i]->key_len = kl;
+		memcpy(entries[i]->key, kp, kl);
+		masstree_st_insert(kp, (int)kl, (void *)entries[i]);
+	}
+	rss = get_rss_kb();
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = masstree_st_lookup(kp, (int)kl);
+			FORCE_READ_LEAF(sink);
+		}
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = masstree_st_lookup(kp, (int)kl);
+			FORCE_READ_LEAF(sink);
+		}
+		double ns = (double)(now_ns() - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+	printf("%.1f %ld\n", best, rss);
+	cds_ft_external_arena_destroy(arena);
+	free(entries);
+}
+
+/*
+ * ART-OLC (flode/ARTSynchronized, Apache-2.0) — single-threaded, via
+ * src/bench_artolc_st.cpp.  Byte radix => prefix-free keys: integers are fixed
+ * length; strings include the NUL.  Value = a cold artolc_st_kv the loadKey
+ * callback reconstructs and the harness force-reads.
+ */
+void *artolc_st_create(void);
+void artolc_st_insert(const void *key, int len, uint64_t tid_val);
+uint64_t artolc_st_lookup(const void *key, int len);
+
+struct artolc_st_kv { uint32_t len; uint8_t bytes[]; };	/* matches the shim */
+
+static void run_artolc(void)
+{
+	long rss;
+	double best = 1e18;
+	uint8_t ibuf[8];
+	artolc_st_create();
+	struct artolc_st_kv **kvs = calloc(n_keys, sizeof(struct artolc_st_kv *));
+	struct cds_ft_external_arena *arena = cds_ft_external_arena_create(NULL);
+
+	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		int alen = key_len_bytes ? (int)kl : (int)kl + 1;
+		kvs[i] = cds_ft_external_arena_alloc(arena,
+			sizeof(struct artolc_st_kv) + alen);
+		kvs[i]->len = (uint32_t)alen;
+		memcpy(kvs[i]->bytes, kp, alen);
+		artolc_st_insert(kp, alen, (uint64_t)(uintptr_t)kvs[i]);
+	}
+	rss = get_rss_kb();
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			int alen = key_len_bytes ? (int)kl : (int)kl + 1;
+			uint64_t tid = artolc_st_lookup(kp, alen);
+			FORCE_READ_LEAF((const void *)(uintptr_t)tid);
+		}
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			int alen = key_len_bytes ? (int)kl : (int)kl + 1;
+			uint64_t tid = artolc_st_lookup(kp, alen);
+			FORCE_READ_LEAF((const void *)(uintptr_t)tid);
+		}
+		double ns = (double)(now_ns() - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+	printf("%.1f %ld\n", best, rss);
+	cds_ft_external_arena_destroy(arena);
+	free(kvs);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo masstree artolc\n", argv[0]);
 		return 1;
 	}
 
@@ -965,6 +1072,8 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[2], "art") == 0)     run_art();
 	else if (strcmp(argv[2], "hot") == 0)     run_hot();
 	else if (strcmp(argv[2], "cuckoo") == 0)  run_cuckoo();
+	else if (strcmp(argv[2], "masstree") == 0) run_masstree();
+	else if (strcmp(argv[2], "artolc") == 0)  run_artolc();
 	else { fprintf(stderr, "Unknown engine: %s\n", argv[2]); return 1; }
 
 	rcu_unregister_thread();

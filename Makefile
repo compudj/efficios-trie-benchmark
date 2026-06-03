@@ -85,10 +85,24 @@ src/bench_cuckoo.o: src/bench_cuckoo.c
 	$(CC) $(CUCKOO_CF) -c -o $@ $<
 
 # Single-threaded, single-engine benchmark:
-#   ft_eager / ft_eager_on_spec / ft_cand / ft_spec / judy / qp / art / hot / cuckoo.
+#   ft_* / judy / qp / art / hot / cuckoo / masstree / artolc.
 # -flto at link lets the Cuckoo objects (compiled -flto) be optimized together.
-bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) $(CUCKOO_OBJS) | check-urcu
-	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -flto -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++ -lm
+# Masstree (MIT) and ART-OLC (Apache-2.0) are linked single-threaded via thin
+# shims over their vendored sources (+ oneTBB for ART-OLC's epoch).  The masstree
+# core / artolc Tree objects are built by the pattern rules in the bench_scale
+# section below (MASSTREE_CXXFLAGS / ARTOLC_CXXFLAGS).
+ST_MT_OBJS := third_party/masstree/compiler.o third_party/masstree/str.o \
+              third_party/masstree/string.o third_party/masstree/straccum.o \
+              third_party/masstree/kvthread.o src/bench_masstree_st.o \
+              third_party/artolc/OptimisticLockCoupling/Tree.o src/bench_artolc_st.o
+
+src/bench_masstree_st.o: src/bench_masstree_st.cpp
+	$(CXX) $(MASSTREE_CXXFLAGS) -c -o $@ $<
+src/bench_artolc_st.o: src/bench_artolc_st.cpp
+	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
+
+bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) $(CUCKOO_OBJS) $(ST_MT_OBJS) | check-urcu
+	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -flto -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++ -lm -ltbb
 
 # Vendored competitor sources: compile with the same opt flags, but only their
 # own include dir (they are independent of urcu/FT).
