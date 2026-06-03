@@ -49,6 +49,11 @@ static volatile uint64_t g_sink;
  */
 static struct bench_arena hot_arena;
 
+/* A second pointer per churn key with identical bytes: the value IS the key
+ * (IdentityKeyExtractor), so the mutator's REPLACE upserts this distinct
+ * pointer to actually swap the stored leaf value at the same trie key. */
+static char *churn_copy_b[CHURN_KEYS];
+
 extern "C" void hotrowex_build(void)
 {
 	g_hr = new HotRowex();
@@ -64,6 +69,34 @@ extern "C" void hotrowex_build(void)
 		memcpy(copy, str_keys[i], str_lens[i]);
 		copy[str_lens[i]] = '\0';
 		g_hr->insert(copy);
+	}
+
+	for (int c = 0; c < CHURN_KEYS; c++) {
+		char *b = (char *)malloc(churn_lens[c] + 1);
+		memcpy(b, churn_keys[c], churn_lens[c]);
+		b[churn_lens[c]] = '\0';
+		churn_copy_b[c] = b;
+	}
+}
+
+/*
+ * Mutator-benchmark op.  ROWEX has no delete (no_remove=1, REMOVE never
+ * called), so INSERT and REPLACE are both upserts: INSERT stores the churn
+ * key's own pointer, REPLACE stores the distinct same-bytes copy, so the leaf
+ * value genuinely changes.  Both drive the full ROWEX write path.
+ */
+extern "C" void hotrowex_writer_op(void *ctx, int op, unsigned int idx)
+{
+	(void)ctx;
+	switch (op) {
+	case BENCH_OP_INSERT:
+		g_hr->upsert(churn_keys[idx]);
+		break;
+	case BENCH_OP_REPLACE:
+		g_hr->upsert(churn_copy_b[idx]);
+		break;
+	case BENCH_OP_REMOVE:
+		break;	/* no_remove */
 	}
 }
 
@@ -117,6 +150,8 @@ static const struct bench_engine hotrowex_engine = {
 	nullptr,		/* writer_teardown */
 	nullptr,		/* run_reset */
 	nullptr,		/* cleanup_churn */
+	hotrowex_writer_op,	/* writer_op */
+	1,			/* no_remove (ROWEX has no concurrent delete) */
 };
 
 int main(int argc, char **argv)

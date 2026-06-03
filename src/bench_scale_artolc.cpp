@@ -46,6 +46,14 @@ static volatile uint64_t g_sink;
 
 /* Pre-allocated churn key copies (reused across insert/remove) + presence. */
 static artolc_kv *churn_kv[CHURN_KEYS];
+/* A second value object per churn key (same key bytes, distinct pointer) so
+ * the mutator's REPLACE actually changes the leaf's TID — ART has no in-place
+ * value update, so replace = remove(old) + insert(new). */
+static artolc_kv *churn_kv_b[CHURN_KEYS];
+/* Value currently mapped at each churn key in the mutator sweep (or NULL): so
+ * REMOVE/REPLACE pass the right TID to ART's remove and the drain knows what to
+ * delete.  Touched only by the single mutator thread. */
+static artolc_kv *churn_cur[CHURN_KEYS];
 static char churn_present[CHURN_KEYS];
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -79,6 +87,40 @@ extern "C" void artolc_build(void)
 		kv->len = churn_lens[c] + 1;
 		memcpy(kv->bytes, churn_keys[c], churn_lens[c] + 1);
 		churn_kv[c] = kv;
+		artolc_kv *kvb = (artolc_kv *)malloc(sizeof(artolc_kv) +
+			churn_lens[c] + 1);
+		kvb->len = churn_lens[c] + 1;
+		memcpy(kvb->bytes, churn_keys[c], churn_lens[c] + 1);
+		churn_kv_b[c] = kvb;
+	}
+}
+
+/*
+ * Mutator-benchmark op (single mutator thread; the tree handles reader/writer
+ * safety, so no churn mutex).  REPLACE swaps to the second value object.
+ */
+extern "C" void artolc_writer_op(void *ctx, int op, unsigned int idx)
+{
+	ART::ThreadInfo *ti = static_cast<ART::ThreadInfo *>(ctx);
+	Key key;
+	key.set(churn_keys[idx], churn_lens[idx] + 1);
+	switch (op) {
+	case BENCH_OP_INSERT:
+		g_tree->insert(key, kv_tid(churn_kv[idx]), *ti);
+		churn_cur[idx] = churn_kv[idx];
+		break;
+	case BENCH_OP_REPLACE:
+		if (churn_cur[idx])
+			g_tree->remove(key, kv_tid(churn_cur[idx]), *ti);
+		g_tree->insert(key, kv_tid(churn_kv_b[idx]), *ti);
+		churn_cur[idx] = churn_kv_b[idx];
+		break;
+	case BENCH_OP_REMOVE:
+		if (churn_cur[idx]) {
+			g_tree->remove(key, kv_tid(churn_cur[idx]), *ti);
+			churn_cur[idx] = nullptr;
+		}
+		break;
 	}
 }
 
@@ -166,6 +208,8 @@ static const struct bench_engine artolc_engine = {
 	artolc_writer_teardown,	/* writer_teardown */
 	artolc_run_reset,	/* run_reset */
 	artolc_cleanup_churn,	/* cleanup_churn */
+	artolc_writer_op,	/* writer_op */
+	0,			/* no_remove */
 };
 
 int main(int argc, char **argv)

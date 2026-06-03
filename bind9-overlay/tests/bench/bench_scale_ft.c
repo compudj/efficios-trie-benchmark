@@ -274,6 +274,88 @@ static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 		rcu_quiescent_state();
 }
 
+/* Remove the entry currently mapped at churn key @idx (must be present). */
+static void ft_churn_remove(struct cds_ft_iter *it, unsigned int idx)
+{
+	struct ft_entry *old = churn_entries[idx];
+	enum cds_ft_status ls, rs;
+
+	cds_ft_iter_invalidate_cache(it);
+	ls = cds_ft_iter_set_key(it, (const uint8_t *)churn_keys[idx],
+		churn_lens[idx]);
+	if (ls < 0) {
+		fprintf(stderr, "iter_set_key error: %d\n", ls);
+		abort();
+	}
+	ls = cds_ft_lookup(g_ft, it);
+	if (ls != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup failed: %d\n", ls);
+		abort();
+	}
+	rs = cds_ft_remove(g_ft, it, &old->ft_node);
+	if (rs != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "remove failed: %d\n", rs);
+		abort();
+	}
+	churn_entries[idx] = NULL;
+	call_rcu(&old->rcu_head, free_ft_entry_rcu);
+}
+
+/* Insert a fresh node (the mutator's value) for churn key @idx (must be absent). */
+static void ft_churn_insert(unsigned int idx)
+{
+	struct ft_entry *e = calloc(1, sizeof(*e) + churn_lens[idx]);
+	struct cds_ft_node *result;
+	enum cds_ft_status status;
+
+	if (!e) {
+		fprintf(stderr, "OOM\n");
+		abort();
+	}
+	memcpy(e->key, churn_keys[idx], churn_lens[idx]);
+	e->key_len = churn_lens[idx];
+	status = cds_ft_insert_unique(g_ft, (const uint8_t *)churn_keys[idx],
+		churn_lens[idx], &e->ft_node, &result);
+	if (status != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "insert_unique error/dup: %d\n", status);
+		abort();
+	}
+	churn_entries[idx] = e;
+}
+
+/*
+ * Mutator-benchmark op.  FT has no in-place value update, so REPLACE swaps the
+ * leaf for a fresh node (remove old + RCU-free, then insert new) — the natural
+ * "replace" cost for an RCU trie.  churn_entries[] tracks the live node so the
+ * driver's drain can empty the churn set between reader-count points.  Single
+ * mutator, so the (uncontended) g_ft_mutex only mirrors the read-sweep writer;
+ * FT readers stay lock-free throughout.
+ */
+static void ft_writer_op(void *ctx, int op, unsigned int idx)
+{
+	struct cds_ft_iter *it = ctx;
+
+	pthread_mutex_lock(&g_ft_mutex);
+	switch (op) {
+	case BENCH_OP_INSERT:
+		ft_churn_insert(idx);
+		break;
+	case BENCH_OP_REPLACE:
+		if (churn_entries[idx])
+			ft_churn_remove(it, idx);
+		ft_churn_insert(idx);
+		break;
+	case BENCH_OP_REMOVE:
+		if (churn_entries[idx])
+			ft_churn_remove(it, idx);
+		break;
+	}
+	pthread_mutex_unlock(&g_ft_mutex);
+
+	if ((idx & 1023) == 0)
+		rcu_quiescent_state();
+}
+
 static void ft_run_reset(void)
 {
 	memset(churn_entries, 0, sizeof(churn_entries));
@@ -346,6 +428,7 @@ static const struct bench_engine ft_engine = {
 	.writer_teardown = ft_writer_teardown,
 	.run_reset	= ft_run_reset,
 	.cleanup_churn	= ft_cleanup_churn,
+	.writer_op	= ft_writer_op,
 };
 
 int main(int argc, char **argv)

@@ -105,6 +105,13 @@ void *bench_arena_alloc(struct bench_arena *a, size_t sz, size_t align);
  *   - cleanup_churn()  optional; removes leftover churn entries on the main
  *                      thread after each thread-count point.
  */
+/*
+ * Mutator-benchmark op codes (see writer_op below).  The mutator sweep
+ * (BENCH_MUTATOR=1) measures one mutator thread's insert/replace/remove
+ * throughput as the reader count scales 0 -> N.
+ */
+enum bench_op { BENCH_OP_INSERT = 0, BENCH_OP_REPLACE = 1, BENCH_OP_REMOVE = 2 };
+
 struct bench_engine {
 	const char *name;	/* short id used on the CLI / in output: "ft" … */
 	const char *label;	/* human label for the table column header */
@@ -121,6 +128,21 @@ struct bench_engine {
 
 	void  (*run_reset)(void);				/* optional */
 	void  (*cleanup_churn)(void);				/* optional */
+
+	/*
+	 * Mutator-benchmark hook (optional, enabled by BENCH_MUTATOR=1).  Perform
+	 * exactly ONE operation on churn key @idx in [0,CHURN_KEYS):
+	 *   BENCH_OP_INSERT  — key currently absent -> present (value A)
+	 *   BENCH_OP_REPLACE — key present, value A -> a distinct value B
+	 *   BENCH_OP_REMOVE  — key present -> absent
+	 * The driver calls it under @ctx (from writer_setup) in timed insert-all /
+	 * replace-all / remove-all phases over the whole churn set while N readers
+	 * run, so each op's rate is measured in isolation.  An engine with no
+	 * concurrent delete (HOTRowex) sets no_remove=1: the remove phase is then
+	 * skipped and INSERT/REPLACE act as upserts.
+	 */
+	void  (*writer_op)(void *ctx, int op, unsigned int idx);
+	int   no_remove;
 };
 
 /*

@@ -290,6 +290,41 @@ static void b9qp_cleanup_churn(void)
 	dns_qpmulti_commit(g_bind9_qp, &qpt);
 }
 
+/*
+ * Mutator-benchmark op.  Each op is one dns_qpmulti write transaction.  dns_qp
+ * has no in-place value update, so REPLACE deletes + reinserts the leaf within
+ * one transaction.  bind9_churn_present[] tracks state so the driver's drain
+ * (and cleanup) remove exactly what is live.
+ */
+static void b9qp_writer_op(void *ctx, int op, unsigned int idx)
+{
+	(void)ctx;
+	dns_qp_t *qpt = NULL;
+
+	dns_qpmulti_write(g_bind9_qp, &qpt);
+	switch (op) {
+	case BENCH_OP_INSERT:
+		dns_qp_insert(qpt, bind9_churn_leaves[idx], N_KEYS + idx);
+		bind9_churn_present[idx] = true;
+		break;
+	case BENCH_OP_REPLACE:
+		dns_qp_deletekey(qpt, qp_churn_keys[idx], qp_churn_lens[idx],
+			NULL, NULL);
+		dns_qp_insert(qpt, bind9_churn_leaves[idx], N_KEYS + idx);
+		break;
+	case BENCH_OP_REMOVE:
+		if (bind9_churn_present[idx]) {
+			dns_qp_deletekey(qpt, qp_churn_keys[idx],
+				qp_churn_lens[idx], NULL, NULL);
+			bind9_churn_present[idx] = false;
+		}
+		break;
+	}
+	if (dns_qp_memusage(qpt).fragmented)
+		dns_qp_compact(qpt, DNS_QPGC_NOW);
+	dns_qpmulti_commit(g_bind9_qp, &qpt);
+}
+
 static const struct bench_engine b9qp_engine = {
 	.name		= "b9qp",
 	.label		= "BIND9 QP",
@@ -302,6 +337,7 @@ static const struct bench_engine b9qp_engine = {
 	.writer_teardown = b9qp_writer_teardown,
 	.run_reset	= b9qp_run_reset,
 	.cleanup_churn	= b9qp_cleanup_churn,
+	.writer_op	= b9qp_writer_op,
 };
 
 int main(int argc, char **argv)

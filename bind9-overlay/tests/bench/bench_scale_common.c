@@ -277,6 +277,132 @@ void *bench_arena_alloc(struct bench_arena *a, size_t sz, size_t align)
 	return a->base + off;
 }
 
+/* ── Mutator benchmark (BENCH_MUTATOR=1) ─────────────────────
+ * One mutator thread runs timed insert-all / replace-all / remove-all phases
+ * over the churn set while nr_readers readers do lookups, isolating each op's
+ * throughput.  Sweeping readers 0 -> N shows how reader concurrency affects a
+ * single mutator: RCU writers never block readers; rwlock writers serialize
+ * with them; the concurrent tries restart (OLC) or node-exclude (ROWEX).
+ */
+struct mut_arg {
+	uint64_t ns[3];
+	uint64_t cnt[3];
+};
+
+static uint64_t mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void *mutator_thread(void *arg)
+{
+	struct mut_arg *ma = arg;
+	void *ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
+	int nops = g_eng->no_remove ? 2 : 3;	/* skip REMOVE phase if unsupported */
+	static const int order[3] = {
+		BENCH_OP_INSERT, BENCH_OP_REPLACE, BENCH_OP_REMOVE
+	};
+
+	for (int i = 0; i < 3; i++) {
+		ma->ns[i] = 0;
+		ma->cnt[i] = 0;
+	}
+
+	while (!start_flag)
+		__asm__ __volatile__("pause" ::: "memory");
+
+	/*
+	 * Chunked phases: each outer pass runs insert -> replace -> remove over a
+	 * CHUNK-key sub-batch, advancing through the churn set.  Chunking (rather
+	 * than one whole-set phase per op) ensures all three ops get sampled even
+	 * when the mutator is slow — e.g. an rwlock writer starved under reader
+	 * load would otherwise spend the whole window in the insert phase and
+	 * report replace/remove = 0.  Each chunk fully cycles
+	 * absent->present->present->absent within one pass, so at every chunk
+	 * boundary (and at stop) at most the in-flight chunk is present; the drain
+	 * below empties it.  CHUNK divides CHURN_KEYS evenly.
+	 */
+	const unsigned int CHUNK = 500;
+	unsigned int base = 0;
+	while (!stop_flag) {
+		for (int oi = 0; oi < nops; oi++) {
+			int op = order[oi];
+			uint64_t t0 = mono_ns();
+			for (unsigned int i = 0; i < CHUNK; i++)
+				g_eng->writer_op(ctx, op, (base + i) % CHURN_KEYS);
+			ma->ns[op] += mono_ns() - t0;
+			ma->cnt[op] += CHUNK;
+			if (stop_flag)
+				break;
+		}
+		base += CHUNK;
+		if (base >= CHURN_KEYS)
+			base = 0;
+	}
+
+	/*
+	 * Drain (untimed, not counted): leave every churn key absent so the next
+	 * reader-count point starts from a known-empty churn set.  Without this,
+	 * a point that stops after an insert/replace phase leaves keys present,
+	 * and the next point's insert phase corrupts state (duplicate inserts /
+	 * removes that miss).  Skipped for no_remove engines (their INSERT/REPLACE
+	 * are idempotent upserts, so leftover-present is harmless).
+	 */
+	if (!g_eng->no_remove)
+		for (unsigned int idx = 0; idx < CHURN_KEYS; idx++)
+			g_eng->writer_op(ctx, BENCH_OP_REMOVE, idx);
+
+	if (g_eng->writer_teardown)
+		g_eng->writer_teardown(ctx);
+	return NULL;
+}
+
+/* Per-op throughput in kops/s (insert, replace, remove) into out[3]. */
+static void mutator_run_bench(int nr_readers, double out[3])
+{
+	pthread_t *threads = calloc(nr_readers + 1, sizeof(pthread_t));
+	struct thread_arg *rargs =
+		calloc(nr_readers ? nr_readers : 1, sizeof(struct thread_arg));
+	struct mut_arg ma;
+
+	start_flag = 0;
+	stop_flag = 0;
+	prime_done_count = 0;
+
+	if (g_eng->run_reset)
+		g_eng->run_reset();
+
+	for (int i = 0; i < nr_readers; i++) {
+		rargs[i].count = 0;
+		rargs[i].seed = 42 + (uint64_t)i * 1000;
+		pthread_create(&threads[i], NULL, reader_thread, &rargs[i]);
+	}
+	pthread_create(&threads[nr_readers], NULL, mutator_thread, &ma);
+
+	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
+		usleep(1000);
+
+	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
+	usleep(DURATION_SEC * 1000000);
+	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+
+	for (int i = 0; i < nr_readers + 1; i++)
+		pthread_join(threads[i], NULL);
+
+	for (int op = 0; op < 3; op++)
+		out[op] = ma.cnt[op]
+			? (double)ma.cnt[op] / ((double)ma.ns[op] / 1e9) / 1e3
+			: 0.0;
+
+	if (g_eng->cleanup_churn)
+		g_eng->cleanup_churn();
+
+	free(threads);
+	free(rargs);
+}
+
 int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 {
 	int max_threads = 384;
@@ -318,6 +444,30 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 
 	/* Machine-readable output consumed by scripts/run_scale_rw.sh. */
 	printf("engine %s rss_kb %ld\n", eng->name, rss);
+
+	/*
+	 * Mutator-throughput sweep (BENCH_MUTATOR=1): one mutator thread doing
+	 * insert/replace/remove, readers scaling 0 -> 191, per-op kops.  Requires
+	 * the engine to provide writer_op; otherwise fall through to the default
+	 * read-scaling sweep.
+	 */
+	if (getenv("BENCH_MUTATOR") != NULL && eng->writer_op != NULL) {
+		int reader_counts[] = { 0, 1, 2, 4, 8, 16, 32, 64, 128, 191 };
+		size_t nrc = sizeof(reader_counts) / sizeof(reader_counts[0]);
+		printf("# readers insert_kops replace_kops remove_kops\n");
+		fflush(stdout);
+		for (size_t i = 0; i < nrc; i++) {
+			int nr = reader_counts[i];
+			if (nr + 1 > max_threads)	/* +1 for the mutator */
+				break;
+			double out[3];
+			mutator_run_bench(nr, out);
+			printf("%d %.1f %.1f %.1f\n", nr, out[0], out[1], out[2]);
+			fflush(stdout);
+		}
+		return 0;
+	}
+
 	printf("# readers read_mops write_kops\n");
 	fflush(stdout);
 

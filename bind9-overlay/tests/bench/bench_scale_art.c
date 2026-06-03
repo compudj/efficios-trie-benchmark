@@ -58,12 +58,37 @@ static void art_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 	pthread_rwlock_unlock(&g_rwlock);
 }
 
+/* Mutator-benchmark op: art_insert overwrites the value in place (native
+ * REPLACE, returns the old value); INSERT/REMOVE by NUL-terminated key. */
+static void art_writer_op(void *ctx, int op, unsigned int idx)
+{
+	(void)ctx;
+	pthread_rwlock_wrlock(&g_rwlock);
+	switch (op) {
+	case BENCH_OP_INSERT:
+		art_insert(&g_art, (unsigned char *)churn_keys[idx],
+			churn_lens[idx] + 1, (void *)(uintptr_t)((idx + 1) << 1));
+		break;
+	case BENCH_OP_REPLACE:
+		art_insert(&g_art, (unsigned char *)churn_keys[idx],
+			churn_lens[idx] + 1,
+			(void *)(uintptr_t)(((idx + 1) << 1) + 0x100));
+		break;
+	case BENCH_OP_REMOVE:
+		art_delete(&g_art, (unsigned char *)churn_keys[idx],
+			churn_lens[idx] + 1);
+		break;
+	}
+	pthread_rwlock_unlock(&g_rwlock);
+}
+
 static const struct bench_engine art_engine = {
 	.name		= "art",
 	.label		= "ART+rwl",
 	.build		= art_build,
 	.reader_batch	= art_reader_batch,
 	.writer_step	= art_writer_step,
+	.writer_op	= art_writer_op,
 };
 
 int main(int argc, char **argv)

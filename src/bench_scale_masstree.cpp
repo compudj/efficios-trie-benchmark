@@ -55,6 +55,10 @@ static int g_thread_idx;
 /* Which churn keys are currently inserted (value pointer, or NULL). */
 static char *churn_present[CHURN_KEYS];
 static pthread_mutex_t g_mt_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Distinct same-bytes value pointer per churn key, so the mutator's REPLACE
+ * stores a different value than INSERT (Masstree updates the leaf value in
+ * place via the cursor). */
+static char *churn_copy_b[CHURN_KEYS];
 
 static threadinfo *make_worker_ti(void)
 {
@@ -86,7 +90,50 @@ extern "C" void masstree_build(void)
 		lp.value() = copy;
 		lp.finish(1, *g_main_ti);
 	}
+
+	for (int c = 0; c < CHURN_KEYS; c++) {
+		char *b = (char *)malloc(churn_lens[c] + 1);
+		memcpy(b, churn_keys[c], churn_lens[c]);
+		b[churn_lens[c]] = '\0';
+		churn_copy_b[c] = b;
+	}
 	g_main_ti->rcu_stop();		/* main builds, then goes inactive */
+}
+
+/*
+ * Mutator-benchmark op (single mutator; the cursor's leaf lock covers
+ * reader/writer safety, so no churn mutex).  REPLACE updates the leaf value in
+ * place (Masstree's native value update) to the distinct same-bytes pointer.
+ */
+extern "C" void masstree_writer_op(void *ctx, int op, unsigned int idx)
+{
+	threadinfo *ti = (threadinfo *)ctx;
+	Masstree::tcursor<mt_params> lp(g_table, churn_keys[idx],
+		(int)churn_lens[idx]);
+	switch (op) {
+	case BENCH_OP_INSERT: {
+		bool found = lp.find_insert(*ti);
+		lp.value() = churn_keys[idx];
+		lp.finish(found ? 0 : 1, *ti);
+		break;
+	}
+	case BENCH_OP_REPLACE: {
+		bool found = lp.find_insert(*ti);
+		lp.value() = churn_copy_b[idx];
+		lp.finish(found ? 0 : 1, *ti);
+		break;
+	}
+	case BENCH_OP_REMOVE: {
+		bool found = lp.find_locked(*ti);
+		lp.finish(found ? -1 : 0, *ti);
+		break;
+	}
+	}
+	if (op == BENCH_OP_REMOVE && (idx & 1023) == 0) {
+		globalepoch.store(globalepoch.load() + 1);
+		active_epoch.store(threadinfo::min_active_epoch());
+	}
+	ti->rcu_quiesce();
 }
 
 extern "C" void *masstree_reader_setup(void)
@@ -176,6 +223,8 @@ static const struct bench_engine masstree_engine = {
 	masstree_writer_teardown, /* writer_teardown */
 	masstree_run_reset,	/* run_reset */
 	nullptr,		/* cleanup_churn */
+	masstree_writer_op,	/* writer_op */
+	0,			/* no_remove */
 };
 
 int main(int argc, char **argv)

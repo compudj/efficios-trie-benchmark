@@ -57,12 +57,42 @@ static void judy_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 	pthread_rwlock_unlock(&g_rwlock);
 }
 
+/* Mutator-benchmark op: JudySL has native in-place value update (JSLG + *pv),
+ * so REPLACE is cheap; INSERT/REMOVE by key.  All under the writer rwlock. */
+static void judy_writer_op(void *ctx, int op, unsigned int idx)
+{
+	(void)ctx;
+	pthread_rwlock_wrlock(&g_rwlock);
+	{
+		Word_t *pv;
+		int rc;
+		switch (op) {
+		case BENCH_OP_INSERT:
+			JSLI(pv, g_judy, (uint8_t *)churn_keys[idx]);
+			if (pv)
+				*pv = idx + 1;
+			break;
+		case BENCH_OP_REPLACE:
+			JSLG(pv, g_judy, (uint8_t *)churn_keys[idx]);
+			if (pv)
+				*pv = idx + 1 + 0x1000000;
+			break;
+		case BENCH_OP_REMOVE:
+			JSLD(rc, g_judy, (uint8_t *)churn_keys[idx]);
+			(void)rc;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&g_rwlock);
+}
+
 static const struct bench_engine judy_engine = {
 	.name		= "judy",
 	.label		= "Judy+rwl",
 	.build		= judy_build,
 	.reader_batch	= judy_reader_batch,
 	.writer_step	= judy_writer_step,
+	.writer_op	= judy_writer_op,
 };
 
 int main(int argc, char **argv)

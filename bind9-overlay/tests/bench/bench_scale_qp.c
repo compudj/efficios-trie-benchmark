@@ -53,12 +53,35 @@ static void qp_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 	pthread_rwlock_unlock(&g_rwlock);
 }
 
+/* Mutator-benchmark op: Tsetl overwrites the value in place (native REPLACE);
+ * INSERT/REMOVE by key.  Values stay even (low bit reserved by Tbl). */
+static void qp_writer_op(void *ctx, int op, unsigned int idx)
+{
+	(void)ctx;
+	pthread_rwlock_wrlock(&g_rwlock);
+	switch (op) {
+	case BENCH_OP_INSERT:
+		g_qp = Tsetl(g_qp, churn_keys[idx], churn_lens[idx],
+			(void *)(uintptr_t)((idx + 1) << 1));
+		break;
+	case BENCH_OP_REPLACE:
+		g_qp = Tsetl(g_qp, churn_keys[idx], churn_lens[idx],
+			(void *)(uintptr_t)(((idx + 1) << 1) + 0x100));
+		break;
+	case BENCH_OP_REMOVE:
+		g_qp = Tdell(g_qp, churn_keys[idx], churn_lens[idx]);
+		break;
+	}
+	pthread_rwlock_unlock(&g_rwlock);
+}
+
 static const struct bench_engine qp_engine = {
 	.name		= "qp",
 	.label		= "QP+rwl",
 	.build		= qp_build,
 	.reader_batch	= qp_reader_batch,
 	.writer_step	= qp_writer_step,
+	.writer_op	= qp_writer_op,
 };
 
 int main(int argc, char **argv)
