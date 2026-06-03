@@ -12,9 +12,26 @@
 #include <idx/contenthelpers/OptionalValue.hpp>
 
 #include <cstddef>
+#include <cstdint>
 
 using HotTrie = hot::singlethreaded::HOTSingleThreaded<
 	const char *, idx::contenthelpers::IdentityKeyExtractor>;
+
+/*
+ * Integer HOT (the u32/u64 datasets): map-mode, value = pointer to the caller's
+ * key record (a uint64_t the caller owns), key extracted by dereferencing it.
+ * Storing a pointer (not the raw uint64) keeps HOT on the same footing as the
+ * other integer engines: the lookup returns a cold record pointer that
+ * bench_one_st force-reads, instead of HOT's cheaper set-mode where the value
+ * IS the key (no separate value load).
+ */
+template <typename ValueType>		/* ValueType == uint64_t* */
+struct HotU64PtrExtractor {
+	typedef uint64_t KeyType;
+	inline KeyType operator()(ValueType const &v) const { return *v; }
+};
+using HotIntTrie = hot::singlethreaded::HOTSingleThreaded<
+	uint64_t *, HotU64PtrExtractor>;
 
 extern "C" {
 
@@ -48,6 +65,30 @@ const char *hot_lookup(void *h, const char *key)
 {
 	idx::contenthelpers::OptionalValue<const char *> r =
 		static_cast<HotTrie *>(h)->lookup(key);
+	return r.mIsValid ? r.mValue : nullptr;
+}
+
+/* Integer HOT (u32/u64).  @rec is a pointer to the caller's uint64_t key. */
+void *hot_u64_create(void)
+{
+	return new HotIntTrie();
+}
+
+void hot_u64_destroy(void *h)
+{
+	delete static_cast<HotIntTrie *>(h);
+}
+
+int hot_u64_insert(void *h, uint64_t *rec)
+{
+	return static_cast<HotIntTrie *>(h)->insert(rec) ? 1 : 0;
+}
+
+/* Return the stored record pointer (cold) or NULL. */
+const void *hot_u64_lookup(void *h, uint64_t key)
+{
+	idx::contenthelpers::OptionalValue<uint64_t *> r =
+		static_cast<HotIntTrie *>(h)->lookup(key);
 	return r.mIsValid ? r.mValue : nullptr;
 }
 

@@ -306,6 +306,34 @@ struct kv_entry {
 	char key[];
 };
 
+/*
+ * Encode an integer key as key_len_bytes big-endian bytes, for the byte-keyed
+ * engines (qp / ART / Cuckoo / Masstree / ART-OLC) on the integer datasets.
+ * Big-endian keeps radix order == integer order; fixed length means the keys
+ * are prefix-free, so no terminator is needed (unlike the string datasets).
+ */
+static inline void encode_int_key(uint64_t v, uint8_t *out)
+{
+	for (int b = 0; b < key_len_bytes; b++)
+		out[b] = (uint8_t)(v >> (8 * (key_len_bytes - 1 - b)));
+}
+
+/*
+ * Byte key + length for lookup index @i: the encoded integer (into @intbuf)
+ * on an integer dataset, or str_keys[i] on a string dataset.  Callers that
+ * need a prefix-free string key (ART) read one extra byte (the str_keys NUL).
+ */
+static inline const void *key_at(unsigned int i, uint8_t *intbuf, size_t *klen)
+{
+	if (key_len_bytes) {
+		encode_int_key(int_keys[i], intbuf);
+		*klen = key_len_bytes;
+		return intbuf;
+	}
+	*klen = str_lens[i];
+	return str_keys[i];
+}
+
 /* ── engines ─────────────────────────────────────────────── */
 
 static void run_ft(int skip, int candidate, int spec_validated)
@@ -652,10 +680,10 @@ static void run_judy(void)
 
 static void run_qp(void)
 {
-	if (key_len_bytes) { printf("- 0\n"); return; }
 	Tbl *qp = NULL;
 	long rss;
 	double best = 1e18;
+	uint8_t ibuf[8];
 	struct kv_entry **entries = calloc(n_keys, sizeof(struct kv_entry *));
 	/*
 	 * Allocate kv_entry leaves from a cds_ft_external_arena so the
@@ -667,12 +695,13 @@ static void run_qp(void)
 	struct cds_ft_external_arena *leaf_arena = cds_ft_external_arena_create(NULL);
 
 	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
 		entries[i] = cds_ft_external_arena_alloc(leaf_arena,
-			sizeof(struct kv_entry) + str_lens[i]);
-		entries[i]->key_len = str_lens[i];
-		memcpy(entries[i]->key, str_keys[i], str_lens[i]);
-		Tbl *new_qp = Tsetl(qp, str_keys[i], str_lens[i],
-			(void *)entries[i]);
+			sizeof(struct kv_entry) + kl);
+		entries[i]->key_len = kl;
+		memcpy(entries[i]->key, kp, kl);
+		Tbl *new_qp = Tsetl(qp, kp, kl, (void *)entries[i]);
 		if (!new_qp) {
 			fprintf(stderr, "Tsetl failed at i=%u\n", i);
 			exit(1);
@@ -683,7 +712,9 @@ static void run_qp(void)
 
 	for (int w = 0; w < WARMUP; w++)
 		for (unsigned int i = 0; i < n_keys; i++) {
-			void *sink = Tgetl(qp, str_keys[i], str_lens[i]);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = Tgetl(qp, kp, kl);
 			FORCE_READ_LEAF(sink);
 		}
 
@@ -691,7 +722,9 @@ static void run_qp(void)
 		uint64_t t0, t1;
 		t0 = now_ns();
 		for (unsigned int i = 0; i < n_keys; i++) {
-			void *sink = Tgetl(qp, str_keys[i], str_lens[i]);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = Tgetl(qp, kp, kl);
 			FORCE_READ_LEAF(sink);
 		}
 		t1 = now_ns();
@@ -705,28 +738,34 @@ static void run_qp(void)
 
 static void run_art(void)
 {
-	if (key_len_bytes) { printf("- 0\n"); return; }
 	art_tree art;
 	long rss;
 	double best = 1e18;
+	uint8_t ibuf[8];
 	struct kv_entry **entries = calloc(n_keys, sizeof(struct kv_entry *));
 	struct cds_ft_external_arena *leaf_arena = cds_ft_external_arena_create(NULL);
 
+	/* ART needs prefix-free keys: strings include the NUL (str_lens[i]+1),
+	 * integers are fixed length (key_len_bytes) and already prefix-free. */
 	art_tree_init(&art);
 	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		int alen = key_len_bytes ? (int)kl : (int)kl + 1;
 		entries[i] = cds_ft_external_arena_alloc(leaf_arena,
-			sizeof(struct kv_entry) + str_lens[i]);
-		entries[i]->key_len = str_lens[i];
-		memcpy(entries[i]->key, str_keys[i], str_lens[i]);
-		art_insert(&art, (unsigned char *)str_keys[i],
-			str_lens[i] + 1, (void *)entries[i]);
+			sizeof(struct kv_entry) + kl);
+		entries[i]->key_len = kl;
+		memcpy(entries[i]->key, kp, kl);
+		art_insert(&art, (unsigned char *)kp, alen, (void *)entries[i]);
 	}
 	rss = get_rss_kb();
 
 	for (int w = 0; w < WARMUP; w++)
 		for (unsigned int i = 0; i < n_keys; i++) {
-			void *sink = art_search(&art, (unsigned char *)str_keys[i],
-				str_lens[i] + 1);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			int alen = key_len_bytes ? (int)kl : (int)kl + 1;
+			void *sink = art_search(&art, (unsigned char *)kp, alen);
 			FORCE_READ_LEAF(sink);
 		}
 
@@ -734,8 +773,10 @@ static void run_art(void)
 		uint64_t t0, t1;
 		t0 = now_ns();
 		for (unsigned int i = 0; i < n_keys; i++) {
-			void *sink = art_search(&art, (unsigned char *)str_keys[i],
-				str_lens[i] + 1);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			int alen = key_len_bytes ? (int)kl : (int)kl + 1;
+			void *sink = art_search(&art, (unsigned char *)kp, alen);
 			FORCE_READ_LEAF(sink);
 		}
 		t1 = now_ns();
@@ -755,10 +796,45 @@ void *hot_create(void);
 void hot_destroy(void *h);
 int hot_insert(void *h, const char *key);
 const char *hot_lookup(void *h, const char *key);
+void *hot_u64_create(void);
+void hot_u64_destroy(void *h);
+int hot_u64_insert(void *h, uint64_t *rec);
+const void *hot_u64_lookup(void *h, uint64_t key);
 
 static void run_hot(void)
 {
-	if (key_len_bytes) { printf("- 0\n"); return; }	/* string-key engine */
+	if (key_len_bytes) {
+		/* Integer HOT (map-mode): value = pointer to the key record, so
+		 * the lookup returns a cold pointer to force-read, like the other
+		 * integer engines (not HOT's cheaper set-mode where value==key). */
+		long rss;
+		double best = 1e18;
+		void *hot = hot_u64_create();
+		uint64_t *recs = malloc(n_keys * sizeof(uint64_t));
+		for (unsigned int i = 0; i < n_keys; i++) {
+			recs[i] = int_keys[i];
+			hot_u64_insert(hot, &recs[i]);
+		}
+		rss = get_rss_kb();
+		for (int w = 0; w < WARMUP; w++)
+			for (unsigned int i = 0; i < n_keys; i++) {
+				const void *s = hot_u64_lookup(hot, int_keys[i]);
+				FORCE_READ_LEAF(s);
+			}
+		for (int r = 0; r < RUNS; r++) {
+			uint64_t t0 = now_ns();
+			for (unsigned int i = 0; i < n_keys; i++) {
+				const void *s = hot_u64_lookup(hot, int_keys[i]);
+				FORCE_READ_LEAF(s);
+			}
+			double ns = (double)(now_ns() - t0) / n_keys;
+			if (ns < best) best = ns;
+		}
+		printf("%.1f %ld\n", best, rss);
+		hot_u64_destroy(hot);
+		free(recs);
+		return;
+	}
 	long rss;
 	double best = 1e18;
 	void *hot = hot_create();
@@ -813,14 +889,16 @@ const void *cuckoo_lookup(void *t, const void *key, unsigned int len);
 
 static void run_cuckoo(void)
 {
-	if (key_len_bytes) { printf("- 0\n"); return; }	/* string-key engine */
 	long rss;
 	double best = 1e18;
+	uint8_t ibuf[8];
 	void *ct = cuckoo_create(n_keys);
 	if (!ct) { fprintf(stderr, "cuckoo alloc failed\n"); printf("- 0\n"); return; }
 
 	for (unsigned int i = 0; i < n_keys; i++) {
-		int r = cuckoo_insert(ct, str_keys[i], str_lens[i]);
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		int r = cuckoo_insert(ct, kp, kl);
 		if (r != 0) {
 			fprintf(stderr, "cuckoo_insert status %d at i=%u "
 				"(2=overflow,3=keytoolong)\n", r, i);
@@ -832,14 +910,18 @@ static void run_cuckoo(void)
 
 	for (int w = 0; w < WARMUP; w++)
 		for (unsigned int i = 0; i < n_keys; i++) {
-			const void *sink = cuckoo_lookup(ct, str_keys[i], str_lens[i]);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			const void *sink = cuckoo_lookup(ct, kp, kl);
 			FORCE_READ_LEAF(sink);
 		}
 
 	for (int r = 0; r < RUNS; r++) {
 		uint64_t t0 = now_ns();
 		for (unsigned int i = 0; i < n_keys; i++) {
-			const void *sink = cuckoo_lookup(ct, str_keys[i], str_lens[i]);
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			const void *sink = cuckoo_lookup(ct, kp, kl);
 			FORCE_READ_LEAF(sink);
 		}
 		uint64_t t1 = now_ns();
