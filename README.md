@@ -13,7 +13,9 @@ implementations:
 | `art`      | Adaptive Radix Tree (libart), Armon Dadgar      | `third_party/libart` (vendored) |
 | `hot`      | Height Optimized Trie (Binna et al., SIGMOD'18) | `third_party/hot` (ISC, vendored) |
 | `cuckoo`   | Cuckoo Trie (Zeitak & Morrison, SOSP'21)        | `third_party/cuckoo-trie` (Unlicense) |
-| `judy`     | JudyL / JudySL                                  | system `libJudy`                |
+| `judy` / `judyl` / `judysl` / `judyhs` | Judy — combined, JudyL (int), JudySL (string radix), JudyHS (hash) | system `libJudy` |
+| `masstree` | Masstree, B+tree-of-tries (Mao/Kohler/Morris)   | `third_party/masstree` (MIT); ST + MT |
+| `artolc`   | ART-OLC, concurrent ART OLC (Leis et al.)       | `third_party/artolc` (Apache-2.0); ST + MT |
 | BIND9 QP   | `dns_qpmulti` (multithreaded test only)         | our bind9 clone (`bind9-src/`)  |
 
 ## Dependency model (hybrid)
@@ -50,41 +52,84 @@ Single dataset, single engine, run in its own process for accurate RSS:
 ```sh
 ./bench_one_st <dataset> <engine>
 #   dataset: u32d u32s u64d u64s dns dict paths   (all generated synthetically)
-#   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot
-# output: <ns/op> <RSS_kB>      ('-' for string engines on integer datasets)
+#   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs
+#            qp art hot cuckoo masstree artolc
+# output: <ns/op> <RSS_kB>   ('-' where an engine does not apply: judysl on
+#         integers, judyl on strings)
 ```
 
-Example sweep:
+Example sweep (all engines that apply, on one dataset):
 
 ```sh
-for e in ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot; do printf '%-17s ' "$e"; ./bench_one_st dns "$e"; done
+for e in ft_cand ft_spec judyl judysl judyhs qp art hot cuckoo masstree artolc; do \
+  printf '%-10s ' "$e"; ./bench_one_st dns "$e"; done
 ```
 
 Useful env vars (see `src/bench_one_st.c`): `FT_BENCH_COMPACT` (compact between
 build and query), `FT_DUMP_STATS`, `N_KEYS` / `WARMUP` / `RUNS` (compile-time).
 
-### Representative results (`dns`, 1M keys, single thread)
+### Results across datasets (1M keys, single thread)
 
-Lookup time (best of `RUNS` timed passes after `WARMUP`) and post-build RSS, on
-the hardware below (2× EPYC 9654; `cuckoo` run with reserved 2 MiB hugepages and
-built `-O3 -flto`). Sorted fastest first:
+Lookup time, ns/op (best of `RUNS` timed passes after `WARMUP`), on the hardware
+below (2× EPYC 9654; `cuckoo` run with reserved 2 MiB hugepages, `-O3 -flto`).
+Every engine now runs on every dataset — the byte-keyed engines key integers as
+big-endian bytes; `judysl` (string radix) and `judyl` (integer array) are the
+two split-out Judy variants, `judyhs` is Judy's hash array.
 
-| Engine     | ns/op | RSS (MB) | Notes |
-|------------|------:|---------:|-------|
-| `hot`      |   100 |      110 | Height Optimized Trie — fastest lookups |
-| `ft_cand`  |   112 |      252 | FT, pure candidate (no validation) |
-| `qp`       |   116 |      160 | qp-trie (Tony Finch) |
-| `ft_spec`  |   118 |      252 | FT reference (speculative + lib-side memcmp) |
-| `wormhole` |   118 |      125 | separate **GPL** binary (`bench_wormhole_gpl`) |
-| `judy`     |   205 |      107 | JudySL |
-| `art`      |   207 |      226 | ART (libart) |
-| `cuckoo`   |   336 |      104 | Cuckoo Trie — slowest here (hashes whole keys; see below) |
+**String keys** (`dns` DNS names, `dict` words, `paths` filesystem paths),
+fastest-first by `dns`:
 
-Single snapshot (best-of-`RUNS` filters most noise; figures move a few % run to
-run). Takeaway: short DNS keys with heavy shared prefixes favor prefix-exploiting
-tries; **HOT still has the fastest lookups**, but at ~2.3× less memory than the
-FT here rather than being the outright smallest — `judy` and `cuckoo` are now
-slightly smaller (see the fairness note).
+| Engine     | `dns` | `dict` | `paths` |
+|------------|------:|-------:|--------:|
+| `hot`      |    98 |    109 |      77 |
+| `ft_cand`  |   114 |    106 |     143 |
+| `qp`       |   119 |    129 |     180 |
+| `ft_spec`  |   120 |    111 |     142 |
+| `judyhs`   |   145 |    120 |     142 |
+| `judysl`   |   201 |    259 |     264 |
+| `art`      |   209 |    181 |     231 |
+| `artolc`   |   214 |    208 |     249 |
+| `masstree` |   241 |    196 |     210 |
+| `cuckoo`   |   337 |    313 |     333 |
+
+(`wormhole`, the separate GPL binary, is ~118 ns on `dns`.)
+
+**Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
+fastest-first by `u64d`:
+
+| Engine     | `u32d` | `u32s` | `u64d` | `u64s` |
+|------------|-------:|-------:|-------:|-------:|
+| `judyl`    |     11 |     37 |     11 |     65 |
+| `qp`       |     12 |     12 |     13 |     13 |
+| `ft_cand`  |     15 |     32 |     15 |     32 |
+| `art`      |     15 |     49 |     17 |     54 |
+| `ft_spec`  |     16 |     36 |     17 |     36 |
+| `hot`      |     20 |     49 |     20 |     50 |
+| `artolc`   |     22 |     97 |     23 |    100 |
+| `judyhs`   |     24 |     46 |     38 |     79 |
+| `masstree` |     48 |    171 |     46 |    169 |
+| `cuckoo`   |     95 |     98 |    118 |     98 |
+
+Takeaways:
+- **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
+  four* sets, including the sparse random ones where everything else degrades 2–6×
+  (`judyl` 11→65, `ft` 15→36, `art` 17→54). Its bit-popcount nodes don't care
+  whether keys cluster.
+- **`judyl` wins dense integers** (11 ns) but collapses on sparse (65); **`judyhs`
+  beats `judysl` on strings** (hash suits these distributions better than the
+  radix tree), and **`hot` has the fastest string lookups** (77–109 ns).
+- **`cuckoo` is slowest throughout** (it hashes whole keys, no prefix sharing);
+  **Masstree and ART-OLC carry their concurrency machinery** even single-threaded,
+  so they trail the dedicated ST engines (ART-OLC the closer of the two).
+- Single snapshot, best-of-`RUNS` (figures move a few % run to run).
+
+> **Validation fairness.** Every engine stores its own **copy** of each key
+> (FT/qp/ART/Masstree/ART-OLC in a dense `cds_ft_external_arena`; Judy/Cuckoo
+> internally; HOT in the same arena) and the timed loop consumes the lookup
+> status and force-reads the returned leaf (`FORCE_READ_LEAF`), so each pays a
+> real validating compare against cold memory and no validation is dead-code-
+> eliminated. HOT (integer) uses map-mode (value = a pointer to the key record),
+> not its cheaper set-mode, so it touches a cold value like the others.
 
 > **Validation fairness (why these differ from earlier numbers).** Every engine
 > here stores its own **copy** of each key (FT/qp/ART in a dense
