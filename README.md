@@ -519,12 +519,12 @@ LD_LIBRARY_PATH=urcu-build/src/.libs BENCH_MUTATOR=1 \
 | `ft`       |  1340 |  592|  666 |  326|  498| **RCU** |
 | `b9qp`     |   441 |  419|  288 |  268|  191| **RCU** |
 | `judy`     | 10628 |**2.8**| 19 |  92 | 429 | rwlock |
-| `qp`       | 34392 |**29** | 1051|  44 |  20 | rwlock |
+| `qp`       |  9170 |**3.8**|  33 | 134 | 513 | rwlock |
 | `art`      | 10197 |**2.8**| 34 | 113 | 461 | rwlock |
 
 **The cliff is the result.** The three **rwlock** engines have the *fastest*
-single-thread mutation (qp 34M ops/s!), then **fall off a cliff the instant a
-reader appears** — judy/art `10628 → 2.8`, qp `34392 → 29` kops, a 1000–10000×
+single-thread mutation (~9–11M ops/s), then **fall off a cliff the instant a
+reader appears** — judy/art `10628 → 2.8`, qp `9170 → 3.8` kops, a ~1000–3000×
 collapse — because the writer-preferring rwlock writer must wait for readers, and
 each reader holds the rdlock across a whole 1000-lookup batch. (The noisy partial
 "recovery" at higher reader counts is scheduling churn in the starved regime, not
@@ -546,7 +546,7 @@ robust set (RCU reclamation timing) but never starves.
 | `ft`       |      1057 |         375 |     2412 |        754 |
 | `b9qp`     |       446 |         196 |      471 |        206 |
 | `judy`     |     14923 |         669 |     9015 |        358 |
-| `qp`       |     34455 |          20 |    76710 |         35 |
+| `qp`       |     17265 |        1358 |    16343 |       1050 |
 | `art`      |     15361 |         800 |    12311 |        482 |
 
 Per-op shape follows the mechanism: **Masstree's in-place update makes replace its
@@ -557,6 +557,62 @@ replace are both `upsert`. (Caveat: the rwlock collapse magnitude is tied to the
 reader lock-hold granularity — readers batch 1000 lookups per rdlock here; finer
 locking would starve the writer less, but the qualitative RCU-vs-rwlock gap
 stands.)
+
+**Compaction accounting.** Each engine's kops includes whatever maintenance it
+does *inline*: b9qp's `dns_qp_compact(…, NOW)` (when `dns_qp_memusage().fragmented`)
+and Masstree's epoch advance run inside the timed `writer_op`, so that
+compaction/reclamation time is in the denominator (lowering their kops) though
+it is not counted as an op. **FT does no inline compaction** — its reclamation is
+asynchronous `call_rcu` on a separate thread — so FT's figure is the
+no-compaction sustained mutation rate (it does spend a background core on the
+deferred frees). Read FT vs b9qp with that asymmetry in mind: b9qp pays for
+staying compact within the figure, FT does not.
+
+### Ordered iteration throughput vs reader threads
+
+A third axis: instead of point lookups or mutation, each of **1 → 192 reader
+threads** loops a **full in-order traversal** of every key, and we report
+aggregate **`next`-op** (key-visit) throughput. Read-only; `BENCH_ITERATE=1`.
+Each engine uses its native ordered traversal — a cursor (FT
+`cds_ft_for_each_rcu`, qp `Tnextl`, JudySL `JSLN`, HOTRowex `begin()`/`++`, BIND9
+`dns_qpiter`), a callback scan (libart `art_iter`, Masstree `masstree_scan`), or
+a range fetch (ART-OLC/ROWEX `lookupRange`).
+
+```sh
+BENCH_ITERATE=1 ./bench_scale_hotrowex 192
+LD_LIBRARY_PATH=urcu-build/src/.libs BENCH_ITERATE=1 \
+    bind9-src/build/tests/bench/bench_scale_ft 192
+```
+
+Median of 3, next Mops/s — readers across the top:
+
+| Engine | 1 | 16 | 64 | 192 | traversal |
+|------------|------:|------:|-------:|-------:|:----------|
+| `hotrowex` |   176 |  2573 |  10437 | **27842** | contiguous leaf scan |
+| `b9qp`     |    91 |  1369 |   5444 |  11057 | RCU read snapshot |
+| `art`      |    29 |   345 |   1269 |   3472 | recursive callback |
+| `masstree` |    19 |   302 |   1193 |   2896 | B+tree leaf scan |
+| `artolc`   |    18 |   226 |    892 |   2575 | range-into-buffer |
+| `artrowex` |    15 |   223 |    789 |   2242 | range-into-buffer |
+| `judy`     |   6.0 |    84 |    335 |    989 | JSLN cursor |
+| `qp`       |   5.5 |    68 |    280 |    771 | Tnextl cursor |
+| `ft`       |   2.8 |    33 |    116 |    365 | cds_ft_next cursor |
+
+**Two findings.** (1) **Ordered iteration is embarrassingly parallel** — every
+engine scales near-linearly (≈120–165× from 1 to 192 threads): a full traversal
+is read-only and touches no shared mutable state, so threads stream the structure
+independently, bounded mainly by memory bandwidth. (2) **Per-traversal speed
+spans ~60×**, split on *how* you advance: the bulk **leaf-scan / range** engines
+(HOTRowex, b9qp, ART, Masstree) walk contiguous leaves and run 5–60× faster than
+the **cursor** engines (Judy, qp, FT) that compute each successor by re-descending.
+**FT is the slowest ordered iterator** — a striking inversion of its point-lookup
+and mutation strength: `cds_ft_next` pays a per-step descent through the fractal
+trie where a B+tree or HOT just follows a leaf link. FT is tuned for point
+operations, not bulk ordered scans.
+
+(All engines visit the same ~995,830 unique keys — the generated DNS set has
+~4,170 duplicates the dedup'ing tries collapse; ART keeps all 1,000,000 inserts,
+a <0.5% difference, immaterial to throughput.)
 
 ### Why one process per engine
 
