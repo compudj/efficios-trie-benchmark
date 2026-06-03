@@ -82,6 +82,28 @@ static void art_writer_op(void *ctx, int op, unsigned int idx)
 	pthread_rwlock_unlock(&g_rwlock);
 }
 
+/* Ordered-iteration op: art_iter visits every leaf in sorted order. */
+static int art_count_cb(void *data, const unsigned char *key, uint32_t klen,
+			void *val)
+{
+	(void)key;
+	(void)klen;
+	(void)val;
+	(*(unsigned long *)data)++;
+	return 0;	/* continue */
+}
+
+static unsigned long art_iterate(void *ctx)
+{
+	unsigned long n = 0;
+
+	(void)ctx;
+	pthread_rwlock_rdlock(&g_rwlock);
+	art_iter(&g_art, art_count_cb, &n);
+	pthread_rwlock_unlock(&g_rwlock);
+	return n;
+}
+
 static const struct bench_engine art_engine = {
 	.name		= "art",
 	.label		= "ART+rwl",
@@ -89,6 +111,7 @@ static const struct bench_engine art_engine = {
 	.reader_batch	= art_reader_batch,
 	.writer_step	= art_writer_step,
 	.writer_op	= art_writer_op,
+	.iterate	= art_iterate,
 };
 
 int main(int argc, char **argv)

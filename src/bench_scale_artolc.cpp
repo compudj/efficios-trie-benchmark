@@ -59,6 +59,10 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline TID kv_tid(artolc_kv *kv) { return reinterpret_cast<TID>(kv); }
 
+/* Per-thread result buffer for the ordered-iteration op (freed in teardown). */
+static thread_local TID *g_iter_buf = nullptr;
+static thread_local size_t g_iter_cap = 0;
+
 extern "C" void artolc_build(void)
 {
 	g_tree = new ART_OLC::Tree(load_key);
@@ -132,6 +136,9 @@ extern "C" void *artolc_reader_setup(void)
 extern "C" void artolc_reader_teardown(void *ctx)
 {
 	delete static_cast<ART::ThreadInfo *>(ctx);
+	free(g_iter_buf);
+	g_iter_buf = nullptr;
+	g_iter_cap = 0;
 }
 
 extern "C" void artolc_reader_batch(void *ctx, uint64_t *seed)
@@ -196,6 +203,31 @@ extern "C" void artolc_cleanup_churn(void)
 	}
 }
 
+/* Ordered-iteration op: ART has no cursor; lookupRange returns the whole key
+ * range [min, all-0xFF] into one per-thread buffer.  Sizing the buffer above the
+ * key count makes it a single call, so there is no continueKey pagination (which
+ * double-counts boundary keys). */
+extern "C" unsigned long artolc_iterate(void *ctx)
+{
+	ART::ThreadInfo *ti = static_cast<ART::ThreadInfo *>(ctx);
+	Key start, end, continueKey;
+	uint8_t maxb[128];
+
+	start.set("", 0);
+	memset(maxb, 0xff, sizeof(maxb));
+	end.set(reinterpret_cast<const char *>(maxb), sizeof(maxb));
+
+	size_t need = (size_t)N_KEYS + 16;
+	if (g_iter_cap < need) {
+		free(g_iter_buf);
+		g_iter_buf = (TID *)malloc(need * sizeof(TID));
+		g_iter_cap = need;
+	}
+	size_t count = 0;
+	g_tree->lookupRange(start, end, continueKey, g_iter_buf, need, count, *ti);
+	return count;
+}
+
 static const struct bench_engine artolc_engine = {
 	"artolc",		/* name */
 	"ART-OLC",		/* label */
@@ -210,6 +242,7 @@ static const struct bench_engine artolc_engine = {
 	artolc_cleanup_churn,	/* cleanup_churn */
 	artolc_writer_op,	/* writer_op */
 	0,			/* no_remove */
+	artolc_iterate,		/* iterate */
 };
 
 int main(int argc, char **argv)

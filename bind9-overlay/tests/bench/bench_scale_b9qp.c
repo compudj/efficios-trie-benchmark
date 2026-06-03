@@ -325,6 +325,26 @@ static void b9qp_writer_op(void *ctx, int op, unsigned int idx)
 	dns_qpmulti_commit(g_bind9_qp, &qpt);
 }
 
+/* Ordered-iteration op: dns_qpiter walks all keys in sorted order on a read
+ * snapshot (dns_qpmulti_query) — the same read view the lookup reader uses. */
+static unsigned long b9qp_iterate(void *ctx)
+{
+	dns_qpread_t qpr;
+	dns_qpiter_t iter;
+	void *pval;
+	uint32_t ival;
+	unsigned long n = 0;
+
+	(void)ctx;
+	dns_qpmulti_query(g_bind9_qp, &qpr);
+	dns_qpiter_init(&qpr, &iter);
+	while (dns_qpiter_next(&iter, &pval, &ival) == ISC_R_SUCCESS)
+		n++;
+	dns_qpread_destroy(g_bind9_qp, &qpr);
+	rcu_quiescent_state();
+	return n;
+}
+
 static const struct bench_engine b9qp_engine = {
 	.name		= "b9qp",
 	.label		= "BIND9 QP",
@@ -338,6 +358,7 @@ static const struct bench_engine b9qp_engine = {
 	.run_reset	= b9qp_run_reset,
 	.cleanup_churn	= b9qp_cleanup_churn,
 	.writer_op	= b9qp_writer_op,
+	.iterate	= b9qp_iterate,
 };
 
 int main(int argc, char **argv)

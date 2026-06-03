@@ -86,6 +86,25 @@ static void judy_writer_op(void *ctx, int op, unsigned int idx)
 	pthread_rwlock_unlock(&g_rwlock);
 }
 
+/* Ordered-iteration op: JudySL JSLF/JSLN walk all keys in sorted order. */
+static unsigned long judy_iterate(void *ctx)
+{
+	uint8_t key[256];
+	Word_t *pv;
+	unsigned long n = 0;
+
+	(void)ctx;
+	pthread_rwlock_rdlock(&g_rwlock);
+	key[0] = '\0';
+	JSLF(pv, g_judy, key);
+	while (pv != NULL) {
+		n++;
+		JSLN(pv, g_judy, key);
+	}
+	pthread_rwlock_unlock(&g_rwlock);
+	return n;
+}
+
 static const struct bench_engine judy_engine = {
 	.name		= "judy",
 	.label		= "Judy+rwl",
@@ -93,6 +112,7 @@ static const struct bench_engine judy_engine = {
 	.reader_batch	= judy_reader_batch,
 	.writer_step	= judy_writer_step,
 	.writer_op	= judy_writer_op,
+	.iterate	= judy_iterate,
 };
 
 int main(int argc, char **argv)

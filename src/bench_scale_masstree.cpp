@@ -27,6 +27,7 @@
 #include "masstree_insert.hh"
 #include "masstree_get.hh"
 #include "masstree_remove.hh"
+#include "masstree_scan.hh"
 
 #include "bench_scale_common.h"
 
@@ -211,6 +212,30 @@ extern "C" void masstree_run_reset(void)
 	memset(churn_present, 0, sizeof(churn_present));
 }
 
+/* Ordered-iteration op: Masstree forward scan from the first key, counting
+ * every visited value (the scanner returns true to keep going). */
+struct mt_count_scanner {
+	unsigned long n = 0;
+	template <typename SS, typename K>
+	void visit_leaf(const SS &, const K &, threadinfo &) {}
+	bool visit_value(lcdf::Str key, void *value, threadinfo &ti) {
+		(void)key;
+		(void)value;
+		(void)ti;
+		++n;
+		return true;
+	}
+};
+
+extern "C" unsigned long masstree_iterate(void *ctx)
+{
+	threadinfo *ti = (threadinfo *)ctx;
+	mt_count_scanner sc;
+	g_table.scan(lcdf::Str("", 0), true, sc, *ti);
+	ti->rcu_quiesce();
+	return sc.n;
+}
+
 static const struct bench_engine masstree_engine = {
 	"masstree",		/* name */
 	"Masstree",		/* label */
@@ -225,6 +250,7 @@ static const struct bench_engine masstree_engine = {
 	nullptr,		/* cleanup_churn */
 	masstree_writer_op,	/* writer_op */
 	0,			/* no_remove */
+	masstree_iterate,	/* iterate */
 };
 
 int main(int argc, char **argv)

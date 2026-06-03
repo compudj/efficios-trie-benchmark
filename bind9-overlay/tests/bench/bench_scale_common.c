@@ -403,6 +403,76 @@ static void mutator_run_bench(int nr_readers, double out[3])
 	free(rargs);
 }
 
+/* ── Ordered-iteration benchmark (BENCH_ITERATE=1) ───────────
+ * Read-only: each of nr_readers threads repeatedly traverses every key in
+ * sorted order (engine->iterate), and we report aggregate "next" (key-visit)
+ * throughput as readers scale 1 -> 192.  Full traversals stream the whole
+ * structure, so this is largely a memory-bandwidth / read-scaling test of the
+ * ordered cursor, distinct from the random point-lookup sweep.
+ */
+static void *iterate_reader_thread(void *arg)
+{
+	struct thread_arg *ta = arg;
+	unsigned long count = 0;
+	void *ctx = g_eng->reader_setup ? g_eng->reader_setup() : NULL;
+
+	if (getenv("BENCH_NO_PRIME") == NULL) {
+		unsigned long visited = g_eng->iterate(ctx);	/* one warm traversal */
+		if (getenv("BENCH_ITER_DEBUG"))
+			fprintf(stderr, "[iter] %s one traversal visited %lu keys "
+				"(expect %d)\n", g_eng->name, visited, N_KEYS);
+	}
+
+	__atomic_fetch_add(&prime_done_count, 1, __ATOMIC_RELEASE);
+	while (!start_flag)
+		__asm__ __volatile__("pause" ::: "memory");
+
+	while (!stop_flag)
+		count += g_eng->iterate(ctx);
+
+	if (g_eng->reader_teardown)
+		g_eng->reader_teardown(ctx);
+	ta->count = count;
+	return NULL;
+}
+
+/* Aggregate next-op throughput (Mops/s) for nr_readers iterating threads. */
+static double iterate_run_bench(int nr_readers)
+{
+	pthread_t *threads = calloc(nr_readers, sizeof(pthread_t));
+	struct thread_arg *rargs = calloc(nr_readers, sizeof(struct thread_arg));
+	unsigned long total = 0;
+
+	start_flag = 0;
+	stop_flag = 0;
+	prime_done_count = 0;
+
+	for (int i = 0; i < nr_readers; i++) {
+		rargs[i].count = 0;
+		rargs[i].seed = 42 + (uint64_t)i * 1000;
+		pthread_create(&threads[i], NULL, iterate_reader_thread, &rargs[i]);
+	}
+
+	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
+		usleep(1000);
+
+	uint64_t t0 = mono_ns();
+	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
+	usleep(DURATION_SEC * 1000000);
+	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+
+	for (int i = 0; i < nr_readers; i++)
+		pthread_join(threads[i], NULL);
+	uint64_t t1 = mono_ns();
+
+	for (int i = 0; i < nr_readers; i++)
+		total += rargs[i].count;
+
+	free(threads);
+	free(rargs);
+	return (double)total / ((double)(t1 - t0) / 1e9) / 1e6;
+}
+
 int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 {
 	int max_threads = 384;
@@ -463,6 +533,25 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 			double out[3];
 			mutator_run_bench(nr, out);
 			printf("%d %.1f %.1f %.1f\n", nr, out[0], out[1], out[2]);
+			fflush(stdout);
+		}
+		return 0;
+	}
+
+	/*
+	 * Ordered-iteration sweep (BENCH_ITERATE=1): readers 1 -> 192, each looping
+	 * a full in-order traversal; aggregate next-op throughput.  Read-only.
+	 */
+	if (getenv("BENCH_ITERATE") != NULL && eng->iterate != NULL) {
+		int counts[] = { 1, 2, 4, 8, 16, 32, 64, 128, 192 };
+		size_t nrc = sizeof(counts) / sizeof(counts[0]);
+		printf("# readers next_mops\n");
+		fflush(stdout);
+		for (size_t i = 0; i < nrc; i++) {
+			int nr = counts[i];
+			if (nr > max_threads)
+				break;
+			printf("%d %.1f\n", nr, iterate_run_bench(nr));
 			fflush(stdout);
 		}
 		return 0;

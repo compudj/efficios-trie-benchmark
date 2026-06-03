@@ -143,6 +143,16 @@ struct bench_engine {
 	 */
 	void  (*writer_op)(void *ctx, int op, unsigned int idx);
 	int   no_remove;
+
+	/*
+	 * Ordered-iteration sweep hook (optional, enabled by BENCH_ITERATE=1):
+	 * perform ONE full in-order traversal of every key under @ctx (from
+	 * reader_setup) and return the number of keys visited ("next" ops).  The
+	 * driver scales readers 1 -> 192, each repeatedly calling this, and
+	 * reports aggregate next-op throughput (Mops/s).  Read-only — no mutator
+	 * runs in this mode.
+	 */
+	unsigned long (*iterate)(void *ctx);
 };
 
 /*

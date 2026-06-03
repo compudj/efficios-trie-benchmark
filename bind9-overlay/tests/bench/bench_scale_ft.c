@@ -411,6 +411,23 @@ static void ft_cleanup_churn(void)
 		rcu_barrier();
 }
 
+/* Ordered-iteration op: one full in-order traversal under the RCU read lock. */
+static unsigned long ft_iterate(void *ctx)
+{
+	struct cds_ft_iter *iter;
+	unsigned long n = 0;
+
+	(void)ctx;
+	cds_ft_iter_create(g_ft, &iter);
+	rcu_read_lock();
+	cds_ft_for_each_rcu(g_ft, iter)
+		n++;
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	return n;
+}
+
 static const struct bench_engine ft_engine = {
 #ifdef BENCH_FT_QSBR
 	.name		= "ft_qsbr",
@@ -429,6 +446,7 @@ static const struct bench_engine ft_engine = {
 	.run_reset	= ft_run_reset,
 	.cleanup_churn	= ft_cleanup_churn,
 	.writer_op	= ft_writer_op,
+	.iterate	= ft_iterate,
 };
 
 int main(int argc, char **argv)

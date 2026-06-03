@@ -138,6 +138,17 @@ extern "C" void hotrowex_writer_step(void *ctx, uint64_t *seed,
 	g_hr->upsert(churn_keys[cidx]);
 }
 
+/* Ordered-iteration op: HOT's synchronized iterator walks keys in sorted order
+ * (it self-guards the epoch like lookup). */
+extern "C" unsigned long hotrowex_iterate(void *ctx)
+{
+	(void)ctx;
+	unsigned long n = 0;
+	for (auto it = g_hr->begin(); it != g_hr->end(); ++it)
+		n++;
+	return n;
+}
+
 static const struct bench_engine hotrowex_engine = {
 	"hotrowex",		/* name */
 	"HOTRowex",		/* label */
@@ -152,6 +163,7 @@ static const struct bench_engine hotrowex_engine = {
 	nullptr,		/* cleanup_churn */
 	hotrowex_writer_op,	/* writer_op */
 	1,			/* no_remove (ROWEX has no concurrent delete) */
+	hotrowex_iterate,	/* iterate */
 };
 
 int main(int argc, char **argv)
