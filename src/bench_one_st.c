@@ -4,7 +4,7 @@
  *
  * Usage: bench_one <dataset> <engine>
  *   dataset: u32d u32s u64d u64s dns dict paths
- *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo
+ *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyhs qp art hot cuckoo masstree artolc
  *
  * Output: <ns/op> <RSS_kB>
  */
@@ -678,6 +678,51 @@ static void run_judy(void)
 	printf("%.1f %ld\n", best, rss);
 }
 
+/*
+ * JudyHS — Judy's hash-based array, keyed on arbitrary byte strings (JHSI/JHSG)
+ * rather than JudySL's digital/radix tree.  Runs on every dataset via key_at
+ * (JudyHS-vs-JudySL on strings, JudyHS-vs-JudyL on integers).
+ */
+static void run_judyhs(void)
+{
+	Pvoid_t judy = NULL;
+	long rss;
+	double best = 1e18;
+	uint8_t ibuf[8];
+
+	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		Word_t *pv;
+		JHSI(pv, judy, (void *)kp, (Word_t)kl);
+		*pv = i;
+	}
+	rss = get_rss_kb();
+
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			Word_t *pv;
+			JHSG(pv, judy, (void *)kp, (Word_t)kl);
+			FORCE_READ_LEAF(pv);
+		}
+
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			Word_t *pv;
+			JHSG(pv, judy, (void *)kp, (Word_t)kl);
+			FORCE_READ_LEAF(pv);
+		}
+		double ns = (double)(now_ns() - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+	printf("%.1f %ld\n", best, rss);
+}
+
 static void run_qp(void)
 {
 	Tbl *qp = NULL;
@@ -1043,7 +1088,7 @@ int main(int argc, char **argv)
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy qp art hot cuckoo masstree artolc\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyhs qp art hot cuckoo masstree artolc\n", argv[0]);
 		return 1;
 	}
 
@@ -1068,6 +1113,7 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[2], "ft_cand") == 0)      run_ft(1, 1, 0);
 	else if (strcmp(argv[2], "ft_spec") == 0)      run_ft(0, 0, 1);
 	else if (strcmp(argv[2], "judy") == 0)    run_judy();
+	else if (strcmp(argv[2], "judyhs") == 0)  run_judyhs();
 	else if (strcmp(argv[2], "qp") == 0)      run_qp();
 	else if (strcmp(argv[2], "art") == 0)     run_art();
 	else if (strcmp(argv[2], "hot") == 0)     run_hot();
