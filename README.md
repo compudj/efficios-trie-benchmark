@@ -490,6 +490,74 @@ fastest insert/remove churn (~5000 vs ART-OLC ~1850 vs FT ~500 Kops/s); FT alone
 does full concurrent insert **and** remove under RCU with the lowest read-side
 cost.
 
+### Mutator throughput vs reader concurrency
+
+The sweep above scales *readers* against one writer; this one **inverts** it —
+fix **one mutator thread** doing insert/replace/remove and scale **readers 0 →
+191** — to show how reader concurrency throttles a single writer. Same binaries
+(`BENCH_MUTATOR=1`); per-op throughput in **kops/s**, median of 3. "Replace" is
+each engine's natural value update where it has one (Judy/qp/ART/Masstree update
+in place), an `upsert` for HOTRowex (no delete), or remove+reinsert where there
+is no value-update API (FT swaps the leaf node + RCU-frees the old; ART-OLC/ROWEX;
+BIND9 `dns_qp` delete+insert in one write txn).
+
+```sh
+# per engine; bind9 engines need LD_LIBRARY_PATH and live in bind9-src/build/...
+BENCH_MUTATOR=1 ./bench_scale_artrowex 200
+LD_LIBRARY_PATH=urcu-build/src/.libs BENCH_MUTATOR=1 \
+    bind9-src/build/tests/bench/bench_scale_ft 200
+```
+
+**Insert (kops/s)** — readers across the top:
+
+| Engine | 0 | 1 | 16 | 64 | 191 | sync |
+|------------|------:|----:|-----:|----:|----:|:-----|
+| `masstree` | 11272 |11123|10589 |10508| 9494| optimistic |
+| `hotrowex` |  5680 | 5610| 5235 | 4713| 4152| ROWEX |
+| `artolc`   |  4091 | 3272| 2160 | 1796| 1457| OLC |
+| `artrowex` |  3421 | 2849| 2087 | 1639| 1469| ROWEX |
+| `ft`       |  1340 |  592|  666 |  326|  498| **RCU** |
+| `b9qp`     |   441 |  419|  288 |  268|  191| **RCU** |
+| `judy`     | 10628 |**2.8**| 19 |  92 | 429 | rwlock |
+| `qp`       | 34392 |**29** | 1051|  44 |  20 | rwlock |
+| `art`      | 10197 |**2.8**| 34 | 113 | 461 | rwlock |
+
+**The cliff is the result.** The three **rwlock** engines have the *fastest*
+single-thread mutation (qp 34M ops/s!), then **fall off a cliff the instant a
+reader appears** — judy/art `10628 → 2.8`, qp `34392 → 29` kops, a 1000–10000×
+collapse — because the writer-preferring rwlock writer must wait for readers, and
+each reader holds the rdlock across a whole 1000-lookup batch. (The noisy partial
+"recovery" at higher reader counts is scheduling churn in the starved regime, not
+a real trend; the rwlock numbers there are not reproducible point-to-point.)
+**RCU and the lock-free concurrent tries do not collapse** — FT, b9qp, Masstree,
+HOTRowex and both ARTs keep mutating within the same order of magnitude all the
+way to 191 readers, because their readers never hold a lock the writer needs.
+Masstree is barely touched (−16% over the whole sweep); FT is the noisiest of the
+robust set (RCU reclamation timing) but never starves.
+
+**Replace** and **Remove (kops/s)** at the endpoints (0 / 191 readers):
+
+| Engine | replace 0 | replace 191 | remove 0 | remove 191 |
+|------------|----------:|------------:|---------:|-----------:|
+| `masstree` |     12913 |       12183 |    12175 |       9207 |
+| `hotrowex` |      6185 |        4516 |   *n/a*  |     *n/a*  |
+| `artolc`   |      1243 |        1170 |     1193 |       1057 |
+| `artrowex` |       790 |         702 |     1144 |        929 |
+| `ft`       |      1057 |         375 |     2412 |        754 |
+| `b9qp`     |       446 |         196 |      471 |        206 |
+| `judy`     |     14923 |         669 |     9015 |        358 |
+| `qp`       |     34455 |          20 |    76710 |         35 |
+| `art`      |     15361 |         800 |    12311 |        482 |
+
+Per-op shape follows the mechanism: **Masstree's in-place update makes replace its
+*cheapest* op** (12.9M ops/s, above its own insert and remove — no node split or
+merge). The remove+reinsert engines (FT, ART-OLC/ROWEX) pay replace ≈ the harmonic
+mean of their remove+insert. **HOTRowex has no remove** (ROWEX); its insert and
+replace are both `upsert`. (Caveat: the rwlock collapse magnitude is tied to the
+reader lock-hold granularity — readers batch 1000 lookups per rdlock here; finer
+locking would starve the writer less, but the qualitative RCU-vs-rwlock gap
+stands.)
+
 ### Why one process per engine
 
 BIND9's libisc ELF constructor (`isc__lib_initialize`) calls
