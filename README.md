@@ -201,7 +201,12 @@ This is the **inverse** of the random-access read/write `bench_scale` result
 (where HOTRowex leads at 192) — load-names does *sequential* lookups
 (prefetch-friendly) on real qpkeys with FT's leaf slots round-robin
 **interleaved** across NUMA nodes. ART-OLC scales smoothly (208 → 428 → 685) but
-trails the two radix tries, landing third.
+trails the two radix tries, landing third. Across the full thread sweep its gap
+to `ft_spec_il` is a **steady ~1.5× constant factor**, not a scaling defect: it
+is already ~1.4× behind single-threaded (≈ 258 ns/op vs FT's ≈ 186 ns — ART's
+radix descent + the `loadKey` validation read + constructing an ART `Key`, a
+128-byte stack object, per lookup), and from 1 → 192 threads it scales ~183×
+(~95% parallel efficiency), the **cleanest scaler** of the competitors here.
 
 **Masstree does not scale here** — it plateaus at ~128 (~262) and does not climb
 to 192 (~267), while the other three keep going. ART-OLC is the telling control:
