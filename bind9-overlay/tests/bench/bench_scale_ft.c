@@ -97,6 +97,15 @@ static void ft_build(void)
 	 */
 	cds_ft_group_attr_set_lookup_optimization(attr,
 		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	/*
+	 * Leaf-key capture offset: makes the ordered-iteration path
+	 * (cds_ft_for_each_rcu -> cds_ft_next -> limit-none inequality) run the
+	 * speculative use_keycopy=true path -- recovering the result key from the
+	 * matched leaf instead of rebuilding it from the descent.  Without this the
+	 * "ft_spec" engine's iterate silently falls back to the eager ordinal_key
+	 * rebuild, so the speculative iterate path goes unmeasured.
+	 */
+	cds_ft_group_attr_set_speculative_key_offset(attr, FT_KEY_OFFSET);
 	cds_ft_group_create(attr, &group);
 	cds_ft_group_attr_destroy(attr);
 	cds_ft_create(group, NULL, &g_ft);
