@@ -56,6 +56,14 @@ struct ft_entry {
 #define FT_KEY_OFFSET \
 	(offsetof(struct ft_entry, key) - offsetof(struct ft_entry, ft_node))
 
+/*
+ * Byte offset from the (struct cds_ft_node *) to the leaf's stored key length,
+ * for the library-owned ordered list (Option E): a variable-length cds_ft_next
+ * materializes the result-key length from the leaf without descending.
+ */
+#define FT_KEYLEN_OFFSET \
+	(offsetof(struct ft_entry, key_len) - offsetof(struct ft_entry, ft_node))
+
 static struct cds_ft *g_ft;
 static pthread_mutex_t g_ft_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -106,6 +114,18 @@ static void ft_build(void)
 	 * rebuild, so the speculative iterate path goes unmeasured.
 	 */
 	cds_ft_group_attr_set_speculative_key_offset(attr, FT_KEY_OFFSET);
+	/*
+	 * FT_ORD: enable the library-owned ordered cell list (Option E,
+	 * FEATURE_FT_ORD_CELL).  cds_ft_for_each_rcu / cds_ft_next then walk the
+	 * key-ordered cell list (O(1)/step, lazy-ref result key) instead of the
+	 * O(depth) limit-none inequality descent.  key_len_offset lets the
+	 * variable-length walk recover the result-key length from the leaf.
+	 */
+	if (getenv("FT_ORD")) {
+		cds_ft_group_attr_set_key_len_offset(attr, FT_KEYLEN_OFFSET);
+		cds_ft_group_attr_set_ordered_list(attr);
+		fprintf(stderr, "[ft_build] ordered cell list ENABLED (FT_ORD)\n");
+	}
 	cds_ft_group_create(attr, &group);
 	cds_ft_group_attr_destroy(attr);
 	cds_ft_create(group, NULL, &g_ft);
@@ -151,6 +171,20 @@ static void ft_build(void)
 	}
 
 	/*
+	 * FT_BENCH_COMPACT: compact the freshly-built trie HERE, while the main
+	 * thread is still online (cds_ft_compact needs it for its per-batch
+	 * read-lock) and before the offline below.  Doing it here -- rather than
+	 * via ft_cleanup_churn, whose extra rcu_thread_online/offline + rcu_barrier
+	 * perturb the iterate sweep's RCU thread state and collapse MT scaling --
+	 * lets the sweep measure a compacted shape with main left in exactly the
+	 * same (offline) state as a non-compacting build.  The deferred cell/node
+	 * frees drain lazily; no rcu_barrier needed.
+	 */
+	int do_compact = (getenv("FT_BENCH_COMPACT") != NULL);
+	if (do_compact)
+		cds_ft_compact(g_ft);
+
+	/*
 	 * Drop the main thread offline for the remainder of the sweep.  It does
 	 * RCU work only here (build) and in ft_cleanup_churn (which briefly
 	 * brings it back online); in between it sleeps through each timed window,
@@ -158,6 +192,16 @@ static void ft_build(void)
 	 * periods.
 	 */
 	rcu_thread_offline();
+	/*
+	 * Flush the compaction's deferred cell/node frees BEFORE the timed sweep
+	 * (mirrors ft_cleanup_churn).  Without this, the ~nproc per-CPU call_rcu
+	 * worker threads churn through ~N_KEYS pending frees DURING the sweep,
+	 * stealing cores from the iterate threads and capping MT throughput (and
+	 * leaving the drained old cell ranges mapped -- inflated RSS).  Done after
+	 * going offline so an online idle main can't stall the grace period.
+	 */
+	if (do_compact)
+		rcu_barrier();
 }
 
 static void *ft_reader_setup(void)
@@ -232,7 +276,8 @@ static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 		/* Remove the currently-present churn key. */
 		struct ft_entry *old = churn_entries[cidx];
 		enum cds_ft_status ls, rs;
-		cds_ft_iter_invalidate_cache(ft_iter);
+		/* Repositioning with a fresh search key: cds_ft_iter_set_key()
+		 * clears any cached position, so no explicit invalidate/bind. */
 		ls = cds_ft_iter_set_key(ft_iter,
 			(const uint8_t *)churn_keys[cidx], churn_lens[cidx]);
 		if (ls < 0) {
@@ -289,7 +334,7 @@ static void ft_churn_remove(struct cds_ft_iter *it, unsigned int idx)
 	struct ft_entry *old = churn_entries[idx];
 	enum cds_ft_status ls, rs;
 
-	cds_ft_iter_invalidate_cache(it);
+	/* Fresh-search reposition: set_key clears the cached position. */
 	ls = cds_ft_iter_set_key(it, (const uint8_t *)churn_keys[idx],
 		churn_lens[idx]);
 	if (ls < 0) {
