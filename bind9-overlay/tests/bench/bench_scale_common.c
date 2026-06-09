@@ -483,23 +483,33 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	g_eng = eng;
 
 	/*
-	 * Optional NUMA interleaving (BENCH_NUMA_INTERLEAVE): spread every
-	 * allocation this main thread faults in -- the query-key set AND the
-	 * structure built below -- across all NUMA nodes, so at high reader
-	 * counts spanning multiple sockets no single node's memory bandwidth
-	 * bottlenecks the shared read set.  Applied uniformly to whatever engine
-	 * is under test.  (load-names' ft_spec_il achieves the same with an
-	 * mbind'd arena; this is the cross-engine equivalent.)  Set before
-	 * bench_gen_keys() so the query keys are interleaved too.
+	 * NUMA interleaving, ON BY DEFAULT.  Spread every allocation this main
+	 * thread faults in -- the query-key set AND the structure built below --
+	 * across all NUMA nodes, so at high reader counts spanning multiple
+	 * sockets no single node's memory bandwidth bottlenecks the shared read
+	 * set.  Applied UNIFORMLY to whatever engine is under test (a process-wide
+	 * mempolicy, set before bench_gen_keys() / eng->build()), so the
+	 * cross-engine reference is fair: it interleaves qp/ART/etc. exactly like
+	 * the Fractal Trie.  Without it, first-touch piles the whole shared
+	 * structure onto this node and Linux auto-NUMA-balancing thrashes the
+	 * unbound pages -- a ~10-20x MT cliff and high run-to-run variance on a
+	 * many-node box.  No-op on a single-node machine.
+	 *
+	 * Opt out with BENCH_NUMA_INTERLEAVE=0 to measure the naive first-touch
+	 * case (matches the FT library's CDS_FT_NUMA_INTERLEAVE=0 convention).
 	 */
-	if (getenv("BENCH_NUMA_INTERLEAVE") != NULL) {
-		if (numa_available() != -1) {
-			numa_set_interleave_mask(numa_all_nodes_ptr);
-			fprintf(stderr,
-				"NUMA: interleaving allocations across all nodes\n");
-		} else {
-			fprintf(stderr,
-				"NUMA: BENCH_NUMA_INTERLEAVE set but libnuma unavailable\n");
+	{
+		const char *ni = getenv("BENCH_NUMA_INTERLEAVE");
+
+		if (!ni || ni[0] != '0') {
+			if (numa_available() != -1) {
+				numa_set_interleave_mask(numa_all_nodes_ptr);
+				fprintf(stderr,
+					"NUMA: interleaving allocations across all nodes (BENCH_NUMA_INTERLEAVE=0 to disable)\n");
+			} else {
+				fprintf(stderr,
+					"NUMA: interleave requested but libnuma unavailable\n");
+			}
 		}
 	}
 
