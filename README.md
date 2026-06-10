@@ -580,46 +580,59 @@ a range fetch (ART-OLC/ROWEX `lookupRange`).
 
 ```sh
 BENCH_ITERATE=1 ./bench_scale_hotrowex 192
-LD_LIBRARY_PATH=urcu-build/src/.libs BENCH_ITERATE=1 \
-    bind9-src/build/tests/bench/bench_scale_ft 192
+LD_LIBRARY_PATH=urcu-build/src/.libs FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64 \
+    BENCH_ITERATE=1 bind9-src/build/tests/bench/bench_scale_ft 192
 ```
 
 Median of 3, next Mops/s — readers across the top:
 
 | Engine | 1 | 16 | 64 | 192 | traversal |
 |------------|------:|------:|-------:|-------:|:----------|
-| `hotrowex` |   176 |  2573 |  10437 | **27842** | contiguous leaf scan |
-| `b9qp`     |    91 |  1369 |   5444 |  11057 | RCU read snapshot |
-| `art`      |    29 |   345 |   1269 |   3472 | recursive callback |
-| `masstree` |    19 |   302 |   1193 |   2896 | B+tree leaf scan |
-| `artolc`   |    18 |   226 |    892 |   2575 | range-into-buffer |
-| `artrowex` |    15 |   223 |    789 |   2242 | range-into-buffer |
-| `judy`     |   6.0 |    84 |    335 |    989 | JSLN cursor |
-| `qp`       |   5.5 |    68 |    280 |    771 | Tnextl cursor |
-| `ft`       |   2.8 |    33 |    116 |    365 | cds_ft_next cursor |
+| **`ft`**   | **462** | **7367** | **29347** | **79417** | **batched cell gather, compacted (phys-next MLP)** |
+| `hotrowex` |   175 |  2540 |  9759 | 27471 | inlined header-template + contiguous leaves |
+| `b9qp`     |    91 |  1467 |   5851 |  15072 | `dns_qpiter` `.so` call + DFS-compacted chunks |
+| `art`      |    22 |   339 |   1243 |   3745 | recursive callback |
+| `masstree` |    19 |   261 |   1065 |   2972 | B+tree leaf scan |
+| `artolc`   |    18 |   224 |    840 |   2532 | range-into-buffer |
+| `artrowex` |    15 |   194 |    818 |   2227 | range-into-buffer |
+| `judy`     |   5.2 |    82 |    337 |    968 | JSLN cursor (materializes key) |
+| `qp`       |   4.3 |    65 |    263 |    785 | Tnextl cursor (materializes key) |
+
+**FT is now the fastest ordered iterator** — ~2.9× over hotrowex at 192T, a full
+reversal of the previous result (FT was *last*, 365 Mops/s). It got there in four
+steps, each measured on the same 1M-key set:
+
+| FT ordered-scan config | 192T Mops/s | what changed |
+|---|--:|:--|
+| `cds_ft_next` descent (pre-cell) | 352 | re-descend per step (the old result) |
+| + ordered cell list (`FT_ORD`) | 3736 | O(1) cell hop; cells still in insert order |
+| + compaction (`FT_BENCH_COMPACT`) | 19139 | cells packed in key order → contiguous walk |
+| + batched iterator (`FT_BATCH=64`) | 32389 | amortize the per-step `.so` call boundary |
+| + physical-next prediction (`cmm_ptr_eq`) | **79417** | break the dependent `ord_next` load → MLP |
 
 **Two findings.** (1) **Ordered iteration is embarrassingly parallel** — every
-engine scales near-linearly (≈120–165× from 1 to 192 threads): a full traversal
+engine scales near-linearly (~120–170× from 1 to 192 threads): a full traversal
 is read-only and touches no shared mutable state, so threads stream the structure
-independently, bounded mainly by memory bandwidth. (2) **Per-traversal speed
-spans ~60×**, split on *how* you advance: the bulk **leaf-scan / range** engines
-(HOTRowex, b9qp, ART, Masstree) walk contiguous leaves and run 5–60× faster than
-the **cursor** engines (Judy, qp, FT) that compute each successor by re-descending.
-**FT is the slowest ordered iterator** — a striking inversion of its point-lookup
-and mutation strength: `cds_ft_next` pays a per-step descent through the fractal
-trie where a B+tree or HOT just follows a leaf link. FT is tuned for point
-operations, not bulk ordered scans.
+independently, bounded mainly by memory bandwidth. (2) **What wins is contiguity
+plus a tight inner loop, not the data structure.** The old "cursor engines
+re-descend, so they lose" framing was an artifact of the *un-compacted,
+per-element* FT cursor. Once the cells are compacted (contiguous in key order) the
+walk is a leaf-scan in all but name; once the per-step library-call boundary is
+amortized by a batched fill, and the dependent `ord_next` load is broken by a
+`cmm_ptr_eq` physical-next prediction (the next cell is `cur + 32 B`, validated,
+so its body load issues off arithmetic rather than waiting on the pointer load),
+the gather pipelines (MLP) and streams faster than even HOTRowex's fully-inlined
+header-template scan. `b9qp` leads the non-FT engines on the strength of its
+DFS-compacted chunk layout despite paying an un-inlined `dns_qpiter_next` call per
+step — exactly the call boundary FT's batched iterator amortizes away.
 
-**Note — FT uses its *cached* iterator, the fast path.** The traversal runs
-under one continuous RCU read lock with the default `CDS_FT_ITER_CACHED` mode,
-so each `cds_ft_next` advances from the current position by backtracking up the
-*live parent chain* to the nearest ancestor with an unexplored child rather than
-re-descending from the root. The alternative `CDS_FT_ITER_UNCACHED` mode does a
-fresh top-down descent from the root *per step* (so the RCU read lock may be
-dropped between keys, e.g. for blocking work) and is substantially slower. FT's
-last-place numbers here are therefore already its *best* ordered-scan case, not a
-pessimal one — so the cursor-vs-leaf-scan gap above is not an artifact of an
-unfavorable iterator mode.
+**The cell scheme + compaction are required for the headline number.** It is the
+*batched, compacted* path (`FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64`, lib built
+`-DFEATURE_FT_ORD_CELL`); the plain `cds_ft_for_each_rcu` cursor on an
+un-compacted trie is ~20× slower (the 3736 row). Compaction trades RSS and a
+one-time pack for the scan speed, so it suits read-mostly / snapshot scans rather
+than churning tries. The batched walk is hidden behind a drop-in macro,
+`cds_ft_for_each_batched_rcu(ft, iter, node, buf, cap)`.
 
 (All engines visit the same ~995,830 unique keys — the generated DNS set has
 ~4,170 duplicates the dedup'ing tries collapse; ART keeps all 1,000,000 inserts,

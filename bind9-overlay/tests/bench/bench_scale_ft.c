@@ -83,6 +83,9 @@ static struct bench_arena ft_str_arena;
 /* Which churn keys are currently inserted, and the live entry for each. */
 static struct ft_entry *churn_entries[CHURN_KEYS];
 
+/* Ordered-iteration batch cap (FT_BATCH env): 0 = per-element cds_ft_next. */
+static int g_ft_batch;
+
 /* RCU callback: free an ft_entry after a grace period. */
 static void free_ft_entry_rcu(struct rcu_head *head)
 {
@@ -125,6 +128,12 @@ static void ft_build(void)
 		cds_ft_group_attr_set_key_len_offset(attr, FT_KEYLEN_OFFSET);
 		cds_ft_group_attr_set_ordered_list(attr);
 		fprintf(stderr, "[ft_build] ordered cell list ENABLED (FT_ORD)\n");
+	}
+	if (getenv("FT_BATCH")) {
+		g_ft_batch = atoi(getenv("FT_BATCH"));
+		if (g_ft_batch < 1) g_ft_batch = 1;
+		if (g_ft_batch > 1024) g_ft_batch = 1024;
+		fprintf(stderr, "[ft_build] batched iterate cap=%d (FT_BATCH)\n", g_ft_batch);
 	}
 	cds_ft_group_create(attr, &group);
 	cds_ft_group_attr_destroy(attr);
@@ -465,7 +474,9 @@ static void ft_cleanup_churn(void)
 		rcu_barrier();
 }
 
-/* Ordered-iteration op: one full in-order traversal under the RCU read lock. */
+/* Ordered-iteration op: one full in-order traversal under the RCU read lock.
+ * FT_BATCH=<n> uses the batched for-each (amortizes the per-step call boundary
+ * over n nodes via cds_ft_iter_next_batch); unset = per-step cds_ft_next. */
 static unsigned long ft_iterate(void *ctx)
 {
 	struct cds_ft_iter *iter;
@@ -474,8 +485,25 @@ static unsigned long ft_iterate(void *ctx)
 	(void)ctx;
 	cds_ft_iter_create(g_ft, &iter);
 	rcu_read_lock();
-	cds_ft_for_each_rcu(g_ft, iter)
-		n++;
+	if (g_ft_batch) {
+		struct cds_ft_node *node, *batch[1024];
+		size_t cap = (size_t) g_ft_batch;
+
+		if (getenv("FT_REVERSE")) {
+			cds_ft_for_each_reverse_batched_rcu(g_ft, iter, node, batch, cap) {
+				(void) node;
+				n++;
+			}
+		} else {
+			cds_ft_for_each_batched_rcu(g_ft, iter, node, batch, cap) {
+				(void) node;
+				n++;
+			}
+		}
+	} else {
+		cds_ft_for_each_rcu(g_ft, iter)
+			n++;
+	}
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
