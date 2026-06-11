@@ -21,6 +21,7 @@
 #include <sched.h>
 #include <numa.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 
 char  *str_keys[N_KEYS];
 size_t str_lens[N_KEYS];
@@ -141,6 +142,38 @@ static void bench_pin_to_cpu(int cpu)
 	CPU_SET(cpu, &set);
 	if (sched_setaffinity(0, sizeof(set), &set) != 0)
 		perror("bench: sched_setaffinity");
+}
+
+/*
+ * perf-stat gating.  When BENCH_PERF_CTL names the ctl FIFO of an external
+ *   perf stat -D -1 --control fifo:$BENCH_PERF_CTL,$BENCH_PERF_ACK -- ...
+ * write "enable"/"disable" around the timed window so perf counts ONLY the
+ * measured 3s, not build / prime / teardown.  Reads one ack line (from
+ * BENCH_PERF_ACK) to be sure perf applied the command before we proceed.
+ * No-op when BENCH_PERF_CTL is unset.
+ */
+static void bench_perf_ctl(const char *cmd)
+{
+	static int ctl_fd = -2, ack_fd = -2;
+	char buf[32];
+	int n;
+
+	if (ctl_fd == -2) {
+		const char *cp = getenv("BENCH_PERF_CTL");
+		const char *ap = getenv("BENCH_PERF_ACK");
+
+		ctl_fd = cp ? open(cp, O_WRONLY) : -1;
+		ack_fd = ap ? open(ap, O_RDONLY) : -1;
+	}
+	if (ctl_fd < 0)
+		return;
+	n = snprintf(buf, sizeof(buf), "%s\n", cmd);
+	if (write(ctl_fd, buf, n) != n)
+		return;
+	if (ack_fd >= 0) {
+		ssize_t r = read(ack_fd, buf, sizeof(buf));	/* sync on ack */
+		(void) r;
+	}
 }
 
 static void *reader_thread(void *arg)
@@ -419,9 +452,11 @@ static void mutator_run_bench(int nr_readers, double out[3])
 	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
 		usleep(1000);
 
+	bench_perf_ctl("enable");	/* count only the timed window */
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
 	usleep(DURATION_SEC * 1000000);
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+	bench_perf_ctl("disable");
 
 	for (int i = 0; i < nr_readers + 1; i++)
 		pthread_join(threads[i], NULL);
@@ -496,9 +531,11 @@ static double iterate_run_bench(int nr_readers)
 		usleep(1000);
 
 	uint64_t t0 = mono_ns();
+	bench_perf_ctl("enable");	/* count only the timed window */
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
 	usleep(DURATION_SEC * 1000000);
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+	bench_perf_ctl("disable");
 
 	for (int i = 0; i < nr_readers; i++)
 		pthread_join(threads[i], NULL);
