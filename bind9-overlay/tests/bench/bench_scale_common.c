@@ -117,18 +117,41 @@ static const struct bench_engine *g_eng;
 struct thread_arg {
 	unsigned long count;
 	uint64_t seed;
+	int cpu;
 };
 
 struct writer_arg {
 	unsigned long writes;
+	int cpu;
 };
+
+/*
+ * Pin the calling thread to one logical CPU.  Workers are pinned worker i ->
+ * CPU i; the sweep is capped at 192 threads and CPUs 0-191 are the first HW
+ * thread of each physical core (siblings live at 192-383), so this gives one
+ * thread per physical core with no SMT-sibling contention, matching load-names.
+ * Pin BEFORE engine setup / priming so first-touch allocations land on the
+ * pinned core's NUMA node.
+ */
+static void bench_pin_to_cpu(int cpu)
+{
+	cpu_set_t set;
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	if (sched_setaffinity(0, sizeof(set), &set) != 0)
+		perror("bench: sched_setaffinity");
+}
 
 static void *reader_thread(void *arg)
 {
 	struct thread_arg *ta = arg;
 	unsigned long count = 0;
 	uint64_t seed = ta->seed;
-	void *ctx = g_eng->reader_setup ? g_eng->reader_setup() : NULL;
+	void *ctx;
+
+	bench_pin_to_cpu(ta->cpu);
+	ctx = g_eng->reader_setup ? g_eng->reader_setup() : NULL;
 
 	/*
 	 * Cache-priming phase: on by default, set BENCH_NO_PRIME to skip it.
@@ -165,7 +188,10 @@ static void *writer_thread(void *arg)
 	struct writer_arg *wa = arg;
 	unsigned long writes = 0;
 	uint64_t seed = 99999;
-	void *ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
+	void *ctx;
+
+	bench_pin_to_cpu(wa->cpu);
+	ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
 
 	while (!start_flag)
 		__asm__ __volatile__("pause" ::: "memory");
@@ -208,10 +234,13 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 	for (int i = 0; i < nr_readers; i++) {
 		rargs[i].count = 0;
 		rargs[i].seed = 42 + (uint64_t)i * 1000;
+		rargs[i].cpu = i;
 		pthread_create(&threads[i], NULL, reader_thread, &rargs[i]);
 	}
-	if (!no_writer)
+	if (!no_writer) {
+		warg.cpu = nr_readers;	/* writer on the core past the readers */
 		pthread_create(&threads[nr_readers], NULL, writer_thread, &warg);
+	}
 
 	/*
 	 * Wait until every reader has finished any cache-priming warm-up pass
@@ -287,6 +316,7 @@ void *bench_arena_alloc(struct bench_arena *a, size_t sz, size_t align)
 struct mut_arg {
 	uint64_t ns[3];
 	uint64_t cnt[3];
+	int cpu;
 };
 
 static uint64_t mono_ns(void)
@@ -299,8 +329,11 @@ static uint64_t mono_ns(void)
 static void *mutator_thread(void *arg)
 {
 	struct mut_arg *ma = arg;
-	void *ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
+	void *ctx;
 	int nops = g_eng->no_remove ? 2 : 3;	/* skip REMOVE phase if unsupported */
+
+	bench_pin_to_cpu(ma->cpu);
+	ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
 	static const int order[3] = {
 		BENCH_OP_INSERT, BENCH_OP_REPLACE, BENCH_OP_REMOVE
 	};
@@ -377,8 +410,10 @@ static void mutator_run_bench(int nr_readers, double out[3])
 	for (int i = 0; i < nr_readers; i++) {
 		rargs[i].count = 0;
 		rargs[i].seed = 42 + (uint64_t)i * 1000;
+		rargs[i].cpu = i;
 		pthread_create(&threads[i], NULL, reader_thread, &rargs[i]);
 	}
+	ma.cpu = nr_readers;	/* mutator on the core past the readers */
 	pthread_create(&threads[nr_readers], NULL, mutator_thread, &ma);
 
 	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
@@ -414,7 +449,10 @@ static void *iterate_reader_thread(void *arg)
 {
 	struct thread_arg *ta = arg;
 	unsigned long count = 0;
-	void *ctx = g_eng->reader_setup ? g_eng->reader_setup() : NULL;
+	void *ctx;
+
+	bench_pin_to_cpu(ta->cpu);
+	ctx = g_eng->reader_setup ? g_eng->reader_setup() : NULL;
 
 	if (getenv("BENCH_NO_PRIME") == NULL) {
 		unsigned long visited = g_eng->iterate(ctx);	/* one warm traversal */
@@ -450,6 +488,7 @@ static double iterate_run_bench(int nr_readers)
 	for (int i = 0; i < nr_readers; i++) {
 		rargs[i].count = 0;
 		rargs[i].seed = 42 + (uint64_t)i * 1000;
+		rargs[i].cpu = i;
 		pthread_create(&threads[i], NULL, iterate_reader_thread, &rargs[i]);
 	}
 
@@ -532,7 +571,7 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	 * read-scaling sweep.
 	 */
 	if (getenv("BENCH_MUTATOR") != NULL && eng->writer_op != NULL) {
-		int reader_counts[] = { 0, 1, 2, 4, 8, 16, 32, 64, 128, 191 };
+		int reader_counts[] = { 0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 191 };
 		size_t nrc = sizeof(reader_counts) / sizeof(reader_counts[0]);
 		printf("# readers insert_kops replace_kops remove_kops\n");
 		fflush(stdout);
@@ -553,7 +592,7 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	 * a full in-order traversal; aggregate next-op throughput.  Read-only.
 	 */
 	if (getenv("BENCH_ITERATE") != NULL && eng->iterate != NULL) {
-		int counts[] = { 1, 2, 4, 8, 16, 32, 64, 128, 192 };
+		int counts[] = { 1, 2, 4, 8, 16, 32, 64, 96, 128, 192 };
 		size_t nrc = sizeof(counts) / sizeof(counts[0]);
 		printf("# readers next_mops\n");
 		fflush(stdout);
@@ -570,12 +609,40 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	printf("# readers read_mops write_kops\n");
 	fflush(stdout);
 
-	int thread_counts[] = {1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 383};
+	/*
+	 * Reserve a core for the writer thread only when there is one
+	 * (BENCH_NO_WRITER drops it).  This lets each sweep fill the 192
+	 * physical cores exactly, with no SMT oversubscription:
+	 *   - read/write (1 active writer): readers stop at 191 (191 + 1 = 192)
+	 *   - read-only  (BENCH_NO_WRITER):  readers reach 192
+	 * The shared list carries both 191 and 192; the guard picks the right
+	 * top per mode.
+	 */
+	int no_writer = (getenv("BENCH_NO_WRITER") != NULL);
+	int writer_slots = no_writer ? 0 : 1;
+	int thread_counts[] = {1, 2, 4, 8, 16, 32, 64, 96, 128, 191, 192, 256, 383};
 	int nr_counts = sizeof(thread_counts) / sizeof(thread_counts[0]);
+
+	/*
+	 * BENCH_THREADS=N: run a single reader count instead of the sweep --
+	 * one clean timed window for perf-stat / profiling (mirrors load-names).
+	 */
+	const char *bt = getenv("BENCH_THREADS");
+	if (bt) {
+		int nt = atoi(bt);
+		double r, w;
+
+		if (nt > 0 && nt + writer_slots <= max_threads) {
+			run_bench(nt, &r, &w);
+			printf("%d %.1f %.1f\n", nt, r, w);
+			fflush(stdout);
+		}
+		return 0;
+	}
 
 	for (int ti = 0; ti < nr_counts; ti++) {
 		int nt = thread_counts[ti];
-		if (nt + 1 > max_threads)	/* +1 for the writer */
+		if (nt + writer_slots > max_threads)	/* + writer thread, if any */
 			break;
 
 		double r, w;
