@@ -85,6 +85,20 @@ static struct ft_entry *churn_entries[CHURN_KEYS];
 
 /* Ordered-iteration batch cap (FT_BATCH env): 0 = per-element cds_ft_next. */
 static int g_ft_batch;
+/*
+ * Reader lookup-mode toggles (NUMA leaf-sensitivity A/B):
+ *   BENCH_FT_CAND  -> cds_ft_lookup_candidate_key (no validating memcmp)
+ *   BENCH_FT_EAGER -> build the EAGER encoding (descent compares bytes inline)
+ */
+static int g_ft_cand;
+static int g_ft_eager;
+/*
+ * BENCH_FT_NO_READER_QS: skip the reader's per-batch rcu_quiescent_state().
+ * ONLY valid in readers-only (BENCH_NO_WRITER) mode -- with no writer there is
+ * no grace period to advance, so the reader need not quiesce.  Diagnostic for
+ * the QSBR-vs-memb reader gap (isolates the quiescent-state path).
+ */
+static int g_no_reader_qs;
 
 /* RCU callback: free an ft_entry after a grace period. */
 static void free_ft_entry_rcu(struct rcu_head *head)
@@ -102,12 +116,22 @@ static void ft_build(void)
 	cds_ft_group_attr_set_max_key_len(attr, 256);
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	/*
-	 * Speculative lookup optimization; the reader uses
-	 * cds_ft_speculative_lookup_key (ft_spec), which validates the candidate
-	 * with a library-side memcmp at FT_KEY_OFFSET (see ft_reader_batch).
+	 * Lookup optimization: SPECULATIVE by default (blind descent + one
+	 * end-of-walk memcmp at FT_KEY_OFFSET; see ft_reader_batch).  BENCH_FT_EAGER
+	 * builds the EAGER encoding instead (compressed bytes compared inline during
+	 * descent) -- a descent-heavier, less leaf-read-dominated profile for the
+	 * NUMA leaf-sensitivity A/B.
 	 */
+	g_ft_eager = (getenv("BENCH_FT_EAGER") != NULL);
+	g_ft_cand = (getenv("BENCH_FT_CAND") != NULL);
+	g_no_reader_qs = (getenv("BENCH_FT_NO_READER_QS") != NULL);
 	cds_ft_group_attr_set_lookup_optimization(attr,
-		CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+		g_ft_eager ? CDS_FT_LOOKUP_OPTIMIZE_EAGER
+			   : CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE);
+	if (g_ft_eager)
+		fprintf(stderr, "[ft_build] EAGER lookup optimization (BENCH_FT_EAGER)\n");
+	if (g_ft_cand)
+		fprintf(stderr, "[ft_build] CANDIDATE lookup, no validation (BENCH_FT_CAND)\n");
 	/*
 	 * Leaf-key capture offset: makes the ordered-iteration path
 	 * (cds_ft_for_each_rcu -> cds_ft_next -> limit-none inequality) run the
@@ -147,6 +171,20 @@ static void ft_build(void)
 	}
 	bench_arena_init(&ft_str_arena, arena_bytes);
 
+	/*
+	 * Build the trie with the builder thread OFFLINE.  The build has exclusive
+	 * access (no readers/writer spawned yet), so it needs no RCU read-side
+	 * protection at all -- and going offline lets the per-CPU call_rcu workers
+	 * reclaim the inserts' node-restructuring frees PROMPTLY.  The node
+	 * allocator then recycles those freed slots instead of bump-allocating
+	 * fresh ones, keeping the final internal-node layout compact for better
+	 * descent cache locality.  An ONLINE builder under QSBR stalls those grace
+	 * periods between its occasional quiescent states, so reclaim lags and the
+	 * live nodes scatter across a larger region -- a per-read penalty paid for
+	 * the whole sweep.  No-op under membarrier (whose GPs never wait on the
+	 * builder), so this only changes the QSBR build.
+	 */
+	rcu_thread_offline();
 	for (unsigned int i = 0; i < N_KEYS; i++) {
 		struct cds_ft_node *result;
 		struct ft_entry *e = bench_arena_alloc(&ft_str_arena,
@@ -155,10 +193,9 @@ static void ft_build(void)
 		e->key_len = str_lens[i];
 		cds_ft_insert_unique(g_ft, (const uint8_t *)str_keys[i],
 			str_lens[i], &e->ft_node, &result);
-		if ((i & 1023) == 0)
-			rcu_quiescent_state();
 	}
-	rcu_quiescent_state();
+	/* Back online for the read-side self-check + (optional) compaction below. */
+	rcu_thread_online();
 
 	/*
 	 * Self-check: a present key must resolve via the speculative path, i.e.
@@ -202,15 +239,19 @@ static void ft_build(void)
 	 */
 	rcu_thread_offline();
 	/*
-	 * Flush the compaction's deferred cell/node frees BEFORE the timed sweep
-	 * (mirrors ft_cleanup_churn).  Without this, the ~nproc per-CPU call_rcu
-	 * worker threads churn through ~N_KEYS pending frees DURING the sweep,
-	 * stealing cores from the iterate threads and capping MT throughput (and
-	 * leaving the drained old cell ranges mapped -- inflated RSS).  Done after
-	 * going offline so an online idle main can't stall the grace period.
+	 * Flush ALL deferred call_rcu frees BEFORE the timed sweep: both the plain
+	 * insert build's node-restructuring frees and (if compacted) the compaction's
+	 * cell/node frees.  Without this, the ~nproc per-CPU call_rcu worker threads
+	 * churn through the pending frees DURING the timed window -- stealing cores
+	 * from the reader/iterate threads (capping MT throughput, adding variance) and
+	 * leaving freed ranges mapped (inflated RSS).  UNCONDITIONAL: the non-
+	 * compacting build defers frees too, so it needs the drain just as much (the
+	 * barrier was previously gated on FT_BENCH_COMPACT, leaving the common build
+	 * to drain mid-measurement).  Done after going offline so an online idle main
+	 * can't stall the grace period.
 	 */
-	if (do_compact)
-		rcu_barrier();
+	(void) do_compact;
+	rcu_barrier();
 }
 
 static void *ft_reader_setup(void)
@@ -241,9 +282,14 @@ static void ft_reader_batch(void *ctx, uint64_t *seed)
 		 * key_readable_pad = str_lens[idx] matches the prior candidate
 		 * call's descent behavior; FT_KEY_OFFSET locates the stored key.
 		 */
-		cds_ft_speculative_lookup_key(g_ft,
-			(const uint8_t *)str_keys[idx],
-			str_lens[idx], str_lens[idx], FT_KEY_OFFSET, &found);
+		if (g_ft_cand)
+			cds_ft_lookup_candidate_key(g_ft,
+				(const uint8_t *)str_keys[idx],
+				str_lens[idx], str_lens[idx], &found);
+		else
+			cds_ft_speculative_lookup_key(g_ft,
+				(const uint8_t *)str_keys[idx],
+				str_lens[idx], str_lens[idx], FT_KEY_OFFSET, &found);
 		if (found) {
 			/*
 			 * Force-read the validated leaf's first byte: prevents
@@ -258,13 +304,27 @@ static void ft_reader_batch(void *ctx, uint64_t *seed)
 	}
 	rcu_read_unlock();
 	ft_reader_sink = acc;
-	rcu_quiescent_state();
+	if (!g_no_reader_qs)
+		rcu_quiescent_state();
 }
 
 static void *ft_writer_setup(void)
 {
 	struct cds_ft_iter *ft_iter;
 	rcu_register_thread();
+	/*
+	 * The writer mutates under g_ft_mutex and never reads under RCU (its
+	 * cds_ft_lookup walks live nodes it has not removed yet), so it has no
+	 * reason to be an online QSBR reader.  Stay OFFLINE for the whole churn:
+	 * an online writer that only quiesces occasionally blocks every QSBR
+	 * grace period, postponing call_rcu reclaim -- freed entries pile up and
+	 * each insert calloc's fresh memory instead of recycling, scattering the
+	 * working set and hurting both writer and reader locality.  Offline, the
+	 * per-CPU call_rcu helpers run grace periods without waiting on us, so
+	 * reclaim is prompt -- matching membarrier (where the writer never blocks
+	 * GPs).  No-op under membarrier.  call_rcu from an offline thread is fine.
+	 */
+	rcu_thread_offline();
 	cds_ft_iter_create(g_ft, &ft_iter);
 	return ft_iter;
 }
@@ -272,6 +332,7 @@ static void *ft_writer_setup(void)
 static void ft_writer_teardown(void *ctx)
 {
 	cds_ft_iter_destroy((struct cds_ft_iter *)ctx);
+	rcu_thread_online();		/* online before unregister */
 	rcu_unregister_thread();
 }
 
@@ -333,8 +394,7 @@ static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 		pthread_mutex_unlock(&g_ft_mutex);
 	}
 
-	if (writes % 1000 == 0)
-		rcu_quiescent_state();
+	(void) writes;	/* writer is rcu_thread_offline(); no quiescent state to report */
 }
 
 /* Remove the entry currently mapped at churn key @idx (must be present). */
@@ -414,9 +474,7 @@ static void ft_writer_op(void *ctx, int op, unsigned int idx)
 		break;
 	}
 	pthread_mutex_unlock(&g_ft_mutex);
-
-	if ((idx & 1023) == 0)
-		rcu_quiescent_state();
+	/* writer is rcu_thread_offline(); no quiescent state to report */
 }
 
 static void ft_run_reset(void)
@@ -470,8 +528,15 @@ static void ft_cleanup_churn(void)
 	 * blocks while online would stall the very grace period it waits on.
 	 */
 	rcu_thread_offline();
-	if (do_compact)
-		rcu_barrier();
+	/*
+	 * Flush the run's deferred call_rcu frees (this churn's insert/remove
+	 * toggling, plus any compaction frees) BEFORE the next thread-count point,
+	 * so the per-CPU call_rcu workers are quiescent for its timed window.
+	 * UNCONDITIONAL for the same reason as the post-build barrier: the churn
+	 * defers frees whether or not we recompact.
+	 */
+	(void) do_compact;
+	rcu_barrier();
 }
 
 /* Ordered-iteration op: one full in-order traversal under the RCU read lock.
