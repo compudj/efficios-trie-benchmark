@@ -371,46 +371,63 @@ freshly-shaped trie rather than one progressively fragmented by churn (closer
 to BIND9-QP, which stays compact via `dns_qp_compact`). It affects
 throughput/shape, not the reported RSS (sampled once after build).
 
-### Result — FT (RCU) vs HOTRowex (ROWEX) at scale
+### Result — read throughput vs reader threads
 
-Read throughput (1M DNS keys, 1 writer + N readers, priming on, **median of 10
-runs** per point) on the same 2× EPYC 9654 / 192-physical-core box as the
-`load-names` result above, worker `i` pinned to core `i`. Both engines are on
-**equal footing**: each stores its lookup keys as copies in a dense
-`bench_arena` external-node region (FT: the `ft_entry` embedding the
-`cds_ft_node`; HOTRowex: the byte copies its values point at — *not* pointers
-into the shared query buffer), the FT reader uses the validating
-`cds_ft_speculative_lookup_key` (`ft_spec`), and both force-read the returned
-leaf, so each lookup pays a real validating compare against cold memory that is
-never dead-code-eliminated.
+Read throughput on 1M DNS keys (priming on), **threads pinned one per physical
+core** (worker `i` → CPU `i`, so the 192-thread points fill the 2× EPYC 9654's
+192 physical cores with no SMT-sibling contention), on the same box as the
+`load-names` result above. All engines are on **equal footing**: each stores its
+lookup keys as copies in a dense `bench_arena` external-node region (FT: the
+`ft_entry` embedding the `cds_ft_node`; HOTRowex / Masstree / ART: the byte
+copies their values point at — *not* pointers into the shared query buffer),
+every reader validates (FT via `cds_ft_speculative_lookup_key`, ART via
+`loadKey`, HOT via `contentEquals`) and force-reads the returned leaf, so each
+lookup pays a real validating compare against cold memory that is never
+dead-code-eliminated. Two workloads, each filling all 192 cores:
 
-| Readers | `ft` (FT spec) Mops/s | `hotrowex` Mops/s † | HOTRowex vs FT |
-|--------:|----------------------:|--------------------:|---------------:|
-| 64      | 152                   | 194                 | ≈ 1.3×         |
-| 128     | 244                   | 336                 | ≈ 1.4×         |
-| 192     | 287 ‡                 | 446                 | ≈ 1.55×        |
-| RSS     | 245 MB                | **110 MB**          | ≈ ½ the memory |
+**1 writer + N readers** — a writer churns insert/remove the whole window;
+readers cap at 191 so reader + writer = 192 threads. Medians (5–10 runs/cell), read Mops/s:
 
-HOTRowex's lock-free optimistic reads pull further ahead as cores climb
-(1.3× → 1.55×); on top of that it runs in ≈ half the RSS.
+| Readers | `ft` | `ft_qsbr` | `hotrowex` † | `artolc` | `artrowex` | `masstree` |
+|--------:|-----:|----------:|-------------:|---------:|-----------:|-----------:|
+| 64  | 160 | 166 | 177 | 127 | 123 | 116 |
+| 96  | 226 | 234 | 252 | 188 | 182 | 171 |
+| 128 | 286 | 290 | 320 | 250 | 243 | 227 |
+| 191 | 380 | 377 | **426** | 367 | 356 | 330 |
+| RSS | 320 MB | 320 MB | **110 MB** | 141 MB | 141 MB | 185 MB |
 
-‡ Medians of 10 runs. HOTRowex (192-core reps 431–453) and FT-QSBR (252–262) are
-tight and well-converged; **FT under membarrier stays noisy** (267–354, median
-287) — its occasional highs are luck, not capability, so best-of would flatter
-it. FT-QSBR's median is 256, so HOTRowex leads it by ≈ 1.7× at 192.
+**Readers only** (`BENCH_NO_WRITER`, no concurrent mutation; readers reach 192).
+Median of 7, read Mops/s:
 
-> **Earlier drafts of this result were built on unfair measurements.** Two bugs,
-> both now fixed: (1) the FT reader left its result unused, so the compiler
-> dead-code-eliminated the validating memcmp — it was really timing `ft_cand`,
-> the *unvalidated* candidate lookup (it read ~431 Mops/s); and (2) HOTRowex
-> stored pointers straight into the shared query buffer, so its `contentEquals`
-> validated against already-hot memory for free and kept no key copies (79 MB,
-> ~699 Mops/s). The intermediate half-fix (FT validated but in *scattered*
-> calloc, HOTRowex still zero-copy) swung the other way to ~2.5×. With both
-> engines validated **and** both storing key copies in a dense arena, FT-spec
-> settled at ≈ 287 Mops/s and HOTRowex at ≈ 446 (RSS 79 → 110 MB): an honest
-> ≈ 1.55× read gap plus ≈ ½ the RSS. (The original 1.6× ratio was coincidentally
-> close — both numbers were inflated by roughly the same factor.)
+| Readers | `ft` | `ft_qsbr` | `hotrowex` | `artolc` | `artrowex` | `masstree` |
+|--------:|-----:|----------:|-----------:|---------:|-----------:|-----------:|
+| 64  | 166 | 173 | 179 | 129 | 127 | 116 |
+| 96  | 236 | 248 | 259 | 192 | 188 | 172 |
+| 128 | 298 | 301 | 323 | 255 | 251 | 228 |
+| 192 | 396 | 393 | **431** | 378 | 372 | 333 |
+
+At 192 the order is **HOTRowex > FT ≈ FT-QSBR > ART-OLC > ART-ROWEX > Masstree**.
+HOTRowex leads reads (~1.08× over FT) and footprint (110 MB), but FT is a close
+second and **ahead of all three ART/Masstree variants** — and it is the only
+engine doing full concurrent insert **and** remove under RCU (HOTRowex's ROWEX
+has no concurrent delete; it churns by `upsert`). FT's higher RSS (320 MB) is
+dominated by the default-on ordered-list cells (32 B/key of update-side state
+the point-lookup reader never touches), not the descent working set.
+
+> **This result depended on getting the measurement right.** On top of the
+> earlier fairness fixes — every reader now *validates* against a key copy in a
+> dense arena (an un-validated reader once let the compiler dead-code-eliminate
+> the compare; HOTRowex once stored pointers into the shared query buffer and
+> kept no copies) — three later bench bugs had made FT look *last*, all now
+> fixed: (1) **no thread pinning** — unpinned, the scheduler stacked readers on
+> SMT siblings and left physical cores idle, and FT's larger footprint paid the
+> contention most; (2) under QSBR the **churn writer ran online**, stalling the
+> grace periods that reclaim removed nodes; and (3) `rcu_barrier()` was **gated
+> on `FT_BENCH_COMPACT`**, so a plain build's deferred node frees drained
+> *during* the timed window, stealing cores from the readers. Pinning
+> one-thread-per-core plus a fully offline, promptly-reclaimed FT build erased a
+> spurious ~13% QSBR gap and a larger SMT-contention penalty, lifting FT from
+> last to a close second.
 
 > **† HOTRowex (ROWEX) does not support `remove`.** Upstream HOT's concurrent
 > ROWEX variant implements lookup / scan / insert / `upsert` only — there is no
@@ -421,33 +438,34 @@ it. FT-QSBR's median is 256, so HOTRowex leads it by ≈ 1.7× at 192.
 > but its workload is strictly easier on the write path. The Fractal Trie
 > supports full concurrent insert **and** remove under RCU.
 
-**RCU flavor is not the variable.** `bench_scale_ft` uses liburcu's membarrier
-flavor; `bench_scale_ft_qsbr` is the identical engine built `-DBENCH_FT_QSBR`
-against the QSBR flavor (its only diff — see `bench_scale_ft.c`). QSBR has the
-cheapest possible read side (`rcu_read_lock`/`rcu_read_unlock` compile to
-nothing), yet the two are within ~12% (192-core medians of 10: memb ≈ 287, QSBR
-≈ 256) — membarrier slightly higher but much noisier (reps 267–354), QSBR tight
-(252–262) and more reproducible. Expected: the reader brackets one
-`rcu_read_lock`/`unlock` pair around a whole 1000-lookup batch, so the read-side
-cost is amortized to ~nothing under membarrier too, and the `call_rcu` writer
-makes grace periods (and membarrier's broadcast IPIs) infrequent — so flavor
-barely moves the throughput, it mostly affects the variance. (QSBR does demand a stricter
-discipline: its otherwise-idle main thread must go `rcu_thread_offline()` across
-each timed window or it would stall every grace period — handled in `ft_build` /
-`ft_cleanup_churn`.)
+**RCU flavor is genuinely not the variable.** `bench_scale_ft` (membarrier) and
+`bench_scale_ft_qsbr` (`-DBENCH_FT_QSBR`, QSBR — its only diff) now read **within
+~1%** of each other at every thread count (readers-only @192: memb 396, QSBR 393,
+overlapping distributions). That is the expected result — the reader brackets one
+`rcu_read_lock`/`unlock` pair around a whole 1000-lookup batch, so the read side
+is amortized to ~nothing under both flavors. An earlier ~13% QSBR deficit was
+*not* the flavor but a benchmark artifact: under QSBR an online registered thread
+stalls grace periods, so deferred frees piled up and the FT node layout
+scattered. The fix is uniform discipline now applied to both: the exclusive FT
+build **and** the churn writer run `rcu_thread_offline()` (they hold the writer
+lock and never read under RCU), and `rcu_barrier()` drains the deferred frees
+before each timed window — so QSBR's grace periods are never stalled and its
+layout is as compact as membarrier's.
 
-**NUMA interleaving does not help this benchmark.** `BENCH_NUMA_INTERLEAVE`
-spreads each engine's keys + arena across all NUMA nodes
-(`numa_set_interleave_mask`); at 192 cores it is a wash and at low thread counts
-it *hurts*, because this writer-contended workload is latency-bound
-pointer-chasing, not bandwidth-bound — the opposite of `load-names`' read-only
-`ft_spec_il`, where an interleaved arena wins at ≥128 threads. Left off by
-default; the numbers above are non-interleaved.
+**NUMA interleaving is a wash here.** `BENCH_NUMA_INTERLEAVE` (default on,
+`numa_set_interleave_mask`) spreads each engine's keys + arena across all 24
+nodes. With threads pinned one-per-core, an interleave on/off A/B is within
+run-to-run noise at every thread count for this latency-bound pointer-chase —
+neither helps nor hurts. (Contrast `load-names`' read-only `ft_spec_il`, where an
+interleaved arena wins at ≥128 threads, and the bandwidth-bound ordered-iteration
+sweep, where it is a 10-20× swing.) FT keeps its own 2 MiB-coarse arena
+interleave either way; opt out of the process interleave with
+`BENCH_NUMA_INTERLEAVE=0`.
 
-### Adding Masstree, ART-OLC and ART-ROWEX
+### The non-FT concurrent structures
 
-More concurrent structures join the sweep on the same fair footing (key
-copies in the dense arena, validated descent, force-read leaf):
+The four non-FT engines in the tables above join the sweep on the same fair
+footing (key copies in the dense arena, validated descent, force-read leaf):
 
 - `bench_scale_masstree` — **Masstree** (Mao/Kohler/Morris, EuroSys'12;
   kohler/masstree-beta, MIT): a B+tree of tries, optimistic version-validated
@@ -471,23 +489,15 @@ copies in the dense arena, validated descent, force-read leaf):
   (`artrowex`); its vendored sources are byte-identical to upstream, and its
   Epoche object coexists with ART-OLC's via weak/COMDAT symbols.
 
-Medians of 5, reads (Mops/s):
-
-| Readers | `ft_spec` | `masstree` | `artolc` | `artrowex` | `hotrowex` |
-|--------:|----------:|-----------:|---------:|-----------:|-----------:|
-| 64      | 157       | 118        | 132      | 123        | **179**    |
-| 128     | 236       | 232        | 255      | 242        | **328**    |
-| 192     | 280       | 330        | 376      | 356        | **439**    |
-
-At 192 the order is **HOTRowex (439) > ART-OLC (376) > ART-ROWEX (356) >
-Masstree (330) > FT-spec (280)** — all five scale, none dominates every axis.
-(Unlike load-names, here ART-ROWEX trails ART-OLC slightly: this random-access
-write/read churn keeps a writer constantly touching nodes, so ROWEX readers pay
-the node-exclusion wait more often than they save on avoided restarts.) HOTRowex
-leads reads and footprint (110 MB); ART-OLC, ART-ROWEX and Masstree slot above
-ft_spec on reads (RSS ~144 MB for both ARTs, 184 for Masstree); Masstree has the
-fastest insert/remove churn (~5000 vs ART-OLC ~1850 vs FT ~500 Kops/s); FT alone
-does full concurrent insert **and** remove under RCU with the lowest read-side
+Their per-engine read numbers are in the two tables above. Two notes on the
+writer workload: unlike `load-names`, here **ART-ROWEX trails ART-OLC** slightly
+— the random-access write/read churn keeps a writer constantly touching nodes,
+so ROWEX readers pay the node-exclusion wait more often than they save on avoided
+restarts. And the engines differ sharply on **mutator** throughput: Masstree has
+the fastest insert/remove churn (~5000 Kops/s), then ART-OLC (~1850) and FT
+(~500); HOTRowex's ROWEX has no concurrent `remove` at all. So FT trades a modest
+read deficit (~1.08× behind HOTRowex) and a larger RSS for being the only engine
+with full concurrent insert **and** remove under RCU at the lowest read-side
 cost.
 
 ### Mutator throughput vs reader concurrency
