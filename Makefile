@@ -57,8 +57,14 @@ ART_CF   := -O3 -DNDEBUG -march=native -mpopcnt -Wall
 
 BENCHES := bench_one_st
 
+# Standalone scale engines (built into the repo root, no bind9 clone needed) and
+# the separate GPL wormhole binary.  The bind9-built scale engines (ft, ft_qsbr,
+# b9qp, art, judy, qp) require a bind9 checkout and stay under `make bind9`.
+SCALE_BENCHES := bench_scale_hotrowex bench_scale_masstree \
+                 bench_scale_artolc bench_scale_artrowex
+
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9
-all: $(BENCHES)
+all: $(BENCHES) $(SCALE_BENCHES) bench_wormhole_gpl
 
 # HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
 # via a small extern "C" shim (src/bench_hot.cpp).  Needs AVX2+BMI2 (covered by
