@@ -112,6 +112,17 @@ static void ft_build(void)
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 
+	/*
+	 * The whole construction (group create, inserts, restructuring frees) has
+	 * exclusive access -- no readers/writer exist yet -- so run it ALL with the
+	 * builder OFFLINE.  An online QSBR builder blocks the grace periods that
+	 * reclaim deferred node frees, so the node allocator bump-allocates fresh
+	 * slots instead of recycling, scattering the layout.  Online again only for
+	 * the read-side self-check + optional compaction below.  No-op under
+	 * membarrier.
+	 */
+	rcu_thread_offline();
+
 	cds_ft_group_attr_create(&attr);
 	cds_ft_group_attr_set_max_key_len(attr, 256);
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
@@ -171,20 +182,7 @@ static void ft_build(void)
 	}
 	bench_arena_init(&ft_str_arena, arena_bytes);
 
-	/*
-	 * Build the trie with the builder thread OFFLINE.  The build has exclusive
-	 * access (no readers/writer spawned yet), so it needs no RCU read-side
-	 * protection at all -- and going offline lets the per-CPU call_rcu workers
-	 * reclaim the inserts' node-restructuring frees PROMPTLY.  The node
-	 * allocator then recycles those freed slots instead of bump-allocating
-	 * fresh ones, keeping the final internal-node layout compact for better
-	 * descent cache locality.  An ONLINE builder under QSBR stalls those grace
-	 * periods between its occasional quiescent states, so reclaim lags and the
-	 * live nodes scatter across a larger region -- a per-read penalty paid for
-	 * the whole sweep.  No-op under membarrier (whose GPs never wait on the
-	 * builder), so this only changes the QSBR build.
-	 */
-	rcu_thread_offline();
+	/* Builder is already offline (see top of ft_build) -> prompt reclaim. */
 	for (unsigned int i = 0; i < N_KEYS; i++) {
 		struct cds_ft_node *result;
 		struct ft_entry *e = bench_arena_alloc(&ft_str_arena,
