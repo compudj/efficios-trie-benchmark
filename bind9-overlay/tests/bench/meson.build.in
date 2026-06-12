@@ -93,10 +93,13 @@ bench_threads_dep = dependency('threads')
 # bench_scale_common.c can interleave allocations across NUMA nodes
 # (BENCH_NUMA_INTERLEAVE); every bench_scale_* engine links it, so all need libnuma.
 bench_numa_dep = meson.get_compiler('c').find_library('numa')
+# bench_topology.c pins one worker per physical core (no SMT siblings) via hwloc,
+# regardless of host topology; load-names and every bench_scale_* engine link it.
+bench_hwloc_dep = dependency('hwloc')
 
 executable(
     'load-names',
-    files('load-names.c'),
+    files('load-names.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     sources: default_sanitize_options,
@@ -124,6 +127,7 @@ executable(
         libdns_dep,
         libns_dep,
         libtest_dep,
+        bench_hwloc_dep,
     ],
 )
 executable(
@@ -157,12 +161,12 @@ executable(
 
 executable(
     'bench_scale_ft',
-    files('bench_scale_ft.c', 'bench_scale_common.c'),
+    files('bench_scale_ft.c', 'bench_scale_common.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
-    dependencies: [urcu_ft_dep, bench_threads_dep, bench_numa_dep],
+    dependencies: [urcu_ft_dep, bench_threads_dep, bench_numa_dep, bench_hwloc_dep],
 )
 
 # QSBR build of the very same FT engine source — only the RCU flavor differs
@@ -170,53 +174,53 @@ executable(
 # this isolates read-side flavor cost: ft (membarrier) vs ft_qsbr (QSBR).
 executable(
     'bench_scale_ft_qsbr',
-    files('bench_scale_ft.c', 'bench_scale_common.c'),
+    files('bench_scale_ft.c', 'bench_scale_common.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     c_args: ['-DBENCH_FT_QSBR'],
-    dependencies: [urcu_ft_qsbr_dep, bench_threads_dep, bench_numa_dep],
+    dependencies: [urcu_ft_qsbr_dep, bench_threads_dep, bench_numa_dep, bench_hwloc_dep],
 )
 
 executable(
     'bench_scale_judy',
-    files('bench_scale_judy.c', 'bench_scale_common.c'),
+    files('bench_scale_judy.c', 'bench_scale_common.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
-    dependencies: [bench_threads_dep, bench_numa_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep, bench_hwloc_dep],
     link_args: ['-lJudy'],
 )
 
 executable(
     'bench_scale_qp',
-    files('bench_scale_qp.c', 'bench_scale_common.c', 'Tbl.c', 'qp.c'),
+    files('bench_scale_qp.c', 'bench_scale_common.c', 'bench_topology.c', 'Tbl.c', 'qp.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     c_args: ['-w'],
     override_options: ['werror=false'],
-    dependencies: [bench_threads_dep, bench_numa_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep, bench_hwloc_dep],
 )
 
 executable(
     'bench_scale_art',
-    files('bench_scale_art.c', 'bench_scale_common.c', 'art.c'),
+    files('bench_scale_art.c', 'bench_scale_common.c', 'bench_topology.c', 'art.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
     sources: default_sanitize_options,
     c_args: ['-w'],
     override_options: ['werror=false'],
-    dependencies: [bench_threads_dep, bench_numa_dep],
+    dependencies: [bench_threads_dep, bench_numa_dep, bench_hwloc_dep],
 )
 
 executable(
     'bench_scale_b9qp',
-    files('bench_scale_b9qp.c', 'bench_scale_common.c'),
+    files('bench_scale_b9qp.c', 'bench_scale_common.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     include_directories: include_directories('.'),
@@ -228,6 +232,7 @@ executable(
         libns_dep,
         libtest_dep,
         bench_numa_dep,
+        bench_hwloc_dep,
     ],
 )
 

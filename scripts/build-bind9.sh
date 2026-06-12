@@ -51,7 +51,10 @@ cp "$OV/load-names.c" "$OV/qpmulti_ft.c" "$DEST/"
 cp "$REPO/src/load_names_hotrowex.cpp" "$REPO/src/load_names_masstree.cpp" \
    "$REPO/src/load_names_artolc.cpp" "$REPO/src/load_names_artrowex.cpp" "$DEST/"
 # Per-engine read/write scaling benchmark: shared driver + one file per engine.
+# bench_topology.{c,h} = shared hwloc one-PU-per-core worker pinning (load-names
+# and every bench_scale_* engine link it).
 cp "$OV/bench_scale_common.h" "$OV/bench_scale_common.c" \
+   "$OV/bench_topology.h"   "$OV/bench_topology.c" \
    "$OV/bench_scale_ft.c"   "$OV/bench_scale_judy.c" "$OV/bench_scale_qp.c" \
    "$OV/bench_scale_art.c"  "$OV/bench_scale_b9qp.c"  "$DEST/"
 cp "$REPO/third_party/qp-trie/Tbl.c" "$REPO/third_party/qp-trie/Tbl.h" \

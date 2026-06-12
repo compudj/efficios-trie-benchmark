@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #endif
 #include "bench_scale_common.h"
+#include "bench_topology.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,21 +128,17 @@ struct writer_arg {
 };
 
 /*
- * Pin the calling thread to one logical CPU.  Workers are pinned worker i ->
- * CPU i; the sweep is capped at 192 threads and CPUs 0-191 are the first HW
- * thread of each physical core (siblings live at 192-383), so this gives one
- * thread per physical core with no SMT-sibling contention, matching load-names.
- * Pin BEFORE engine setup / priming so first-touch allocations land on the
- * pinned core's NUMA node.
+ * Pin worker @cpu (a dense worker index) to a physical core.  Delegates to the
+ * hwloc-driven topology map (bench_topology_init() must have run in main): one
+ * PU per physical core for the first ncores workers, SMT siblings only past
+ * that -- so no sibling contention on any machine, not just where the OS
+ * numbers CPUs 0..N-1 one-per-core.  Falls back to identity (worker i -> CPU i)
+ * if hwloc is unavailable.  Pin BEFORE engine setup / priming so first-touch
+ * allocations land on the pinned core's NUMA node.
  */
 static void bench_pin_to_cpu(int cpu)
 {
-	cpu_set_t set;
-
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	if (sched_setaffinity(0, sizeof(set), &set) != 0)
-		perror("bench: sched_setaffinity");
+	bench_topology_pin(cpu);
 }
 
 /*
@@ -557,6 +554,9 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 		max_threads = atoi(argv[1]);
 
 	g_eng = eng;
+
+	/* Build the worker -> physical-core pin map once, before any thread. */
+	bench_topology_init();
 
 	/*
 	 * NUMA interleaving, ON BY DEFAULT.  Spread every allocation this main

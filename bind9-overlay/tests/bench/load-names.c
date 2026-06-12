@@ -49,6 +49,8 @@
 #include <tests/dns.h>
 #include <tests/qp.h>
 
+#include "bench_topology.h"
+
 struct item_s {
 	const char *text;
 	dns_fixedname_t fixed;
@@ -427,29 +429,21 @@ struct thread_s {
 } threads[1024];
 
 /*
- * Pin the calling worker thread to a single physical CPU.  Without
- * pinning, the kernel scheduler may co-locate threads on SMT siblings
- * of the same physical core; SMT siblings on Zen 4 share the L1d/L1i,
- * L2, and the 256-bit FPU/vector pipeline — so SIMD-heavy paths
- * (collapsed prefix scan, scan_16, scan_32) see throughput halved on
- * any core that hosts two siblings.  By assigning thread i to CPU i
- * (i in [0, 191] = first SMT thread of each physical core on
- * 2x96-core EPYC 9654), each worker gets a private FPU and L1/L2.
+ * Pin worker @cpu (a dense worker index) to a single physical core.  Without
+ * pinning, the kernel scheduler may co-locate threads on SMT siblings of the
+ * same physical core; SMT siblings on Zen 4 share the L1d/L1i, L2, and the
+ * 256-bit FPU/vector pipeline — so SIMD-heavy paths (collapsed prefix scan,
+ * scan_16, scan_32) see throughput halved on any core that hosts two siblings.
  *
- * TODO: replace this hardcoded "CPU id == thread index" mapping with
- * an hwloc-driven enumeration so the bench picks one PU per physical
- * core regardless of the host topology (different SMT degree, different
- * core/socket counts, different OS CPU id ordering).
+ * The mapping is now hwloc-driven (bench_topology_init() runs once in main):
+ * one PU per physical core for the first ncores workers, SMT siblings only
+ * after every core is used — correct on any host topology (SMT degree, core /
+ * socket counts, OS CPU id ordering), not just where CPU i is the first thread
+ * of core i.  Identity fallback if hwloc is unavailable.
  */
 static void
 pin_thread_to_cpu(unsigned int cpu) {
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
-		perror("pthread_setaffinity_np");
-		abort();
-	}
+	bench_topology_pin((int) cpu);
 }
 
 /*
@@ -2360,6 +2354,9 @@ main(int argc, char *argv[]) {
 
 	setlinebuf(stdout);
 	dump_item_layout();
+
+	/* Build the worker -> physical-core pin map once, before any thread. */
+	bench_topology_init();
 
 	/*
 	 * Clear any inherited PR_SET_THP_DISABLE so MADV_HUGEPAGE on the FT
