@@ -132,7 +132,7 @@ executable(
 )
 executable(
     'qpmulti_ft',
-    files('qpmulti_ft.c'),
+    files('qpmulti_ft.c', 'bench_topology.c'),
     export_dynamic: true,
     install: false,
     sources: default_sanitize_options,
@@ -142,6 +142,8 @@ executable(
         libdns_dep,
         libns_dep,
         libtest_dep,
+        bench_numa_dep,
+        bench_hwloc_dep,
     ],
 )
 

@@ -12,6 +12,7 @@
  */
 
 #include <math.h>
+#include <numa.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +51,8 @@
 #include "qp_p.h"
 
 #include <tests/qp.h>
+
+#include "bench_topology.h"
 
 #define ITEM_COUNT	 ((size_t)1000000)
 #define RUNTIME		 (0.25 * NS_PER_SEC)
@@ -144,10 +147,28 @@ read_pick_idx(uint32_t max_item) {
 
 struct ft_entry {
 	struct cds_ft_node ft_node;
-	uint32_t idx;  /* index into item[] */
+	struct rcu_head rcu;	/* defers node-memory reuse past a grace period */
+	uint32_t idx;		/* index into item[] */
+	bool reclaiming;	/* removed; memory not reusable until the GP ends */
 };
 
 static struct ft_entry *ft_entries;  /* array of ITEM_COUNT entries */
+
+/*
+ * After cds_ft_remove() unchains a node, concurrent rcu readers may still
+ * dereference it until a grace period elapses, so its caller-owned memory must
+ * not be reused (zeroed + reinserted) before then.  The mutate path call_rcu's
+ * this callback on remove; it zeroes the node and clears @reclaiming once the
+ * grace period has passed, and refuses to reinsert an index while reclaiming is
+ * set -- so a removed node is never written under a live reader.
+ */
+static void
+ft_entry_reclaim(struct rcu_head *head) {
+	struct ft_entry *e = caa_container_of(head, struct ft_entry, rcu);
+
+	memset(&e->ft_node, 0, sizeof(e->ft_node));
+	__atomic_store_n(&e->reclaiming, false, __ATOMIC_RELEASE);
+}
 
 static void
 init_items(isc_mem_t *mctx) {
@@ -240,7 +261,6 @@ init_items(isc_mem_t *mctx) {
 static void
 init_ft(void) {
 	struct cds_ft_group_attr *group_attr;
-	struct cds_ft_attr *ft_attr = NULL;
 	struct cds_ft_group *group;
 	uint64_t start;
 	size_t count = 0;
@@ -255,49 +275,28 @@ init_ft(void) {
 	{
 		const char *no_skip = getenv("FT_NO_SKIP_COMPRESSED");
 		g_ft_skip_mode = !(no_skip && *no_skip == '1');
-		unsigned int flags = g_ft_skip_mode
-			? CDS_FT_FLAG_SKIP_COMPRESSED : 0U;
-		cds_ft_group_attr_set_flags(group_attr, flags);
-		printf("FT mode: %s\n", g_ft_skip_mode ? "skip-compressed (ft_cand)"
-						        : "precise (non-skip)");
+		/*
+		 * Skip-compressed (the old CDS_FT_FLAG_SKIP_COMPRESSED) is now
+		 * the SPECULATIVE lookup optimization, which is the default;
+		 * precise is EAGER.  The read path pairs each with its matching
+		 * lookup function below (candidate vs eager).
+		 */
+		cds_ft_group_attr_set_lookup_optimization(group_attr,
+			g_ft_skip_mode ? CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE
+				       : CDS_FT_LOOKUP_OPTIMIZE_EAGER);
+		printf("FT mode: %s\n", g_ft_skip_mode ? "speculative (ft_cand)"
+						        : "eager (precise)");
 	}
 	cds_ft_group_create(group_attr, &group);
 	cds_ft_group_attr_destroy(group_attr);
-	{
-		const char *t_env = getenv("FT_COLLAPSE_THRESHOLD");
-		const char *c_env = getenv("FT_COLLAPSE_SCAN_MUL_PCT");
-		const char *m_env = getenv("FT_COMPRESS_SCAN_MUL_PCT");
-		bool any = (t_env || c_env || m_env);
-		if (any) {
-			cds_ft_attr_create(&ft_attr);
-			if (t_env) {
-				unsigned int tval;
-				if (strcmp(t_env, "disabled") == 0)
-					tval = CDS_FT_COLLAPSE_THRESHOLD_DISABLED;
-				else
-					tval = (unsigned int)strtoul(t_env, NULL, 10);
-				cds_ft_attr_set_collapse_threshold(ft_attr, tval);
-			}
-			if (c_env) {
-				cds_ft_attr_set_collapse_scan_mul(
-					ft_attr, (unsigned)atoi(c_env));
-			}
-			if (m_env) {
-				cds_ft_attr_set_compress_scan_mul(
-					ft_attr, (unsigned)atoi(m_env));
-			}
-			printf("FT attr: T=%s c=%s m=%s\n",
-			       t_env ? t_env : "default",
-			       c_env ? c_env : "default",
-			       m_env ? m_env : "default");
-		} else {
-			printf("FT attr: defaults\n");
-		}
-	}
-	cds_ft_create(group, ft_attr, &g_ft);
-	if (ft_attr) {
-		cds_ft_attr_destroy(ft_attr);
-	}
+	/*
+	 * The per-instance collapse/compress tuning knobs
+	 * (cds_ft_attr_set_collapse_threshold / _collapse_scan_mul /
+	 * _compress_scan_mul + CDS_FT_COLLAPSE_THRESHOLD_DISABLED) were removed
+	 * from the FT API -- those heuristics are internal now -- so create the
+	 * trie with default per-instance attributes.
+	 */
+	cds_ft_create(group, NULL, &g_ft);
 
 	for (size_t i = 0; i < ITEM_COUNT; i++) {
 		if (!item[i].present) {
@@ -309,6 +308,14 @@ init_ft(void) {
 				     &ft_entries[i].ft_node, &result);
 		count++;
 	}
+
+	/*
+	 * Drain the build's deferred (call_rcu) frees before the FT read
+	 * window so it times a settled internal-node arena rather than peak
+	 * build residency -- the same drain-before-timing discipline as
+	 * load-names and the read/write scale bench.
+	 */
+	rcu_barrier();
 
 	double time = (double)(isc_time_monotonic() - start) / NS_PER_SEC;
 	printf("FT: %f sec to load %zu items, %f/sec\n", time, count,
@@ -492,8 +499,8 @@ ft_read_transactions(void *varg) {
 				cds_ft_lookup_candidate_key(g_ft, item[i].key,
 							    item[i].len, item[i].len, &found);
 			} else {
-				cds_ft_lookup_key(g_ft, item[i].key,
-						  item[i].len, item[i].len, &found);
+				cds_ft_eager_lookup_key(g_ft, item[i].key,
+							item[i].len, item[i].len, &found);
 			}
 			if (found) {
 				args->present++;
@@ -515,6 +522,17 @@ ft_mutate_transactions(void *varg) {
 		for (uint32_t op = 0; op < args->ops_per_tx; op++) {
 			uint32_t i = isc_random_uniform(args->max_item);
 			pthread_mutex_lock(&g_ft_mutex);
+			if (__atomic_load_n(&ft_entries[i].reclaiming,
+					    __ATOMIC_ACQUIRE)) {
+				/*
+				 * Node still within its post-remove grace
+				 * period: its memory is not yet reusable, so
+				 * skip this op rather than touch a node a
+				 * reader may still hold.
+				 */
+				pthread_mutex_unlock(&g_ft_mutex);
+				continue;
+			}
 			if (item[i].present) {
 				struct cds_ft_iter *iter;
 				cds_ft_iter_create(g_ft, &iter);
@@ -527,15 +545,18 @@ ft_mutate_transactions(void *varg) {
 					item[i].present = false;
 					args->present++;
 					/*
-					 * Zero the ft_node so it can be
-					 * reinserted after a grace period.
-					 * The node is embedded in ft_entries[]
-					 * which is never freed, so this is safe.
-					 * The ISC tickers provide periodic
-					 * quiescent states.
+					 * Defer the node-memory reuse past a
+					 * grace period: rcu readers may still
+					 * hold the just-removed node, so the
+					 * zero + any reinsert must wait.
+					 * ft_entry_reclaim() zeroes it and
+					 * clears reclaiming once the GP ends.
 					 */
-					memset(&ft_entries[i].ft_node, 0,
-					       sizeof(ft_entries[i].ft_node));
+					__atomic_store_n(
+						&ft_entries[i].reclaiming, true,
+						__ATOMIC_RELEASE);
+					call_rcu(&ft_entries[i].rcu,
+						 ft_entry_reclaim);
 				}
 				cds_ft_iter_destroy(iter);
 			} else {
@@ -1137,6 +1158,15 @@ start_ticker(void *varg) {
 	struct ticker *ticker = varg;
 	isc_loop_t *loop = isc_loop();
 
+	/*
+	 * isc_loopmgr does not bind its loops to CPUs, so pin each loop's
+	 * thread to one PU per physical core here (this setup runs on the
+	 * loop's own thread).  Without it the scheduler floats loops across
+	 * SMT siblings, halving SIMD throughput on shared cores and adding
+	 * run-to-run variance.  hwloc-driven via the shared bench_topology map.
+	 */
+	bench_topology_pin(isc_tid());
+
 	isc_timer_create(loop, tick, NULL, &ticker->timer);
 	isc_timer_start(ticker->timer, isc_timertype_ticker,
 			&(isc_interval_t){
@@ -1171,6 +1201,29 @@ setup_tickers(isc_mem_t *mctx) {
 int
 main(void) {
 	setlinebuf(stdout);
+
+	/*
+	 * NUMA interleaving, ON BY DEFAULT (BENCH_NUMA_INTERLEAVE=0 to disable).
+	 * Spread every allocation the process first-touches -- item[], the FT,
+	 * and the qp -- across all NUMA nodes, set BEFORE any allocation, so at
+	 * high loop counts spanning sockets no single node's bandwidth
+	 * bottlenecks the shared read set and auto-NUMA-balancing does not
+	 * thrash a first-touched-on-one-node structure.  Applied uniformly to
+	 * qp and FT so the comparison stays fair.  Matches bench_scale_common.
+	 */
+	{
+		const char *ni = getenv("BENCH_NUMA_INTERLEAVE");
+
+		if ((!ni || ni[0] != '0') && numa_available() != -1) {
+			numa_set_interleave_mask(numa_all_nodes_ptr);
+			fprintf(stderr,
+				"NUMA: interleaving allocations across all nodes "
+				"(BENCH_NUMA_INTERLEAVE=0 to disable)\n");
+		}
+	}
+
+	/* Build the loop -> physical-core pin map before the loops spawn. */
+	bench_topology_init();
 
 	uint32_t nloops;
 	const char *env_workers = getenv("ISC_TASK_WORKERS");

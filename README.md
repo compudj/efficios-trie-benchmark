@@ -673,9 +673,21 @@ double-registration cannot happen.
 
 ### Status of qpmulti_ft
 
-`make bind9` also overlays `qpmulti_ft.c`, which still tracks an **older
-Fractal Trie API** than the current `fractal-trie-dev`. It is attempted and
-**skipped on failure** until updated to the current API.
+`make bind9` also overlays `qpmulti_ft.c` — FT vs BIND9's native `dns_qpmulti`
+in bind9's own `isc_loopmgr` micro-benchmark (the `vary_ft_*` sweeps). It is now
+**ported to the current FT API and built by default** (it was previously
+attempted-and-skipped against a stale API). The port carried over the same
+methodology the other benches use: NUMA-interleaved allocation by default,
+hwloc one-PU-per-core loop pinning (`isc_loopmgr` doesn't bind loops itself), a
+build-time `rcu_barrier` reclaim drain before the FT read window, and — because
+`isc_loopmgr` runs real concurrent readers — an RCU-safe mutate path that defers
+each removed node's memory reuse past a grace period (`call_rcu`) instead of
+zeroing it immediately under live readers. Run it with our liburcu on the path:
+
+```sh
+LD_LIBRARY_PATH=urcu-build/src/.libs DNS_NAMES_FILE=datasets/names-1M-shuf.csv \
+  ISC_TASK_WORKERS=32 bind9-src/build/tests/bench/qpmulti_ft
+```
 
 ## Layout
 
