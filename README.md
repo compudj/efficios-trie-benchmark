@@ -598,7 +598,7 @@ Median of 3, next Mops/s — readers across the top:
 
 | Engine | 1 | 16 | 64 | 192 | traversal |
 |------------|------:|------:|-------:|-------:|:----------|
-| **`ft`**   | **476** | **7634** | **30501** | **82626** | **batched cell gather, compacted (phys-next MLP + O(1) resume cache)** |
+| **`ft`**   | **510** | **8168** | **32678** | **88124** | **batched cell gather, compacted (phys-next MLP; cell-native, no node touch)** |
 | `hotrowex` |   175 |  2540 |  9759 | 27471 | inlined header-template + contiguous leaves |
 | `b9qp`     |    91 |  1467 |   5851 |  15072 | `dns_qpiter` `.so` call + DFS-compacted chunks |
 | `art`      |    22 |   339 |   1243 |   3745 | recursive callback |
@@ -608,27 +608,31 @@ Median of 3, next Mops/s — readers across the top:
 | `judy`     |   5.2 |    82 |    337 |    968 | JSLN cursor (materializes key) |
 | `qp`       |   4.3 |    65 |    263 |    785 | Tnextl cursor (materializes key) |
 
-**FT is now the fastest ordered iterator** — ~3.0× over hotrowex at 192T, a full
+**FT is now the fastest ordered iterator** — ~3.2× over hotrowex at 192T, a full
 reversal of the previous result (FT was *last*, 365 Mops/s). It got there in four
 steps, each measured on the same 1M-key set:
 
 | FT ordered-scan config | 192T Mops/s | what changed |
 |---|--:|:--|
 | `cds_ft_next` descent (pre-cell) | 350 | re-descend per step (the old result) |
-| + ordered cell list (`FT_ORD`) | 3722 | O(1) cell hop; cells still in insert order |
-| + compaction (`FT_BENCH_COMPACT`) | 21432 | cells packed in key order → contiguous walk |
-| + batched gather (`FT_BATCH=64`) | **82626** | one call per batch + phys-next MLP + O(1) resume cache |
+| + ordered cell list (`FT_ORD`) | 3641 | O(1) cell hop; cells still in insert order |
+| + compaction (`FT_BENCH_COMPACT`) | 20008 | cells packed in key order → contiguous walk |
+| + batched gather (`FT_BATCH=64`) | **88124** | one call per batch + phys-next MLP; cell-native (no node touch) |
 
-The final step folds three things into `cds_ft_node_next_batch`: it amortizes the
+The final step folds three things into `cds_ft_cell_next_batch`: it amortizes the
 library-call boundary over a whole batch; it predicts the physically-next cell
 (post-compaction the cells are contiguous at a fixed stride, so a `cmm_ptr_eq`
 arithmetic guess validates and the next `ord_next` load issues off arithmetic,
-breaking the dependent-load chain → MLP); and it threads an **O(1) resume cache**
-(the `void **pos` out-param) that carries the resume *cell* across batches, so
-re-entry reads no node body. Without the resume cache, the iterator-free walk
-re-derived the cell from the node's body once per batch — a scattered cache miss
-(~66 ns) that, at `FT_BATCH=64`, capped the walk at ~51k; with it the walk is
-**cap-insensitive** (`FT_BATCH=16` already reaches ~80k).
+breaking the dependent-load chain → MLP); and it is **cell-native** — the walk
+hands back opaque cell handles and the cursor is itself a cell, so it never
+touches an external head node. (The earlier node-yielding batch recovered each
+cell from the head's body via `node->prev` — a scattered cache miss per batch
+that needed an `O(1)` resume cache to hide; making the walk cell-native removes
+that touch structurally, so it is **cap-insensitive** — `FT_BATCH=16` already
+reaches ~87k — and a count- or key-only scan, which never dereferences the node,
+touches *no* external-head cachelines at all.) The node is recovered lazily, only
+when the consumer wants the value, via `cds_ft_cell_node()`; the key via
+`cds_ft_cell_get_key()`.
 
 **Two findings.** (1) **Ordered iteration is embarrassingly parallel** — every
 engine scales near-linearly (~120–170× from 1 to 192 threads): a full traversal
@@ -649,11 +653,12 @@ step — exactly the call boundary FT's batched iterator amortizes away.
 **The cell scheme + compaction are required for the headline number.** It is the
 *batched, compacted* path (`FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64`, lib built
 `-DFEATURE_FT_ORD_CELL`); the plain `cds_ft_for_each_rcu` cursor on an
-un-compacted trie is ~22× slower (the 3722 row). Compaction trades RSS and a
+un-compacted trie is ~24× slower (the 3641 row). Compaction trades RSS and a
 one-time pack for the scan speed, so it suits read-mostly / snapshot scans rather
 than churning tries. The batched walk is hidden behind a drop-in macro,
-`cds_ft_for_each_batched_rcu(ft, node, buf, cap)` (iterator-free: it carries a
-hidden node cursor over `cds_ft_node_next_batch`, no `cds_ft_iter` in scope).
+`cds_ft_for_each_batched_rcu(ft, cell, buf, cap)` (iterator-free: a hidden cell
+cursor over `cds_ft_cell_next_batch`; recover the node lazily with
+`cds_ft_cell_node`, no `cds_ft_iter` in scope).
 
 (All engines visit the same ~995,830 unique keys — the generated DNS set has
 ~4,170 duplicates the dedup'ing tries collapse; ART keeps all 1,000,000 inserts,
