@@ -548,17 +548,17 @@ static unsigned long ft_iterate(void *ctx)
 	(void)ctx;
 	rcu_read_lock();
 	if (g_ft_batch) {
-		struct cds_ft_node *node, *batch[1024];
+		const struct cds_ft_cell *cell, *batch[1024];
 		size_t cap = (size_t) g_ft_batch;
 
 		if (getenv("FT_REVERSE")) {
-			cds_ft_for_each_reverse_batched_rcu(g_ft, node, batch, cap) {
-				(void) node;
+			cds_ft_for_each_reverse_batched_rcu(g_ft, cell, batch, cap) {
+				(void) cell;
 				n++;
 			}
 		} else {
-			cds_ft_for_each_batched_rcu(g_ft, node, batch, cap) {
-				(void) node;
+			cds_ft_for_each_batched_rcu(g_ft, cell, batch, cap) {
+				(void) cell;
 				n++;
 			}
 		}
