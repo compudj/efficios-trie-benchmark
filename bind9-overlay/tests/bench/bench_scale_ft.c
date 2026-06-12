@@ -161,7 +161,7 @@ static void ft_build(void)
 	 */
 	if (getenv("FT_ORD")) {
 		cds_ft_group_attr_set_key_len_offset(attr, FT_KEYLEN_OFFSET);
-		cds_ft_group_attr_set_ordered_list(attr);
+		cds_ft_group_attr_set_ordered_list(attr, true);
 		fprintf(stderr, "[ft_build] ordered cell list ENABLED (FT_ORD)\n");
 	}
 	if (getenv("FT_BATCH")) {
@@ -539,36 +539,38 @@ static void ft_cleanup_churn(void)
 
 /* Ordered-iteration op: one full in-order traversal under the RCU read lock.
  * FT_BATCH=<n> uses the batched for-each (amortizes the per-step call boundary
- * over n nodes via cds_ft_iter_next_batch); unset = per-step cds_ft_next. */
+ * over n nodes via the iterator-free cds_ft_node_next_batch / node cursor);
+ * unset = per-step cds_ft_for_each_rcu via a stateful iterator. */
 static unsigned long ft_iterate(void *ctx)
 {
-	struct cds_ft_iter *iter;
 	unsigned long n = 0;
 
 	(void)ctx;
-	cds_ft_iter_create(g_ft, &iter);
 	rcu_read_lock();
 	if (g_ft_batch) {
 		struct cds_ft_node *node, *batch[1024];
 		size_t cap = (size_t) g_ft_batch;
 
 		if (getenv("FT_REVERSE")) {
-			cds_ft_for_each_reverse_batched_rcu(g_ft, iter, node, batch, cap) {
+			cds_ft_for_each_reverse_batched_rcu(g_ft, node, batch, cap) {
 				(void) node;
 				n++;
 			}
 		} else {
-			cds_ft_for_each_batched_rcu(g_ft, iter, node, batch, cap) {
+			cds_ft_for_each_batched_rcu(g_ft, node, batch, cap) {
 				(void) node;
 				n++;
 			}
 		}
 	} else {
+		struct cds_ft_iter *iter;
+
+		cds_ft_iter_create(g_ft, &iter);
 		cds_ft_for_each_rcu(g_ft, iter)
 			n++;
+		cds_ft_iter_destroy(iter);
 	}
 	rcu_read_unlock();
-	cds_ft_iter_destroy(iter);
 	rcu_quiescent_state();
 	return n;
 }
