@@ -1497,6 +1497,22 @@ _thread_ft_alloc(void *arg0, ft_add_fn add, ft_get_fn get, bool force_read) {
 	isc_barrier_wait(&barrier);
 
 	/*
+	 * Drain the build's deferred (call_rcu) frees before the timed query.
+	 * FT insert restructuring (node splits / compression) frees the old
+	 * internal nodes via call_rcu; left in flight they would keep peak build
+	 * residency mapped through the measurement and, worse, get caught by the
+	 * query phase's single long read-side critical section -- under
+	 * membarrier an open reader blocks the grace period, so the build frees
+	 * could not reclaim until timing ends.  One global drain on thread 0
+	 * settles the internal-node arena to its steady state first, mirroring
+	 * qp's post-compact reclaim and the scale bench's ft_build, keeping the
+	 * FT vs qp comparison fair.  The barrier below makes the other workers
+	 * wait for it.
+	 */
+	if (arg->start == 0)
+		rcu_barrier();
+
+	/*
 	 * Compaction experiment (BENCH_THREADS=1): thread 0 has built the
 	 * whole trie under the writer mutex; quiescent at this barrier.
 	 * FT_BENCH_COMPACT runs a full in-place compaction (cds_ft_compact)
