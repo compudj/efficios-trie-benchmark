@@ -274,6 +274,67 @@ static void gen_keys(const char *dataset)
 	}
 }
 
+/* ── miss-query injection ─────────────────────────────────── */
+
+/*
+ * FT_BENCH_MISS_PCT=<0..100> replaces that share of the FT engines'
+ * lookup queries (pseudorandomly interleaved, fixed seed) with absent
+ * keys; the build phase always inserts the original keys.  Shape:
+ *   default ("near"): integer datasets query int_keys[i] + n_keys
+ *     (guaranteed absent on dense sets, absent w.h.p. on sparse);
+ *     string datasets replace the LAST byte with '~' (never generated)
+ *     so the walk diverges at the deepest level.
+ *   FT_BENCH_MISS_EARLY=1: integer datasets force the top key byte to
+ *     0xFF; string datasets replace byte 0 with '~' — divergence at
+ *     the root.  The two shapes bracket divergence-depth sensitivity.
+ * Only the FT lookup loops read the q_* arrays (hit slots alias the
+ * original keys, so a 0% run is bit-identical to the old behavior).
+ */
+static uint64_t q_int_keys[N_KEYS];
+static const char *q_str_keys[N_KEYS];
+static size_t q_str_lens[N_KEYS];
+static unsigned int g_miss_pct, g_miss_planned;
+static uint64_t g_null_found;
+
+static void setup_miss_queries(void)
+{
+	const char *e = getenv("FT_BENCH_MISS_PCT");
+	int early = getenv("FT_BENCH_MISS_EARLY") != NULL;
+	uint64_t dseed = 0xDEADBEEFCAFEF00DULL;
+	unsigned int i;
+
+	g_miss_pct = e ? (unsigned int) atoi(e) : 0U;
+	for (i = 0; i < n_keys; i++) {
+		int miss = g_miss_pct &&
+			(xorshift64(&dseed) % 100) < g_miss_pct;
+
+		g_miss_planned += miss;
+		if (key_len_bytes) {
+			uint64_t q = int_keys[i];
+
+			if (miss)
+				q = early ?
+					(q | (0xFFULL << (8 * (key_len_bytes - 1)))) :
+					(q + n_keys);
+			q_int_keys[i] = q;
+		} else {
+			q_str_keys[i] = str_keys[i];
+			q_str_lens[i] = str_lens[i];
+			if (miss) {
+				char *m = cds_ft_external_arena_alloc(
+					str_keys_arena, str_lens[i] + 1);
+
+				memcpy(m, str_keys[i], str_lens[i]);
+				m[early ? 0 : str_lens[i] - 1] = '~';
+				q_str_keys[i] = m;
+			}
+		}
+	}
+	if (g_miss_pct)
+		fprintf(stderr, "MISS: pct=%u planned=%u/%u early=%d\n",
+			g_miss_pct, g_miss_planned, n_keys, early);
+}
+
 /* ── entry struct for candidate verify ────────────────────── */
 
 struct ft_entry {
@@ -418,9 +479,9 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				uint8_t k[8];
 				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
-					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u32_to_key(ft, (uint32_t)q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
-					cds_ft_u64_to_key(ft, int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u64_to_key(ft, q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				if (candidate) {
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
@@ -448,9 +509,9 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				uint8_t k[8];
 				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
-					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u32_to_key(ft, (uint32_t)q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
-					cds_ft_u64_to_key(ft, int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u64_to_key(ft, q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				if (candidate) {
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
@@ -465,6 +526,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 					cds_ft_eager_lookup_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
 				}
 				FORCE_READ_LEAF(found);
+				g_null_found += !found;
 			}
 			t1 = now_ns();
 			rcu_read_unlock();
@@ -482,9 +544,9 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				uint8_t k[8];
 				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
-					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u32_to_key(ft, (uint32_t)q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
-					cds_ft_u64_to_key(ft, int_keys[i], k, CDS_FT_LEN_DEFAULT);
+					cds_ft_u64_to_key(ft, q_int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				uint64_t s = rdtscp_serialized();
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft, k, CDS_FT_LEN_DEFAULT, CDS_FT_LEN_DEFAULT, &found);
@@ -545,17 +607,17 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				struct cds_ft_node *found = NULL;
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD,
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD,
 						offsetof(struct ft_entry, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				}
 				FORCE_READ_LEAF(found);
 			}
@@ -572,19 +634,20 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				if (candidate) {
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD,
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD,
 						offsetof(struct ft_entry, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				}
 				FORCE_READ_LEAF(found);
+				g_null_found += !found;
 			}
 			t1 = now_ns();
 			rcu_read_unlock();
@@ -603,17 +666,17 @@ static void run_ft(int skip, int candidate, int spec_validated)
 				uint64_t s = rdtscp_serialized();
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				} else if (spec_validated) {
 					cds_ft_speculative_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD,
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD,
 						offsetof(struct ft_entry, key), &found);
 				} else {
 					cds_ft_eager_lookup_key(ft,
-						(const uint8_t *)str_keys[i],
-						str_lens[i], STR_KEYS_READABLE_PAD, &found);
+						(const uint8_t *)q_str_keys[i],
+						q_str_lens[i], STR_KEYS_READABLE_PAD, &found);
 				}
 				FORCE_READ_LEAF(found);
 				uint64_t e = rdtscp_serialized();
@@ -629,6 +692,8 @@ static void run_ft(int skip, int candidate, int spec_validated)
 		free(entries);
 	}
 	printf("%.1f %ld\n", best, rss);
+	fprintf(stderr, "NULLFOUND: %lu / %lu timed lookups\n",
+		g_null_found, (uint64_t)RUNS * n_keys);
 	fprintf(stderr, "TIMING: build_ns=%lu lookup_ns=%lu lookups=%lu\n",
 		t_lookup_start - t_build_start,
 		t_lookup_end - t_lookup_start,
@@ -1204,6 +1269,7 @@ int main(int argc, char **argv)
 	}
 	g_dataset_label = argv[1];
 	gen_keys(argv[1]);
+	setup_miss_queries();
 
 	if (strcmp(argv[2], "ft_eager") == 0)          run_ft(0, 0, 0);
 	else if (strcmp(argv[2], "ft_eager_on_spec") == 0) run_ft(1, 0, 0);
