@@ -689,6 +689,52 @@ LD_LIBRARY_PATH=urcu-build/src/.libs DNS_NAMES_FILE=datasets/names-1M-shuf.csv \
   ISC_TASK_WORKERS=32 bind9-src/build/tests/bench/qpmulti_ft
 ```
 
+#### Result — FT vs `dns_qpmulti` in bind9's event loop (192 cores)
+
+Same 1M DNS names; each trie holds ~500k entries over that key space, so **~50% of
+lookups miss**. Both engines are NUMA-interleaved and core-pinned. FT is shown in
+two *fair* modes — **speculative** (skip-compressed descent + a validating key
+compare, the API contract, mirroring qp's `leaf_qpkey`+`qpkey_compare`) and
+**eager** (exact byte-by-byte descent). Aggregate read throughput (Mops/s), `loop`
+column, readers across:
+
+**Read-only:**
+
+| readers | `qp` | FT eager | FT speculative |
+|--:|--:|--:|--:|
+| 1   | 2.3 | 2.2 | 2.3 |
+| 16  | 42.7 | 39.9 | 40.3 |
+| 64  | 170 | 159 | 161 |
+| **192** | **508** | **443** (0.87×) | **462** (0.91×) |
+
+**Mutate + read** (N readers alongside 192−N mutators):
+
+| readers | `qp` | FT eager | FT speculative |
+|--:|--:|--:|--:|
+| 1   | 1.3 | 1.5 (1.17×) | 1.7 (1.31×) |
+| 16  | 34.2 | 34.6 | 35.8 |
+| 64  | 133 | 140 | 148 (1.11×) |
+| **191** | **450** | **430** (0.95×) | **450** (1.00×) |
+
+**Two findings.** (1) **Speculative is FT's best fair mode — it beats eager
+everywhere.** Eager compares every key byte against the compressed-node encoding at
+each level; speculative skips those compares and pays a *single* validation memcmp
+at the leaf, and that wins even at a 50% miss rate. (2) **The result is
+workload-dependent.** On the miss-heavy read-only sweep FT trails `qp` ~9% — qp's
+sparse-branch descent exits early on a miss, while FT's speculative descent runs to
+a candidate leaf before the validating compare rejects it. Under write contention
+FT pulls ahead (1.0–1.31×, largest when mutators dominate) because its RCU read
+path dirties no shared memory while qp's write-shares. This is the same mechanism
+as the 100%-hit `load-names` result (FT ~1.3×) seen from the *other* end of the
+hit-rate axis: **FT wins hit-heavy and write-contended; qp wins miss-heavy
+read-only.**
+
+> The speculative path **must validate the candidate** — `cds_ft_lookup_candidate_key`
+> returns the unvalidated descent result, so counting any non-NULL candidate as a hit
+> both miscounts misses and skips the compare qp performs, inflating FT ~14% and
+> falsely showing it ahead on read-only. `FT_RAW_CANDIDATE=1` runs that unvalidated
+> path as a (non-comparable) ceiling: ~527/517 Mops/s read-only/mut+read at the top.
+
 ## Layout
 
 ```
