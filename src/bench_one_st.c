@@ -416,7 +416,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			rcu_read_lock();
 			for (unsigned int i = 0; i < n_keys; i++) {
 				uint8_t k[8];
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
 					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
@@ -446,7 +446,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			t0 = now_ns();
 			for (unsigned int i = 0; i < n_keys; i++) {
 				uint8_t k[8];
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
 					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
@@ -480,7 +480,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			rcu_read_lock();
 			for (unsigned int i = 0; i < n_keys; i++) {
 				uint8_t k[8];
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				if (key_len_bytes == 4)
 					cds_ft_u32_to_key(ft, (uint32_t)int_keys[i], k, CDS_FT_LEN_DEFAULT);
 				else
@@ -542,7 +542,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 		for (int w = 0; w < WARMUP; w++) {
 			rcu_read_lock();
 			for (unsigned int i = 0; i < n_keys; i++) {
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft,
 						(const uint8_t *)str_keys[i],
@@ -568,7 +568,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			rcu_read_lock();
 			t0 = now_ns();
 			for (unsigned int i = 0; i < n_keys; i++) {
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				if (candidate) {
 					/* Pure candidate lookup: no caller-side memcmp. */
 					cds_ft_lookup_candidate_key(ft,
@@ -599,7 +599,7 @@ static void run_ft(int skip, int candidate, int spec_validated)
 			uint64_t *samples = malloc((size_t)n_keys * sizeof(uint64_t));
 			rcu_read_lock();
 			for (unsigned int i = 0; i < n_keys; i++) {
-				struct cds_ft_node *found;
+				struct cds_ft_node *found = NULL;
 				uint64_t s = rdtscp_serialized();
 				if (candidate) {
 					cds_ft_lookup_candidate_key(ft,
