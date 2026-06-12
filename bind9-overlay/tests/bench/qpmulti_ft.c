@@ -129,6 +129,7 @@ const dns_qpmethods_t item_methods = {
 static struct cds_ft *g_ft;
 static pthread_mutex_t g_ft_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_ft_skip_mode = true;
+static bool g_ft_raw_candidate = false;	/* FT_RAW_CANDIDATE=1: skip validation */
 static uint32_t g_mut_pace_us = 0;
 static uint32_t g_read_hot_size = 0;
 static uint32_t g_read_hot_pct = 100;
@@ -284,8 +285,21 @@ init_ft(void) {
 		cds_ft_group_attr_set_lookup_optimization(group_attr,
 			g_ft_skip_mode ? CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE
 				       : CDS_FT_LOOKUP_OPTIMIZE_EAGER);
-		printf("FT mode: %s\n", g_ft_skip_mode ? "speculative (ft_cand)"
-						        : "eager (precise)");
+		/*
+		 * The speculative descent returns an UNVALIDATED candidate, so
+		 * the read path confirms it with a key compare (like qp's
+		 * leaf_qpkey + qpkey_compare) -- otherwise absent keys count as
+		 * false-positive hits and FT skips the compare qp pays, biasing
+		 * the comparison.  FT_RAW_CANDIDATE=1 measures the raw
+		 * unvalidated descent instead (NOT comparable to qp).
+		 */
+		g_ft_raw_candidate = (getenv("FT_RAW_CANDIDATE") != NULL);
+		printf("FT mode: %s%s\n",
+		       g_ft_skip_mode ? "speculative (ft_cand)" : "eager (precise)",
+		       g_ft_skip_mode
+			       ? (g_ft_raw_candidate ? " + RAW candidate (unvalidated)"
+						     : " + validation")
+			       : "");
 	}
 	cds_ft_group_create(group_attr, &group);
 	cds_ft_group_attr_destroy(group_attr);
@@ -498,6 +512,27 @@ ft_read_transactions(void *varg) {
 			if (g_ft_skip_mode) {
 				cds_ft_lookup_candidate_key(g_ft, item[i].key,
 							    item[i].len, item[i].len, &found);
+				/*
+				 * Validate the speculative candidate (the API
+				 * mandates it): compare the candidate node's key
+				 * against the lookup key.  The node carries only
+				 * an index, so its key is item[idx] -- exactly
+				 * the source qp's leaf_qpkey materializes from,
+				 * so this is symmetric work.  A mismatch means a
+				 * false candidate => true miss.  Skipped under
+				 * FT_RAW_CANDIDATE (then absent keys mis-count).
+				 */
+				if (found && !g_ft_raw_candidate) {
+					struct ft_entry *e = caa_container_of(
+						found, struct ft_entry, ft_node);
+					uint32_t ci = e->idx;
+
+					if (item[ci].len != item[i].len ||
+					    memcmp(item[ci].key, item[i].key,
+						   item[i].len) != 0) {
+						found = NULL;
+					}
+				}
 			} else {
 				cds_ft_eager_lookup_key(g_ft, item[i].key,
 							item[i].len, item[i].len, &found);
