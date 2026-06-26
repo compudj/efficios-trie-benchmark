@@ -872,7 +872,7 @@ static void usage(const char *p)
 	for (i = 0; i < NR_ENGINES; i++)
 		fprintf(stderr, " %s", engines[i].name);
 	fprintf(stderr, "\n  env: LIST_SIZE CHURN DURATION_SEC BENCH_NO_WRITER "
-		"BENCH_WRITESCALE BENCH_READERS\n"
+		"BENCH_WRITESCALE BENCH_RW_BALANCED BENCH_READERS\n"
 		"       BENCH_FIXED_READERS=N BENCH_WRITE_RATE=N(toggles/s/writer) "
 		"BENCH_ALLOW_SMT\n"
 		"       BENCH_NO_PRIME BENCH_NUMA_INTERLEAVE "
@@ -967,6 +967,33 @@ int main(int argc, char **argv)
 		g_eng->name, get_rss_kb(), LIST_SIZE, CHURN);
 
 	allow_smt = getenv("BENCH_ALLOW_SMT") != NULL;
+
+	if (getenv("BENCH_RW_BALANCED")) {
+		/*
+		 * Balanced 50/50 sweep: at each total thread count T, run T/2 readers
+		 * and T/2 writers concurrently (each on its own physical core), so the
+		 * structure takes simultaneous read and write pressure as the machine
+		 * fills.  Shows how each engine handles a mixed workload: RCU readers
+		 * never block (and bidir_lf's writers also scale), whereas the lock /
+		 * seqlock engines serialize readers against writers.
+		 */
+		int tc[] = {2,4,8,16,32,64,96,128,160,192};
+		int n = sizeof(tc)/sizeof(tc[0]);
+		int cap = allow_smt ? max_threads
+			: (max_phys_cores < max_threads ? max_phys_cores : max_threads);
+		printf("# total readers writers read_mvisits write_mops violations\n");
+		fflush(stdout);
+		for (i = 0; i < n; i++) {
+			int t = tc[i], rr = t / 2, ww = t - rr;
+			double r, w; long v;
+			if (t > cap)
+				break;
+			run_point(rr, ww, &r, &w, &v);
+			printf("%d %d %d %.1f %.2f %ld\n", t, rr, ww, r, w, v);
+			fflush(stdout);
+		}
+		goto done;
+	}
 
 	if (getenv("BENCH_WRITESCALE")) {
 		/* Writer-scaling: readers fixed, writers 1 -> N, each on its own core. */

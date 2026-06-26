@@ -791,7 +791,8 @@ reverse walk strictly decreasing — so monotonicity is a **free coherence check
 
 Modes (env): default = read-scaling (readers 1→191 + 1 writer); `BENCH_NO_WRITER`
 = read-only ceiling (readers 1→192, +SMT); `BENCH_WRITESCALE` = writer-scaling
-(writers 1→N); `BENCH_FIXED_READERS=N` = single point; `BENCH_WRITE_RATE=N` =
+(writers 1→N); `BENCH_RW_BALANCED` = balanced 50/50 (at each total T, T/2 readers
++ T/2 writers); `BENCH_FIXED_READERS=N` = single point; `BENCH_WRITE_RATE=N` =
 throttle each writer to N toggles/s. Worker pinning fills one PU per physical core
 first (hwloc), and every sweep caps total workers at the physical-core count so
 **writers never share an SMT sibling** (`BENCH_ALLOW_SMT` to override). NUMA
