@@ -20,6 +20,7 @@
  */
 static int *g_pu_map;
 static int g_pu_count;
+static int g_ncores;	/* physical cores; worker idx < g_ncores => own core */
 
 void
 bench_topology_init(void)
@@ -80,11 +81,18 @@ bench_topology_init(void)
 		}
 	}
 	g_pu_count = idx;
+	g_ncores = ncores;
 
 	fprintf(stderr,
 		"bench: hwloc pinning -- %d cores, %d PUs, one PU per core first\n",
 		ncores, g_pu_count);
 	hwloc_topology_destroy(topo);
+}
+
+int
+bench_topology_ncores(void)
+{
+	return g_ncores;
 }
 
 void

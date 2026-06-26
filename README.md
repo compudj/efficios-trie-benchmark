@@ -740,6 +740,168 @@ read-only.**
 > falsely showing it ahead on read-only. `FT_RAW_CANDIDATE=1` runs that unvalidated
 > path as a (non-comparable) ceiling: ~527/517 Mops/s read-only/mut+read at the top.
 
+## Bidirectional RCU list scaling — `bench_list_scale`
+
+A separate benchmark (not a trie) comparing the **new userspace-rcu bidirectional
+RCU lists** against the state-of-the-art ways to make a doubly-linked list
+concurrent. The bidir lists (from `compudj/userspace-rcu-dev`, branch
+`rcu-bidir-list-dev`) publish the forward **and** backward edges coherently, so a
+reader may walk the ring in either direction — or reverse mid-walk — and never
+see `next`/`prev` disagree, something the classic forward-only `rculist` cannot
+offer. The question this answers: *what does that coherence cost, and how do the
+two new lists scale against locks / seqlock at 192 cores?*
+
+| engine      | synchronization                                   | reader | writer |
+|-------------|---------------------------------------------------|--------|--------|
+| `bidir_su`  | `<urcu/rcu-bidir-list.h>` — RCU, single updater   | lock-free | 1 (mutual excl.) |
+| `bidir_lf`  | `<urcu/rcu-bidir-list-lockfree.h>` — RCU, MCAS    | lock-free | lock-free (N) |
+| `rculist`   | classic `<urcu/rculist.h>` — **forward-only ref** | lock-free | 1 |
+| `mutex`     | one `pthread_mutex`                                | serialized | serialized |
+| `fairmutex` | liburcu `cds_fair_mutex` (MCS/FIFO queue lock)    | serialized | serialized |
+| `rwlock_r`  | `pthread_rwlock`, reader-preferring               | shared | exclusive |
+| `rwlock_w`  | `pthread_rwlock`, writer-preferring               | shared | exclusive |
+| `iscrw`     | bind9 `isc_rwlock` (C-RW-WP phase-fair)           | shared | exclusive |
+| `seqlock`   | sequence lock + type-stable nodes                 | optimistic (retry) | serialized |
+
+The `iscrw` engine links the **real** bind9 lock (`bind9-src/lib/isc/rwlock.c`),
+compiled standalone with a no-op probes shim (`src/iscrw-shim/`) and an isolation
+wrapper (`src/bench_iscrw.c`) so the `isc/` macros never reach the main TU and no
+libisc constructor runs.
+
+### Building
+
+```sh
+make urcu-bidir          # clone rcu-bidir-list-dev into urcu-bidir-build/ + build liburcu
+make bench_list_scale    # needs bind9-src/ isc headers (make bind9) for the iscrw engine
+```
+
+The lists are header-only (flip-latch + bidir headers); only a stock liburcu
+build of that branch is linked. QSBR flavor, `_LGPL_SOURCE` (inlined read side —
+verified: no out-of-line `urcu_qsbr_read_lock`).
+
+### Workload & methodology
+
+A sorted ring of `LIST_SIZE` permanent **stable** nodes (always present) plus
+`CHURN` **churn** nodes toggled in/out just after a unique, spread-out stable
+anchor — so every insert/delete is O(1) and the ring stays strictly sorted at all
+times. Readers walk forward **then** reverse, counting node visits; because the
+ring is always sorted, a forward walk must see strictly increasing keys and a
+reverse walk strictly decreasing — so monotonicity is a **free coherence check**
+(0 violations across every run here). Writers toggle churn nodes.
+
+Modes (env): default = read-scaling (readers 1→191 + 1 writer); `BENCH_NO_WRITER`
+= read-only ceiling (readers 1→192, +SMT); `BENCH_WRITESCALE` = writer-scaling
+(writers 1→N); `BENCH_FIXED_READERS=N` = single point; `BENCH_WRITE_RATE=N` =
+throttle each writer to N toggles/s. Worker pinning fills one PU per physical core
+first (hwloc), and every sweep caps total workers at the physical-core count so
+**writers never share an SMT sibling** (`BENCH_ALLOW_SMT` to override). NUMA
+interleaving of the shared structure is on by default.
+
+Two defaults were chosen after the investigation below:
+- **Segregated `rcu_head`** (default; `-DLIST_RCU_INLINE_RCU_HEAD` for the
+  artifact build): the `rcu_head` lives *outside* the hot 24 B node and stable
+  nodes are arena-packed, the way a metadata-segregating allocator behaves.
+- **Per-CPU `call_rcu` workers** (default; `BENCH_NO_PERCPU_CALLRCU` to disable):
+  one reclaim worker per CPU instead of liburcu's single global worker.
+
+### Results
+
+Hardware: 2× AMD EPYC 9654 (192 physical cores / 384 threads, 24 NUMA nodes, 8
+cores/node). **The box was shared during measurement, so treat absolute numbers
+as indicative — the order-of-magnitude shapes are what matter.** `LIST_SIZE=1000`,
+`CHURN=200`.
+
+#### Read-only ceiling — Mvisits/s, readers 1 → 383
+
+| readers   |   1 |    32 |    96 |   191 |   383 |
+|-----------|----:|------:|------:|------:|------:|
+| `bidir_su`| 796 | 25478 | 74859 | **148724** | 235828 |
+| `bidir_lf`| 785 | 25185 | 74054 | 147180 | 233661 |
+| `rculist` | 729 | 23401 | 68956 | 136065 | 247247 |
+| `seqlock` | 599 | 19240 | 58270 | 113916 | 166750 |
+| `iscrw`   | 599 | 18600 | 45390 | 39983 | 55245 |
+| `rwlock_r`| 600 | 18714 | 30502 | 35103 | 28639 |
+| `rwlock_w`| 598 | 18721 | 30381 | 34909 | 28207 |
+| `mutex`   | 599 |   407 |   392 |   285 |   267 |
+| `fairmutex`| 598 |  219 |   193 |    35 |    42 |
+
+- **The two bidir lists scale dead-linear to 192 cores and *beat* seqlock**
+  (148 k vs 114 k @191), matching the forward-only `rculist` — so a coherent
+  bidirectional reverse walk is **free** on the read side.
+- `pthread_rwlock` plateaus ~30–35 k (its shared reader-count cacheline is the
+  bottleneck); `iscrw` C-RW-WP does better but is still counter-bound.
+- `mutex` (~400) and `fairmutex` (~40) **collapse** — "concurrent" readers take an
+  *exclusive* lock, so they serialize; the MCS lock's futex park/wake is worst.
+
+#### Why the node layout matters (`rcu_head` footprint)
+
+seqlock used to *win* read-only — but only because every RCU node embedded a 16 B
+`struct rcu_head` inline, bloating it 24 → 40 B so the cold reclamation metadata
+polluted the traversal's cacheline working set (40 KB spills L1d; 24 KB fits). A
+controlled test at 96 readers (`-DLIST_RCU_INLINE_RCU_HEAD` vs the segregated
+default):
+
+| LIST_SIZE | seqlock (24 B) | bidir_su **inline** 40 B | bidir_su **segregated** 24 B |
+|-----------|---:|---:|---:|
+| 1,000  | 55938 | 36391 | **74916** |
+| 30,000 | 72496 | 16773 | **69775** |
+
+Segregating the `rcu_head` is a **2–4× read speedup** and lifts the bidir lists to
+match/beat seqlock. The seqlock "edge" was a node-layout artifact, not a read-path
+advantage — which is why the segregated layout is the default. (A production
+strided allocator that pairs hot data with cold metadata on separate cachelines
+gets this for free.)
+
+#### Read throughput with a concurrent writer
+
+bidir scales to ~48 k Mvisits/s @191; `rwlock_r` also scales (~35 k) but only by
+**starving the writer**; `rwlock_w` collapses to ~2.6 k (writers block readers in
+bursts); `iscrw` is the honest middle (~19 k); `mutex`/`fairmutex` ~400/40;
+**`seqlock` → ~0** (a 2000-node read section almost always overlaps the steady
+writer and retries forever). **Caveat:** this mode conflates read-scaling with
+each engine's *writer rate* — a cheaper/faster writer dirties reader cachelines
+more (e.g. `rculist`'s writer is ~6× faster than bidir's, so its readers cap
+lower). Use `BENCH_WRITE_RATE` to pin all engines to one mutation rate for a clean
+comparison.
+
+#### Writer scaling & allocation
+
+`bidir_lf` is the **only** engine whose write throughput rises with concurrent
+writers; everything else serializes. But the limiter is **reclamation, not the
+MCAS**: liburcu's single global `call_rcu` worker funnels every deferred free and
+caps throughput at ~8 Mops/s. Distributing reclaim per-CPU
+(`create_all_cpu_call_rcu_data()`, now the default) is ~5×, and pairing it with a
+per-CPU allocator stacks further — `bidir_lf` write Mops/s:
+
+| writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
+|---------|------:|------:|------:|
+| 1  | 1.6 | 2.7 | 2–7 |
+| 8  | 21  | **38** | 12–15 |
+| 32 | 31  | **46** | 13 |
+| 64 | 34  | 39 | — |
+
+Takeaways on allocation: (1) RCU reclamation is a **producer→consumer cross-thread
+free** (writer allocates, reclaim worker frees) — the worst case for per-thread
+allocator caches, which is why an allocator swap alone *hurt* until reclaim was
+distributed. (2) Per-CPU `call_rcu` + per-CPU allocator arenas keep alloc and free
+on one CPU's pool. (3) `tcmalloc_minimal` is gperftools' *per-thread* build (fast
+single-writer, scales worst); the per-CPU rseq allocator is Google's
+`google/tcmalloc`, not packaged as `tcmalloc-minimal`. Still open: a per-CPU node
+pool (recycle through `call_rcu` to the owning CPU's arena) and liburcu MCAS
+descriptor pooling.
+
+### Takeaways
+
+- Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
+  and with a sane node layout the bidir lists are the **fastest read path here**,
+  scaling linearly to 192 cores — while locks/seqlock cannot offer a safe reverse
+  walk at all.
+- `bidir_lf` is the only design whose **writers scale**; per-CPU reclaim +
+  allocator is the lever (~5×), not the lock-free MCAS.
+- The classic reader/writer-preference rwlock tradeoff is stark (reader-pref
+  scales reads but starves writers; writer-pref collapses reads); **seqlock is
+  unusable for long read-side traversals under a steady writer.**
+
 ## Layout
 
 ```
@@ -763,8 +925,13 @@ third_party/cuckoo-trie/         vendored Cuckoo Trie, C (Unlicense)
 src/bench_cuckoo.c               C shim exposing Cuckoo Trie to bench_one_st
 third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl only)
 src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
+src/bench_list_scale.c           bidirectional RCU list scaling benchmark
+                                   (bidir_su/lf vs mutex/rwlock/seqlock/iscrw)
+src/bench_iscrw.c                isolation wrapper linking the real bind9 isc_rwlock
+src/iscrw-shim/probes-isc.h      no-op SystemTap probes shim for that standalone build
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
 urcu-build/                      our liburcu clone (fractal-trie-dev), gitignored
+urcu-bidir-build/                our liburcu clone (rcu-bidir-list-dev), gitignored
 bind9-src/                       our bind9 clone + overlay + build, gitignored
 scripts/build-bind9.sh           clones/overlays/builds the bind9 MT benches
 scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined table

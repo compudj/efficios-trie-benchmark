@@ -21,4 +21,13 @@
 void bench_topology_init(void);
 void bench_topology_pin(int worker_index);
 
+/*
+ * Number of physical cores discovered by bench_topology_init(): worker indices
+ * 0 .. bench_topology_ncores()-1 are guaranteed to map one-per-physical-core
+ * (no two SMT siblings of the same core).  Keeping the live worker count at or
+ * below this value pins every worker to its own core.  Returns 0 if the
+ * topology was not discovered (hwloc unavailable / identity fallback).
+ */
+int bench_topology_ncores(void);
+
 #endif /* BENCH_TOPOLOGY_H */

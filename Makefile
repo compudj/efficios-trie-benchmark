@@ -63,7 +63,8 @@ BENCHES := bench_one_st
 SCALE_BENCHES := bench_scale_hotrowex bench_scale_masstree \
                  bench_scale_artolc bench_scale_artrowex
 
-.PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9
+.PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9 \
+        urcu-bidir check-urcu-bidir clean-urcu-bidir
 all: $(BENCHES) $(SCALE_BENCHES) bench_wormhole_gpl
 
 # HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
@@ -276,5 +277,77 @@ check-urcu:
 	  echo "       Run 'make urcu' to clone + build our liburcu (the Fractal Trie)."; \
 	  exit 1; }
 
+# ---------------------------------------------------------------------------
+# Bidirectional-list scaling benchmark (bench_list_scale).
+#
+# Compares the NEW userspace-rcu bidirectional RCU lists (single-updater +
+# lock-free, from the rcu-bidir-list-dev branch) against lock/seqlock lists at
+# scale.  Those lists live on a DIFFERENT userspace-rcu branch than the FT, so
+# they get their own in-tree clone+build, urcu-bidir-build/ (analogous to
+# urcu-build/).  Run `make urcu-bidir` first, then `make bench_list_scale`.
+#
+# Engines: bidir_su bidir_lf rculist mutex fairmutex rwlock_r rwlock_w iscrw
+# seqlock.  The iscrw engine links bind9's real isc_rwlock (C-RW-WP) from
+# bind9-src/lib/isc/rwlock.c, compiled standalone with a no-op probes shim
+# (src/iscrw-shim/) + an isolation wrapper (src/bench_iscrw.c) so the isc/
+# macros never reach the main TU and no libisc constructor runs.  `make bind9`
+# is what populates bind9-src/ (only the isc headers + rwlock.c are needed).
+# ---------------------------------------------------------------------------
+URCU_BIDIR_UPSTREAM ?= https://github.com/compudj/userspace-rcu-dev
+URCU_BIDIR_BRANCH   ?= rcu-bidir-list-dev
+URCU_BIDIR_BUILD    ?= $(CURDIR)/urcu-bidir-build
+URCU_BIDIR_INC      := $(URCU_BIDIR_BUILD)/include
+URCU_BIDIR_LIB      := $(URCU_BIDIR_BUILD)/src/.libs
+
+ISC_INC  := bind9-src/lib/isc/include
+ISC_SHIM := src/iscrw-shim
+TOPO_DIR := bind9-overlay/tests/bench
+
+LIST_CFLAGS := $(OPTFLAGS) -pthread -Wall
+HWLOC_CFLAGS := $(shell pkg-config --cflags hwloc)
+HWLOC_LIBS   := $(shell pkg-config --libs hwloc)
+
+urcu-bidir:
+	@if [ ! -d "$(URCU_BIDIR_BUILD)/.git" ]; then \
+	  echo ">> cloning $(URCU_BIDIR_UPSTREAM) ($(URCU_BIDIR_BRANCH)) -> $(URCU_BIDIR_BUILD)"; \
+	  git clone --branch "$(URCU_BIDIR_BRANCH)" --single-branch "$(URCU_BIDIR_UPSTREAM)" "$(URCU_BIDIR_BUILD)"; \
+	else \
+	  echo ">> fetching $(URCU_BIDIR_BRANCH)"; \
+	  git -C "$(URCU_BIDIR_BUILD)" fetch origin "$(URCU_BIDIR_BRANCH)" && \
+	  git -C "$(URCU_BIDIR_BUILD)" checkout "$(URCU_BIDIR_BRANCH)" && \
+	  git -C "$(URCU_BIDIR_BUILD)" merge --ff-only "origin/$(URCU_BIDIR_BRANCH)"; \
+	fi
+	@test -x "$(URCU_BIDIR_BUILD)/configure" || ( cd "$(URCU_BIDIR_BUILD)" && ./bootstrap )
+	@test -f "$(URCU_BIDIR_BUILD)/config.status" || \
+	  ( cd "$(URCU_BIDIR_BUILD)" && CFLAGS="$(URCU_CFLAGS)" ./configure )
+	$(MAKE) -C "$(URCU_BIDIR_BUILD)/src"
+
+check-urcu-bidir:
+	@test -f "$(URCU_BIDIR_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: liburcu (bidir branch) not found under $(URCU_BIDIR_LIB)"; \
+	  echo "       Run 'make urcu-bidir' to clone + build it."; exit 1; }
+	@test -f "$(ISC_INC)/isc/rwlock.h" || { \
+	  echo "ERROR: bind9 isc headers not found under $(ISC_INC)"; \
+	  echo "       Run 'make bind9' to populate bind9-src/ (for the iscrw engine)."; exit 1; }
+
+bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c \
+		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-bidir
+	$(CC) $(LIST_CFLAGS) -I$(URCU_BIDIR_INC) -I$(TOPO_DIR) \
+	  -c src/bench_list_scale.c -o src/bench_list_scale.o
+	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
+	  -c src/bench_iscrw.c -o src/bench_iscrw.o
+	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
+	  -c bind9-src/lib/isc/rwlock.c -o src/iscrw.o
+	$(CC) $(LIST_CFLAGS) $(HWLOC_CFLAGS) -I$(TOPO_DIR) \
+	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
+	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/bench_iscrw.o \
+	  src/iscrw.o src/bench_topology_list.o \
+	  -L$(URCU_BIDIR_LIB) -Wl,-rpath,$(URCU_BIDIR_LIB) \
+	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
+
+clean-urcu-bidir:
+	rm -rf "$(URCU_BIDIR_BUILD)"
+
 clean:
-	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS)
+	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) bench_list_scale \
+	  src/bench_list_scale.o src/bench_iscrw.o src/iscrw.o src/bench_topology_list.o
