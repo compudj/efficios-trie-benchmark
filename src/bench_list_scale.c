@@ -52,6 +52,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
+#include <sys/mman.h>
 #include <numa.h>
 
 #include <urcu/compiler.h>
@@ -113,6 +115,129 @@ static long get_rss_kb(void)
 	fclose(f);
 	return rss;
 }
+
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+/* ════════════════════════════════════════════════════════════════
+ * Per-CPU slab node allocator (prototype) -- models the fractal-trie
+ * external arena (urcu/fractal-trie-alloc.c) repurposed for per-CPU
+ * arenas.  Each CPU gets its own arena: a LIFO freelist of recycled
+ * nodes plus a bump pointer into RANGE-aligned, NUMA-node-local mmap'd
+ * superblocks.  free() finds a node's ORIGIN arena from the superblock
+ * header (superblocks are RANGE-aligned, so header = ptr & ~(RANGE-1)),
+ * so a node allocated on CPU X and freed by the per-CPU call_rcu worker
+ * -- on whatever CPU it runs -- returns to arena X.  That is exactly the
+ * migration-safe property the FT range->arena back-pointer provides;
+ * here it is a one-word superblock header.  Per-arena mutex (contended
+ * only by threads currently on that CPU); an rseq fast path would make
+ * it lock-free, like tcmalloc's per-CPU caches.  Activated by
+ * BENCH_PCPU_ALLOC (inline-rcu_head build only -- the recycled churn
+ * node reuses its first word as the freelist link and carries an rh).
+ * ════════════════════════════════════════════════════════════════ */
+#define PCPU_SLAB_RANGE_SIZE	(1UL << 24)		/* 16 MiB superblocks (== FT_EXT_ARENA) */
+#define PCPU_SLAB_RANGE_MASK	(PCPU_SLAB_RANGE_SIZE - 1)
+
+struct pcpu_slab_arena;
+struct pcpu_slab_sb {				/* superblock header at the RANGE-aligned base */
+	struct pcpu_slab_arena *owner;
+	size_t bump;				/* next free byte offset within this sb */
+	struct pcpu_slab_sb *next;		/* arena's superblock list */
+};
+struct pcpu_slab_freenode { struct pcpu_slab_freenode *next; };
+struct pcpu_slab_arena {
+	pthread_mutex_t lock;
+	struct pcpu_slab_freenode *flist;	/* LIFO recycle list (hot reuse) */
+	struct pcpu_slab_sb *sb;		/* current bump superblock + list head */
+	int numa_node;				/* NUMA node of this CPU (or -1) */
+	char _pad[64];				/* keep arenas off each other's cachelines */
+};
+struct pcpu_slab {
+	int ncpu;
+	size_t obj;				/* fixed object size (>= node, >= 16, 16-aligned) */
+	struct pcpu_slab_arena *arena;		/* [ncpu] */
+};
+
+static size_t pcpu_round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
+
+static struct pcpu_slab *pcpu_slab_create(size_t obj_size)
+{
+	struct pcpu_slab *s = calloc(1, sizeof(*s));
+	int i, ncpu = (int) sysconf(_SC_NPROCESSORS_CONF);
+	int have_numa = (numa_available() != -1);
+
+	if (ncpu < 1) ncpu = 1;
+	s->ncpu = ncpu;
+	s->obj = pcpu_round_up(obj_size < 16 ? 16 : obj_size, 16);
+	s->arena = calloc((size_t) ncpu, sizeof(*s->arena));
+	for (i = 0; i < ncpu; i++) {
+		pthread_mutex_init(&s->arena[i].lock, NULL);
+		s->arena[i].numa_node = have_numa ? numa_node_of_cpu(i) : -1;
+	}
+	return s;
+}
+
+/* Map a fresh RANGE-aligned superblock, bound to @a's NUMA node. */
+static struct pcpu_slab_sb *pcpu_slab_sb_new(struct pcpu_slab_arena *a)
+{
+	size_t raw = 2 * PCPU_SLAB_RANGE_SIZE;
+	char *p = mmap(NULL, raw, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	char *base;
+	struct pcpu_slab_sb *sb;
+
+	if (p == MAP_FAILED) { perror("pcpu_slab mmap"); abort(); }
+	base = (char *) (((uintptr_t) p + PCPU_SLAB_RANGE_MASK) & ~(uintptr_t) PCPU_SLAB_RANGE_MASK);
+	if (base != p)				/* trim slack so only the aligned RANGE stays mapped */
+		munmap(p, base - p);
+	if (base + PCPU_SLAB_RANGE_SIZE != p + raw)
+		munmap(base + PCPU_SLAB_RANGE_SIZE, (p + raw) - (base + PCPU_SLAB_RANGE_SIZE));
+	if (a->numa_node >= 0)
+		numa_tonode_memory(base, PCPU_SLAB_RANGE_SIZE, a->numa_node);
+	sb = (struct pcpu_slab_sb *) base;
+	sb->owner = a;
+	sb->bump = pcpu_round_up(sizeof(*sb), 16);	/* objects start past the header */
+	sb->next = a->sb;
+	return sb;
+}
+
+static void *pcpu_slab_alloc(struct pcpu_slab *s)
+{
+	int cpu = sched_getcpu();
+	struct pcpu_slab_arena *a;
+	void *p;
+
+	if (cpu < 0 || cpu >= s->ncpu) cpu = 0;
+	a = &s->arena[cpu];
+	pthread_mutex_lock(&a->lock);
+	if (a->flist) {				/* hot: reuse a just-freed node */
+		p = a->flist;
+		a->flist = a->flist->next;
+	} else {				/* cold: bump from the active superblock */
+		if (!a->sb || a->sb->bump + s->obj > PCPU_SLAB_RANGE_SIZE)
+			a->sb = pcpu_slab_sb_new(a);
+		p = (char *) a->sb + a->sb->bump;
+		a->sb->bump += s->obj;
+	}
+	pthread_mutex_unlock(&a->lock);
+	return p;
+}
+
+/* Return @ptr to its ORIGIN arena (found from the RANGE-aligned superblock). */
+static void pcpu_slab_free(void *ptr)
+{
+	struct pcpu_slab_sb *sb = (struct pcpu_slab_sb *)
+			((uintptr_t) ptr & ~(uintptr_t) PCPU_SLAB_RANGE_MASK);
+	struct pcpu_slab_arena *a = sb->owner;
+	struct pcpu_slab_freenode *fn = ptr;
+
+	pthread_mutex_lock(&a->lock);
+	fn->next = a->flist;
+	a->flist = fn;
+	pthread_mutex_unlock(&a->lock);
+}
+
+static int g_pcpu_alloc;			/* BENCH_PCPU_ALLOC */
+static struct pcpu_slab *g_slab;
+#endif /* LIST_RCU_INLINE_RCU_HEAD */
 
 /* ── Engine vtable ─────────────────────────────────────────────── */
 struct lengine {
@@ -498,6 +623,11 @@ static void lf_free(struct rcu_head *h)
 {
 	free(caa_container_of(h, struct lf_elem, rh));
 }
+/* call_rcu reclaim that returns the churn node to its per-CPU slab arena. */
+static void lf_slab_free(struct rcu_head *h)
+{
+	pcpu_slab_free(caa_container_of(h, struct lf_elem, rh));
+}
 #endif
 static void lf_build(void)
 {
@@ -562,13 +692,18 @@ static void lf_write(int slot)
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 			seg_call_rcu(e);
 #else
-			call_rcu(&e->rh, lf_free);
+			call_rcu(&e->rh, g_pcpu_alloc ? lf_slab_free : lf_free);
 #endif
 		g_lf_churn[slot] = NULL;
 		g_present[slot] = 0;
 	} else {
 		int a = g_anchor[slot], r;
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+		struct lf_elem *e = g_pcpu_alloc ?
+				(struct lf_elem *) pcpu_slab_alloc(g_slab) : malloc(sizeof(*e));
+#else
 		struct lf_elem *e = malloc(sizeof(*e));
+#endif
 		e->key = 2 * a + 1;
 		rcu_read_lock();
 		r = cds_bidir_list_lf_insert_after_rcu(&e->node,
@@ -956,6 +1091,15 @@ int main(int argc, char **argv)
 			else
 				fprintf(stderr, "per-cpu call_rcu workers enabled (default; BENCH_NO_PERCPU_CALLRCU to disable)\n");
 		}
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+		/* Per-CPU slab node allocator (prototype) for bidir_lf's churn nodes. */
+		if (getenv("BENCH_PCPU_ALLOC")) {
+			g_pcpu_alloc = 1;
+			g_slab = pcpu_slab_create(sizeof(struct lf_elem));
+			fprintf(stderr, "per-CPU slab node allocator enabled "
+				"(obj=%zu B, %d arenas)\n", g_slab->obj, g_slab->ncpu);
+		}
+#endif
 	}
 
 	g_eng->build();
