@@ -797,7 +797,10 @@ Modes (env): default = read-scaling (readers 1→191 + 1 writer); `BENCH_NO_WRIT
 throttle each writer to N toggles/s. Worker pinning fills one PU per physical core
 first (hwloc), and every sweep caps total workers at the physical-core count so
 **writers never share an SMT sibling** (`BENCH_ALLOW_SMT` to override). NUMA
-interleaving of the shared structure is on by default.
+interleaving of the shared structure is on by default. Size knobs (env):
+`LIST_SIZE` stable nodes, `CHURN` churn nodes — which is *also* the transacted
+index's slot count in `BENCH_RANDOM_POS`, capped at `LIST_SIZE` — and
+`DURATION_SEC` per point.
 
 Two defaults were chosen after the investigation below:
 - **Segregated `rcu_head`** (default; `-DLIST_RCU_INLINE_RCU_HEAD` for the
@@ -892,7 +895,8 @@ allocation-dominated.
 **Random transacted index** (`BENCH_RANDOM_POS`) — each writer atomically toggles
 a randomly chosen slot of an external index that points at list cells; the index
 update folds into the same MCAS (the composable path), so there is more compute
-per op and contention is spread across slots.
+per op. The index has exactly `CHURN` slots and each writer picks one uniformly,
+so the per-slot collision rate is `~ writers / CHURN`.
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` |
 |---------|------:|------:|
@@ -902,6 +906,23 @@ per op and contention is spread across slots.
 | 64  | **18** | 17 |
 | 128 | 14  | 12  |
 | 192 | 2.9 | 11  |
+
+At the default `CHURN=200`, 192 writers collide ~1:1 on the index, so the random
+path is **index-contention-bound** — it peaks near 64 writers and then *falls*
+(the decline above is contention on the 200-slot index, not an engine limit).
+Enlarging the index — raise `CHURN`, capped at `LIST_SIZE`, so raise both —
+spreads the collisions and restores writer scaling (jemalloc, write Mops/s):
+
+| index slots (`CHURN`) | @64 | @128 | @192 |
+|-----------------------|----:|-----:|-----:|
+| 200 (default)         | 16  | 11   | 9.7  |
+| 10 000                | 29  | 40   | 44   |
+| 100 000               | 41  | 68   | 90   |
+| 1 000 000             | 48  | 82   | **108** |
+
+With a 1 M-slot index the composable random path scales to ~108 Mops/s at 192
+writers — *above* plain churn — confirming the fall-off is purely index
+contention (`writers / CHURN`), not the transaction engine.
 
 The composable index path is ~30–40 % slower per op (the extra transacted slot),
 and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
