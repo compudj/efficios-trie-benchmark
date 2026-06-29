@@ -880,28 +880,28 @@ Mops/s by allocator, writers 1/8/32/64/128/192 (this box: 192 cores / 384 PUs):
 and out after spread anchors: a list insert/delete (2–3-edge MCAS), so the op is
 allocation-dominated.
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
-|---------|------:|------:|------:|
-| 1   | 1.4 | 2.4 | 3.0 |
-| 8   | 14  | 25  | 11  |
-| 32  | 21  | 45  | 10  |
-| 64  | 30  | 39  | 9.9 |
-| 128 | 43  | 51  | 7.8 |
-| 192 | 41  | **80** | 6.8 |
+| writers | glibc | jemalloc `percpu_arena:phycpu` |
+|---------|------:|------:|
+| 1   | 1.4 | 2.4 |
+| 8   | 14  | 25  |
+| 32  | 21  | 45  |
+| 64  | 30  | 39  |
+| 128 | 43  | 51  |
+| 192 | 41  | **80** |
 
 **Random transacted index** (`BENCH_RANDOM_POS`) — each writer atomically toggles
 a randomly chosen slot of an external index that points at list cells; the index
 update folds into the same MCAS (the composable path), so there is more compute
 per op and contention is spread across slots.
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
-|---------|------:|------:|------:|
-| 1   | 0.9 | 1.9 | 1.7 |
-| 8   | 9.0 | 13  | 9.5 |
-| 32  | 13  | 17  | 8.9 |
-| 64  | **18** | 17 | 6.7 |
-| 128 | 14  | 12  | 5.3 |
-| 192 | 2.9 | 11  | 5.0 |
+| writers | glibc | jemalloc `percpu_arena:phycpu` |
+|---------|------:|------:|
+| 1   | 0.9 | 1.9 |
+| 8   | 9.0 | 13  |
+| 32  | 13  | 17  |
+| 64  | **18** | 17 |
+| 128 | 14  | 12  |
+| 192 | 2.9 | 11  |
 
 The composable index path is ~30–40 % slower per op (the extra transacted slot),
 and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
@@ -909,12 +909,13 @@ and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
 path spends less of its time in malloc/free and more in the MCAS install.
 
 Out to the full box (192 writers), the allocator decides whether the list keeps
-scaling. Plain churn under jemalloc's per-CPU arenas climbs to ~80 Mops/s; glibc
-plateaus near ~42 past 128 (reclaim-bound) and `tcmalloc_minimal` — gperftools'
-per-thread build — *degrades*, since RCU's cross-thread producer→consumer frees
-defeat per-thread caches. The random-index path collapses under glibc at 192
-(cross-thread reclaim oversubscribing the cores) but holds ~11 under jemalloc.
-0 coherence violations at every point, every allocator, through 192 writers.
+scaling. Plain churn under jemalloc's per-CPU arenas climbs to ~80 Mops/s, while
+glibc plateaus near ~42 past 128 (reclaim-bound): RCU reclamation is a
+cross-thread producer→consumer free (writer allocates, reclaim worker frees), so
+only a per-CPU allocator keeps alloc and free on one CPU's pool. The random-index
+path collapses under glibc at 192 (cross-thread reclaim oversubscribing the cores)
+but holds ~11 under jemalloc. 0 coherence violations at every point through 192
+writers.
 
 Both tables are on the **A-B-A-hardened** engine, whose per-record install latch
 is now a single tri-state word (`FREE → BUSY → DONE`): the FREE→BUSY CAS is the
@@ -932,11 +933,13 @@ Takeaways on allocation: (1) RCU reclamation is a **producer→consumer cross-th
 free** (writer allocates, reclaim worker frees) — the worst case for per-thread
 allocator caches, which is why an allocator swap alone *hurt* until reclaim was
 distributed. (2) Per-CPU `call_rcu` + per-CPU allocator arenas keep alloc and free
-on one CPU's pool. (3) `tcmalloc_minimal` is gperftools' *per-thread* build (fast
-single-writer, scales worst); the per-CPU rseq allocator is Google's
-`google/tcmalloc`, not packaged as `tcmalloc-minimal`. Still open: a per-CPU node
-pool (recycle through `call_rcu` to the owning CPU's arena) and liburcu MCAS
-descriptor pooling.
+on one CPU's pool. (3) `tcmalloc_minimal` is deliberately omitted: it is
+gperftools' *per-thread*-cache build, not a per-CPU/rseq allocator, so it is the
+worst case for the cross-thread frees above and not a meaningful per-CPU
+comparison — the real per-CPU rseq allocator is Google's `google/tcmalloc` (Bazel
+build, not packaged for distros), which would be a second per-CPU data point
+alongside jemalloc. Still open: a per-CPU node pool (recycle through `call_rcu` to
+the owning CPU's arena) and liburcu MCAS descriptor pooling.
 
 ### Takeaways
 
