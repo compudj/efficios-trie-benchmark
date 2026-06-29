@@ -775,7 +775,8 @@ make urcu-bidir          # clone rcu-bidir-list-dev into urcu-bidir-build/ + bui
 make bench_list_scale    # needs bind9-src/ isc headers (make bind9) for the iscrw engine
 ```
 
-The lists are header-only (flip-latch + bidir headers); only a stock liburcu
+The lists are header-only (the `rcu-mcas`/`rcu-txn` engine + the `rcu-txn-list`
+headers); only a stock liburcu
 build of that branch is linked. QSBR flavor, `_LGPL_SOURCE` (inlined read side —
 verified: no out-of-line `urcu_qsbr_read_lock`).
 
@@ -873,7 +874,7 @@ in both the limiter is **reclamation, not the MCAS**: liburcu's single global
 `call_rcu` worker funnels every deferred free and caps throughput at ~8 Mops/s;
 distributing reclaim per-CPU (`create_all_cpu_call_rcu_data()`, now the default)
 is ~5×, and pairing it with a per-CPU allocator stacks further. `txn_list` write
-Mops/s by allocator, writers 1/8/32/64:
+Mops/s by allocator, writers 1/8/32/64/128/192 (this box: 192 cores / 384 PUs):
 
 **Plain churn** (default `BENCH_WRITESCALE`) — each writer toggles churn nodes in
 and out after spread anchors: a list insert/delete (2–3-edge MCAS), so the op is
@@ -881,10 +882,12 @@ allocation-dominated.
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
 |---------|------:|------:|------:|
-| 1  | 1.6 | 2.7 | 1.9 |
-| 8  | 14  | 21  | 12  |
-| 32 | 20  | **44** | 8 |
-| 64 | 29  | 39 | 11 |
+| 1   | 1.4 | 2.4 | 3.0 |
+| 8   | 14  | 25  | 11  |
+| 32  | 21  | 45  | 10  |
+| 64  | 30  | 39  | 9.9 |
+| 128 | 43  | 51  | 7.8 |
+| 192 | 41  | **80** | 6.8 |
 
 **Random transacted index** (`BENCH_RANDOM_POS`) — each writer atomically toggles
 a randomly chosen slot of an external index that points at list cells; the index
@@ -893,24 +896,37 @@ per op and contention is spread across slots.
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
 |---------|------:|------:|------:|
-| 1  | 0.6 | 2.1 | 1.7 |
-| 8  | 9.1 | 14  | 9.6 |
-| 32 | 13  | 16  | 10 |
-| 64 | 16  | **18** | 7.4 |
+| 1   | 0.9 | 1.9 | 1.7 |
+| 8   | 9.0 | 13  | 9.5 |
+| 32  | 13  | 17  | 8.9 |
+| 64  | **18** | 17 | 6.7 |
+| 128 | 14  | 12  | 5.3 |
+| 192 | 2.9 | 11  | 5.0 |
 
 The composable index path is ~30–40 % slower per op (the extra transacted slot),
-and the **allocator lever shrinks** with it: glibc→jemalloc is 20→44 (2.2×) for
-plain churn but only 13→16 for the random index, because that path spends less of
-its time in malloc/free and more in the MCAS install.
+and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
+21→45 (2.1×) for plain churn but only 13→17 for the random index, because that
+path spends less of its time in malloc/free and more in the MCAS install.
 
-Both tables are on the **A-B-A-hardened** engine: every record install now takes a
-per-record install latch — the fix for a slot-value A-B-A use-after-free where a
-doubly-linked next-pointer recurs `B → X → B` and a stalled helper re-planted a
-proxy *after* the transaction linearized, resurrecting a freed node. That latch
-(plus a torn-read-set poison check and a corrected `cds_fair_mutex` teardown
-acquire) is a modest per-install cost, and the run is now use-after-free-free and
-ThreadSanitizer-clean (0 coherence violations across every point, where the old
-engine could corrupt the ring under concentrated contention).
+Out to the full box (192 writers), the allocator decides whether the list keeps
+scaling. Plain churn under jemalloc's per-CPU arenas climbs to ~80 Mops/s; glibc
+plateaus near ~42 past 128 (reclaim-bound) and `tcmalloc_minimal` — gperftools'
+per-thread build — *degrades*, since RCU's cross-thread producer→consumer frees
+defeat per-thread caches. The random-index path collapses under glibc at 192
+(cross-thread reclaim oversubscribing the cores) but holds ~11 under jemalloc.
+0 coherence violations at every point, every allocator, through 192 writers.
+
+Both tables are on the **A-B-A-hardened** engine, whose per-record install latch
+is now a single tri-state word (`FREE → BUSY → DONE`): the FREE→BUSY CAS is the
+install lock and DONE is the install-once gate that closes a slot-value A-B-A
+use-after-free — a doubly-linked next-pointer recurs `B → X → B`, and without the
+gate a stalled helper re-plants a proxy *after* the transaction linearized,
+resurrecting a freed node. The one-word try-lock replaced an earlier per-record
+`cds_fair_mutex` (whose fairness was never load-bearing — starvation-freedom is
+the per-domain escalation lane's job); it is a modest per-install cost, the engine
+is use-after-free-free and ThreadSanitizer-clean, and its committed transactions
+are linearizable at the single status-word commit (atomic across every structure
+folded into that commit; see `<urcu/rcu-txn.h>`).
 
 Takeaways on allocation: (1) RCU reclamation is a **producer→consumer cross-thread
 free** (writer allocates, reclaim worker frees) — the worst case for per-thread
