@@ -753,8 +753,8 @@ two new lists scale against locks / seqlock at 192 cores?*
 
 | engine      | synchronization                                   | reader | writer |
 |-------------|---------------------------------------------------|--------|--------|
-| `bidir_su`  | `<urcu/rcu-bidir-list.h>` — RCU, single updater   | lock-free | 1 (mutual excl.) |
-| `bidir_lf`  | `<urcu/rcu-bidir-list-lockfree.h>` — RCU, MCAS    | lock-free | lock-free (N) |
+| `txn_sw_list`  | `<urcu/rcu-txn-sw-list.h>` — RCU, single updater   | lock-free | 1 (mutual excl.) |
+| `txn_list`  | `<urcu/rcu-txn-list.h>` — RCU, MCAS    | lock-free | bounded-blocking (N) |
 | `rculist`   | classic `<urcu/rculist.h>` — **forward-only ref** | lock-free | 1 |
 | `mutex`     | one `pthread_mutex`                                | serialized | serialized |
 | `fairmutex` | liburcu `cds_fair_mutex` (MCS/FIFO queue lock)    | serialized | serialized |
@@ -816,8 +816,8 @@ as indicative — the order-of-magnitude shapes are what matter.** `LIST_SIZE=10
 
 | readers   |   1 |    32 |    96 |   191 |   383 |
 |-----------|----:|------:|------:|------:|------:|
-| `bidir_su`| 796 | 25478 | 74859 | **148724** | 235828 |
-| `bidir_lf`| 785 | 25185 | 74054 | 147180 | 233661 |
+| `txn_sw_list`| 796 | 25478 | 74859 | **148724** | 235828 |
+| `txn_list`| 785 | 25185 | 74054 | 147180 | 233661 |
 | `rculist` | 729 | 23401 | 68956 | 136065 | 247247 |
 | `seqlock` | 599 | 19240 | 58270 | 113916 | 166750 |
 | `iscrw`   | 599 | 18600 | 45390 | 39983 | 55245 |
@@ -842,7 +842,7 @@ polluted the traversal's cacheline working set (40 KB spills L1d; 24 KB fits). A
 controlled test at 96 readers (`-DLIST_RCU_INLINE_RCU_HEAD` vs the segregated
 default):
 
-| LIST_SIZE | seqlock (24 B) | bidir_su **inline** 40 B | bidir_su **segregated** 24 B |
+| LIST_SIZE | seqlock (24 B) | txn_sw_list **inline** 40 B | txn_sw_list **segregated** 24 B |
 |-----------|---:|---:|---:|
 | 1,000  | 55938 | 36391 | **74916** |
 | 30,000 | 72496 | 16773 | **69775** |
@@ -867,19 +867,50 @@ comparison.
 
 #### Writer scaling & allocation
 
-`bidir_lf` is the **only** engine whose write throughput rises with concurrent
-writers; everything else serializes. But the limiter is **reclamation, not the
-MCAS**: liburcu's single global `call_rcu` worker funnels every deferred free and
-caps throughput at ~8 Mops/s. Distributing reclaim per-CPU
-(`create_all_cpu_call_rcu_data()`, now the default) is ~5×, and pairing it with a
-per-CPU allocator stacks further — `bidir_lf` write Mops/s:
+`txn_list` is the **only** engine whose write throughput rises with concurrent
+writers; everything else serializes. Two write workloads are measured below, and
+in both the limiter is **reclamation, not the MCAS**: liburcu's single global
+`call_rcu` worker funnels every deferred free and caps throughput at ~8 Mops/s;
+distributing reclaim per-CPU (`create_all_cpu_call_rcu_data()`, now the default)
+is ~5×, and pairing it with a per-CPU allocator stacks further. `txn_list` write
+Mops/s by allocator, writers 1/8/32/64:
+
+**Plain churn** (default `BENCH_WRITESCALE`) — each writer toggles churn nodes in
+and out after spread anchors: a list insert/delete (2–3-edge MCAS), so the op is
+allocation-dominated.
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
 |---------|------:|------:|------:|
-| 1  | 1.6 | 2.7 | 2–7 |
-| 8  | 21  | **38** | 12–15 |
-| 32 | 31  | **46** | 13 |
-| 64 | 34  | 39 | — |
+| 1  | 1.6 | 2.7 | 1.9 |
+| 8  | 14  | 21  | 12  |
+| 32 | 20  | **44** | 8 |
+| 64 | 29  | 39 | 11 |
+
+**Random transacted index** (`BENCH_RANDOM_POS`) — each writer atomically toggles
+a randomly chosen slot of an external index that points at list cells; the index
+update folds into the same MCAS (the composable path), so there is more compute
+per op and contention is spread across slots.
+
+| writers | glibc | jemalloc `percpu_arena:phycpu` | tcmalloc_minimal |
+|---------|------:|------:|------:|
+| 1  | 0.6 | 2.1 | 1.7 |
+| 8  | 9.1 | 14  | 9.6 |
+| 32 | 13  | 16  | 10 |
+| 64 | 16  | **18** | 7.4 |
+
+The composable index path is ~30–40 % slower per op (the extra transacted slot),
+and the **allocator lever shrinks** with it: glibc→jemalloc is 20→44 (2.2×) for
+plain churn but only 13→16 for the random index, because that path spends less of
+its time in malloc/free and more in the MCAS install.
+
+Both tables are on the **A-B-A-hardened** engine: every record install now takes a
+per-record install latch — the fix for a slot-value A-B-A use-after-free where a
+doubly-linked next-pointer recurs `B → X → B` and a stalled helper re-planted a
+proxy *after* the transaction linearized, resurrecting a freed node. That latch
+(plus a torn-read-set poison check and a corrected `cds_fair_mutex` teardown
+acquire) is a modest per-install cost, and the run is now use-after-free-free and
+ThreadSanitizer-clean (0 coherence violations across every point, where the old
+engine could corrupt the ring under concentrated contention).
 
 Takeaways on allocation: (1) RCU reclamation is a **producer→consumer cross-thread
 free** (writer allocates, reclaim worker frees) — the worst case for per-thread
@@ -897,8 +928,9 @@ descriptor pooling.
   and with a sane node layout the bidir lists are the **fastest read path here**,
   scaling linearly to 192 cores — while locks/seqlock cannot offer a safe reverse
   walk at all.
-- `bidir_lf` is the only design whose **writers scale**; per-CPU reclaim +
-  allocator is the lever (~5×), not the lock-free MCAS.
+- `txn_list` is the only design whose **writers scale**; per-CPU reclaim +
+  allocator is the lever (~5×), not the MCAS install (whose per-record latch is a
+  modest, A-B-A-safe cost).
 - The classic reader/writer-preference rwlock tradeoff is stark (reader-pref
   scales reads but starves writers; writer-pref collapses reads); **seqlock is
   unusable for long read-side traversals under a steady writer.**
@@ -927,7 +959,7 @@ src/bench_cuckoo.c               C shim exposing Cuckoo Trie to bench_one_st
 third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl only)
 src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
 src/bench_list_scale.c           bidirectional RCU list scaling benchmark
-                                   (bidir_su/lf vs mutex/rwlock/seqlock/iscrw)
+                                   (txn_sw_list/txn_list vs mutex/rwlock/seqlock/iscrw)
 src/bench_iscrw.c                isolation wrapper linking the real bind9 isc_rwlock
 src/iscrw-shim/probes-isc.h      no-op SystemTap probes shim for that standalone build
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
