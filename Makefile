@@ -281,12 +281,12 @@ check-urcu:
 # Bidirectional-list scaling benchmark (bench_list_scale).
 #
 # Compares the NEW userspace-rcu bidirectional RCU lists (single-updater +
-# lock-free, from the rcu-bidir-list-dev branch) against lock/seqlock lists at
+# concurrent, from the urcu-txn-dev branch) against lock/seqlock lists at
 # scale.  Those lists live on a DIFFERENT userspace-rcu branch than the FT, so
 # they get their own in-tree clone+build, urcu-bidir-build/ (analogous to
 # urcu-build/).  Run `make urcu-bidir` first, then `make bench_list_scale`.
 #
-# Engines: bidir_su bidir_lf rculist mutex fairmutex rwlock_r rwlock_w iscrw
+# Engines: txn_sw_list txn_list rculist mutex fairmutex rwlock_r rwlock_w iscrw
 # seqlock.  The iscrw engine links bind9's real isc_rwlock (C-RW-WP) from
 # bind9-src/lib/isc/rwlock.c, compiled standalone with a no-op probes shim
 # (src/iscrw-shim/) + an isolation wrapper (src/bench_iscrw.c) so the isc/
@@ -294,7 +294,7 @@ check-urcu:
 # is what populates bind9-src/ (only the isc headers + rwlock.c are needed).
 # ---------------------------------------------------------------------------
 URCU_BIDIR_UPSTREAM ?= https://github.com/compudj/userspace-rcu-dev
-URCU_BIDIR_BRANCH   ?= rcu-bidir-list-dev
+URCU_BIDIR_BRANCH   ?= urcu-txn-dev
 URCU_BIDIR_BUILD    ?= $(CURDIR)/urcu-bidir-build
 URCU_BIDIR_INC      := $(URCU_BIDIR_BUILD)/include
 URCU_BIDIR_LIB      := $(URCU_BIDIR_BUILD)/src/.libs

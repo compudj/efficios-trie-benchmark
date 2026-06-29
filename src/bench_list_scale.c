@@ -5,8 +5,8 @@
  * state-of-the-art lock-based and seqlock alternatives.
  *
  * The new lists (from compudj/userspace-rcu-dev, branch rcu-bidir-list-dev):
- *   bidir_su  <urcu/rcu-bidir-list.h>          RCU readers, SINGLE updater
- *   bidir_lf  <urcu/rcu-bidir-list-lockfree.h> RCU readers, LOCK-FREE updaters
+ *   txn_sw_list  <urcu/rcu-txn-sw-list.h>          RCU readers, SINGLE updater
+ *   txn_list  <urcu/rcu-txn-list.h> RCU readers, concurrent updaters
  * Both publish forward AND backward edges coherently, so a reader may walk the
  * ring in either direction (or reverse mid-walk) and never see next/prev disagree.
  *
@@ -60,9 +60,9 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-bidir-list.h>
-#include <urcu/rcu-bidir-list-lockfree.h>
-#include <urcu/flip-latch-txn-lockfree.h>
+#include <urcu/rcu-txn-sw-list.h>
+#include <urcu/rcu-txn-list.h>
+#include <urcu/rcu-txn.h>
 #include <urcu/rculist.h>
 #include <urcu/fair-mutex.h>
 
@@ -76,6 +76,46 @@ extern void bench_iscrw_rdlock(void *);
 extern void bench_iscrw_rdunlock(void *);
 extern void bench_iscrw_wrlock(void *);
 extern void bench_iscrw_wrunlock(void *);
+
+/*
+ * Flight-recorder instrumentation (diagnostic only, -DBENCH_LTTNG): trace the
+ * cell lifecycle (call_rcu -> free) and each writer's quiescent state, then dump
+ * the LTTng snapshot from the ASan death callback so the window leading to the
+ * use-after-free is captured.  Compiles out entirely without the flag.
+ */
+#ifdef BENCH_LTTNG
+#include "bench_tp.h"
+extern void __sanitizer_set_death_callback(void (*)(void));
+static __thread int t_id = -1;		/* writer index (-1: not a writer) */
+static __thread unsigned long t_epoch;	/* quiescent-state count for this thread */
+#define TP_QS()       do { lttng_ust_tracepoint(bench, qs, t_id, t_epoch); t_epoch++; } while (0)
+#define TP_CALLRCU(c) lttng_ust_tracepoint(bench, callrcu, (void *)(c), t_id, t_epoch)
+#define TP_FREE(c)    lttng_ust_tracepoint(bench, freecell, (void *)(c))
+#define TP_READSUCC(s) lttng_ust_tracepoint(bench, readsucc, (void *)(s), t_id, t_epoch)
+#define TP_SET_WID(w) do { t_id = (w); } while (0)
+static void bench_on_death(void) { (void) system("lttng snapshot record 1>&2"); }
+#ifdef URCU_MCAS_STORE_TRACE
+/*
+ * Engine structural-store hook (diagnostic): the MCAS engine calls this
+ * for every per-record install (phase 0), steal (1) and settle (2), so the
+ * trace names which record's slot was -- or was not -- written by a commit.
+ */
+void (*urcu_mcas_store_hook)(const void *, void **, void *, void *,
+		int, int, unsigned long);
+static void bench_store_hook(const void *mcas, void **slot, void *oldv,
+		void *newv, int phase, int ok, unsigned long status)
+{
+	lttng_ust_tracepoint(bench, store, (void *) mcas, (void *) slot,
+			oldv, newv, phase, ok, status, t_id);
+}
+#endif
+#else
+#define TP_QS()
+#define TP_CALLRCU(c)
+#define TP_FREE(c)
+#define TP_READSUCC(s)
+#define TP_SET_WID(w)
+#endif
 
 /* ── Run configuration (env-overridable) ───────────────────────── */
 static int LIST_SIZE = 1000;	/* stable nodes always present */
@@ -250,7 +290,27 @@ struct lengine {
 	unsigned long (*read_pass)(long *viol);
 	/* toggle churn slot @slot: insert if absent, else delete. */
 	void (*write_toggle)(int slot);
+	/* BENCH_RANDOM_POS: toggle a randomly chosen TRANSACTED INDEX slot.  Each
+	 * slot points at a list cell or is empty; a writer folds the list splice
+	 * (or unlink) AND the index-slot update into ONE flip, and reads the slot
+	 * back through a txn load -- modeling an external index (e.g. a
+	 * fractal-trie leaf) kept coherent with list membership by a single
+	 * multi-slot commit.  Collisions on the same slot (P ~ writers/NINDEX) are
+	 * serialized by the slot's MCAS.  NULL => engine has no transacted-index
+	 * mode (falls back to the partitioned toggle). */
+	void (*write_random)(uint64_t *rng);
+	/* Clear all transacted-index cells (single-threaded, between sweep
+	 * points).  NULL unless the engine provides write_random. */
+	void (*reset_random)(void);
 };
+
+/* xorshift64: cheap per-writer PRNG for random anchor selection. */
+static inline uint64_t xorshift64(uint64_t *s)
+{
+	uint64_t x = *s;
+	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+	return *s = x;
+}
 
 /* ════════════════════════════════════════════════════════════════
  * Plain doubly-linked list, shared by every lock/seqlock engine.
@@ -503,6 +563,7 @@ struct seg_reclaim { struct rcu_head rh; void *node; };
 static void seg_reclaim_cb(struct rcu_head *h)
 {
 	struct seg_reclaim *w = caa_container_of(h, struct seg_reclaim, rh);
+	TP_FREE(w->node);		/* cell about to be physically freed */
 	free(w->node);
 	free(w);
 }
@@ -515,16 +576,16 @@ static void seg_call_rcu(void *node)		/* node: an individually-malloc'd churn no
 }
 #endif
 
-/* ── bidir_su: single-updater coherent bidirectional RCU list ── */
+/* ── txn_sw_list: single-updater coherent bidirectional RCU list ── */
 struct su_elem {
-	struct cds_bidir_list_head node;
+	struct urcu_txn_sw_list_node node;
 	int key;
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
 };
-static struct cds_bidir_list_head g_su_head =
-		CDS_BIDIR_LIST_HEAD_INIT(g_su_head);
+static struct urcu_txn_sw_list_head g_su_head =
+		URCU_TXN_SW_LIST_HEAD_INIT(g_su_head);
 static struct su_elem **g_su_stable;
 static struct su_elem **g_su_churn;
 static pthread_mutex_t g_su_wlock = PTHREAD_MUTEX_INITIALIZER;
@@ -538,7 +599,7 @@ static void su_free(struct rcu_head *h)
 static void su_build(void)
 {
 	int i;
-	cds_bidir_list_init(&g_su_head);
+	urcu_txn_sw_list_init(&g_su_head);
 	g_su_stable = calloc(LIST_SIZE, sizeof(*g_su_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 	struct su_elem *arena = calloc(LIST_SIZE, sizeof(struct su_elem));
@@ -550,7 +611,7 @@ static void su_build(void)
 		struct su_elem *e = calloc(1, sizeof(*e));
 #endif
 		e->key = 2 * i;
-		if (cds_bidir_list_add_tail_rcu(&e->node, &g_su_head))
+		if (urcu_txn_sw_list_add_tail_rcu(&e->node, &g_su_head))
 			abort();
 		g_su_stable[i] = e;
 	}
@@ -558,21 +619,21 @@ static void su_build(void)
 }
 static unsigned long su_read(long *viol)
 {
-	struct cds_bidir_list_head *p;
+	struct urcu_txn_sw_list_node *p;
 	unsigned long vis = 0;
 	int prev, steps;
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
-	for (p = cds_bidir_list_next_rcu(&g_su_head); p != &g_su_head;
-			p = cds_bidir_list_next_rcu(p)) {
+	for (p = urcu_txn_sw_list_next_rcu(&g_su_head.node); p != &g_su_head.node;
+			p = urcu_txn_sw_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct su_elem, node)->key;
 		if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
 		prev = k; vis++;
 	}
 	prev = INT_MAX; steps = 0;
-	for (p = cds_bidir_list_prev_rcu(&g_su_head); p != &g_su_head;
-			p = cds_bidir_list_prev_rcu(p)) {
+	for (p = urcu_txn_sw_list_prev_rcu(&g_su_head.node); p != &g_su_head.node;
+			p = urcu_txn_sw_list_prev_rcu(p)) {
 		int k = caa_container_of(p, struct su_elem, node)->key;
 		if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
 		prev = k; vis++;
@@ -585,7 +646,7 @@ static void su_write(int slot)
 	pthread_mutex_lock(&g_su_wlock);
 	if (g_present[slot]) {
 		struct su_elem *e = g_su_churn[slot];
-		if (cds_bidir_list_del_rcu(&e->node))
+		if (urcu_txn_sw_list_del_rcu(&e->node))
 			abort();
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 		seg_call_rcu(e);
@@ -598,7 +659,7 @@ static void su_write(int slot)
 		int a = g_anchor[slot];
 		struct su_elem *e = malloc(sizeof(*e));
 		e->key = 2 * a + 1;
-		if (cds_bidir_list_add_after_rcu(&e->node, &g_su_stable[a]->node))
+		if (urcu_txn_sw_list_add_after_rcu(&e->node, &g_su_stable[a]->node))
 			abort();
 		g_su_churn[slot] = e;
 		g_present[slot] = 1;
@@ -606,17 +667,25 @@ static void su_write(int slot)
 	pthread_mutex_unlock(&g_su_wlock);
 }
 
-/* ── bidir_lf: lock-free coherent bidirectional RCU list ── */
+/* ── txn_list: concurrent coherent bidirectional RCU list ── */
 struct lf_elem {
-	struct cds_bidir_list_lf_node node;
+	struct urcu_txn_list_node node;
 	int key;
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
 };
-static struct cds_bidir_list_lf_head g_lf_head;
+static struct urcu_txn_list_head g_lf_head;
 static struct lf_elem **g_lf_stable;
 static struct lf_elem **g_lf_churn;
+/*
+ * Transacted external index (BENCH_RANDOM_POS): each slot points at a list cell
+ * or is NULL.  Writers update a slot atomically WITH the list splice/unlink in
+ * one flip and read it back through a txn load -- modeling a fractal-trie
+ * leaf kept coherent with the ordered-cell list.
+ */
+static struct urcu_txn_list_node **g_lf_index;	/* [g_nindex] */
+static int g_nindex;
 
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 static void lf_free(struct rcu_head *h)
@@ -629,10 +698,44 @@ static void lf_slab_free(struct rcu_head *h)
 	pcpu_slab_free(caa_container_of(h, struct lf_elem, rh));
 }
 #endif
+
+/* ── cell alloc / free / reclaim (shared by the transacted-index writer) ── */
+static inline struct lf_elem *lf_cell_alloc(void)
+{
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+	return g_pcpu_alloc ? (struct lf_elem *) pcpu_slab_alloc(g_slab)
+			    : malloc(sizeof(struct lf_elem));
+#else
+	return malloc(sizeof(struct lf_elem));
+#endif
+}
+/* Free an UNPUBLISHED cell synchronously (never linked, no readers reached it). */
+static inline void lf_cell_free(struct lf_elem *e)
+{
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+	if (g_pcpu_alloc)
+		pcpu_slab_free(e);
+	else
+		free(e);
+#else
+	free(e);
+#endif
+}
+/* Reclaim a PUBLISHED cell after a grace period. */
+static inline void lf_cell_reclaim(struct lf_elem *e)
+{
+	TP_CALLRCU(&e->node);		/* this writer defers the cell's free */
+#ifndef LIST_RCU_INLINE_RCU_HEAD
+	seg_call_rcu(e);
+#else
+	call_rcu(&e->rh, g_pcpu_alloc ? lf_slab_free : lf_free);
+#endif
+}
+
 static void lf_build(void)
 {
 	int i;
-	cds_bidir_list_lf_init(&g_lf_head);
+	urcu_txn_list_init(&g_lf_head);
 	g_lf_stable = calloc(LIST_SIZE, sizeof(*g_lf_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 	struct lf_elem *arena = calloc(LIST_SIZE, sizeof(struct lf_elem));
@@ -644,31 +747,33 @@ static void lf_build(void)
 		struct lf_elem *e = calloc(1, sizeof(*e));
 #endif
 		e->key = 2 * i;
-		if (cds_bidir_list_lf_add_tail_rcu(&e->node, &g_lf_head))
+		if (urcu_txn_list_add_tail_rcu(&e->node, &g_lf_head))
 			abort();
 		g_lf_stable[i] = e;
 	}
 	g_lf_churn = calloc(CHURN, sizeof(*g_lf_churn));
+	g_nindex = CHURN > 0 ? CHURN : 1;	/* index-slot count = contention knob */
+	g_lf_index = calloc((size_t) g_nindex, sizeof(*g_lf_index));
 }
 static unsigned long lf_read(long *viol)
 {
-	struct cds_bidir_list_lf_node *p;
+	struct urcu_txn_list_node *p;
 	unsigned long vis = 0;
 	int prev, steps;
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
-	for (p = cds_bidir_list_lf_next_rcu(&g_lf_head.node);
+	for (p = urcu_txn_list_next_rcu(&g_lf_head.node);
 			p != &g_lf_head.node;
-			p = cds_bidir_list_lf_next_rcu(p)) {
+			p = urcu_txn_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
 		if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
 		prev = k; vis++;
 	}
 	prev = INT_MAX; steps = 0;
-	for (p = cds_bidir_list_lf_prev_rcu(&g_lf_head.node);
+	for (p = urcu_txn_list_prev_rcu(&g_lf_head.node);
 			p != &g_lf_head.node;
-			p = cds_bidir_list_lf_prev_rcu(p)) {
+			p = urcu_txn_list_prev_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
 		if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
 		prev = k; vis++;
@@ -684,7 +789,7 @@ static void lf_write(int slot)
 		struct lf_elem *e = g_lf_churn[slot];
 		int r;
 		rcu_read_lock();
-		r = cds_bidir_list_lf_del_rcu(&e->node, &g_lf_head);
+		r = urcu_txn_list_del_rcu(&e->node, &g_lf_head);
 		rcu_read_unlock();
 		if (r < 0)
 			abort();		/* -ENOMEM */
@@ -706,13 +811,280 @@ static void lf_write(int slot)
 #endif
 		e->key = 2 * a + 1;
 		rcu_read_lock();
-		r = cds_bidir_list_lf_insert_after_rcu(&e->node,
+		r = urcu_txn_list_insert_after_rcu(&e->node,
 				&g_lf_stable[a]->node, &g_lf_head);
 		rcu_read_unlock();
 		if (r != 0)			/* anchor is permanent: never -ENOENT */
 			abort();
 		g_lf_churn[slot] = e;
 		g_present[slot] = 1;
+	}
+}
+/*
+ * Diagnostic: with -DBENCH_IDX_XOR the index slot stores the cell pointer XORed
+ * with a fixed non-heap, 16-aligned constant, so the stored value never
+ * pointer-EQUALS any list node -- the txn is structurally identical (same slots,
+ * same sort, same proxy machinery), only the value "names" nothing.  Used to
+ * tell "foreign slot in the sorted MCAS" apart from "index value aliases a list
+ * node".  Default (unset): the index stores &cell->node directly.
+ */
+#ifdef BENCH_IDX_XOR
+#define IDX_MAGIC	((uintptr_t) 0x5a5a5a5a0000ULL)	/* 16-aligned, non-heap */
+#define IDX_ENC(node)	((void *) ((uintptr_t) (node) ^ IDX_MAGIC))
+#define IDX_DEC(v)	((struct urcu_txn_list_node *) ((uintptr_t) (v) ^ IDX_MAGIC))
+#else
+#define IDX_ENC(node)	((void *) (node))
+#define IDX_DEC(v)	((struct urcu_txn_list_node *) (v))
+#endif
+
+#ifdef BENCH_LTTNG
+/*
+ * Coherence probe: pos->next == succ must imply succ->prev == pos in a coherent
+ * bidir list.  Fire the incoh violation (and snapshot+abort) if not -- catching
+ * a non-atomic/incoherent composed commit while succ is still alive, before it
+ * is deleted and pos->next is left dangling.  (If succ is already dangling, the
+ * succ->prev read trips ASan -> death-callback snapshot instead.)
+ */
+static void bench_coh_check(struct urcu_txn_list_node *pos)
+{
+	struct urcu_txn_list_node *succ = urcu_txn_list_next_rcu(pos);
+	struct urcu_txn_list_node *sp;
+
+	if (succ == pos)
+		return;
+	sp = urcu_txn_list_prev_rcu(succ);		/* succ->prev */
+	/* Re-read pos->next: only a STABLE incoherence (pos->next still succ after
+	 * we observed succ->prev != pos) counts -- rules out a transient where two
+	 * non-atomic reads straddle a coherent flip. */
+	if (sp != pos && urcu_txn_list_next_rcu(pos) == succ) {
+		lttng_ust_tracepoint(bench, incoh, pos, succ, sp, t_id, t_epoch);
+		(void) system("lttng snapshot record 1>&2");
+		abort();
+	}
+}
+#endif
+
+/*
+ * Transacted-index churn (BENCH_RANDOM_POS): pick a random index slot
+ * g_lf_index[i] and toggle it, folding the list mutation AND the index-slot
+ * update into ONE flip transaction:
+ *
+ *   empty slot -> alloc a cell, insert it after a random stable anchor, and
+ *                 publish g_lf_index[i] = &cell -- all in one commit;
+ *   full slot  -> unlink the indexed cell and clear g_lf_index[i] in one commit,
+ *                 then reclaim the cell after a grace period.
+ *
+ * The index slot is read back through a txn load (urcu_txn_load),
+ * so a writer sees a coherent value even while a peer is mid-flip on that slot.
+ * Concurrent writers that draw the same i collide on the slot's MCAS -- one
+ * commits, the others abort and re-decide -- so contention is ~ writers/NINDEX,
+ * and the index<->membership invariant is preserved by the single multi-slot
+ * commit.  This is the bidir-list-as-fractal-trie-ordered-cells model in
+ * miniature.  Each attempt's begin/end brackets its own RCU read-side section
+ * (the txn existence guarantee), keeping the loaded cell and the anchor alive
+ * across that attempt's commit.
+ */
+static void lf_write_random(uint64_t *rng)
+{
+	int i = (int) (xorshift64(rng) % (uint64_t) g_nindex);
+	struct urcu_mcas_txn txn;
+	struct lf_elem *reclaim = NULL;		/* published cell to free (delete path) */
+
+	urcu_txn_init(&txn, &g_lf_head.domain);
+	/*
+	 * Hold ONE read-side section around the whole operation (all retry
+	 * attempts), as the engine's existence model requires ("rcu_read_lock
+	 * around the whole operation") -- the per-attempt begin/end sections leave
+	 * a quiescent gap between attempts in which a node reached from the array
+	 * (a stale cur, or a succ neighbour) can be reclaimed under us.
+	 */
+	rcu_read_lock();
+	for (;;) {
+		struct urcu_txn_list_node *cur;
+		struct lf_elem *fresh = NULL;	/* cell built this attempt (insert path) */
+		enum urcu_txn_status st;
+		void *raw;			/* slot's stored value (possibly encoded) */
+		int prep;
+#ifdef BENCH_LTTNG
+		struct urcu_txn_list_node *ins_pos = NULL; /* anchor (insert) */
+		void *old_succ = NULL;		/* pos->next BEFORE this insert */
+		struct urcu_txn_list_node *del_cur = NULL; /* cell being removed */
+		struct urcu_txn_list_node *del_prev = NULL; /* its predecessor P */
+		struct urcu_txn_list_node *del_succ = NULL; /* its successor S */
+#endif
+
+		urcu_txn_begin(&txn);
+		/* Flip-latch load of the transacted index slot (resolves any proxy). */
+		raw = urcu_txn_load(&txn, (void **) &g_lf_index[i]);
+		cur = (raw == NULL) ? NULL : IDX_DEC(raw);
+		if (cur == NULL) {		/* empty -> insert + publish index, one flip */
+			int a = (int) (xorshift64(rng) % (uint64_t) LIST_SIZE);
+
+			fresh = lf_cell_alloc();
+			fresh->key = 0;		/* unsorted: random mode is writer-only */
+			/* record the succ (pos->next) the prepare is about to deref */
+			TP_READSUCC(urcu_txn_list_next_rcu(&g_lf_stable[a]->node));
+#ifdef BENCH_LTTNG
+			ins_pos = &g_lf_stable[a]->node;
+			old_succ = urcu_txn_list_next_rcu(ins_pos);
+			bench_coh_check(&g_lf_stable[a]->node);
+#endif
+			prep = urcu_txn_list_insert_after_prepare(&txn,
+					&fresh->node, &g_lf_stable[a]->node);
+			if (prep == 0)
+				urcu_txn_store(&txn, (void **) &g_lf_index[i],
+						NULL, IDX_ENC(&fresh->node));
+		} else {			/* full -> unlink + clear index, one flip */
+#ifdef BENCH_LTTNG
+			del_cur = cur;
+			del_prev = urcu_txn_list_prev_rcu(cur);
+			del_succ = urcu_txn_list_next_rcu(cur);
+#endif
+			prep = urcu_txn_list_del_prepare(&txn, cur);
+			if (prep == 0)
+				urcu_txn_store(&txn, (void **) &g_lf_index[i],
+						raw, NULL);
+		}
+		if (prep != 0) {		/* del: cur was concurrently removed */
+			urcu_txn_end(&txn);
+			if (fresh != NULL)	/* insert never bails, but never leak */
+				lf_cell_free(fresh);
+			continue;		/* re-read the index, re-decide */
+		}
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_OK) {
+			if (cur != NULL)	/* delete path won: reclaim the old cell */
+				reclaim = caa_container_of(cur, struct lf_elem, node);
+#ifdef BENCH_LTTNG
+			/*
+			 * SOURCE CHECK (delete path): the composed del(cur) just
+			 * committed SUCCEEDED, so the predecessor's forward edge
+			 * P->next MUST now bypass cur.  If P->next still names cur
+			 * (while the back edge S->prev landed == P), the MCAS
+			 * committed a SUBSET: the prev->next store was dropped, the
+			 * succ->prev store landed -- leaving P->next dangling to a
+			 * cell we are about to reclaim.  This is the corruption the
+			 * 18ms-of-readsucc-after-free window showed.  Snapshot now,
+			 * microseconds after the commit and long before the GP that
+			 * frees cur, so the engine store events are still in-window.
+			 */
+			if (cur != NULL && del_prev != NULL &&
+					del_prev != del_cur) {
+				void *raw = (void *) rcu_dereference(del_prev->next);
+				void *logv = (((uintptr_t) raw) &
+					(URCU_MCAS_TAG | URCU_TXN_LIST_MARK)) ?
+					urcu_mcas_resolve(raw) : raw;
+				int prev_dead = urcu_txn_list_is_marked(logv);
+				struct urcu_txn_list_node *prev_succ =
+					urcu_txn_list_unmark(logv);
+
+				/*
+				 * Fire ONLY on a LIVE (unmarked) predecessor still
+				 * naming the removed cell.  A MARKED predecessor was
+				 * itself concurrently deleted: its dangling ->next is
+				 * unreachable, RCU keeps it from being reused, and it is
+				 * therefore benign -- the false positive of the earlier
+				 * mark-blind check.  A live predecessor pointing at a
+				 * cell we are about to reclaim is the real corruption.
+				 */
+				if (!prev_dead && prev_succ == del_cur) {
+					void *sp = (del_succ != del_cur) ?
+						urcu_txn_list_prev_rcu(del_succ) :
+						NULL;
+
+					lttng_ust_tracepoint(bench, subset,
+						del_prev, del_cur, prev_succ, sp,
+						t_id, t_epoch);
+					fprintf(stderr,
+						"BENCH-LIVE-DANGLE prev=%p cur=%p "
+						"prevnext=%p succ_prev=%p\n",
+						(void *) del_prev, (void *) del_cur,
+						(void *) prev_succ, sp);
+					(void) system("lttng snapshot record 1>&2");
+					abort();
+				}
+			}
+#endif
+#ifdef BENCH_LTTNG
+			/*
+			 * SOURCE CHECK (insert path): the composed insert_after(pos)
+			 * just committed SUCCEEDED, so pos->next MUST be the fresh
+			 * cell.  If instead pos->next is unchanged (== old_succ) while
+			 * the back edge landed (old_succ->prev == fresh), the MCAS
+			 * committed a SUBSET of its records: the pos->next store was
+			 * dropped, the succ->prev store landed.  Name it and snapshot
+			 * now -- microseconds after the corrupting commit, so the
+			 * engine store events are still in the flight-recorder window.
+			 */
+			if (ins_pos != NULL && fresh != NULL) {
+				void *pn = urcu_txn_list_next_rcu(ins_pos);
+
+				if (pn != &fresh->node && pn == old_succ &&
+						old_succ != ins_pos) {
+					struct urcu_txn_list_node *os = old_succ;
+					void *sp = urcu_txn_list_prev_rcu(os);
+
+					if (sp == &fresh->node) {
+						lttng_ust_tracepoint(bench, subset,
+							ins_pos, &fresh->node, pn, sp,
+							t_id, t_epoch);
+						fprintf(stderr,
+							"BENCH-SUBSET-COMMIT pos=%p fresh=%p "
+							"posnext=%p succ_prev=%p\n",
+							(void *) ins_pos, (void *) &fresh->node,
+							pn, sp);
+						(void) system("lttng snapshot record 1>&2");
+						abort();
+					}
+				}
+			}
+#endif
+			break;
+		}
+		if (fresh != NULL)		/* insert path lost the race: drop the cell */
+			lf_cell_free(fresh);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;		/* contention: re-read, re-decide */
+		abort();			/* -ENOMEM: fatal, as elsewhere */
+	}
+	rcu_read_unlock();
+	if (reclaim != NULL)
+		lf_cell_reclaim(reclaim);
+}
+
+/* Clear every transacted-index cell (single-threaded, between sweep points). */
+static void lf_reset_index(void)
+{
+	int i;
+
+	for (i = 0; i < g_nindex; i++) {
+		void *raw = g_lf_index[i];
+		struct urcu_txn_list_node *cur;
+		struct urcu_mcas_txn txn;
+		int removed = 0;
+
+		if (raw == NULL)
+			continue;
+		cur = IDX_DEC(raw);
+		/*
+		 * Unlink the cell AND clear its index slot in ONE flip, like the
+		 * writer's delete path, so the transacted index slot is only ever
+		 * written through the MCAS -- never a plain store.  Single-threaded
+		 * here, so there is no contention (commit cannot ABORT and del_prepare
+		 * cannot observe a peer's mark): one attempt suffices.
+		 */
+		urcu_txn_init(&txn, &g_lf_head.domain);
+		urcu_txn_begin(&txn);
+		if (urcu_txn_list_del_prepare(&txn, cur) == 0) {
+			urcu_txn_store(&txn, (void **) &g_lf_index[i],
+					raw, NULL);
+			removed = urcu_txn_commit(&txn) ==
+					URCU_TXN_STATUS_OK;
+		}
+		urcu_txn_end(&txn);
+		if (removed)
+			lf_cell_reclaim(caa_container_of(cur, struct lf_elem, node));
 	}
 }
 
@@ -802,8 +1174,8 @@ static void rl_write(int slot)
 
 /* ── Engine registry ─────────────────────────────────────────── */
 static const struct lengine engines[] = {
-	{ "bidir_su",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
-	{ "bidir_lf",  "RCU lock-free, coherent bidir",      1, lf_build,  lf_read,  lf_write  },
+	{ "txn_sw_list",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
+	{ "txn_list",  "RCU concurrent, coherent bidir",      1, lf_build,  lf_read,  lf_write, lf_write_random, lf_reset_index },
 	{ "rculist",   "RCU classic, forward-only (ref)",    1, rl_build,  rl_read,  rl_write  },
 	{ "mutex",     "pthread_mutex",                      0, mtx_build, mtx_read, mtx_write },
 	{ "fairmutex", "liburcu cds_fair_mutex (MCS/FIFO)",  0, fm_build,  fm_read,  fm_write  },
@@ -815,6 +1187,7 @@ static const struct lengine engines[] = {
 #define NR_ENGINES ((int)(sizeof(engines) / sizeof(engines[0])))
 
 static const struct lengine *g_eng;
+static int g_random_pos;		/* BENCH_RANDOM_POS: random-anchor writer mode */
 
 /* ── Worker threads ───────────────────────────────────────────── */
 struct reader_arg { unsigned long visits; long viol; int cpu; };
@@ -868,8 +1241,12 @@ static void *writer_thread(void *arg)
 	long rate = wr ? atol(wr) : 0;
 	uint64_t period_ns = rate > 0 ? 1000000000ULL / (uint64_t) rate : 0;
 	uint64_t base;
+	/* Per-writer PRNG seed for BENCH_RANDOM_POS (distinct, non-zero per wid). */
+	uint64_t rng = (0x9e3779b97f4a7c15ULL ^ ((uint64_t) wid * 0x100000001b3ULL)) | 1;
+	int random_pos = g_random_pos && g_eng->write_random != NULL;
 
 	bench_topology_pin(wa->cpu);
+	TP_SET_WID(wid);
 	if (g_eng->uses_rcu)
 		rcu_register_thread();
 
@@ -878,13 +1255,19 @@ static void *writer_thread(void *arg)
 	base = mono_ns();
 
 	while (!uatomic_load(&stop_flag, CMM_RELAXED)) {
-		int slot = first + m * nw;
-		if (slot >= CHURN) { m = 0; slot = first; }
-		g_eng->write_toggle(slot);
+		if (random_pos) {
+			g_eng->write_random(&rng);
+		} else {
+			int slot = first + m * nw;
+			if (slot >= CHURN) { m = 0; slot = first; }
+			g_eng->write_toggle(slot);
+			m++;
+		}
 		writes++;
-		m++;
-		if (g_eng->uses_rcu)
+		if (g_eng->uses_rcu) {
 			rcu_quiescent_state();
+			TP_QS();
+		}
 		if (period_ns) {
 			uint64_t target = base + writes * period_ns;
 			struct timespec ts = { (time_t)(target / 1000000000ULL),
@@ -907,6 +1290,8 @@ static void reset_churn(void)
 	for (j = 0; j < CHURN; j++)
 		if (g_present[j])
 			g_eng->write_toggle(j);		/* present -> delete */
+	if (g_random_pos && g_eng->reset_random)
+		g_eng->reset_random();			/* clear transacted-index cells */
 	if (g_eng->uses_rcu) {
 		rcu_quiescent_state();
 		rcu_barrier();				/* drain deferred frees */
@@ -940,9 +1325,16 @@ static void run_point(int nr_readers, int nr_writers,
 		pthread_create(&th[nr_readers + i], NULL, writer_thread, &wa[i]);
 	}
 
-	/* Wait until readers finished priming and are spinning on start_flag. */
+	/* Wait until readers finished priming and are spinning on start_flag.
+	 * main blocks here, so it must be RCU-offline: an online thread that
+	 * stops quiescing stalls every grace period (and thus call_rcu reclaim
+	 * AND any writer's commit-time synchronize_rcu) for the whole wait. */
+	if (g_eng->uses_rcu)
+		rcu_thread_offline();
 	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
 		usleep(1000);
+	if (g_eng->uses_rcu)
+		rcu_thread_online();
 
 	t0 = mono_ns();
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
@@ -959,8 +1351,16 @@ static void run_point(int nr_readers, int nr_writers,
 	}
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
 
+	/* main blocks in join while workers drain their last ops -- some of which
+	 * are committing through synchronize_rcu.  Stay RCU-offline across the join
+	 * so those grace periods can complete; otherwise main (online, no longer
+	 * quiescing) deadlocks the writers waiting on it. */
+	if (g_eng->uses_rcu)
+		rcu_thread_offline();
 	for (i = 0; i < total; i++)
 		pthread_join(th[i], NULL);
+	if (g_eng->uses_rcu)
+		rcu_thread_online();
 	t1 = mono_ns();
 	elapsed = (double)(t1 - t0) / 1e9;
 
@@ -1023,6 +1423,13 @@ int main(int argc, char **argv)
 	int allow_smt;
 	const char *e;
 
+#ifdef BENCH_LTTNG
+	__sanitizer_set_death_callback(bench_on_death);	/* dump snapshot on ASan abort */
+#ifdef URCU_MCAS_STORE_TRACE
+	urcu_mcas_store_hook = bench_store_hook;	/* engine structural-store trace */
+#endif
+#endif
+
 	if (argc < 2) { usage(argv[0]); return 1; }
 	for (i = 0; i < NR_ENGINES; i++)
 		if (strcmp(argv[1], engines[i].name) == 0) { g_eng = &engines[i]; break; }
@@ -1079,7 +1486,7 @@ int main(int argc, char **argv)
 		 * CPU instead of liburcu's single default worker, so call_rcu() routes
 		 * each deferred free to the worker for the caller's CPU: reclamation is
 		 * distributed and CPU-local rather than funnelled through one thread
-		 * (which otherwise caps lock-free writer throughput at ~8 Mops/s and is
+		 * (which otherwise caps concurrent writer throughput at ~8 Mops/s and is
 		 * the worst case for any thread-caching allocator's cross-thread free).
 		 * Pays off most when the allocator is ALSO per-CPU (tcmalloc rseq caches
 		 * or jemalloc MALLOC_CONF=percpu_arena:phycpu), so a node freed on CPU X
@@ -1092,7 +1499,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "per-cpu call_rcu workers enabled (default; BENCH_NO_PERCPU_CALLRCU to disable)\n");
 		}
 #ifdef LIST_RCU_INLINE_RCU_HEAD
-		/* Per-CPU slab node allocator (prototype) for bidir_lf's churn nodes. */
+		/* Per-CPU slab node allocator (prototype) for txn_list's churn nodes. */
 		if (getenv("BENCH_PCPU_ALLOC")) {
 			g_pcpu_alloc = 1;
 			g_slab = pcpu_slab_create(sizeof(struct lf_elem));
@@ -1111,6 +1518,10 @@ int main(int argc, char **argv)
 		g_eng->name, get_rss_kb(), LIST_SIZE, CHURN);
 
 	allow_smt = getenv("BENCH_ALLOW_SMT") != NULL;
+	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
+	if (g_random_pos && g_eng->write_random)
+		fprintf(stderr, "%s: random-position writer mode "
+			"(collisions ~ writers/LIST_SIZE)\n", g_eng->name);
 
 	if (getenv("BENCH_RW_BALANCED")) {
 		/*
@@ -1118,7 +1529,7 @@ int main(int argc, char **argv)
 		 * and T/2 writers concurrently (each on its own physical core), so the
 		 * structure takes simultaneous read and write pressure as the machine
 		 * fills.  Shows how each engine handles a mixed workload: RCU readers
-		 * never block (and bidir_lf's writers also scale), whereas the lock /
+		 * never block (and txn_list's writers also scale), whereas the lock /
 		 * seqlock engines serialize readers against writers.
 		 */
 		int tc[] = {2,4,8,16,32,64,96,128,160,192};
