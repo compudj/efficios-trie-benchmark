@@ -307,6 +307,14 @@ LIST_CFLAGS := $(OPTFLAGS) -pthread -Wall
 HWLOC_CFLAGS := $(shell pkg-config --cflags hwloc)
 HWLOC_LIBS   := $(shell pkg-config --libs hwloc)
 
+# Reference Read-Log-Update (third_party/rlu), an added bench_list_scale engine.
+# RLU_DEFS MUST be identical for rlu.o and bench_list_scale.o: both see
+# sizeof(rlu_thread_data_t), so a mismatch is an ABI break.  The sweep reaches
+# 192 threads (>128) and our commits touch 2-3 tiny nodes (default 20 MB/thread
+# of write-set buffers is wasteful) -- see third_party/rlu/PROVENANCE.txt.
+RLU_DIR  := third_party/rlu
+RLU_DEFS := -DRLU_MAX_THREADS=256 -DRLU_MAX_WRITE_SET_BUFFER_SIZE=8192
+
 urcu-bidir:
 	@if [ ! -d "$(URCU_BIDIR_BUILD)/.git" ]; then \
 	  echo ">> cloning $(URCU_BIDIR_UPSTREAM) ($(URCU_BIDIR_BRANCH)) -> $(URCU_BIDIR_BUILD)"; \
@@ -330,17 +338,19 @@ check-urcu-bidir:
 	  echo "ERROR: bind9 isc headers not found under $(ISC_INC)"; \
 	  echo "       Run 'make bind9' to populate bind9-src/ (for the iscrw engine)."; exit 1; }
 
-bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c \
+bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-bidir
-	$(CC) $(LIST_CFLAGS) -I$(URCU_BIDIR_INC) -I$(TOPO_DIR) \
+	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(URCU_BIDIR_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
 	  -c src/bench_list_scale.c -o src/bench_list_scale.o
+	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(RLU_DIR) \
+	  -c $(RLU_DIR)/rlu.c -o src/rlu.o
 	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
 	  -c src/bench_iscrw.c -o src/bench_iscrw.o
 	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
 	  -c bind9-src/lib/isc/rwlock.c -o src/iscrw.o
 	$(CC) $(LIST_CFLAGS) $(HWLOC_CFLAGS) -I$(TOPO_DIR) \
 	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
-	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/bench_iscrw.o \
+	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/rlu.o src/bench_iscrw.o \
 	  src/iscrw.o src/bench_topology_list.o \
 	  -L$(URCU_BIDIR_LIB) -Wl,-rpath,$(URCU_BIDIR_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
@@ -350,4 +360,4 @@ clean-urcu-bidir:
 
 clean:
 	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) bench_list_scale \
-	  src/bench_list_scale.o src/bench_iscrw.o src/iscrw.o src/bench_topology_list.o
+	  src/bench_list_scale.o src/rlu.o src/bench_iscrw.o src/iscrw.o src/bench_topology_list.o

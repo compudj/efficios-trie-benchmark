@@ -66,6 +66,8 @@
 #include <urcu/rculist.h>
 #include <urcu/fair-mutex.h>
 
+#include "rlu.h"		/* reference Read-Log-Update engine (third_party/rlu) */
+
 #include "bench_topology.h"
 
 /* ── ISC C-RW-WP rwlock, behind the bench_iscrw.c isolation wrapper ── */
@@ -126,6 +128,11 @@ static int STEP_LIMIT;		/* runaway-walk guard, set after sizes known */
 /* Churn schedule, shared (only one engine builds per process). */
 static int    *g_anchor;	/* [CHURN] stable index a churn node sits after */
 static int8_t *g_present;	/* [CHURN] is this churn slot currently linked? */
+/* BENCH_RANDOM_POS: multi-slot transacted-index writer mode.  Declared here (up
+ * front) so the read passes can suppress the sortedness check in this mode --
+ * random-mode inserts carry key 0, so the list is intentionally unsorted and a
+ * reader only counts visits (measuring read cost under multi-slot writes). */
+static int g_random_pos;
 
 /* ── Run state ─────────────────────────────────────────────────── */
 static volatile int start_flag;
@@ -302,6 +309,15 @@ struct lengine {
 	/* Clear all transacted-index cells (single-threaded, between sweep
 	 * points).  NULL unless the engine provides write_random. */
 	void (*reset_random)(void);
+	/* Optional per-engine thread-lifecycle hooks, for an engine (RLU) that
+	 * carries its OWN thread registration instead of liburcu's.  point_reset
+	 * runs on main at the START of each sweep point, before any worker is
+	 * spawned (rewind the engine's thread registry); tl_begin/tl_end run once
+	 * per worker (and per main churn-reset pass) at entry/exit.  All NULL for
+	 * the liburcu / lock engines. */
+	void (*point_reset)(void);
+	void (*tl_begin)(void);
+	void (*tl_end)(void);
 };
 
 /* xorshift64: cheap per-writer PRNG for random anchor selection. */
@@ -767,16 +783,24 @@ static unsigned long lf_read(long *viol)
 			p != &g_lf_head.node;
 			p = urcu_txn_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
-		if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
-		prev = k; vis++;
+		if (++steps > STEP_LIMIT) { (*viol)++; break; }	/* runaway guard: always */
+		if (!g_random_pos) {			/* sortedness only in the sorted (churn) mode */
+			if (k <= prev) { (*viol)++; break; }
+			prev = k;
+		}
+		vis++;
 	}
 	prev = INT_MAX; steps = 0;
 	for (p = urcu_txn_list_prev_rcu(&g_lf_head.node);
 			p != &g_lf_head.node;
 			p = urcu_txn_list_prev_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
-		if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
-		prev = k; vis++;
+		if (++steps > STEP_LIMIT) { (*viol)++; break; }
+		if (!g_random_pos) {
+			if (k >= prev) { (*viol)++; break; }
+			prev = k;
+		}
+		vis++;
 	}
 	rcu_read_unlock();
 	return vis;
@@ -1172,10 +1196,626 @@ static void rl_write(int slot)
 	pthread_mutex_unlock(&g_rl_wlock);
 }
 
+/* ════════════════════════════════════════════════════════════════
+ * rlu_list: reference Read-Log-Update bidirectional list
+ *
+ * The Matveev/Shavit/Felber/Marlier RLU mechanism (third_party/rlu, MIT),
+ * driving the SAME doubly-linked churn workload as txn_list, so the two
+ * multi-pointer-update schemes meet on identical ground.  RLU is NOT a liburcu
+ * flavor: it carries its own SMR (global clock + rlu_synchronize) and its own
+ * per-thread registration, so this engine sets uses_rcu = 0 and does its own
+ * reader-lock / thread bookkeeping through the tl_* hooks.
+ *
+ * Guarantee (declared, not emulated): an RLU reader section observes a COHERENT
+ * SNAPSHOT of the objects it dereferences -- strictly stronger than txn_list's
+ * per-slot-linearizable (non-snapshot) reads.  We measure both as-is and report
+ * the difference rather than making either side emulate the other.
+ *
+ * Deferral: BENCH_RLU_WS sets RLU's max_write_sets -- 1 = synchronous writeback
+ * (the floor), 100 = headline defer (how RLU is meant to run at scale).  Both
+ * are FINE_GRAINED (per-object locks); COARSE_GRAINED is never used.
+ *
+ * Thread-model bridge: upstream RLU draws uniq_id from a monotonic counter and
+ * assumes long-lived threads, but our harness spawns a fresh worker set per
+ * sweep point.  We give every worker a pooled rlu_thread_data_t, flush it on
+ * exit (tl_end), and rewind the RLU registry between points (point_reset ->
+ * rlu_bench_reset_threads); see the rlu.c local patch.
+ * ════════════════════════════════════════════════════════════════ */
+struct rlu_lnode { struct rlu_lnode *next, *prev; int key; };
+
+static struct rlu_lnode  *g_rlu_head;		/* RLU_ALLOC'd circular sentinel */
+static struct rlu_lnode **g_rlu_stable;		/* [LIST_SIZE] permanent nodes */
+static struct rlu_lnode **g_rlu_churn;		/* [CHURN] master ptr per slot */
+
+/*
+ * Transacted external index for the multi-slot random workload (BENCH_RANDOM_POS).
+ * rcu-txn transacts the raw array word g_lf_index[i] DIRECTLY in the same MCAS as
+ * the list splice.  RLU can only log a write to a FIELD OF A LOCKED OBJECT, so
+ * each index slot must be a permanent RLU object (rlu_icell) whose ->target field
+ * names a list cell or is NULL; the writer locks that cell together with the
+ * splice nodes so the index update commits atomically with the list op.  That
+ * extra indirection + lock is exactly the modelling cost of "RLU transacts object
+ * fields, not arbitrary words" -- a headline difference, not just plumbing.
+ */
+struct rlu_icell { struct rlu_lnode *target; };
+static struct rlu_icell **g_rlu_index;		/* [g_rlu_nindex] permanent RLU cells */
+static int g_rlu_nindex;
+
+#ifndef RLU_POOL_MAX
+#define RLU_POOL_MAX	RLU_MAX_THREADS
+#endif
+static rlu_thread_data_t *g_rlu_pool;		/* [RLU_POOL_MAX], reused each point */
+static volatile long g_rlu_slot;		/* next free pool slot; reset per point */
+static volatile long g_rlu_gen;			/* bumped per point; invalidates TLS self */
+static __thread rlu_thread_data_t *tls_rlu;	/* this OS thread's registered self */
+static __thread long tls_rlu_gen = -1;		/* the gen tls_rlu was registered for */
+static int g_rlu_ws = 100;			/* RLU deferral depth (BENCH_RLU_WS) */
+
+/* Register (once per point per OS thread) and return this thread's RLU self.
+ * A generation mismatch means point_reset rewound the registry, so re-register
+ * into a fresh pool slot -- reusing pool memory, no per-thread leak. */
+static rlu_thread_data_t *rlu_self(void)
+{
+	if (caa_unlikely(tls_rlu == NULL || tls_rlu_gen != g_rlu_gen)) {
+		long s = __atomic_fetch_add(&g_rlu_slot, 1, __ATOMIC_RELAXED);
+		if (s >= RLU_POOL_MAX)		/* raise RLU_MAX_THREADS if this fires */
+			abort();
+		tls_rlu = &g_rlu_pool[s];
+		rlu_thread_init(tls_rlu);
+		tls_rlu_gen = g_rlu_gen;
+	}
+	return tls_rlu;
+}
+
+static void rlu_tl_begin(void) { (void) rlu_self(); }
+static void rlu_tl_end(void)   { if (tls_rlu) rlu_bench_flush(tls_rlu); }
+
+/* main, between points, no worker live: rewind the RLU registry so the next
+ * point's uniq_ids restart from 0 (bounded by RLU_POOL_MAX, not the sweep's
+ * total thread count). */
+static void rlu_point_reset(void)
+{
+	rlu_bench_reset_threads();
+	__atomic_store_n(&g_rlu_slot, 0, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&g_rlu_gen, 1, __ATOMIC_RELAXED);
+}
+
+static void rlu_build(void)
+{
+	const char *ws = getenv("BENCH_RLU_WS");
+	struct rlu_lnode *prev;
+	int i;
+
+	if (ws) { g_rlu_ws = atoi(ws); if (g_rlu_ws < 1) g_rlu_ws = 1; }
+	rlu_init(RLU_TYPE_FINE_GRAINED, g_rlu_ws);
+	g_rlu_pool = calloc(RLU_POOL_MAX, sizeof(*g_rlu_pool));
+
+	/* Build single-threaded: nodes are unlocked (copy == NULL), so plain
+	 * field stores publish the initial ring without the RLU write protocol. */
+	g_rlu_head = (struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+	g_rlu_head->key = INT_MIN;
+	g_rlu_stable = calloc(LIST_SIZE, sizeof(*g_rlu_stable));
+	prev = g_rlu_head;
+	for (i = 0; i < LIST_SIZE; i++) {
+		struct rlu_lnode *n =
+			(struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+		n->key = 2 * i;
+		n->prev = prev;
+		prev->next = n;
+		g_rlu_stable[i] = n;
+		prev = n;
+	}
+	prev->next = g_rlu_head;		/* close the ring */
+	g_rlu_head->prev = prev;
+	g_rlu_churn = calloc(CHURN, sizeof(*g_rlu_churn));
+
+	/* Permanent RLU index cells for the multi-slot random workload (one per
+	 * contention slot; count == CHURN, mirroring txn_list's g_nindex). */
+	g_rlu_nindex = CHURN > 0 ? CHURN : 1;
+	g_rlu_index = calloc((size_t) g_rlu_nindex, sizeof(*g_rlu_index));
+	for (i = 0; i < g_rlu_nindex; i++) {
+		g_rlu_index[i] = (struct rlu_icell *) RLU_ALLOC(sizeof(struct rlu_icell));
+		g_rlu_index[i]->target = NULL;
+	}
+}
+
+static unsigned long rlu_read(long *viol)
+{
+	rlu_thread_data_t *self = rlu_self();
+	struct rlu_lnode *head = g_rlu_head, *h, *p;
+	unsigned long vis = 0;
+	int prev, steps;
+
+	RLU_READER_LOCK(self);
+	h = (struct rlu_lnode *) RLU_DEREF(self, head);
+	prev = INT_MIN; steps = 0;
+	for (p = (struct rlu_lnode *) RLU_DEREF(self, h->next);
+			!RLU_IS_SAME_PTRS(p, head);
+			p = (struct rlu_lnode *) RLU_DEREF(self, p->next)) {
+		int k = p->key;
+		if (++steps > STEP_LIMIT) { (*viol)++; break; }	/* runaway guard: always */
+		if (!g_random_pos) {			/* sortedness only in the sorted (churn) mode */
+			if (k <= prev) { (*viol)++; break; }
+			prev = k;
+		}
+		vis++;
+	}
+	prev = INT_MAX; steps = 0;
+	for (p = (struct rlu_lnode *) RLU_DEREF(self, h->prev);
+			!RLU_IS_SAME_PTRS(p, head);
+			p = (struct rlu_lnode *) RLU_DEREF(self, p->prev)) {
+		int k = p->key;
+		if (++steps > STEP_LIMIT) { (*viol)++; break; }
+		if (!g_random_pos) {
+			if (k >= prev) { (*viol)++; break; }
+			prev = k;
+		}
+		vis++;
+	}
+	RLU_READER_UNLOCK(self);
+	return vis;
+}
+
+static void rlu_write(int slot)
+{
+	rlu_thread_data_t *self = rlu_self();
+
+	if (g_present[slot]) {			/* unlink the churn node */
+		struct rlu_lnode *cur = g_rlu_churn[slot];	/* master identity */
+		struct rlu_lnode *c, *prev, *succ;
+del_restart:
+		RLU_READER_LOCK(self);
+		c    = (struct rlu_lnode *) RLU_DEREF(self, cur);
+		prev = (struct rlu_lnode *) RLU_DEREF(self, c->prev);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, c->next);
+		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto del_restart; }
+		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto del_restart; }
+		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto del_restart; }
+		RLU_ASSIGN_PTR(self, &prev->next, succ);
+		RLU_ASSIGN_PTR(self, &succ->prev, prev);
+		RLU_FREE(self, cur);
+		RLU_READER_UNLOCK(self);
+		g_rlu_churn[slot] = NULL;
+		g_present[slot] = 0;
+	} else {				/* splice a fresh churn node after the anchor */
+		int a = g_anchor[slot];
+		struct rlu_lnode *pos = g_rlu_stable[a];	/* master identity */
+		struct rlu_lnode *p, *succ, *nw;
+ins_restart:
+		RLU_READER_LOCK(self);
+		p    = (struct rlu_lnode *) RLU_DEREF(self, pos);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, p->next);
+		if (!RLU_TRY_LOCK(self, &pos))  { RLU_ABORT(self); goto ins_restart; }
+		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto ins_restart; }
+		nw = (struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+		nw->key = 2 * a + 1;
+		RLU_ASSIGN_PTR(self, &nw->next, succ);	/* stored as master (FORCE_ACTUAL) */
+		RLU_ASSIGN_PTR(self, &nw->prev, pos);
+		RLU_ASSIGN_PTR(self, &pos->next, nw);
+		RLU_ASSIGN_PTR(self, &succ->prev, nw);
+		RLU_READER_UNLOCK(self);
+		g_rlu_churn[slot] = nw;
+		g_present[slot] = 1;
+	}
+}
+
+/*
+ * Multi-slot random workload (BENCH_RANDOM_POS): pick a random index slot and
+ * fold the list splice/unlink AND the index-slot update into ONE RLU commit --
+ * the direct analogue of txn_list's lf_write_random, which folds them into one
+ * MCAS.  The index cell is LOCKED FIRST, and its ->target is read from the
+ * locked copy: that freezes the insert-vs-delete decision (no peer can change
+ * it until we commit) and serializes concurrent writers that draw the same slot,
+ * exactly the P ~ writers/nindex contention txn_list resolves on the slot's MCAS.
+ * Inserted cells carry key 0 (unsorted -- random mode is writer-only), matching
+ * lf_write_random.
+ */
+static void rlu_write_random(uint64_t *rng)
+{
+	rlu_thread_data_t *self = rlu_self();
+	int i = (int) (xorshift64(rng) % (uint64_t) g_rlu_nindex);
+	struct rlu_icell *ic0 = g_rlu_index[i], *ic;
+	struct rlu_lnode *cur;
+
+retry:
+	RLU_READER_LOCK(self);
+	ic = ic0;
+	if (!RLU_TRY_LOCK(self, &ic)) { RLU_ABORT(self); goto retry; }
+	cur = ic->target;			/* authoritative: frozen while we hold ic */
+	if (cur == NULL) {			/* empty slot -> splice a fresh cell, publish it */
+		int a = (int) (xorshift64(rng) % (uint64_t) LIST_SIZE);
+		struct rlu_lnode *pos = g_rlu_stable[a], *p, *succ, *nw;
+
+		p    = (struct rlu_lnode *) RLU_DEREF(self, pos);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, p->next);
+		if (!RLU_TRY_LOCK(self, &pos))  { RLU_ABORT(self); goto retry; }
+		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
+		nw = (struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+		nw->key = 0;
+		RLU_ASSIGN_PTR(self, &nw->next, succ);
+		RLU_ASSIGN_PTR(self, &nw->prev, pos);
+		RLU_ASSIGN_PTR(self, &pos->next, nw);
+		RLU_ASSIGN_PTR(self, &succ->prev, nw);
+		RLU_ASSIGN_PTR(self, &ic->target, nw);
+	} else {				/* full slot -> unlink the named cell, clear it */
+		struct rlu_lnode *c, *prev, *succ;
+
+		c    = (struct rlu_lnode *) RLU_DEREF(self, cur);
+		prev = (struct rlu_lnode *) RLU_DEREF(self, c->prev);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, c->next);
+		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
+		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto retry; }
+		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
+		RLU_ASSIGN_PTR(self, &prev->next, succ);
+		RLU_ASSIGN_PTR(self, &succ->prev, prev);
+		RLU_ASSIGN_PTR(self, &ic->target, NULL);
+		RLU_FREE(self, cur);
+	}
+	RLU_READER_UNLOCK(self);
+}
+
+/* Clear every index cell (single-threaded, between sweep points): unlink each
+ * named cell AND null its slot in one commit, like the writer's delete path. */
+static void rlu_reset_random(void)
+{
+	rlu_thread_data_t *self = rlu_self();
+	int i;
+
+	for (i = 0; i < g_rlu_nindex; i++) {
+		struct rlu_icell *ic0 = g_rlu_index[i], *ic;
+		struct rlu_lnode *cur, *c, *prev, *succ;
+retry:
+		RLU_READER_LOCK(self);
+		ic = ic0;
+		if (!RLU_TRY_LOCK(self, &ic)) { RLU_ABORT(self); goto retry; }
+		cur = ic->target;
+		if (cur == NULL) { RLU_READER_UNLOCK(self); continue; }
+		c    = (struct rlu_lnode *) RLU_DEREF(self, cur);
+		prev = (struct rlu_lnode *) RLU_DEREF(self, c->prev);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, c->next);
+		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
+		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto retry; }
+		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
+		RLU_ASSIGN_PTR(self, &prev->next, succ);
+		RLU_ASSIGN_PTR(self, &succ->prev, prev);
+		RLU_ASSIGN_PTR(self, &ic->target, NULL);
+		RLU_FREE(self, cur);
+		RLU_READER_UNLOCK(self);
+	}
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * Hash-of-lists (Phase 5 re-home): RLU's OWN showcase structure -- a hash
+ * table of sorted singly-linked bucket lists -- brought into THIS harness so
+ * rcu-txn and RLU meet on RLU's home turf under identical pinning, warm-up,
+ * timing and workload.  Singly-linked (not bidir) buckets on purpose: that is
+ * RLU's native form; bidir buckets would tax RLU an extra prev edge per op it
+ * would never pay in the paper.  Each engine uses its required allocator
+ * (RLU_ALLOC for RLU, malloc+call_rcu for rcu-txn) -- an inherent asymmetry.
+ *
+ * Workload (writer-only-safe knobs, env-overridable): HL_BUCKETS buckets,
+ * HL_INIT initial keys drawn from [0,HL_RANGE) (HL_RANGE = 2*INIT => ~50%
+ * occupancy, steady under toggle), HL_BATCH lookups per read pass.  A reader
+ * pass does HL_BATCH random key lookups (checking per-bucket sortedness into
+ * *viol); a writer op toggles a random key (present -> remove, absent -> add),
+ * so the population stays ~HL_INIT without an explicit reset.  Both bucket
+ * lists carry LONG_MIN head and LONG_MAX tail sentinels so search needs no NULL
+ * or empty-bucket special cases.
+ * ════════════════════════════════════════════════════════════════ */
+static int HL_BUCKETS = 1000;
+static int HL_INIT    = 100000;
+static int HL_RANGE   = 200000;
+static int HL_BATCH   = 16;
+
+static void hl_config(void)
+{
+	const char *s;
+	if ((s = getenv("HL_BUCKETS"))) HL_BUCKETS = atoi(s);
+	if ((s = getenv("HL_INIT")))    HL_INIT    = atoi(s);
+	if ((s = getenv("HL_RANGE")))   HL_RANGE   = atoi(s);
+	if ((s = getenv("HL_BATCH")))   HL_BATCH   = atoi(s);
+	if (HL_BUCKETS < 1) HL_BUCKETS = 1;
+	if (HL_RANGE   < 2) HL_RANGE   = 2;
+	if (HL_BATCH   < 1) HL_BATCH   = 1;
+}
+
+static __thread uint64_t g_hl_rng;
+static inline uint64_t hl_rng(void)
+{
+	if (!g_hl_rng)			/* per-thread seed: address-diverse, non-zero */
+		g_hl_rng = 0x9e3779b97f4a7c15ULL ^ (uint64_t) (uintptr_t) &g_hl_rng;
+	return g_hl_rng;
+}
+static inline unsigned hl_hash(long key)
+{
+	return (unsigned) ((unsigned long) key % (unsigned) HL_BUCKETS);
+}
+
+/* ── txn_hlist: rcu-txn hash-of-lists on ITS OWN bidir list ──
+ *
+ * Option 1 (each engine uses its idiomatic list): rcu-txn buckets are sorted
+ * COHERENT BIDIR lists (urcu_txn_list), not a hand-rolled singly-linked list.
+ * Removal uses the engine's validated urcu_txn_list_del_rcu, so the engine owns
+ * the mark-and-reclaim and the node lifecycle is clean (an earlier hand-rolled
+ * singly-linked version raced -- it guarded cur->next while hand-reclaiming cur;
+ * forcing rcu-txn into RLU's list shape was both unrepresentative and unsafe).
+ * A sorted insert PINS pred->next via load-validate before insert_after_prepare:
+ * a concurrent insert of a smaller key (or a delete of pred) then changes that
+ * slot and poisons/aborts the commit, so we retry -- which keeps the bucket
+ * sorted AND dedups (two adds of the same key contend on pred->next; the loser
+ * re-finds it present). */
+struct thl_node { struct urcu_txn_list_node node; long key; struct rcu_head rh; };
+static struct urcu_txn_list_head *g_thl_bkt;	/* [HL_BUCKETS] */
+
+static void thl_node_free(struct rcu_head *h)
+{
+	free(caa_container_of(h, struct thl_node, rh));
+}
+static struct thl_node *thl_alloc(long key)
+{
+	struct thl_node *n = malloc(sizeof(*n));
+	if (!n) abort();
+	n->key = key;
+	return n;
+}
+/* Key of a list node, or +inf for the bucket's circular sentinel (wrap point). */
+static inline long thl_key(struct urcu_txn_list_head *head,
+		struct urcu_txn_list_node *p)
+{
+	return p == &head->node ? LONG_MAX :
+		caa_container_of(p, struct thl_node, node)->key;
+}
+static void thl_build(void)
+{
+	uint64_t r = 0x1234567ULL;
+	long inserted = 0;
+	int i;
+
+	hl_config();
+	g_thl_bkt = calloc((size_t) HL_BUCKETS, sizeof(*g_thl_bkt));
+	for (i = 0; i < HL_BUCKETS; i++)
+		urcu_txn_list_init(&g_thl_bkt[i]);
+	while (inserted < HL_INIT) {			/* sorted initial fill, single-threaded */
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		struct urcu_txn_list_head *head = &g_thl_bkt[hl_hash(key)];
+		struct urcu_txn_list_node *pred = &head->node, *cur;
+		struct thl_node *n;
+
+		rcu_read_lock();
+		for (cur = urcu_txn_list_next_rcu(pred); cur != &head->node;
+				cur = urcu_txn_list_next_rcu(cur)) {
+			if (thl_key(head, cur) >= key) break;
+			pred = cur;
+		}
+		rcu_read_unlock();
+		if (cur != &head->node && thl_key(head, cur) == key)
+			continue;			/* dup */
+		n = thl_alloc(key);
+		if (urcu_txn_list_insert_after_rcu(&n->node, pred, head))
+			abort();
+		inserted++;
+	}
+}
+static int thl_contains(struct urcu_txn_list_head *head, long key, long *viol)
+{
+	struct urcu_txn_list_node *p = urcu_txn_list_next_rcu(&head->node);
+	long pk = LONG_MIN;
+	int steps = 0;
+
+	while (p != &head->node) {
+		long k = thl_key(head, p);
+		if (k < pk || ++steps > STEP_LIMIT) { (*viol)++; return 0; }
+		pk = k;
+		if (k >= key) return k == key;
+		p = urcu_txn_list_next_rcu(p);
+	}
+	return 0;
+}
+static unsigned long thl_read(long *viol)
+{
+	unsigned long found = 0;
+	uint64_t r = hl_rng();
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < HL_BATCH; i++) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		found += (unsigned long) thl_contains(&g_thl_bkt[hl_hash(key)], key, viol);
+	}
+	rcu_read_unlock();
+	g_hl_rng = r;
+	return found;
+}
+static void thl_write(int slot)
+{
+	uint64_t r = hl_rng();
+	long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+	struct urcu_txn_list_head *head = &g_thl_bkt[hl_hash(key)];
+	struct urcu_txn_list_node *p;
+	struct thl_node *victim = NULL, *n;
+	struct urcu_mcas_txn txn;
+	int mem_err = 0;
+
+	(void) slot;
+	g_hl_rng = r;
+	rcu_read_lock();
+	/* Locate the key. */
+	for (p = urcu_txn_list_next_rcu(&head->node); p != &head->node;
+			p = urcu_txn_list_next_rcu(p)) {
+		long k = thl_key(head, p);
+		if (k >= key) {
+			if (k == key)
+				victim = caa_container_of(p, struct thl_node, node);
+			break;
+		}
+	}
+	if (victim) {					/* present -> remove via the engine's del */
+		if (urcu_txn_list_del_rcu(&victim->node, head) == 1)
+			call_rcu(&victim->rh, thl_node_free);
+		rcu_read_unlock();
+		return;
+	}
+	/* absent -> sorted insert with a pinned predecessor edge */
+	n = thl_alloc(key);
+	urcu_txn_init(&txn, &head->domain);
+	for (;;) {
+		struct urcu_txn_list_node *pred = &head->node, *cur;
+		void *raw;
+		enum urcu_txn_status st;
+		int prep;
+
+		urcu_txn_begin(&txn);
+		for (;;) {				/* walk (unpinned) to the approx predecessor */
+			raw = urcu_txn_load(&txn, (void **) &pred->next);
+			if (urcu_txn_list_is_marked(raw))
+				break;			/* pred being deleted: re-check under the pin */
+			cur = (struct urcu_txn_list_node *) raw;
+			if (thl_key(head, cur) >= key)
+				break;
+			pred = cur;
+		}
+		/* Pin pred->next: a concurrent insert of a smaller key or a delete of
+		 * pred changes this slot, poisoning the commit so we retry. */
+		raw = urcu_txn_load_validate(&txn, (void **) &pred->next);
+		if (urcu_txn_list_is_marked(raw)) {		/* pred deleted under us */
+			urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
+		}
+		cur = (struct urcu_txn_list_node *) raw;
+		if (cur != &head->node) {
+			long ck = thl_key(head, cur);
+			if (ck == key) {			/* someone else added it: done */
+				urcu_txn_end(&txn); free(n); rcu_read_unlock(); return;
+			}
+			if (ck < key) {				/* a closer predecessor appeared */
+				urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
+			}
+		}
+		prep = urcu_txn_list_insert_after_prepare(&txn, &n->node, pred);
+		if (prep) {				/* -EAGAIN succ moved / -ENOENT pred gone */
+			urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
+		}
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_OK)
+			break;
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		if (++mem_err < 64)			/* poison (retry) vs real OOM (bounded) */
+			continue;
+		abort();
+	}
+	rcu_read_unlock();
+}
+
+/* ── rlu_hlist: RLU hash-of-lists (mirrors third_party/rlu hash-list.c) ── */
+struct rlu_hnode { struct rlu_hnode *next; long key; };
+static struct rlu_hnode **g_rhl_bkt;		/* [HL_BUCKETS] head sentinels */
+
+static struct rlu_hnode *rhl_alloc(long key)
+{
+	struct rlu_hnode *n = (struct rlu_hnode *) RLU_ALLOC(sizeof(struct rlu_hnode));
+	n->key = key; n->next = NULL;
+	return n;
+}
+static void rhl_build(void)
+{
+	const char *ws = getenv("BENCH_RLU_WS");
+	uint64_t r = 0x1234567ULL;
+	long inserted = 0;
+	int i;
+
+	if (ws) { g_rlu_ws = atoi(ws); if (g_rlu_ws < 1) g_rlu_ws = 1; }
+	hl_config();
+	rlu_init(RLU_TYPE_FINE_GRAINED, g_rlu_ws);
+	g_rlu_pool = calloc(RLU_POOL_MAX, sizeof(*g_rlu_pool));
+	g_rhl_bkt = calloc((size_t) HL_BUCKETS, sizeof(*g_rhl_bkt));
+	for (i = 0; i < HL_BUCKETS; i++) {
+		struct rlu_hnode *head = rhl_alloc(LONG_MIN);
+		struct rlu_hnode *tail = rhl_alloc(LONG_MAX);
+		head->next = tail; tail->next = tail;
+		g_rhl_bkt[i] = head;
+	}
+	while (inserted < HL_INIT) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		struct rlu_hnode *pred = g_rhl_bkt[hl_hash(key)], *cur = pred->next, *n;
+		while (cur->key < key) { pred = cur; cur = cur->next; }
+		if (cur->key == key) continue;
+		n = rhl_alloc(key); n->next = cur; pred->next = n; inserted++;
+	}
+}
+static int rhl_contains(rlu_thread_data_t *self, struct rlu_hnode *head, long key, long *viol)
+{
+	struct rlu_hnode *pred = (struct rlu_hnode *) RLU_DEREF(self, head);
+	struct rlu_hnode *cur  = (struct rlu_hnode *) RLU_DEREF(self, pred->next);
+	long pk = LONG_MIN;
+	int steps = 0;
+
+	while (cur->key < key) {
+		if (cur->key < pk || ++steps > STEP_LIMIT) { (*viol)++; return 0; }
+		pk = cur->key; pred = cur;
+		cur = (struct rlu_hnode *) RLU_DEREF(self, pred->next);
+	}
+	return cur->key == key;
+}
+static unsigned long rhl_read(long *viol)
+{
+	rlu_thread_data_t *self = rlu_self();
+	unsigned long found = 0;
+	uint64_t r = hl_rng();
+	int i;
+
+	RLU_READER_LOCK(self);
+	for (i = 0; i < HL_BATCH; i++) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		found += (unsigned long) rhl_contains(self, g_rhl_bkt[hl_hash(key)], key, viol);
+	}
+	RLU_READER_UNLOCK(self);
+	g_hl_rng = r;
+	return found;
+}
+static void rhl_write(int slot)
+{
+	rlu_thread_data_t *self = rlu_self();
+	uint64_t r = hl_rng();
+	long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+	struct rlu_hnode *head = g_rhl_bkt[hl_hash(key)], *pred, *cur;
+
+	(void) slot;
+	g_hl_rng = r;
+restart:
+	RLU_READER_LOCK(self);
+	pred = (struct rlu_hnode *) RLU_DEREF(self, head);
+	cur  = (struct rlu_hnode *) RLU_DEREF(self, pred->next);
+	while (cur->key < key) {
+		pred = cur;
+		cur = (struct rlu_hnode *) RLU_DEREF(self, pred->next);
+	}
+	if (cur->key == key) {				/* present -> remove cur */
+		struct rlu_hnode *n = (struct rlu_hnode *) RLU_DEREF(self, cur->next);
+		if (!RLU_TRY_LOCK(self, &pred)) { RLU_ABORT(self); goto restart; }
+		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto restart; }
+		RLU_ASSIGN_PTR(self, &pred->next, n);
+		RLU_FREE(self, cur);
+	} else {					/* absent -> add between pred and cur */
+		struct rlu_hnode *nw;
+		if (!RLU_TRY_LOCK(self, &pred)) { RLU_ABORT(self); goto restart; }
+		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto restart; }
+		nw = rhl_alloc(key);
+		RLU_ASSIGN_PTR(self, &nw->next, cur);
+		RLU_ASSIGN_PTR(self, &pred->next, nw);
+	}
+	RLU_READER_UNLOCK(self);
+}
+
 /* ── Engine registry ─────────────────────────────────────────── */
 static const struct lengine engines[] = {
 	{ "txn_sw_list",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
 	{ "txn_list",  "RCU concurrent, coherent bidir",      1, lf_build,  lf_read,  lf_write, lf_write_random, lf_reset_index },
+	{ "rlu_list",  "RLU (Read-Log-Update), coherent bidir", 0, rlu_build, rlu_read, rlu_write,
+		rlu_write_random, rlu_reset_random, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
+	{ "txn_hlist", "rcu-txn hash-of-sorted-lists",       1, thl_build, thl_read, thl_write },
+	{ "rlu_hlist", "RLU hash-of-sorted-lists (home turf)", 0, rhl_build, rhl_read, rhl_write,
+		NULL, NULL, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
 	{ "rculist",   "RCU classic, forward-only (ref)",    1, rl_build,  rl_read,  rl_write  },
 	{ "mutex",     "pthread_mutex",                      0, mtx_build, mtx_read, mtx_write },
 	{ "fairmutex", "liburcu cds_fair_mutex (MCS/FIFO)",  0, fm_build,  fm_read,  fm_write  },
@@ -1187,7 +1827,6 @@ static const struct lengine engines[] = {
 #define NR_ENGINES ((int)(sizeof(engines) / sizeof(engines[0])))
 
 static const struct lengine *g_eng;
-static int g_random_pos;		/* BENCH_RANDOM_POS: random-anchor writer mode */
 
 /* ── Worker threads ───────────────────────────────────────────── */
 struct reader_arg { unsigned long visits; long viol; int cpu; };
@@ -1202,6 +1841,8 @@ static void *reader_thread(void *arg)
 	bench_topology_pin(ra->cpu);
 	if (g_eng->uses_rcu)
 		rcu_register_thread();
+	if (g_eng->tl_begin)
+		g_eng->tl_begin();			/* engine-private thread registration (RLU) */
 
 	if (getenv("BENCH_NO_PRIME") == NULL)
 		(void) g_eng->read_pass(&viol);		/* one warm pass */
@@ -1216,6 +1857,8 @@ static void *reader_thread(void *arg)
 			rcu_quiescent_state();
 	}
 
+	if (g_eng->tl_end)
+		g_eng->tl_end();			/* flush this thread's deferred RLU write-sets */
 	if (g_eng->uses_rcu)
 		rcu_unregister_thread();
 	ra->visits = visits;
@@ -1249,6 +1892,8 @@ static void *writer_thread(void *arg)
 	TP_SET_WID(wid);
 	if (g_eng->uses_rcu)
 		rcu_register_thread();
+	if (g_eng->tl_begin)
+		g_eng->tl_begin();			/* engine-private thread registration (RLU) */
 
 	while (!start_flag)
 		caa_cpu_relax();
@@ -1276,6 +1921,8 @@ static void *writer_thread(void *arg)
 		}
 	}
 
+	if (g_eng->tl_end)
+		g_eng->tl_end();			/* flush this thread's deferred RLU write-sets */
 	if (g_eng->uses_rcu)
 		rcu_unregister_thread();
 	wa->writes = writes;
@@ -1283,10 +1930,15 @@ static void *writer_thread(void *arg)
 }
 
 /* Restore the churn set to empty between sweep points (called single-threaded
- * by main; main is registered/online so RCU frees and barrier work). */
+ * by main; main is registered/online so RCU frees and barrier work).  For an
+ * engine with its own SMR (RLU), main registers here via tl_begin and flushes
+ * its deferred write-sets via tl_end, so no churn node is left locked before
+ * point_reset rewinds the registry at the next point. */
 static void reset_churn(void)
 {
 	int j;
+	if (g_eng->tl_begin)
+		g_eng->tl_begin();
 	for (j = 0; j < CHURN; j++)
 		if (g_present[j])
 			g_eng->write_toggle(j);		/* present -> delete */
@@ -1296,6 +1948,8 @@ static void reset_churn(void)
 		rcu_quiescent_state();
 		rcu_barrier();				/* drain deferred frees */
 	}
+	if (g_eng->tl_end)
+		g_eng->tl_end();
 }
 
 static void run_point(int nr_readers, int nr_writers,
@@ -1313,6 +1967,9 @@ static void run_point(int nr_readers, int nr_writers,
 	start_flag = 0;
 	stop_flag = 0;
 	prime_done_count = 0;
+
+	if (g_eng->point_reset)
+		g_eng->point_reset();			/* rewind engine thread registry (RLU) */
 
 	for (i = 0; i < nr_readers; i++) {
 		ra[i].cpu = i;

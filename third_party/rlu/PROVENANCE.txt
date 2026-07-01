@@ -1,0 +1,2 @@
+RLU core (rlu.c, rlu.h) vendored verbatim from https://github.com/rlu-sync/rlu (MIT), HEAD ae47f5b, on 2026-06-30.
+Local patch: rlu.h RLU_MAX_THREADS and RLU_MAX_WRITE_SET_BUFFER_SIZE wrapped in #ifndef so they are -D overridable (bench needs 192+ threads; our commits are tiny).
