@@ -159,6 +159,43 @@ static uint64_t mono_ns(void)
 	return (uint64_t) ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* ── Optional per-op write-latency histogram (BENCH_LATENCY=1) ─────────
+ * Log-scale buckets: LAT_SUB sub-buckets per power-of-two ns.  Throughput hides
+ * how long a *starved* op waits before it finally commits, so this exposes the
+ * tail-latency cost of a larger optimistic-retry budget (URCU_TXN_FALLBACK): a
+ * bigger budget trades more pre-escalation retries for less serialization. */
+static int g_lat;			/* BENCH_LATENCY set */
+#define LAT_SUB 4
+#define LAT_NBUCKETS (48 * LAT_SUB)
+static inline int lat_bucket(uint64_t ns)
+{
+	int oct, sub, idx;
+	if (ns < (uint64_t) LAT_SUB)
+		return (int) ns;
+	oct = 63 - __builtin_clzll(ns);
+	sub = (int) ((ns >> (oct - 2)) & (LAT_SUB - 1));
+	idx = oct * LAT_SUB + sub;
+	return idx < LAT_NBUCKETS ? idx : LAT_NBUCKETS - 1;
+}
+static inline uint64_t lat_value(int idx)		/* bucket lower edge, ns */
+{
+	int oct = idx / LAT_SUB, sub = idx % LAT_SUB;
+	if (idx < LAT_SUB)
+		return (uint64_t) idx;
+	return ((uint64_t) (LAT_SUB + sub)) << (oct - 2);
+}
+static uint64_t lat_pct(const uint64_t *h, uint64_t total, double p)
+{
+	uint64_t want = (uint64_t) (p * (double) total), cum = 0;
+	int i;
+	for (i = 0; i < LAT_NBUCKETS; i++) {
+		cum += h[i];
+		if (cum >= want)
+			return lat_value(i);
+	}
+	return lat_value(LAT_NBUCKETS - 1);
+}
+
 static long get_rss_kb(void)
 {
 	FILE *f = fopen("/proc/self/status", "r");
@@ -1861,7 +1898,8 @@ static const struct lengine *g_eng;
 
 /* ── Worker threads ───────────────────────────────────────────── */
 struct reader_arg { unsigned long visits; long viol; int cpu; };
-struct writer_arg { unsigned long writes; int wid; int nwriters; int cpu; };
+struct writer_arg { unsigned long writes; int wid; int nwriters; int cpu;
+		    uint64_t *lat; uint64_t lat_max; };
 
 static void *reader_thread(void *arg)
 {
@@ -1925,12 +1963,15 @@ static void *writer_thread(void *arg)
 		rcu_register_thread();
 	if (g_eng->tl_begin)
 		g_eng->tl_begin();			/* engine-private thread registration (RLU) */
+	if (g_lat)
+		wa->lat = calloc(LAT_NBUCKETS, sizeof(*wa->lat));	/* thread-local, NUMA-local */
 
 	while (!start_flag)
 		caa_cpu_relax();
 	base = mono_ns();
 
 	while (!uatomic_load(&stop_flag, CMM_RELAXED)) {
+		uint64_t t0 = g_lat ? mono_ns() : 0;
 		if (random_pos) {
 			g_eng->write_random(&rng);
 		} else {
@@ -1938,6 +1979,12 @@ static void *writer_thread(void *arg)
 			if (slot >= CHURN) { m = 0; slot = first; }
 			g_eng->write_toggle(slot);
 			m++;
+		}
+		if (g_lat && wa->lat) {
+			uint64_t d = mono_ns() - t0;
+			wa->lat[lat_bucket(d)]++;
+			if (d > wa->lat_max)
+				wa->lat_max = d;
 		}
 		writes++;
 		if (g_eng->uses_rcu) {
@@ -2058,6 +2105,33 @@ static void run_point(int nr_readers, int nr_writers,
 	}
 	for (i = 0; i < nr_writers; i++)
 		tot_writes += wa[i].writes;
+
+	if (g_lat && nr_writers > 0) {
+		uint64_t merged[LAT_NBUCKETS], tot = 0, mx = 0;
+		int b;
+		memset(merged, 0, sizeof(merged));
+		for (i = 0; i < nr_writers; i++) {
+			if (!wa[i].lat)
+				continue;
+			for (b = 0; b < LAT_NBUCKETS; b++) {
+				merged[b] += wa[i].lat[b];
+				tot += wa[i].lat[b];
+			}
+			if (wa[i].lat_max > mx)
+				mx = wa[i].lat_max;
+			free(wa[i].lat);
+		}
+		if (tot)
+			fprintf(stderr, "LAT w=%d n=%llu p50=%llu p90=%llu p99=%llu "
+				"p999=%llu p9999=%llu max=%llu ns\n", nr_writers,
+				(unsigned long long) tot,
+				(unsigned long long) lat_pct(merged, tot, 0.50),
+				(unsigned long long) lat_pct(merged, tot, 0.90),
+				(unsigned long long) lat_pct(merged, tot, 0.99),
+				(unsigned long long) lat_pct(merged, tot, 0.999),
+				(unsigned long long) lat_pct(merged, tot, 0.9999),
+				(unsigned long long) mx);
+	}
 
 	*read_mvps = (double) tot_visits / elapsed / 1e6;
 	*write_mops = (double) tot_writes / elapsed / 1e6;
@@ -2225,6 +2299,7 @@ int main(int argc, char **argv)
 	allow_smt = getenv("BENCH_ALLOW_SMT") != NULL;
 	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
 	g_su_nolock = getenv("BENCH_SU_NOLOCK") != NULL;
+	g_lat = getenv("BENCH_LATENCY") != NULL;
 	if (g_su_nolock)
 		fprintf(stderr, "txn_sw_list: writer mutex DISABLED (BENCH_SU_NOLOCK) -- "
 			"raw single-updater cost; VALID ONLY with a single writer\n");
@@ -2270,6 +2345,19 @@ int main(int argc, char **argv)
 		printf("# writers read_mvisits write_mops violations "
 			"(readers=%d, distinct cores)\n", readers);
 		fflush(stdout);
+		const char *fw = getenv("BENCH_FIXED_WRITERS");
+		if (fw) {
+			/* Single writer count (controlled experiments), not the sweep --
+			 * lets us hold a collapsed point for CPU sampling / perf / trace. */
+			int nw = atoi(fw);
+			double r, w; long v;
+			if (readers + nw <= cap) {
+				run_point(readers, nw, &r, &w, &v);
+				printf("%d %.1f %.2f %ld\n", nw, r, w, v);
+				fflush(stdout);
+			}
+			goto done;
+		}
 		for (i = 0; i < n; i++) {
 			double r, w; long v;
 			if (readers + wc[i] > cap) break;

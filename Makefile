@@ -339,6 +339,12 @@ endif
 ifeq ($(PCPU),1)
   LIST_POOL_CFLAGS += -DLIST_RCU_INLINE_RCU_HEAD -DBENCH_PCPU_ALLOC_DEFAULT
 endif
+# Optimistic-retry budget before a starved txn escalates into the serialized
+# fair lane (urcu/rcu-txn.h URCU_TXN_FALLBACK, default 64).  Higher = stay on the
+# parallel MCAS/priority path longer before serializing.  For collapse studies.
+ifdef TXN_FALLBACK
+  LIST_POOL_CFLAGS += -DURCU_TXN_FALLBACK=$(TXN_FALLBACK)
+endif
 
 urcu-bidir:
 	@if [ ! -d "$(URCU_BIDIR_BUILD)/.git" ]; then \
