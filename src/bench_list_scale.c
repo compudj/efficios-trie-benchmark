@@ -68,6 +68,19 @@
 
 #include "rlu.h"		/* reference Read-Log-Update engine (third_party/rlu) */
 
+#ifdef BENCH_JEMALLOC
+/*
+ * `make JEMALLOC=1` links libjemalloc and defines BENCH_JEMALLOC.  jemalloc
+ * reads this application-defined `malloc_conf` symbol at startup, so the
+ * per-CPU arena config is baked into the binary -- a reproducible pooled build
+ * needing no MALLOC_CONF env.  The MALLOC_CONF env var still overrides it (e.g.
+ * MALLOC_CONF=percpu_arena:phycpu).  Purpose: move the per-commit MCAS
+ * descriptor (and churn-node) allocations off glibc's arena mprotect/mmap_lock,
+ * which serialises writers process-wide -- ~2x writer throughput at scale.
+ */
+const char *malloc_conf = "percpu_arena:percpu";
+#endif
+
 #include "bench_topology.h"
 
 /* ── ISC C-RW-WP rwlock, behind the bench_iscrw.c isolation wrapper ── */
@@ -2156,8 +2169,19 @@ int main(int argc, char **argv)
 				fprintf(stderr, "per-cpu call_rcu workers enabled (default; BENCH_NO_PERCPU_CALLRCU to disable)\n");
 		}
 #ifdef LIST_RCU_INLINE_RCU_HEAD
-		/* Per-CPU slab node allocator (prototype) for txn_list's churn nodes. */
+		/*
+		 * Per-CPU slab node allocator (prototype) for txn_list's churn nodes.
+		 * `make PCPU=1` compiles this in (-DLIST_RCU_INLINE_RCU_HEAD) and also
+		 * defines BENCH_PCPU_ALLOC_DEFAULT so the slab is ON out of the box -- a
+		 * reproducible pooled build.  BENCH_NO_PCPU_ALLOC forces glibc malloc for
+		 * an in-binary A/B; BENCH_PCPU_ALLOC still force-enables it when only
+		 * -DLIST_RCU_INLINE_RCU_HEAD was set by hand (no PCPU=1 default).
+		 */
+#ifdef BENCH_PCPU_ALLOC_DEFAULT
+		if (getenv("BENCH_NO_PCPU_ALLOC") == NULL) {
+#else
 		if (getenv("BENCH_PCPU_ALLOC")) {
+#endif
 			g_pcpu_alloc = 1;
 			g_slab = pcpu_slab_create(sizeof(struct lf_elem));
 			fprintf(stderr, "per-CPU slab node allocator enabled "

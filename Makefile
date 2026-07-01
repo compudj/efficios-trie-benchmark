@@ -315,6 +315,31 @@ HWLOC_LIBS   := $(shell pkg-config --libs hwloc)
 RLU_DIR  := third_party/rlu
 RLU_DEFS := -DRLU_MAX_THREADS=256 -DRLU_MAX_WRITE_SET_BUFFER_SIZE=8192
 
+# ── Pooled-build knobs (reproduce the write-optimised profiling config) ───────
+# The default build is plain glibc malloc + non-inline rcu_head -- the FAIR READ
+# build (smaller nodes read ~1.6x faster).  These opt in to the write side of
+# the RLU comparison's "pooled" config, which is NOT the default because each
+# has a read-side or dependency cost:
+#   make bench_list_scale JEMALLOC=1          # link jemalloc, bake percpu_arena
+#   make bench_list_scale PCPU=1              # per-CPU node slab + inline rcu_head
+#   make bench_list_scale JEMALLOC=1 PCPU=1   # full pooled build
+# JEMALLOC moves the per-op MCAS descriptor off glibc's arena mprotect/mmap_lock
+# (~2x writer throughput at scale; needs libjemalloc-dev).  PCPU recycles
+# txn_list churn nodes per-CPU but forces inline rcu_head (=> slower reads), and
+# is ON by default in that binary (BENCH_NO_PCPU_ALLOC opts back to glibc for an
+# in-binary A/B).  Both apply ONLY to bench_list_scale.o -- neither touches the
+# rlu.o ABI (that is fixed by RLU_DEFS alone).  See the RLU-engine commit.
+LIST_POOL_CFLAGS :=
+LIST_POOL_LIBS   :=
+ifeq ($(JEMALLOC),1)
+  LIST_POOL_CFLAGS += -DBENCH_JEMALLOC
+  LIST_POOL_LIBS   += $(shell pkg-config --libs jemalloc 2>/dev/null || echo -ljemalloc)
+  LIST_JE_CHECK    := check-jemalloc
+endif
+ifeq ($(PCPU),1)
+  LIST_POOL_CFLAGS += -DLIST_RCU_INLINE_RCU_HEAD -DBENCH_PCPU_ALLOC_DEFAULT
+endif
+
 urcu-bidir:
 	@if [ ! -d "$(URCU_BIDIR_BUILD)/.git" ]; then \
 	  echo ">> cloning $(URCU_BIDIR_UPSTREAM) ($(URCU_BIDIR_BRANCH)) -> $(URCU_BIDIR_BUILD)"; \
@@ -338,9 +363,14 @@ check-urcu-bidir:
 	  echo "ERROR: bind9 isc headers not found under $(ISC_INC)"; \
 	  echo "       Run 'make bind9' to populate bind9-src/ (for the iscrw engine)."; exit 1; }
 
+check-jemalloc:
+	@pkg-config --exists jemalloc 2>/dev/null || ldconfig -p 2>/dev/null | grep -qi 'libjemalloc' || { \
+	  echo "ERROR: JEMALLOC=1 but libjemalloc was not found."; \
+	  echo "       Install it (e.g. 'apt install libjemalloc-dev') or drop JEMALLOC=1."; exit 1; }
+
 bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
-		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-bidir
-	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(URCU_BIDIR_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
+		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-bidir $(LIST_JE_CHECK)
+	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) $(LIST_POOL_CFLAGS) -I$(URCU_BIDIR_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
 	  -c src/bench_list_scale.c -o src/bench_list_scale.o
 	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(RLU_DIR) \
 	  -c $(RLU_DIR)/rlu.c -o src/rlu.o
@@ -351,7 +381,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	$(CC) $(LIST_CFLAGS) $(HWLOC_CFLAGS) -I$(TOPO_DIR) \
 	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
 	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/rlu.o src/bench_iscrw.o \
-	  src/iscrw.o src/bench_topology_list.o \
+	  src/iscrw.o src/bench_topology_list.o $(LIST_POOL_LIBS) \
 	  -L$(URCU_BIDIR_LIB) -Wl,-rpath,$(URCU_BIDIR_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
 
