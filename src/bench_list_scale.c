@@ -1492,11 +1492,16 @@ retry:
 	cur = ic->target;			/* authoritative: frozen while we hold ic */
 	if (cur == NULL) {			/* empty slot -> splice a fresh cell, publish it */
 		int a = (int) (xorshift64(rng) % (uint64_t) LIST_SIZE);
-		struct rlu_lnode *pos = g_rlu_stable[a], *p, *succ, *nw;
+		struct rlu_lnode *pos = g_rlu_stable[a], *succ, *nw;
 
-		p    = (struct rlu_lnode *) RLU_DEREF(self, pos);
-		succ = (struct rlu_lnode *) RLU_DEREF(self, p->next);
+		/* Lock the anchor BEFORE reading its ->next.  The lock freezes pos->next,
+		 * so the successor we splice against is pos's true current next and cannot
+		 * be relinked or freed by a concurrent op while it sits in our write-set.
+		 * (Reading pos->next first, then locking, is the read-before-lock UAF: a
+		 * peer deleting that successor at the same position leaves a dead node in
+		 * the write-set that RLU's writeback dereferences.) */
 		if (!RLU_TRY_LOCK(self, &pos))  { RLU_ABORT(self); goto retry; }
+		succ = (struct rlu_lnode *) RLU_DEREF(self, pos->next);
 		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
 		nw = (struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
 		nw->key = 0;
@@ -1506,13 +1511,18 @@ retry:
 		RLU_ASSIGN_PTR(self, &succ->prev, nw);
 		RLU_ASSIGN_PTR(self, &ic->target, nw);
 	} else {				/* full slot -> unlink the named cell, clear it */
-		struct rlu_lnode *c, *prev, *succ;
+		struct rlu_lnode *prev, *succ;
 
-		c    = (struct rlu_lnode *) RLU_DEREF(self, cur);
-		prev = (struct rlu_lnode *) RLU_DEREF(self, c->prev);
-		succ = (struct rlu_lnode *) RLU_DEREF(self, c->next);
-		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
+		/* Lock the target cell FIRST.  Holding cur locked freezes cur->prev and
+		 * cur->next, so the neighbours we read are its true current neighbours,
+		 * and neither can be unlinked (that would require locking cur->prev's or
+		 * cur->next's edge into cur -> conflicts with our lock) or freed before we
+		 * lock them.  Reading the neighbours first, as in the disjoint-slot churn
+		 * path, only stays safe there because no peer touches the same node. */
 		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto retry; }
+		prev = (struct rlu_lnode *) RLU_DEREF(self, cur->prev);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, cur->next);
+		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
 		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
 		RLU_ASSIGN_PTR(self, &prev->next, succ);
 		RLU_ASSIGN_PTR(self, &succ->prev, prev);
@@ -1531,18 +1541,20 @@ static void rlu_reset_random(void)
 
 	for (i = 0; i < g_rlu_nindex; i++) {
 		struct rlu_icell *ic0 = g_rlu_index[i], *ic;
-		struct rlu_lnode *cur, *c, *prev, *succ;
+		struct rlu_lnode *cur, *prev, *succ;
 retry:
 		RLU_READER_LOCK(self);
 		ic = ic0;
 		if (!RLU_TRY_LOCK(self, &ic)) { RLU_ABORT(self); goto retry; }
 		cur = ic->target;
 		if (cur == NULL) { RLU_READER_UNLOCK(self); continue; }
-		c    = (struct rlu_lnode *) RLU_DEREF(self, cur);
-		prev = (struct rlu_lnode *) RLU_DEREF(self, c->prev);
-		succ = (struct rlu_lnode *) RLU_DEREF(self, c->next);
-		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
+		/* Lock the cell first, then read its neighbours from the locked copy --
+		 * same lock-before-read discipline as rlu_write_random (single-threaded
+		 * here, but kept consistent). */
 		if (!RLU_TRY_LOCK(self, &cur))  { RLU_ABORT(self); goto retry; }
+		prev = (struct rlu_lnode *) RLU_DEREF(self, cur->prev);
+		succ = (struct rlu_lnode *) RLU_DEREF(self, cur->next);
+		if (!RLU_TRY_LOCK(self, &prev)) { RLU_ABORT(self); goto retry; }
 		if (!RLU_TRY_LOCK(self, &succ)) { RLU_ABORT(self); goto retry; }
 		RLU_ASSIGN_PTR(self, &prev->next, succ);
 		RLU_ASSIGN_PTR(self, &succ->prev, prev);
