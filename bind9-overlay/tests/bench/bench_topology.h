@@ -30,4 +30,27 @@ void bench_topology_pin(int worker_index);
  */
 int bench_topology_ncores(void);
 
+/*
+ * OS logical CPU that worker @worker_index pins to (the same mapping
+ * bench_topology_pin() uses: one PU per physical core first, then siblings).
+ * Lets a caller learn the workload's exact PU set without pinning.  Returns
+ * @worker_index unchanged if the topology was not discovered (identity map).
+ */
+int bench_topology_cpu(int worker_index);
+
+/*
+ * Number of PUs in the map (>= any live worker count).  0 if not discovered.
+ */
+int bench_topology_pu_count(void);
+
+/*
+ * Topology domain of OS logical CPU @oscpu: bench_topology_core_of() returns a
+ * compact physical-core id, bench_topology_l3_of() a compact L3-cache id (PUs
+ * sharing an L3 share an id).  Used to coarsen per-CPU reclaim/allocation to a
+ * core or L3 domain.  Both fall back to @oscpu if the topology was not
+ * discovered.
+ */
+int bench_topology_core_of(int oscpu);
+int bench_topology_l3_of(int oscpu);
+
 #endif /* BENCH_TOPOLOGY_H */

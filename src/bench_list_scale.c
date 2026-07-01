@@ -213,6 +213,181 @@ static long get_rss_kb(void)
 	return rss;
 }
 
+/* ════════════════════════════════════════════════════════════════
+ * Reclaim / allocation domain granularity  (BENCH_RECLAIM_DOMAIN)
+ *
+ * Both the per-CPU call_rcu reclaim workers and the per-CPU node slab are, by
+ * default, per hardware thread (one per PU) -- domain=hwthread.  This knob
+ * coarsens BOTH to a shared topology domain: core, l3, or a single global one,
+ * to study consolidating reclaim/allocation across HW threads that share a
+ * cache.
+ *
+ * HONEST-ACCOUNTING INVARIANT.  The x-axis is "N writers == N PUs"; any reclaim
+ * hardware OUTSIDE the writers' PU set is uncounted work that would inflate
+ * throughput.  So each domain's call_rcu worker is pinned to the domain's
+ * ANCHOR PU -- the lowest writer-index PU in the domain, which is an occupied
+ * writer PU whenever the domain has any writer (writers fill one-per-core in
+ * index order).  A worker thus only ever time-shares a real writer PU, never a
+ * free sibling or idle core.  BENCH_RECLAIM_UNCONFINED lifts this (pins to the
+ * whole domain cpumask) purely to MEASURE the inflation the freedom buys -- it
+ * is not an honest number.  The worker affinity is set explicitly here, so the
+ * workload's own hwloc pinning can never leak into or constrain the workers.
+ * ════════════════════════════════════════════════════════════════ */
+enum reclaim_domain_level { RDL_HWTHREAD, RDL_CORE, RDL_L3, RDL_SINGLE };
+static enum reclaim_domain_level g_rdl = RDL_HWTHREAD;	/* call_rcu worker domain */
+static enum reclaim_domain_level g_sdl = RDL_HWTHREAD;	/* node slab domain */
+static int  g_rdl_unconfined;		/* BENCH_RECLAIM_UNCONFINED */
+static int  g_rdl_ncpu;			/* sysconf(_SC_NPROCESSORS_CONF) */
+static int *g_cpu_domain;		/* [ncpu] worker domain id 0..ndom-1 */
+static int  g_ndomains;
+static int *g_domain_anchor;		/* [ndom] anchor OS cpu (a writer PU) */
+static int *g_slab_domain;		/* [ncpu] slab domain id (independent) */
+static int  g_slab_ndomains;
+
+static const char *rdl_name(enum reclaim_domain_level l)
+{
+	switch (l) {
+	case RDL_CORE:		return "core";
+	case RDL_L3:		return "l3";
+	case RDL_SINGLE:	return "single";
+	default:		return "hwthread";
+	}
+}
+
+static enum reclaim_domain_level
+rdl_parse(const char *env, enum reclaim_domain_level dflt)
+{
+	if (env == NULL)			return dflt;
+	if (!strcmp(env, "core"))		return RDL_CORE;
+	if (!strcmp(env, "l3"))			return RDL_L3;
+	if (!strcmp(env, "single"))		return RDL_SINGLE;
+	if (!strcmp(env, "hwthread"))		return RDL_HWTHREAD;
+	fprintf(stderr, "domain '%s' unknown; using %s\n", env, rdl_name(dflt));
+	return dflt;
+}
+
+/* Fill map[0..ncpu-1] with a compact domain id per the level; return #domains. */
+static int build_cpu_domain_map(enum reclaim_domain_level lvl, int ncpu, int *map)
+{
+	int c, ndom = 1;
+
+	for (c = 0; c < ncpu; c++) {
+		switch (lvl) {
+		case RDL_CORE:	 map[c] = bench_topology_core_of(c); break;
+		case RDL_L3:	 map[c] = bench_topology_l3_of(c);   break;
+		case RDL_SINGLE: map[c] = 0;			     break;
+		default:	 map[c] = c;			     break;
+		}
+		if (map[c] + 1 > ndom)
+			ndom = map[c] + 1;
+	}
+	return ndom;
+}
+
+/* Build the WORKER domain (+ anchors) and, independently, the SLAB domain.
+ * The slab defaults to hwthread so BENCH_RECLAIM_DOMAIN isolates the worker
+ * effect; BENCH_SLAB_DOMAIN opts the slab into a coarser (shared) arena. */
+static void reclaim_domain_build(void)
+{
+	int ncpu = (int) sysconf(_SC_NPROCESSORS_CONF), c, i, npu;
+
+	if (g_cpu_domain != NULL)
+		return;				/* already built */
+	if (ncpu < 1)
+		ncpu = 1;
+	g_rdl_ncpu = ncpu;
+	g_rdl_unconfined = getenv("BENCH_RECLAIM_UNCONFINED") != NULL;
+	g_rdl = rdl_parse(getenv("BENCH_RECLAIM_DOMAIN"), RDL_HWTHREAD);
+	g_sdl = rdl_parse(getenv("BENCH_SLAB_DOMAIN"), RDL_HWTHREAD);
+
+	g_cpu_domain = malloc((size_t) ncpu * sizeof(*g_cpu_domain));
+	g_ndomains = build_cpu_domain_map(g_rdl, ncpu, g_cpu_domain);
+	g_slab_domain = malloc((size_t) ncpu * sizeof(*g_slab_domain));
+	g_slab_ndomains = build_cpu_domain_map(g_sdl, ncpu, g_slab_domain);
+
+	/* Anchor = lowest writer-index PU that lands in each worker domain (a
+	 * writer PU whenever the domain is active, so confinement holds at C). */
+	g_domain_anchor = malloc((size_t) g_ndomains * sizeof(*g_domain_anchor));
+	for (i = 0; i < g_ndomains; i++)
+		g_domain_anchor[i] = -1;
+	npu = bench_topology_pu_count();
+	if (npu <= 0)
+		npu = ncpu;
+	for (i = 0; i < npu; i++) {
+		int cpu = bench_topology_cpu(i), d;
+
+		if (cpu < 0 || cpu >= ncpu)
+			continue;
+		d = g_cpu_domain[cpu];
+		if (d >= 0 && d < g_ndomains && g_domain_anchor[d] < 0)
+			g_domain_anchor[d] = cpu;
+	}
+	for (i = 0; i < g_ndomains; i++)	/* domains no worker index hit */
+		if (g_domain_anchor[i] < 0)
+			for (c = 0; c < ncpu; c++)
+				if (g_cpu_domain[c] == i) {
+					g_domain_anchor[i] = c;
+					break;
+				}
+
+	fprintf(stderr,
+		"reclaim worker domain: %s (%d) | slab domain: %s (%d) / %d CPUs%s\n",
+		rdl_name(g_rdl), g_ndomains, rdl_name(g_sdl), g_slab_ndomains, ncpu,
+		g_rdl_unconfined ? " [worker UNCONFINED: measures inflation]" : "");
+}
+
+/* One call_rcu worker per domain, pinned to the domain's anchor writer-PU
+ * (or the whole domain cpumask when UNCONFINED), routing every CPU to it.
+ * Replaces create_all_cpu_call_rcu_data().  Returns 0 on success. */
+static int reclaim_workers_setup(void)
+{
+	struct call_rcu_data **worker;
+	int d, c;
+
+	worker = calloc((size_t) g_ndomains, sizeof(*worker));
+	if (worker == NULL)
+		return -1;
+	for (d = 0; d < g_ndomains; d++) {
+		struct call_rcu_data *crdp;
+		cpu_set_t set;
+
+		/* cpu_affinity = -1: liburcu never pins it, so its throttled
+		 * re-pin can't fight or re-narrow the mask we set below. */
+		crdp = create_call_rcu_data(0, -1);
+		if (crdp == NULL) {
+			free(worker);
+			return -1;
+		}
+		worker[d] = crdp;
+		CPU_ZERO(&set);
+		if (g_rdl_unconfined) {
+			for (c = 0; c < g_rdl_ncpu; c++)
+				if (g_cpu_domain[c] == d)
+					CPU_SET(c, &set);
+		} else {
+			CPU_SET(g_domain_anchor[d] >= 0 ? g_domain_anchor[d] : 0,
+				&set);
+		}
+		/* Explicit + independent of any workload pinning the creating
+		 * thread may carry -- this is the invariant that keeps reclaim
+		 * inside the writers' PU budget. */
+		if (pthread_setaffinity_np(get_call_rcu_thread(crdp),
+					   sizeof(set), &set) != 0)
+			perror("reclaim worker setaffinity");
+	}
+	/* Route every CPU to its domain worker (many CPUs -> one worker). */
+	for (c = 0; c < g_rdl_ncpu; c++) {
+		int d2 = g_cpu_domain[c];
+
+		if (d2 < 0 || d2 >= g_ndomains || worker[d2] == NULL)
+			continue;
+		(void) set_cpu_call_rcu_data(c, NULL);		/* clear any prior */
+		(void) set_cpu_call_rcu_data(c, worker[d2]);
+	}
+	free(worker);
+	return 0;
+}
+
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 /* ════════════════════════════════════════════════════════════════
  * Per-CPU slab node allocator (prototype) -- models the fractal-trie
@@ -258,16 +433,22 @@ static size_t pcpu_round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1);
 static struct pcpu_slab *pcpu_slab_create(size_t obj_size)
 {
 	struct pcpu_slab *s = calloc(1, sizeof(*s));
-	int i, ncpu = (int) sysconf(_SC_NPROCESSORS_CONF);
+	int i, narena = g_slab_ndomains > 0 ? g_slab_ndomains : 1;
 	int have_numa = (numa_available() != -1);
 
-	if (ncpu < 1) ncpu = 1;
-	s->ncpu = ncpu;
+	s->ncpu = narena;			/* one arena per slab domain */
 	s->obj = pcpu_round_up(obj_size < 16 ? 16 : obj_size, 16);
-	s->arena = calloc((size_t) ncpu, sizeof(*s->arena));
-	for (i = 0; i < ncpu; i++) {
+	s->arena = calloc((size_t) narena, sizeof(*s->arena));
+	for (i = 0; i < narena; i++) {
+		int rep = 0, c;			/* a CPU in slab domain i, for NUMA */
+
+		for (c = 0; c < g_rdl_ncpu; c++)
+			if (g_slab_domain != NULL && g_slab_domain[c] == i) {
+				rep = c;
+				break;
+			}
 		pthread_mutex_init(&s->arena[i].lock, NULL);
-		s->arena[i].numa_node = have_numa ? numa_node_of_cpu(i) : -1;
+		s->arena[i].numa_node = have_numa ? numa_node_of_cpu(rep) : -1;
 	}
 	return s;
 }
@@ -299,11 +480,13 @@ static struct pcpu_slab_sb *pcpu_slab_sb_new(struct pcpu_slab_arena *a)
 static void *pcpu_slab_alloc(struct pcpu_slab *s)
 {
 	int cpu = sched_getcpu();
+	int d = (g_slab_domain != NULL && cpu >= 0 && cpu < g_rdl_ncpu)
+		? g_slab_domain[cpu] : 0;	/* arena per slab domain */
 	struct pcpu_slab_arena *a;
 	void *p;
 
-	if (cpu < 0 || cpu >= s->ncpu) cpu = 0;
-	a = &s->arena[cpu];
+	if (d < 0 || d >= s->ncpu) d = 0;
+	a = &s->arena[d];
 	pthread_mutex_lock(&a->lock);
 	if (a->flist) {				/* hot: reuse a just-freed node */
 		p = a->flist;
@@ -2266,11 +2449,15 @@ int main(int argc, char **argv)
 		 * or jemalloc MALLOC_CONF=percpu_arena:phycpu), so a node freed on CPU X
 		 * returns to the same pool the writer on CPU X allocates from.
 		 */
+		reclaim_domain_build();		/* also indexes the per-CPU slab below */
 		if (getenv("BENCH_NO_PERCPU_CALLRCU") == NULL) {
-			if (create_all_cpu_call_rcu_data(0))
-				fprintf(stderr, "per-cpu call_rcu: setup failed (%m); using single default worker\n");
+			if (reclaim_workers_setup())
+				fprintf(stderr, "per-domain call_rcu: setup failed (%m); using single default worker\n");
 			else
-				fprintf(stderr, "per-cpu call_rcu workers enabled (default; BENCH_NO_PERCPU_CALLRCU to disable)\n");
+				fprintf(stderr, "per-domain call_rcu workers enabled "
+					"(domain=%s%s; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)\n",
+					rdl_name(g_rdl),
+					g_rdl_unconfined ? ",unconfined" : "");
 		}
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 		/*
