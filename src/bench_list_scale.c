@@ -618,11 +618,22 @@ static struct urcu_txn_sw_list_head g_su_head =
 static struct su_elem **g_su_stable;
 static struct su_elem **g_su_churn;
 static pthread_mutex_t g_su_wlock = PTHREAD_MUTEX_INITIALIZER;
+static int g_su_nolock;		/* BENCH_SU_NOLOCK: skip the per-op writer mutex --
+				 * the RAW lock-free single-updater cost (models the
+				 * quiesced/bulk-mode plain-store path).  CORRECT ONLY
+				 * with a single writer; the mutex otherwise exists so
+				 * the multi-writer sweep harness can't corrupt the
+				 * single-updater list. */
 
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 static void su_free(struct rcu_head *h)
 {
 	free(caa_container_of(h, struct su_elem, rh));
+}
+/* call_rcu reclaim that returns the churn node to its per-CPU slab arena. */
+static void su_slab_free(struct rcu_head *h)
+{
+	pcpu_slab_free(caa_container_of(h, struct su_elem, rh));
 }
 #endif
 static void su_build(void)
@@ -672,7 +683,8 @@ static unsigned long su_read(long *viol)
 }
 static void su_write(int slot)
 {
-	pthread_mutex_lock(&g_su_wlock);
+	if (!g_su_nolock)
+		pthread_mutex_lock(&g_su_wlock);
 	if (g_present[slot]) {
 		struct su_elem *e = g_su_churn[slot];
 		if (urcu_txn_sw_list_del_rcu(&e->node))
@@ -680,20 +692,26 @@ static void su_write(int slot)
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 		seg_call_rcu(e);
 #else
-		call_rcu(&e->rh, su_free);
+		call_rcu(&e->rh, g_pcpu_alloc ? su_slab_free : su_free);
 #endif
 		g_su_churn[slot] = NULL;
 		g_present[slot] = 0;
 	} else {
 		int a = g_anchor[slot];
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+		struct su_elem *e = g_pcpu_alloc ?
+			(struct su_elem *) pcpu_slab_alloc(g_slab) : malloc(sizeof(*e));
+#else
 		struct su_elem *e = malloc(sizeof(*e));
+#endif
 		e->key = 2 * a + 1;
 		if (urcu_txn_sw_list_add_after_rcu(&e->node, &g_su_stable[a]->node))
 			abort();
 		g_su_churn[slot] = e;
 		g_present[slot] = 1;
 	}
-	pthread_mutex_unlock(&g_su_wlock);
+	if (!g_su_nolock)
+		pthread_mutex_unlock(&g_su_wlock);
 }
 
 /* ── txn_list: concurrent coherent bidirectional RCU list ── */
@@ -2182,8 +2200,14 @@ int main(int argc, char **argv)
 #else
 		if (getenv("BENCH_PCPU_ALLOC")) {
 #endif
+			/* One engine per process, but size to the larger node so
+			 * either the concurrent (lf_elem) or single-updater
+			 * (su_elem) churn engine can draw from the same slab. */
+			size_t nsz = sizeof(struct lf_elem);
+			if (sizeof(struct su_elem) > nsz)
+				nsz = sizeof(struct su_elem);
 			g_pcpu_alloc = 1;
-			g_slab = pcpu_slab_create(sizeof(struct lf_elem));
+			g_slab = pcpu_slab_create(nsz);
 			fprintf(stderr, "per-CPU slab node allocator enabled "
 				"(obj=%zu B, %d arenas)\n", g_slab->obj, g_slab->ncpu);
 		}
@@ -2200,6 +2224,10 @@ int main(int argc, char **argv)
 
 	allow_smt = getenv("BENCH_ALLOW_SMT") != NULL;
 	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
+	g_su_nolock = getenv("BENCH_SU_NOLOCK") != NULL;
+	if (g_su_nolock)
+		fprintf(stderr, "txn_sw_list: writer mutex DISABLED (BENCH_SU_NOLOCK) -- "
+			"raw single-updater cost; VALID ONLY with a single writer\n");
 	if (g_random_pos && g_eng->write_random)
 		fprintf(stderr, "%s: random-position writer mode "
 			"(collisions ~ writers/LIST_SIZE)\n", g_eng->name);

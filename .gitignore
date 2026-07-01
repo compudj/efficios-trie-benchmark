@@ -19,6 +19,8 @@
 /bench_scale_artolc
 /bench_scale_artrowex
 /bench_list_scale
+/bench_list_scale.default
+/bench_list_scale.pooled
 
 # Benchmark output / results
 /results/
