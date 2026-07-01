@@ -755,6 +755,7 @@ two new lists scale against locks / seqlock at 192 cores?*
 |-------------|---------------------------------------------------|--------|--------|
 | `txn_sw_list`  | `<urcu/rcu-txn-sw-list.h>` — RCU, single updater   | lock-free | 1 (mutual excl.) |
 | `txn_list`  | `<urcu/rcu-txn-list.h>` — RCU, MCAS    | lock-free | bounded-blocking (N) |
+| `rlu_list`  | reference **RLU** (Read-Log-Update, MIT) — own SMR + per-object locks | lock-free (coherent snapshot) | bounded-blocking (N) |
 | `rculist`   | classic `<urcu/rculist.h>` — **forward-only ref** | lock-free | 1 |
 | `mutex`     | one `pthread_mutex`                                | serialized | serialized |
 | `fairmutex` | liburcu `cds_fair_mutex` (MCS/FIFO queue lock)    | serialized | serialized |
@@ -767,6 +768,18 @@ The `iscrw` engine links the **real** bind9 lock (`bind9-src/lib/isc/rwlock.c`),
 compiled standalone with a no-op probes shim (`src/iscrw-shim/`) and an isolation
 wrapper (`src/bench_iscrw.c`) so the `isc/` macros never reach the main TU and no
 libisc constructor runs.
+
+`rlu_list` is the vendored reference **RLU** (`third_party/rlu`, MIT) driving the
+*same* doubly-linked churn workload as `txn_list`, so the two multi-pointer-update
+schemes meet on identical ground (pinning, warm-up, timing). RLU carries its own
+SMR (a global clock + `rlu_synchronize`), so it is not a liburcu flavor. Its
+guarantee is **declared, not emulated**: an RLU reader observes a *coherent
+snapshot* of the objects it dereferences — strictly stronger than `txn_list`'s
+per-slot-linearizable (non-snapshot) reads — and we measure both as-is rather than
+handicapping either. `BENCH_RLU_WS` sets RLU's deferral depth (`max_write_sets`):
+`1` is synchronous writeback (the floor), `100` is the headline deferred mode. A
+hash-of-lists variant (`rlu_hlist` vs `txn_hlist`) meets RLU on its own native
+showcase structure. See the [RLU comparison](#rlu-read-log-update-comparison) below.
 
 ### Building
 
@@ -896,33 +909,45 @@ allocation-dominated.
 a randomly chosen slot of an external index that points at list cells; the index
 update folds into the same MCAS (the composable path), so there is more compute
 per op. The index has exactly `CHURN` slots and each writer picks one uniformly,
-so the per-slot collision rate is `~ writers / CHURN`.
+so the per-slot collision rate is `~ writers / CHURN`. Best-of-3 (this box is
+bistable at high writer counts), current engine, `URCU_TXN_FALLBACK=256`:
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` |
 |---------|------:|------:|
-| 1   | 0.9 | 1.9 |
-| 8   | 9.0 | 13  |
-| 32  | 13  | 17  |
-| 64  | **18** | 17 |
-| 128 | 14  | 12  |
-| 192 | 2.9 | 11  |
+| 1   | 1.2 | 4.3 |
+| 8   | 8.5 | 16  |
+| 32  | 8.5 | 22  |
+| 64  | 11  | **37** |
+| 128 | 4.5 | 6.7 |
+| 192 | 3.0 | 4.8 |
 
 At the default `CHURN=200`, 192 writers collide ~1:1 on the index, so the random
-path is **index-contention-bound** — it peaks near 64 writers and then *falls*
-(the decline above is contention on the 200-slot index, not an engine limit).
-Enlarging the index — raise `CHURN`, capped at `LIST_SIZE`, so raise both —
-spreads the collisions and restores writer scaling (jemalloc, write Mops/s):
+path is **index-contention-bound** — it peaks near 64 writers and then *falls* (the
+decline is contention on the 200-slot index, not an engine limit). **The high-writer
+end used to collapse off a cliff:** under the former default retry budget
+(`URCU_TXN_FALLBACK=64`) contending writers escalated *en masse* into the domain's
+single serial fair lane, dropping to ~0.1 Mops/s (jemalloc 0.14 @128 / 0.12 @192;
+glibc similar). Raising the budget to **256** — now the liburcu default — keeps them
+on the parallel optimistic priority path: the cliff becomes the graceful decline in
+the table above, and write latency improves at every percentile (median at 192
+writers ~10 ms → sub-µs). Escalation still fires, just later, so starvation-freedom
+is unchanged.
+
+Enlarging the index — raise `CHURN`, capped at `LIST_SIZE`, so raise both — spreads
+the collisions (so escalation rarely triggers regardless of the budget) and restores
+writer scaling (jemalloc, best-of-3, write Mops/s):
 
 | index slots (`CHURN`) | @64 | @128 | @192 |
 |-----------------------|----:|-----:|-----:|
-| 200 (default)         | 16  | 11   | 9.7  |
-| 10 000                | 29  | 40   | 44   |
-| 100 000               | 41  | 68   | 90   |
-| 1 000 000             | 48  | 82   | **108** |
+| 200 (default)         | 36  | 6.5  | 4.8  |
+| 10 000                | 60  | 101  | 141  |
+| 100 000               | 61  | 108  | **145** |
+| 1 000 000             | 58  | 107  | 136  |
 
-With a 1 M-slot index the composable random path scales to ~108 Mops/s at 192
-writers — *above* plain churn — confirming the fall-off is purely index
-contention (`writers / CHURN`), not the transaction engine.
+With a ≥100 k-slot index the composable random path scales to ~145 Mops/s at 192
+writers — *above* plain churn — confirming the fall-off at `CHURN=200` is index
+contention (`writers / CHURN`), not the transaction engine. (The 1 M row dips
+slightly: a 1 M-node ring spills cache.)
 
 The composable index path is ~30–40 % slower per op (the extra transacted slot),
 and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
@@ -962,6 +987,72 @@ build, not packaged for distros), which would be a second per-CPU data point
 alongside jemalloc. Still open: a per-CPU node pool (recycle through `call_rcu` to
 the owning CPU's arena) and liburcu MCAS descriptor pooling.
 
+#### RLU (Read-Log-Update) comparison
+
+`rlu_list`/`rlu_hlist` run the *same* workloads as `txn_list`/`txn_hlist`, so the
+MCAS transaction engine meets the reference multi-word-update scheme on identical
+ground. RLU is shown in both modes — **defer** (`BENCH_RLU_WS=100`, batched
+writeback, how RLU is meant to run) and **sync** (`BENCH_RLU_WS=1`, writeback every
+section, the floor). Single representative runs, `DURATION_SEC=5`, 0 coherence
+violations throughout.
+
+**Disjoint churn** — each writer owns a strided set of slots so writers almost
+never collide (`LIST_SIZE=4096`, `CHURN=3072`, jemalloc, write Mops/s):
+
+| writers      |   1 |  8 | 32 | 64 | 128 |     192 |
+|--------------|----:|---:|---:|---:|----:|--------:|
+| `txn_list`   | 4.6 | 29 | 57 | 70 | 105 | **193** |
+| RLU-defer    |  15 | 34 | 24 | 26 |  20 |      16 |
+| RLU-sync     |  18 | 10 |  7 |  8 |   8 |       8 |
+
+RLU wins at 1 writer (its per-thread write-log + batched writeback is cheap
+uncontended), but `txn_list` overtakes by ~8 writers and reaches **~12× RLU** at the
+full box: disjoint slots never escalate, so every MCAS commit runs in parallel,
+while RLU's global write-clock serializes commit ordering.
+
+**Multi-slot random** (`BENCH_RANDOM_POS`, `LIST_SIZE=1000`, `CHURN=64` — a hot
+64-slot index, ~`writers/64` collision):
+
+| writers      |    1 |    8 |  16 |  32 |  64 |  192 |
+|--------------|-----:|-----:|----:|----:|----:|-----:|
+| `txn_list`   |  1.3 | 11.9 | 11.4| 11.6| 5.7 | 1.2  |
+| RLU-defer    | 11.8 | 12.3 | 5.4 | 4.3 | 3.2 | 1.2  |
+| RLU-sync     | 12.5 |  9.5 | 5.2 | 4.6 | 3.5 | 1.3  |
+
+Under real contention the two trade places: RLU owns the low-writer regime (≤8),
+`txn_list` owns the mid-range (16–32, ~2× RLU-defer — which falls off after 8
+writers), and they converge at the high end (~1.2 Mops, within 5 %). Both degrade
+**gracefully**; the `txn_list` cliff of the previous section appears only under the
+former escalation default (`URCU_TXN_FALLBACK=64`) — at the current `256` it tracks
+RLU.
+
+**Hash-of-lists** — RLU's native showcase; per-bucket escalation domains (write
+Mops/s):
+
+| writers      |   1 |   8 | 32 | 64 | 128 |    192 |
+|--------------|----:|----:|---:|---:|----:|-------:|
+| `txn_hlist`  | 0.7 | 5.6 | 11 | 17 |  24 | **29** |
+| RLU-defer    | 1.3 | 9.1 | 13 | 14 |  16 |     16 |
+| RLU-sync     | 1.3 | 4.6 | 4.4| 5.4| 6.0 |    6.5 |
+
+Even on RLU's home turf `txn_hlist` scales to **~1.8× RLU-defer** at 192 writers
+(per-bucket domains keep each queue shallow, so writers rarely serialize); RLU-defer
+plateaus ~16 and RLU-sync ~6.5.
+
+**Reads scale at parity.** With one writer, list read throughput is within ~15 %
+across all four (Mvisits/s @191 readers: `txn_list` 74 k, `txn_sw_list` 79 k,
+RLU-defer 69 k, RLU-sync 76 k) — RLU's per-node lock check costs little on a
+read-mostly traversal; on the hash RLU reads edge ~15 % ahead (136 k vs 118 k
+lookups/s @191). RLU's coherent-snapshot guarantee — the stronger of the two — is
+*not* paid for on this read path.
+
+(One benchmark bug surfaced here: the multi-slot-random RLU driver read a neighbour
+pointer before `RLU_TRY_LOCK`-ing it, so a concurrent unlink+free at the same
+position could drop a freed node into the write-set — an intermittent use-after-free
+in RLU's writeback, core-confirmed. Locking the anchor before reading its edge
+closes it; the disjoint-slot churn driver keeps the simpler read-before-lock form,
+safe there because no peer ever touches the same node.)
+
 ### Takeaways
 
 - Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
@@ -974,6 +1065,16 @@ the owning CPU's arena) and liburcu MCAS descriptor pooling.
 - The classic reader/writer-preference rwlock tradeoff is stark (reader-pref
   scales reads but starves writers; writer-pref collapses reads); **seqlock is
   unusable for long read-side traversals under a steady writer.**
+- The random path's high-writer **collapse was premature escalation**, not the
+  engine: the former default retry budget (`URCU_TXN_FALLBACK=64`) funnelled
+  contending writers into the domain's single serial fair lane. Raising it to
+  **256** (now the liburcu default) keeps them on the parallel optimistic path —
+  the cliff becomes graceful degradation, and write latency improves at every
+  percentile through p99.9.
+- Against reference **RLU**: RLU wins uncontended / at very low writer counts (its
+  batched writeback), but `txn_list` **scales past it with writers** — ~12× on
+  disjoint churn, ~1.8× on the hash — while **reads run at parity**; the two are a
+  competitive trade under real contention, not a rout either way.
 
 ## Layout
 
