@@ -1269,6 +1269,43 @@ RLU-sync** — txn joins RCU and `cds_lfht` on the scaling side of the "RLU does
 writers" line. (Bucket count is held constant here, so this isolates the mechanism; a
 follow-up shrinks the bucket count to stress *write* contention directly.)
 
+#### Hash-of-lists: dedicated reader/writer scaling (all five engines)
+
+The same 1 000 × 100 hash under the harness's dedicated-thread modes (rather than the
+per-thread mix above): write-only, read-only-under-a-writer, and a 50/50 split, across all
+five engines. Best-of-2, `DURATION_SEC=3`, txn on glibc + descriptor slab, the rest glibc,
+0 violations.
+
+![Dedicated reader/writer hash scaling, five engines: writes lfht > txn ≈ rcu ≫ RLU;
+reads all parity; 50/50 writes lfht ≈ rcu > txn ≫ RLU, but 50/50 reads led by RLU-sync
+because its writers stall](figures/hash_dedicated_rw.png)
+
+**Write scaling** (writers only, write Mops/s):
+
+| writers      |   1 |   8 | 32 | 64 | 128 |     192 |
+|--------------|----:|----:|---:|---:|----:|--------:|
+| `lfht`       | 1.0 | 6.7 | 14 | 21 |  28 |  **34** |
+| `txn_hlist`  | 0.9 | 6.1 | 11 | 16 |  22 |      28 |
+| `rcu_hlist`  | 1.2 | 7.8 | 14 | 19 |  22 |      25 |
+| RLU-defer    | 1.3 | 8.2 | 10 | 14 |  16 |      16 |
+| RLU-sync     | 1.2 | 4.3 | 4.3| 5.5| 6.3 |     6.3 |
+
+`lfht`'s lock-free updates top the write axis; `txn_hlist`'s MCAS and `rcu_hlist`'s
+per-bucket lock scale together just behind (txn edges rcu past ~128 writers); RLU-defer
+plateaus ~16 (global write-clock) and RLU-sync ~6. Everything but RLU scales.
+
+**Read scaling** (readers + 1 writer): all five within ~6 % — **125–132 Mvis/s @191**,
+linear RCU-class reads (RLU marginally top). On a short ~100-node chain the per-node-cost
+differences that separate the engines on long list traversals wash out.
+
+**50/50 balanced** — the read/write tradeoff is starkest here. On the **write** half
+`lfht`/`rcu`/`txn` (23 / 20 / 18 Mops @192) dominate RLU-defer (10) and RLU-sync (2.7). But
+on the **read** half **RLU-sync leads (36 Mvis/s @192)** — precisely *because* its writers
+are nearly stalled: no pending write-sets means `RLU_DEREF` takes its fast path and readers
+run uninterfered, whereas txn's fast writers dirty reader cachelines and give it the lowest
+50/50 reads (15). RLU-sync buys read throughput by forfeiting writes; txn/rcu/lfht keep both
+moderate and balanced.
+
 ### Takeaways
 
 - Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
