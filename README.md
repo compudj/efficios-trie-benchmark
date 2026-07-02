@@ -1138,12 +1138,14 @@ Even on RLU's home turf `txn_hlist` scales to **~1.8× RLU-defer** at 192 writer
 (per-bucket domains keep each queue shallow, so writers rarely serialize); RLU-defer
 plateaus ~16 and RLU-sync ~6.4.
 
-**Reads scale at parity.** With one writer, list read throughput is within ~15 %
-across all four (Mvisits/s @191 readers: `txn_list` 74 k, `txn_sw_list` 79 k,
-RLU-defer 69 k, RLU-sync 76 k) — RLU's per-node lock check costs little on a
-read-mostly traversal; on the hash RLU reads edge ~15 % ahead (136 k vs 118 k
-lookups/s @191). RLU's coherent-snapshot guarantee — the stronger of the two — is
-*not* paid for on this read path.
+**Reads: near-parity on a tiny list, txn ahead on a real one.** On the 1 000-node
+list read throughput is within ~15 % across all four (Mvisits/s @191 readers:
+`txn_list` 74 k, `txn_sw_list` 79 k, RLU-defer 69 k, RLU-sync 76 k) — a short
+traversal is dominated by per-op overhead, so RLU's per-node lock check barely shows.
+But that check is a *per-visit* cost that does not amortize: on a representative
+10 000-node list `txn_list` reads pull **1.6–1.8× ahead** (next subsection) — txn
+amortizes per-op overhead over the longer walk while RLU pays validation on every
+node. On the hash RLU reads still edge ~15 % ahead (136 k vs 118 k lookups/s @191).
 
 (One benchmark bug surfaced here: the multi-slot-random RLU driver read a neighbour
 pointer before `RLU_TRY_LOCK`-ing it, so a concurrent unlink+free at the same
@@ -1151,6 +1153,58 @@ position could drop a freed node into the write-set — an intermittent use-afte
 in RLU's writeback, core-confirmed. Locking the anchor before reading its edge
 closes it; the disjoint-slot churn driver keeps the simpler read-before-lock form,
 safe there because no peer ever touches the same node.)
+
+#### Read, write & 50/50 scaling — representative working set (10k nodes, 2% updates)
+
+The workload tables above each isolate one case on a tiny 1 000-node, cache-resident
+list. This is the same bidir list at a **10 000-node** structure with a **2 % update
+set** (200 churn nodes) — large enough that a read traverses a real, cache-pressured
+span and each writer touches a spread-out node instead of hammering one in L1. Here
+`txn_list` runs on its **shipping config, glibc + the descriptor slab** (no jemalloc —
+it ties jemalloc's per-CPU arenas, see the allocator subsection); RLU runs on glibc.
+
+![RLU vs txn read/write/50-50 scaling at 10k nodes, 2% updates: txn leads reads
+~1.6-1.8x, scales writes to ~104 Mops/s while RLU collapses at scale, and dominates
+the write half of a 50/50 mix](figures/rlu_vs_txn_rw.png)
+
+**Read scaling** (readers + 1 writer, Gvisits/s):
+
+| readers      |   1 |   8 | 32 | 64 | 128 |     191 |
+|--------------|----:|----:|---:|---:|----:|--------:|
+| `txn_list`   | 0.8 | 5.2 | 21 | 43 |  81 | **122** |
+| RLU-defer    | 0.5 | 2.9 | 12 | 25 |  46 |      67 |
+| RLU-sync     | 0.5 | 4.2 | 17 | 31 |  55 |      78 |
+
+Reads scale linearly for all three, but **`txn_list` leads ~1.6–1.8×** (122 vs
+RLU-defer 67 / RLU-sync 78 @191): RLU validates every dereferenced node against its
+per-object lock/clock, a per-visit cost that grows with the traversal, so the
+near-parity on the 1 000-node list was a small-list artifact.
+
+**Write scaling** (writers only, Mops/s):
+
+| writers      |   1 |  8 | 32 | 64 | 128 |     192 |
+|--------------|----:|---:|---:|---:|----:|--------:|
+| `txn_list`   | 5.7 | 40 | 53 | 42 |  50 | **104** |
+| RLU-defer    |  20 | 51 | 15 | 14 | 7.8 |     5.8 |
+| RLU-sync     |  18 | 11 | 7.9| 9.1| 8.3 |     8.1 |
+
+RLU-defer wins at 1–8 writers (cheap batched writeback, uncontended); then its global
+write-clock serializes commit order and it falls to ~6, while **`txn_list` scales to
+104 — ~18× at the full box.**
+
+**50/50 balanced** (T/2 readers + T/2 writers): reads stay close (RLU-sync's read path
+even edges ahead at the top), but on the **write** half txn dominates — deferred
+writeback stalls under a steady reader stream, and synchronous writeback (WS=1) nearly
+stops:
+
+| 50/50 @ total threads       |   2 |   8 |  32 |  64 | 128 |     192 |
+|-----------------------------|----:|----:|----:|----:|----:|--------:|
+| `txn_list` write (Mops/s)   | 4.6 |  14 |  38 |  44 |  32 |  **40** |
+| RLU-defer write (Mops/s)    | 2.4 | 4.1 | 1.8 | 1.7 | 1.6 |     1.4 |
+| RLU-sync write (Mops/s)     | 0.0 | 0.1 | 0.3 | 0.5 | 0.7 |     0.8 |
+| `txn_list` read (Gvisits/s) | 0.8 | 3.0 | 4.4 | 8.1 |  13 |      16 |
+| RLU-defer read (Gvisits/s)  | 0.5 | 1.7 | 2.9 | 5.6 |  10 |      14 |
+| RLU-sync read (Gvisits/s)   | 0.5 | 2.1 | 6.6 |  11 |  15 |      17 |
 
 ### Takeaways
 
@@ -1172,8 +1226,10 @@ safe there because no peer ever touches the same node.)
   percentile through p99.9.
 - Against reference **RLU**: RLU wins uncontended / at very low writer counts (its
   batched writeback), but `txn_list` **scales past it with writers** — ~12× on
-  disjoint churn, ~1.8× on the hash — while **reads run at parity**; the two are a
-  competitive trade under real contention, not a rout either way.
+  disjoint churn, ~18× on a 10k-node/2%-update write sweep, ~1.8× on the hash — and
+  on a representative (non-tiny) list its **reads also lead ~1.6–1.8×** (RLU pays a
+  per-node validation the tiny-list microbench hid). RLU stays competitive only in
+  the low-writer / read-mostly-on-tiny-structures corner.
 
 ## Layout
 
