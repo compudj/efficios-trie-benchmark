@@ -2858,6 +2858,19 @@ int main(int argc, char **argv)
 		printf("# threads total_mops update_mops read_mops violations "
 			"(update_pct=%d)\n", g_update_pct);
 		fflush(stdout);
+		const char *ft = getenv("BENCH_FIXED_THREADS");
+		if (ft) {
+			/* Single thread count (e.g. sweeping HL_BUCKETS at a fixed load
+			 * for the write-contention study), not the thread sweep. */
+			int nt = atoi(ft);
+			double ops, upd; long v;
+			if (nt >= 1 && nt <= cap) {
+				run_point_mixed(nt, &ops, &upd, &v);
+				printf("%d %.2f %.2f %.2f %ld\n", nt, ops, upd, ops - upd, v);
+				fflush(stdout);
+			}
+			goto done;
+		}
 		for (i = 0; i < n; i++) {
 			double ops, upd; long v;
 			if (tc[i] > cap)

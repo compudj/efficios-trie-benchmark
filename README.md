@@ -1306,6 +1306,47 @@ run uninterfered, whereas txn's fast writers dirty reader cachelines and give it
 50/50 reads (15). RLU-sync buys read throughput by forfeiting writes; txn/rcu/lfht keep both
 moderate and balanced.
 
+#### Write contention: shrinking the bucket count
+
+The article config keeps ~1 000 buckets, so writers spread across many independent lanes
+and rarely collide. To isolate **write contention** we hold the chain length ~constant
+(`HL_INIT = 100 × HL_BUCKETS`, ~100 nodes/bucket) and shrink the bucket count — the number
+of independent write lanes — at 40 % updates. Fewer lanes → more writers per bucket.
+(`BENCH_FIXED_THREADS=N` runs a single thread count for the per-bucket sweep.)
+
+![Write contention: as buckets shrink, RCU+lock collapses (its per-bucket lock becomes a
+global lock) while txn and cds_lfht degrade gracefully; at 16 buckets only txn and lfht keep
+scaling to 192](figures/hash_contention.png)
+
+**Throughput vs #buckets at 192 threads** (total Mops/s, 40 % updates):
+
+| buckets      |   1 |   4 |  16 |  64 | 256 | 1024 |
+|--------------|----:|----:|----:|----:|----:|-----:|
+| `lfht`       |  13 |  29 |  47 |  52 |  53 |   53 |
+| `txn_hlist`  | 7.5 |  22 |  35 |  40 |  42 |   44 |
+| `rcu_hlist`  | 0.9 | 1.1 | 5.9 |  19 |  39 |   52 |
+| RLU-defer    | 1.9 | 4.8 | 8.7 |  13 |  19 |   24 |
+| RLU-sync     | 2.0 | 5.3 | 8.3 |  10 |  11 |   11 |
+
+At the article's **1024 buckets** (low contention) `rcu_hlist` ties `lfht` at the top
+(52–53) — the article's result. But as the bucket count shrinks, **`rcu_hlist`
+collapses**: its per-bucket lock becomes a *global* lock, and throughput falls from 52 to
+**0.9** at a single bucket — best to worst, a ~55× drop. `txn_hlist` and `lfht` degrade
+**gracefully** (44 → 7.5 and 53 → 13), staying on top under contention; txn overtakes rcu
+below ~64 buckets. RLU sits low-to-mid throughout — even at 1024 buckets its global
+write-clock caps it (~24 defer / ~11 sync) under 40 % writes.
+
+**Thread scaling at 16 buckets** (heavily contended): only the lock-free `lfht` (→48 @192)
+and MCAS `txn_hlist` (→36) keep scaling; `rcu_hlist`, RLU-defer and RLU-sync all **peak
+around 8 threads and decline** (rcu to 6.0 @192) as the lock / write-clock serializes the
+concentrated writers.
+
+So the article's "RCU meets-or-beats RLU" holds **only at low write contention**.
+Concentrate the writes and RCU's per-bucket lock serializes while `txn_hlist` (and `lfht`)
+stay robust — txn's smooth degradation down to a single hot bucket is the
+`URCU_TXN_FALLBACK=256` escalation fix (the old `64` default cliffed here). `txn_hlist` is
+the one engine that both **tracks RCU at low contention** *and* **stays contention-robust**.
+
 ### Takeaways
 
 - Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
@@ -1336,6 +1377,13 @@ moderate and balanced.
   *scaling* side of that line (within ~7–18 % of the RCU baseline, far above RLU),
   while `cds_lfht` — pinned to equal chains, denying it its resize design point — edges
   ahead once updates are frequent.
+- That RCU win is **contingent on low write contention**. Holding chains constant and
+  shrinking the bucket count (= write lanes) at 40 % updates, `rcu_hlist`'s per-bucket
+  lock becomes a global one and it **collapses ~55× (52 → 0.9 Mops)** from best to worst,
+  while `txn_hlist` and `cds_lfht` degrade gracefully; at 16 buckets only txn and lfht
+  still scale to 192 (RCU/RLU peak ~8 threads). `txn_hlist` is the only engine that both
+  tracks RCU at low contention *and* stays robust under it — its smooth degradation to a
+  single hot bucket being the `URCU_TXN_FALLBACK=256` escalation fix.
 
 ## Layout
 
