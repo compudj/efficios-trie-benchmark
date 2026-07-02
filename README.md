@@ -1385,6 +1385,11 @@ the one engine that both **tracks RCU at low contention** *and* **stays contenti
   tracks RCU at low contention *and* stays robust under it — its smooth degradation to a
   single hot bucket being the `URCU_TXN_FALLBACK=256` escalation fix.
 
+Where these results could apply beyond the benchmark — candidate data structures
+for the urcu-txn API across the kernel, low-level libraries, databases and
+networking — is surveyed in
+[design/rcu-txn-use-cases.md](design/rcu-txn-use-cases.md).
+
 ## Layout
 
 ```
@@ -1410,6 +1415,7 @@ third_party/wormhole/            vendored Wormhole (GPL-3.0; bench_wormhole_gpl 
 src/bench_wormhole_gpl.c         GPL-3.0 single-threaded Wormhole benchmark
 src/bench_list_scale.c           bidirectional RCU list scaling benchmark
                                    (txn_sw_list/txn_list vs mutex/rwlock/seqlock/iscrw)
+design/rcu-txn-use-cases.md      candidate data structures for the urcu-txn API
 src/bench_iscrw.c                isolation wrapper linking the real bind9 isc_rwlock
 src/iscrw-shim/probes-isc.h      no-op SystemTap probes shim for that standalone build
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
