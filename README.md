@@ -1206,6 +1206,69 @@ stops:
 | RLU-defer read (Gvisits/s)  | 0.5 | 1.7 | 2.9 | 5.6 |  10 |      14 |
 | RLU-sync read (Gvisits/s)   | 0.5 | 2.1 | 6.6 |  11 |  15 |      17 |
 
+#### RLU-paper hash benchmark (LWN [#667720](https://lwn.net/Articles/667720/)) — mixed % updates
+
+The sections above use dedicated reader/writer threads. The RLU paper's canonical
+benchmark instead has **every thread do a mix**: a hash table of **1 000 buckets ×
+100 nodes/bucket** (100 000 keys over a 200 000-key range), each thread running
+`(100−X)%` lookups + `X%` updates (toggle a random key), swept at X ∈ {0, 2, 20, 40}.
+This is the workload McKenney reproduced in LWN #667720, whose result was: **RCU meets
+or beats RLU everywhere, and RLU stops scaling as the update rate rises** (past ~32
+threads at 20 %, ~16 at 40 %). We reproduce it (`BENCH_UPDATE_PCT=X`; one op = one lookup
+or one update; total ops/s) and add the MCAS engine plus a lock-free hash:
+
+- **`rcu_hlist`** — the article's actual baseline: RCU readers + a **per-bucket lock**
+  for writers (the classic RCU hash-of-sorted-lists).
+- **`txn_hlist`** — the MCAS transaction engine (glibc + descriptor slab).
+- **`lfht`** — liburcu's `cds_lfht`, **pinned to 1024 fixed buckets, no auto-resize**, so
+  it walks the same ~100-node chains as the others. This deliberately denies cds_lfht its
+  whole design point (it is built to auto-resize so chains stay ~O(1)); it is here as an
+  equal-chain *mechanism* comparison, not cds_lfht as you would deploy it.
+
+RLU is glibc; the four sorted-list engines share the same key stream and sentinels.
+Best-of-2, `DURATION_SEC=3`, 0 coherence violations across all 240 points.
+
+![LWN #667720 hash benchmark reproduced and extended: read-only all five tie; as the
+update rate rises RCU / cds_lfht / txn scale to 192 while RLU-defer walls (~32 threads at
+20 %, ~16–32 at 40 %) and RLU-sync stays flat](figures/lwn667720_hash.png)
+
+**Total ops/s at 192 threads (full box):**
+
+| engine                    |  0% |  2% | 20% | 40% |
+|---------------------------|----:|----:|----:|----:|
+| `rcu_hlist` (RCU + lock)  | 257 | 138 |  76 |  51 |
+| `lfht` (cds_lfht)         | 257 | 136 |  75 |  55 |
+| `txn_hlist` (MCAS)        | 257 | 129 |  62 |  44 |
+| RLU-defer                 | 267 | 105 |  38 |  26 |
+| RLU-sync                  | 267 |  51 |  16 |  11 |
+
+**Total ops/s at 64 threads (the article's 4-socket box):**
+
+| engine                    |  0% |  2% | 20% | 40% |
+|---------------------------|----:|----:|----:|----:|
+| `rcu_hlist` (RCU + lock)  |  88 |  61 |  43 |  33 |
+| `lfht` (cds_lfht)         |  88 |  60 |  42 |  32 |
+| `txn_hlist` (MCAS)        |  88 |  59 |  37 |  27 |
+| RLU-defer                 |  91 |  59 |  31 |  23 |
+| RLU-sync                  |  91 |  43 |  16 |  11 |
+
+**Read-only (0 %)** the five are identical — equal chains, pure RCU-class read scaling to
+~257–267 Mops (RLU marginally top, ~4 %). As updates appear the mechanisms separate and
+the article's headline holds: **RLU-sync breaks first** (flat ~50 by 2 %), and
+**RLU-defer walls** exactly where the paper says — barely moving past 32 threads at 20 %
+(31 → 37 → 38 from 32 → 192) and past ~16–32 at 40 %. Meanwhile **RCU, `cds_lfht` and txn
+all scale to the full 192 cores.**
+
+The new result is that **`txn_hlist` tracks the RCU baseline far more closely than RLU
+does** — within ~7 % at 2 % (129 vs 138), ~18 % at 20 %/40 % — and scales where RLU
+cannot, because at these update rates the RCU-class read path dominates and txn pays MCAS
+only on the X % of ops that write. `cds_lfht` ties `rcu_hlist` at 2–20 % and **overtakes
+it at 40 %** (54 vs 51): once writes are frequent its lock-free updates beat the per-bucket
+lock. So on RLU's own benchmark the ranking is **RCU ≈ lfht ≥ txn ≫ RLU-defer ≫
+RLU-sync** — txn joins RCU and `cds_lfht` on the scaling side of the "RLU doesn't scale
+writers" line. (Bucket count is held constant here, so this isolates the mechanism; a
+follow-up shrinks the bucket count to stress *write* contention directly.)
+
 ### Takeaways
 
 - Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
@@ -1230,6 +1293,12 @@ stops:
   on a representative (non-tiny) list its **reads also lead ~1.6–1.8×** (RLU pays a
   per-node validation the tiny-list microbench hid). RLU stays competitive only in
   the low-writer / read-mostly-on-tiny-structures corner.
+- On **RLU's own paper benchmark** (LWN #667720: a 1 000 × 100 hash with per-thread
+  `%` updates) the reproduction holds — RCU meets-or-beats RLU and RLU stops scaling
+  past ~16–32 writers — and `txn_hlist` lands with `rcu_hlist`/`cds_lfht` on the
+  *scaling* side of that line (within ~7–18 % of the RCU baseline, far above RLU),
+  while `cds_lfht` — pinned to equal chains, denying it its resize design point — edges
+  ahead once updates are frequent.
 
 ## Layout
 

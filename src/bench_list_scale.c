@@ -64,6 +64,7 @@
 #include <urcu/rcu-txn-list.h>
 #include <urcu/rcu-txn.h>
 #include <urcu/rculist.h>
+#include <urcu/rculfhash.h>
 #include <urcu/fair-mutex.h>
 
 #include "rlu.h"		/* reference Read-Log-Update engine (third_party/rlu) */
@@ -2070,6 +2071,213 @@ restart:
 	RLU_READER_UNLOCK(self);
 }
 
+/* ── rcu_hlist: classic RCU hash-of-sorted-lists (RCU reads + per-bucket lock) ──
+ *
+ * The article's actual baseline (LWN #667720): RCU-protected sorted singly-
+ * linked buckets, readers wait-free under rcu_read_lock (rcu_dereference walk),
+ * writers serialized PER BUCKET by a plain mutex (an update touches one bucket,
+ * so contention is 1/HL_BUCKETS of a global lock).  Deletes publish the unlink
+ * with rcu_assign_pointer and defer the free through call_rcu -- the honest RCU
+ * grace-period cost.  Same LONG_MIN/LONG_MAX sentinels and key stream as the txn
+ * and RLU hashes, so the three sorted-list schemes meet on identical ground. */
+struct chl_node { struct chl_node *next; long key; struct rcu_head rh; };
+static struct chl_node **g_chl_bkt;		/* [HL_BUCKETS] head sentinels */
+static pthread_mutex_t   *g_chl_lock;		/* [HL_BUCKETS] per-bucket writer locks */
+
+static void chl_node_free(struct rcu_head *h)
+{
+	free(caa_container_of(h, struct chl_node, rh));
+}
+static struct chl_node *chl_alloc(long key)
+{
+	struct chl_node *n = malloc(sizeof(*n));
+	if (!n) abort();
+	n->key = key; n->next = NULL;
+	return n;
+}
+static void chl_build(void)
+{
+	uint64_t r = 0x1234567ULL;
+	long inserted = 0;
+	int i;
+
+	hl_config();
+	g_chl_bkt  = calloc((size_t) HL_BUCKETS, sizeof(*g_chl_bkt));
+	g_chl_lock = calloc((size_t) HL_BUCKETS, sizeof(*g_chl_lock));
+	for (i = 0; i < HL_BUCKETS; i++) {
+		struct chl_node *head = chl_alloc(LONG_MIN);
+		struct chl_node *tail = chl_alloc(LONG_MAX);
+		head->next = tail; tail->next = tail;	/* tail self-loops (wrap guard) */
+		g_chl_bkt[i] = head;
+		pthread_mutex_init(&g_chl_lock[i], NULL);
+	}
+	while (inserted < HL_INIT) {			/* sorted single-threaded fill */
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		struct chl_node *pred = g_chl_bkt[hl_hash(key)], *cur = pred->next, *n;
+		while (cur->key < key) { pred = cur; cur = cur->next; }
+		if (cur->key == key) continue;		/* dup */
+		n = chl_alloc(key); n->next = cur; pred->next = n; inserted++;
+	}
+}
+static int chl_contains(struct chl_node *head, long key, long *viol)
+{
+	struct chl_node *cur = rcu_dereference(head->next);
+	long pk = LONG_MIN;
+	int steps = 0;
+
+	while (cur->key < key) {
+		if (cur->key < pk || ++steps > STEP_LIMIT) { (*viol)++; return 0; }
+		pk = cur->key;
+		cur = rcu_dereference(cur->next);
+	}
+	return cur->key == key;
+}
+static unsigned long chl_read(long *viol)
+{
+	unsigned long found = 0;
+	uint64_t r = hl_rng();
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < HL_BATCH; i++) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		found += (unsigned long) chl_contains(g_chl_bkt[hl_hash(key)], key, viol);
+	}
+	rcu_read_unlock();
+	g_hl_rng = r;
+	return found;
+}
+static void chl_write(int slot)
+{
+	uint64_t r = hl_rng();
+	long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+	unsigned b = hl_hash(key);
+	struct chl_node *head = g_chl_bkt[b], *pred, *cur;
+
+	(void) slot;
+	g_hl_rng = r;
+	pthread_mutex_lock(&g_chl_lock[b]);		/* one writer per bucket */
+	pred = head; cur = pred->next;			/* writer-exclusive: plain loads */
+	while (cur->key < key) { pred = cur; cur = cur->next; }
+	if (cur->key == key) {				/* present -> unlink + defer free */
+		rcu_assign_pointer(pred->next, cur->next);
+		call_rcu(&cur->rh, chl_node_free);
+	} else {					/* absent -> sorted insert */
+		struct chl_node *n = chl_alloc(key);
+		n->next = cur;
+		rcu_assign_pointer(pred->next, n);
+	}
+	pthread_mutex_unlock(&g_chl_lock[b]);
+}
+
+/* ── lfht: liburcu cds_lfht, a split-ordered lock-free hash ──
+ *
+ * cds_lfht is normally run WITH auto-resize so its chains stay ~O(1).  We
+ * instead PIN it to the SAME bucket count as the sorted-list schemes (HL_BUCKETS
+ * rounded up to a power of two, which cds_lfht requires; no CDS_LFHT_AUTO_RESIZE)
+ * so every engine walks the same ~100-node chain and the comparison isolates the
+ * SYNCHRONIZATION mechanism -- split-ordered lock-free list vs RCU+per-bucket
+ * lock vs RLU vs txn-MCAS -- rather than the bucket count.  This deliberately
+ * denies cds_lfht its resize advantage: an apples-to-apples equal-chain match,
+ * not cds_lfht at its intended O(1) design point. */
+struct lfht_node { struct cds_lfht_node node; long key; struct rcu_head rh; };
+static struct cds_lfht *g_lfht;
+
+/* HL_BUCKETS rounded up to a power of two (cds_lfht bucket counts are 2^k). */
+static unsigned long lfht_nbuckets(void)
+{
+	unsigned long b = 1;
+	while (b < (unsigned long) HL_BUCKETS)
+		b <<= 1;
+	return b;
+}
+
+static inline unsigned long lfht_hash(long key)
+{
+	uint64_t h = (uint64_t) key;			/* fmix64 avalanche */
+	h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+	h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+	h ^= h >> 33;
+	return (unsigned long) h;
+}
+static int lfht_match(struct cds_lfht_node *node, const void *key)
+{
+	return caa_container_of(node, struct lfht_node, node)->key == *(const long *) key;
+}
+static void lfht_free(struct rcu_head *h)
+{
+	free(caa_container_of(h, struct lfht_node, rh));
+}
+static void lfht_build(void)
+{
+	uint64_t r = 0x1234567ULL;
+	long inserted = 0;
+	unsigned long nb;
+
+	hl_config();
+	nb = lfht_nbuckets();
+	/* Fix bucket count to the sorted schemes' (no auto-resize, no resize worker):
+	 * min == init == max so cds_lfht never grows past nb buckets. */
+	g_lfht = cds_lfht_new(nb, nb, nb, 0, NULL);
+	if (!g_lfht) abort();
+	while (inserted < HL_INIT) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		struct lfht_node *n = malloc(sizeof(*n));
+		struct cds_lfht_node *ret;
+		if (!n) abort();
+		n->key = key; cds_lfht_node_init(&n->node);
+		rcu_read_lock();
+		ret = cds_lfht_add_unique(g_lfht, lfht_hash(key), lfht_match, &key, &n->node);
+		rcu_read_unlock();
+		if (ret != &n->node) { free(n); continue; }	/* dup */
+		inserted++;
+	}
+}
+static unsigned long lfht_read(long *viol)
+{
+	unsigned long found = 0;
+	uint64_t r = hl_rng();
+	int i;
+
+	(void) viol;					/* unsorted: no monotonicity check */
+	rcu_read_lock();
+	for (i = 0; i < HL_BATCH; i++) {
+		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+		struct cds_lfht_iter iter;
+		cds_lfht_lookup(g_lfht, lfht_hash(key), lfht_match, &key, &iter);
+		found += (cds_lfht_iter_get_node(&iter) != NULL);
+	}
+	rcu_read_unlock();
+	g_hl_rng = r;
+	return found;
+}
+static void lfht_write(int slot)
+{
+	uint64_t r = hl_rng();
+	long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
+	unsigned long h = lfht_hash(key);
+	struct cds_lfht_iter iter;
+	struct cds_lfht_node *found;
+
+	(void) slot;
+	g_hl_rng = r;
+	rcu_read_lock();
+	cds_lfht_lookup(g_lfht, h, lfht_match, &key, &iter);
+	found = cds_lfht_iter_get_node(&iter);
+	if (found) {					/* present -> remove + defer free */
+		if (!cds_lfht_del(g_lfht, found))
+			call_rcu(&caa_container_of(found, struct lfht_node, node)->rh,
+				 lfht_free);
+	} else {					/* absent -> add (unique) */
+		struct lfht_node *n = malloc(sizeof(*n));
+		if (!n) abort();
+		n->key = key; cds_lfht_node_init(&n->node);
+		if (cds_lfht_add_unique(g_lfht, h, lfht_match, &key, &n->node) != &n->node)
+			free(n);			/* lost the add race to a dup */
+	}
+	rcu_read_unlock();
+}
+
 /* ── Engine registry ─────────────────────────────────────────── */
 static const struct lengine engines[] = {
 	{ "txn_sw_list",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
@@ -2079,6 +2287,8 @@ static const struct lengine engines[] = {
 	{ "txn_hlist", "rcu-txn hash-of-sorted-lists",       1, thl_build, thl_read, thl_write },
 	{ "rlu_hlist", "RLU hash-of-sorted-lists (home turf)", 0, rhl_build, rhl_read, rhl_write,
 		NULL, NULL, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
+	{ "rcu_hlist", "RCU + per-bucket lock hash-of-sorted-lists", 1, chl_build, chl_read, chl_write },
+	{ "lfht",      "liburcu cds_lfht (resizable lock-free hash)", 1, lfht_build, lfht_read, lfht_write },
 	{ "rculist",   "RCU classic, forward-only (ref)",    1, rl_build,  rl_read,  rl_write  },
 	{ "mutex",     "pthread_mutex",                      0, mtx_build, mtx_read, mtx_write },
 	{ "fairmutex", "liburcu cds_fair_mutex (MCS/FIFO)",  0, fm_build,  fm_read,  fm_write  },
@@ -2336,6 +2546,124 @@ static void run_point(int nr_readers, int nr_writers,
 	free(th); free(ra); free(wa);
 }
 
+/*
+ * Mixed per-thread workload (BENCH_UPDATE_PCT=X), the LWN #667720 / RLU-paper
+ * shape: every thread runs the SAME loop, doing an update with probability X%
+ * (else a lookup) rather than the harness's dedicated reader/writer split.  One
+ * op = one lookup or one update (HL_BATCH is forced to 1 in this mode so a read
+ * op is a single key lookup), matching the article's per-operation accounting.
+ * Reported metric is total ops/s (lookups + updates).  Intended for the hash
+ * engines (txn_hlist / rlu_hlist / rcu_hlist / lfht).
+ */
+static int g_update_pct = -1;
+struct mixed_arg { unsigned long reads, writes; long viol; int cpu; int tid; };
+
+static void *mixed_thread(void *arg)
+{
+	struct mixed_arg *ma = arg;
+	unsigned long reads = 0, writes = 0;
+	long viol = 0;
+	uint64_t rng = (0x9e3779b97f4a7c15ULL ^ ((uint64_t) ma->tid * 0x100000001b3ULL)) | 1;
+
+	bench_topology_pin(ma->cpu);
+	if (g_eng->uses_rcu)
+		rcu_register_thread();
+	if (g_eng->tl_begin)
+		g_eng->tl_begin();			/* engine-private thread registration (RLU) */
+
+	if (getenv("BENCH_NO_PRIME") == NULL)
+		(void) g_eng->read_pass(&viol);		/* one warm pass */
+
+	__atomic_fetch_add(&prime_done_count, 1, __ATOMIC_RELEASE);
+	while (!start_flag)
+		caa_cpu_relax();
+
+	while (!uatomic_load(&stop_flag, CMM_RELAXED)) {
+		if ((int) (xorshift64(&rng) % 100u) < g_update_pct) {
+			g_eng->write_toggle(0);		/* hash update: random key, slot ignored */
+			writes++;
+		} else {
+			(void) g_eng->read_pass(&viol);	/* one lookup (HL_BATCH == 1 here) */
+			reads++;
+		}
+		if (g_eng->uses_rcu)
+			rcu_quiescent_state();
+	}
+
+	if (g_eng->tl_end)
+		g_eng->tl_end();			/* flush this thread's deferred RLU write-sets */
+	if (g_eng->uses_rcu)
+		rcu_unregister_thread();
+	ma->reads = reads; ma->writes = writes; ma->viol = viol;
+	return NULL;
+}
+
+static void run_point_mixed(int nthreads, double *ops_mps, double *upd_mops,
+		long *violations)
+{
+	pthread_t *th = calloc(nthreads ? nthreads : 1, sizeof(*th));
+	struct mixed_arg *ma = calloc(nthreads ? nthreads : 1, sizeof(*ma));
+	unsigned long tot_reads = 0, tot_writes = 0;
+	long tot_viol = 0;
+	uint64_t t0, t1;
+	double elapsed;
+	int i;
+
+	start_flag = 0;
+	stop_flag = 0;
+	prime_done_count = 0;
+
+	if (g_eng->point_reset)
+		g_eng->point_reset();			/* rewind engine thread registry (RLU) */
+
+	for (i = 0; i < nthreads; i++) {
+		ma[i].cpu = i;
+		ma[i].tid = i;
+		pthread_create(&th[i], NULL, mixed_thread, &ma[i]);
+	}
+
+	/* Stay RCU-offline while blocking on prime / join (see run_point rationale). */
+	if (g_eng->uses_rcu)
+		rcu_thread_offline();
+	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nthreads)
+		usleep(1000);
+	if (g_eng->uses_rcu)
+		rcu_thread_online();
+
+	t0 = mono_ns();
+	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
+	{
+		uint64_t end = t0 + (uint64_t) DURATION_SEC * 1000000000ULL;
+		while (mono_ns() < end) {
+			usleep(2000);
+			if (g_eng->uses_rcu)
+				rcu_quiescent_state();
+		}
+	}
+	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+
+	if (g_eng->uses_rcu)
+		rcu_thread_offline();
+	for (i = 0; i < nthreads; i++)
+		pthread_join(th[i], NULL);
+	if (g_eng->uses_rcu)
+		rcu_thread_online();
+	t1 = mono_ns();
+	elapsed = (double)(t1 - t0) / 1e9;
+
+	for (i = 0; i < nthreads; i++) {
+		tot_reads += ma[i].reads;
+		tot_writes += ma[i].writes;
+		tot_viol += ma[i].viol;
+	}
+	*ops_mps = (double) (tot_reads + tot_writes) / 1e6 / elapsed;
+	*upd_mops = (double) tot_writes / 1e6 / elapsed;
+	*violations = tot_viol;
+
+	reset_churn();
+	free(th); free(ma);
+}
+
 /* ── Self-check: build is sorted & coherent both directions ──── */
 static void self_check(void)
 {
@@ -2367,6 +2695,8 @@ static void usage(const char *p)
 		"BENCH_WRITESCALE BENCH_RW_BALANCED BENCH_READERS\n"
 		"       BENCH_FIXED_READERS=N BENCH_WRITE_RATE=N(toggles/s/writer) "
 		"BENCH_ALLOW_SMT\n"
+		"       BENCH_UPDATE_PCT=X (mixed hash: every thread does X%% updates, "
+		"LWN #667720) HL_BUCKETS/HL_INIT/HL_RANGE/HL_BATCH\n"
 		"       BENCH_NO_PRIME BENCH_NUMA_INTERLEAVE "
 		"BENCH_NO_PERCPU_CALLRCU\n"
 		"  build: default = segregated rcu_head (24B hot node);"
@@ -2487,6 +2817,11 @@ int main(int argc, char **argv)
 #endif
 	}
 
+	/* Mixed-% mode accounts one lookup per read op, so a read pass must be a
+	 * single key lookup: force HL_BATCH=1 (unless the user pinned it). */
+	if (getenv("BENCH_UPDATE_PCT") && !getenv("HL_BATCH"))
+		setenv("HL_BATCH", "1", 1);
+
 	g_eng->build();
 	self_check();
 
@@ -2505,6 +2840,34 @@ int main(int argc, char **argv)
 	if (g_random_pos && g_eng->write_random)
 		fprintf(stderr, "%s: random-position writer mode "
 			"(collisions ~ writers/LIST_SIZE)\n", g_eng->name);
+
+	if ((e = getenv("BENCH_UPDATE_PCT"))) {
+		/*
+		 * Article-style mixed workload (LWN #667720): N threads, each doing
+		 * (100-X)% lookups + X% updates on the 1000-bucket x 100-node hash.
+		 * Sweep thread count 1 -> N; report total ops/s.  The 64-thread point
+		 * is the article's box; we run to the full machine.
+		 */
+		int tc[] = {1,2,4,8,16,32,64,96,128,160,191,192};
+		int n = sizeof(tc)/sizeof(tc[0]);
+		int cap = allow_smt ? max_threads
+			: (max_phys_cores < max_threads ? max_phys_cores : max_threads);
+		g_update_pct = atoi(e);
+		if (g_update_pct < 0) g_update_pct = 0;
+		if (g_update_pct > 100) g_update_pct = 100;
+		printf("# threads total_mops update_mops read_mops violations "
+			"(update_pct=%d)\n", g_update_pct);
+		fflush(stdout);
+		for (i = 0; i < n; i++) {
+			double ops, upd; long v;
+			if (tc[i] > cap)
+				break;
+			run_point_mixed(tc[i], &ops, &upd, &v);
+			printf("%d %.2f %.2f %.2f %ld\n", tc[i], ops, upd, ops - upd, v);
+			fflush(stdout);
+		}
+		goto done;
+	}
 
 	if (getenv("BENCH_RW_BALANCED")) {
 		/*
