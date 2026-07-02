@@ -820,7 +820,9 @@ Two defaults were chosen after the investigation below:
   artifact build): the `rcu_head` lives *outside* the hot 24 B node and stable
   nodes are arena-packed, the way a metadata-segregating allocator behaves.
 - **Per-CPU `call_rcu` workers** (default; `BENCH_NO_PERCPU_CALLRCU` to disable):
-  one reclaim worker per CPU instead of liburcu's single global worker.
+  one reclaim worker per hardware thread, each pinned to its writer's PU
+  (`BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single`), instead of liburcu's single
+  global worker.
 
 ### Results
 
@@ -887,9 +889,12 @@ comparison.
 `txn_list` is the **only** engine whose write throughput rises with concurrent
 writers; everything else serializes. Two write workloads are measured below, and
 in both the limiter is **reclamation, not the MCAS**: liburcu's single global
-`call_rcu` worker funnels every deferred free and caps throughput at ~8 Mops/s;
-distributing reclaim per-CPU (`create_all_cpu_call_rcu_data()`, now the default)
-is ~5×, and pairing it with a per-CPU allocator stacks further. `txn_list` write
+`call_rcu` worker funnels every deferred free and caps throughput at ~8 Mops/s.
+Distributing reclaim to **one worker per hardware thread, each pinned to its
+writer's PU** so the producer→consumer free stays CPU- and NUMA-local is ~5× and
+is now the default (`BENCH_RECLAIM_DOMAIN=hwthread`; `BENCH_NO_PERCPU_CALLRCU` to
+disable). With reclaim co-located, the *allocator* lever mostly closes on plain
+churn — glibc's thread-cache keeps up once frees are local. `txn_list` write
 Mops/s by allocator, writers 1/8/32/64/128/192 (this box: 192 cores / 384 PUs):
 
 **Plain churn** (default `BENCH_WRITESCALE`) — each writer toggles churn nodes in
@@ -898,28 +903,29 @@ allocation-dominated.
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` |
 |---------|------:|------:|
-| 1   | 1.4 | 2.4 |
-| 8   | 14  | 25  |
-| 32  | 21  | 45  |
-| 64  | 30  | 39  |
-| 128 | 43  | 51  |
-| 192 | 41  | **80** |
+| 1   | 3.6 | 7.8 |
+| 8   | 22  | 42  |
+| 32  | 38  | 50  |
+| 64  | 40  | 39  |
+| 128 | 48  | 52  |
+| 192 | **100** | 82 |
 
 **Random transacted index** (`BENCH_RANDOM_POS`) — each writer atomically toggles
 a randomly chosen slot of an external index that points at list cells; the index
 update folds into the same MCAS (the composable path), so there is more compute
 per op. The index has exactly `CHURN` slots and each writer picks one uniformly,
-so the per-slot collision rate is `~ writers / CHURN`. Best-of-3 (this box is
-bistable at high writer counts), current engine, `URCU_TXN_FALLBACK=256`:
+so the per-slot collision rate is `~ writers / CHURN`. Best-of-2 (the
+per-hwthread reclaim pin removed the high-writer bistability that used to require
+best-of-3), current engine, `URCU_TXN_FALLBACK=256`:
 
 | writers | glibc | jemalloc `percpu_arena:phycpu` |
 |---------|------:|------:|
-| 1   | 1.2 | 4.3 |
-| 8   | 8.5 | 16  |
-| 32  | 8.5 | 22  |
-| 64  | 11  | **37** |
-| 128 | 4.5 | 6.7 |
-| 192 | 3.0 | 4.8 |
+| 1   | 2.7 | 2.5 |
+| 8   | 14  | 16  |
+| 32  | 18  | 26  |
+| 64  | 24  | **32** |
+| 128 | 6.4 | 8.1 |
+| 192 | 3.1 | 5.0 |
 
 At the default `CHURN=200`, 192 writers collide ~1:1 on the index, so the random
 path is **index-contention-bound** — it peaks near 64 writers and then *falls* (the
@@ -935,33 +941,36 @@ is unchanged.
 
 Enlarging the index — raise `CHURN`, capped at `LIST_SIZE`, so raise both — spreads
 the collisions (so escalation rarely triggers regardless of the budget) and restores
-writer scaling (jemalloc, best-of-3, write Mops/s):
+writer scaling (jemalloc, best-of-2, write Mops/s):
 
 | index slots (`CHURN`) | @64 | @128 | @192 |
 |-----------------------|----:|-----:|-----:|
-| 200 (default)         | 36  | 6.5  | 4.8  |
-| 10 000                | 60  | 101  | 141  |
-| 100 000               | 61  | 108  | **145** |
-| 1 000 000             | 58  | 107  | 136  |
+| 200 (default)         | 24  | 8.1  | 4.1  |
+| 10 000                | 57  | 92   | 117  |
+| 100 000               | 57  | 95   | **116** |
+| 1 000 000             | 56  | 93   | 118  |
 
-With a ≥100 k-slot index the composable random path scales to ~145 Mops/s at 192
-writers — *above* plain churn — confirming the fall-off at `CHURN=200` is index
-contention (`writers / CHURN`), not the transaction engine. (The 1 M row dips
-slightly: a 1 M-node ring spills cache.)
+With a ≥100 k-slot index the composable random path scales to ~117 Mops/s at 192
+writers — still *above* plain churn (jemalloc ~82) — confirming the fall-off at
+`CHURN=200` is index contention (`writers / CHURN`), not the transaction engine.
 
-The composable index path is ~30–40 % slower per op (the extra transacted slot),
-and the **allocator lever shrinks** with it: at 32 writers glibc→jemalloc is
-21→45 (2.1×) for plain churn but only 13→17 for the random index, because that
-path spends less of its time in malloc/free and more in the MCAS install.
+The composable index path is ~30–40 % slower per op (the extra transacted slot).
+The **allocator lever is now modest on both**: at 32 writers glibc→jemalloc is
+38→50 (1.3×) for plain churn and 18→26 (1.4×) for the random index — co-locating
+reclaim already removed the cross-thread free penalty the per-CPU allocator used
+to hide, so the remaining gap is just arena bookkeeping.
 
-Out to the full box (192 writers), the allocator decides whether the list keeps
-scaling. Plain churn under jemalloc's per-CPU arenas climbs to ~80 Mops/s, while
-glibc plateaus near ~42 past 128 (reclaim-bound): RCU reclamation is a
-cross-thread producer→consumer free (writer allocates, reclaim worker frees), so
-only a per-CPU allocator keeps alloc and free on one CPU's pool. The random-index
-path collapses under glibc at 192 (cross-thread reclaim oversubscribing the cores)
-but holds ~11 under jemalloc. 0 coherence violations at every point through 192
-writers.
+Out to the full box (192 writers), **co-locating reclaim rewrites the allocator
+story.** With the per-hwthread worker pinned to its writer's PU, the
+producer→consumer free (writer allocates, worker frees) stays on one CPU's pool,
+so glibc's thread-cache no longer eats a cross-CCX penalty: plain churn under
+**glibc climbs to ~100 Mops/s @192, slightly *ahead* of the jemalloc + node-slab
+pool (~82)** — the per-CPU allocator's per-arena bookkeeping stops paying once
+frees are already local. (Before the pin, the reclaim worker drifted to a remote
+CCX and glibc plateaued ~42 there; the per-CPU allocator had been hiding that
+drift, not a fundamental cross-thread cost.) The `CHURN=200` random-index path is
+index-contention-bound, not allocator-bound, landing ~3 (glibc) / ~5 (jemalloc)
+at 192. 0 coherence violations at every point through 192 writers.
 
 Both tables are on the **A-B-A-hardened** engine, whose per-record install latch
 is now a single tri-state word (`FREE → BUSY → DONE`): the FREE→BUSY CAS is the
@@ -978,14 +987,89 @@ folded into that commit; see `<urcu/rcu-txn.h>`).
 Takeaways on allocation: (1) RCU reclamation is a **producer→consumer cross-thread
 free** (writer allocates, reclaim worker frees) — the worst case for per-thread
 allocator caches, which is why an allocator swap alone *hurt* until reclaim was
-distributed. (2) Per-CPU `call_rcu` + per-CPU allocator arenas keep alloc and free
-on one CPU's pool. (3) `tcmalloc_minimal` is deliberately omitted: it is
+distributed. (2) **Pinning** each per-CPU `call_rcu` worker to its writer's PU
+keeps alloc and free on one CPU's pool — enough that even glibc's thread-cache
+keeps up on plain churn, so a per-CPU allocator adds little there and matters only
+where frees still cross threads. (3) `tcmalloc_minimal` is deliberately omitted: it is
 gperftools' *per-thread*-cache build, not a per-CPU/rseq allocator, so it is the
 worst case for the cross-thread frees above and not a meaningful per-CPU
 comparison — the real per-CPU rseq allocator is Google's `google/tcmalloc` (Bazel
 build, not packaged for distros), which would be a second per-CPU data point
-alongside jemalloc. Still open: a per-CPU node pool (recycle through `call_rcu` to
-the owning CPU's arena) and liburcu MCAS descriptor pooling.
+alongside jemalloc. (4) The one lever this leaves — **pooling the MCAS descriptor
+itself** — is the subsection below: it closes the jemalloc gap with *no* external
+allocator. Still open after that: a per-CPU *node* pool (recycle nodes through
+`call_rcu` to the owning CPU's arena, the way descriptors now are).
+
+#### MCAS descriptor slab — closing the allocator gap, no external allocator
+
+The remaining allocator cost is the **per-attempt MCAS descriptor**. Every
+`txn_list` update `posix_memalign`s a descriptor (`struct urcu_mcas` — a header plus
+its inline record array) and hands it to `call_rcu`; the reclaim worker frees it a
+grace period later. That free is the **producer→consumer cross-thread** case again
+(writer allocates, worker frees), so a per-thread malloc cache cannot recycle it —
+and servicing every attempt from glibc's arena at 192 threads grows the arena, which
+`mprotect`s, which serializes on the process-wide `mmap_lock`: an `osq_lock` storm
+that ate ~54 % of runtime in a `perf` profile. Linking jemalloc (per-CPU arenas) was
+what had been hiding this.
+
+A **per-CPU size-classed superblock slab** (`<urcu/rcu-txn-slab.h>`) removes it with
+no external allocator. One arena per `(record-count class, CPU)` — classes
+`{4,8,16,32,64,128}` — is a wait-free-stack freelist over a bump pointer into
+`mmap`'d 2 MiB superblocks. `free()` recovers a block's **origin** arena from its
+superblock header (range-aligned, so `ptr & ~(RANGE−1)`), so a descriptor allocated
+on CPU X and freed by X's pinned reclaim worker returns to X's arena — the
+cross-thread free stays CPU-local with no central structure. Frees `cds_wfs_push`
+(wait-free, never blocking the writer); the single pinned writer per arena pops under
+the wfstack pop-lock. Growth is **capped by construction** — alloc reuses a freed
+block before carving a new one — so the mapped set tracks peak live descriptors and
+then recycles (92–99 % reuse). `URCU_TXN_NO_CACHE=1` disables it (back to
+`posix_memalign`).
+
+Same three allocators, best-of-2, this box, fresh run (shared box → absolute numbers
+differ from the tables above; the shapes are the point):
+
+**Plain churn** (2–3-edge MCAS, allocation-light once reclaim is co-located):
+
+| writers | glibc | jemalloc `percpu` | glibc + descriptor slab |
+|--------:|------:|------------------:|------------------------:|
+| 1   | 9   | 9   | 6   |
+| 8   | 51  | 50  | 40  |
+| 32  | 51  | 51  | 52  |
+| 64  | 41  | 41  | 41  |
+| 128 | 54  | 53  | 50  |
+| 192 | 103 | 101 | 104 |
+
+**Composable random 100 k-slot index** (index + list folded into one MCAS — heavier,
+more descriptor pressure):
+
+| writers | glibc | jemalloc `percpu` | glibc + descriptor slab | slab / jem |
+|--------:|------:|------------------:|------------------------:|-----------:|
+| 1   | 3   | 3   | 4       | 1.1× |
+| 8   | 14  | 14  | 16      | 1.1× |
+| 32  | 24  | 26  | 29      | 1.1× |
+| 64  | 38  | 36  | 52      | 1.4× |
+| 128 | 73  | 64  | 89      | 1.4× |
+| 192 | 91  | 82  | **125** | 1.5× |
+
+On **plain churn the slab is at parity** with both mallocs — once reclaim is
+co-located glibc's thread-cache has little arena contention left to remove, and the
+slab's fixed per-op cost even shows slightly at 1–8 writers. On the **heavier
+composable path** descriptor pressure is high enough that the glibc/jemalloc arenas
+contend, and the slab pulls **1.4–1.5× ahead of jemalloc from 64 writers up** (125 vs
+82 Mops/s at 192) — with **no external allocator linked**, and the tightest
+run-to-run variance of the three (per-CPU arenas are deterministic: the two reps at
+192 landed 123.4 / 124.5). Peak RSS over the 100 k sweep is actually the *lowest* of
+the three (slab 19 GB vs jemalloc 21 GB vs glibc 27 GB); that ~20 GB is the
+allocator-independent `call_rcu` reclaim backlog — present, and worst, under plain
+glibc — not the slab, and capping it needs reclaim backpressure (a separate concern).
+
+The slab is upstreamed into the transaction engine's liburcu tree as a generic
+component shared by the concurrent `rcu-mcas.h` and the single-writer `rcu-txn-sw.h`
+(which folds its former two-part transaction — record array + lazy group block — into
+one slab block). `URCU_TXN_CACHE_STATS` dumps reuse/footprint, but **measure with the
+stats build off**: its per-op `uatomic_inc` counters share a cacheline and collapse
+throughput ~3–4× at 192 threads (they make the slab look 3× *slower* than glibc — the
+counters, not the slab).
 
 #### RLU (Read-Log-Update) comparison
 
@@ -1001,9 +1085,9 @@ never collide (`LIST_SIZE=4096`, `CHURN=3072`, jemalloc, write Mops/s):
 
 | writers      |   1 |  8 | 32 | 64 | 128 |     192 |
 |--------------|----:|---:|---:|---:|----:|--------:|
-| `txn_list`   | 4.6 | 29 | 57 | 70 | 105 | **193** |
-| RLU-defer    |  15 | 34 | 24 | 26 |  20 |      16 |
-| RLU-sync     |  18 | 10 |  7 |  8 |   8 |       8 |
+| `txn_list`   | 8.2 | 35 | 66 | 81 | 107 | **194** |
+| RLU-defer    |  15 | 34 | 21 | 25 |  19 |      15 |
+| RLU-sync     |  18 | 10 | 7.6| 9.1| 8.4 |     7.9 |
 
 RLU wins at 1 writer (its per-thread write-log + batched writeback is cheap
 uncontended), but `txn_list` overtakes by ~8 writers and reaches **~12× RLU** at the
@@ -1015,12 +1099,12 @@ while RLU's global write-clock serializes commit ordering.
 
 | writers      |    1 |    8 |  16 |  32 |  64 |  192 |
 |--------------|-----:|-----:|----:|----:|----:|-----:|
-| `txn_list`   |  1.3 | 11.9 | 11.4| 11.6| 5.7 | 1.2  |
-| RLU-defer    | 11.8 | 12.3 | 5.4 | 4.3 | 3.2 | 1.2  |
-| RLU-sync     | 12.5 |  9.5 | 5.2 | 4.6 | 3.5 | 1.3  |
+| `txn_list`   |  2.5 | 13.1 | 13.7| 14.2| 5.7 | 1.2  |
+| RLU-defer    | 11.9 | 12.3 | 5.4 | 4.3 | 3.2 | 1.2  |
+| RLU-sync     | 11.7 |  9.4 | 5.2 | 4.6 | 3.4 | 1.2  |
 
 Under real contention the two trade places: RLU owns the low-writer regime (≤8),
-`txn_list` owns the mid-range (16–32, ~2× RLU-defer — which falls off after 8
+`txn_list` owns the mid-range (16–32, ~2.5–3× RLU-defer — which falls off after 8
 writers), and they converge at the high end (~1.2 Mops, within 5 %). Both degrade
 **gracefully**; the `txn_list` cliff of the previous section appears only under the
 former escalation default (`URCU_TXN_FALLBACK=64`) — at the current `256` it tracks
@@ -1031,13 +1115,13 @@ Mops/s):
 
 | writers      |   1 |   8 | 32 | 64 | 128 |    192 |
 |--------------|----:|----:|---:|---:|----:|-------:|
-| `txn_hlist`  | 0.7 | 5.6 | 11 | 17 |  24 | **29** |
-| RLU-defer    | 1.3 | 9.1 | 13 | 14 |  16 |     16 |
-| RLU-sync     | 1.3 | 4.6 | 4.4| 5.4| 6.0 |    6.5 |
+| `txn_hlist`  | 0.9 | 6.4 | 12 | 17 |  24 | **29** |
+| RLU-defer    | 1.3 | 9.2 | 11 | 15 |  17 |     17 |
+| RLU-sync     | 1.3 | 4.6 | 4.4| 5.6| 6.4 |    6.4 |
 
-Even on RLU's home turf `txn_hlist` scales to **~1.8× RLU-defer** at 192 writers
+Even on RLU's home turf `txn_hlist` scales to **~1.7× RLU-defer** at 192 writers
 (per-bucket domains keep each queue shallow, so writers rarely serialize); RLU-defer
-plateaus ~16 and RLU-sync ~6.5.
+plateaus ~17 and RLU-sync ~6.4.
 
 **Reads scale at parity.** With one writer, list read throughput is within ~15 %
 across all four (Mvisits/s @191 readers: `txn_list` 74 k, `txn_sw_list` 79 k,
