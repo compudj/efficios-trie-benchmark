@@ -91,7 +91,68 @@ first-node deletes in just the way an interior `&prev->next` is).
   cross-table item move itself is {3-edge unlink + 2-edge insert} in one
   commit.
 
-## 6. What it gives up — and why that is acceptable
+## 6. In-place growth: many small transactions, not one commit
+
+Reserve virtual address space for the maximum table up front
+(`MAP_NORESERVE` anonymous mapping; pages fault in as buckets materialize)
+and the bucket array's address never changes across growth. The tempting
+completion — one commit that resplices every head and updates the size
+field — is the wrong shape: an O(#buckets)-edge txn's conflict footprint
+is the whole table. For the whole commit window, every concurrent insert
+CASes a head slot the resize owns, so every writer in the system either
+aborts against it or is dragged into helping an O(N) transaction (tripping
+the help-depth cap and escalating everyone). That is a stop-the-world
+executed through the most expensive available mechanism; if
+atomic-snapshot resize is ever truly wanted, the bulk-STW regime (writer
+drain + reader gate + plain stores) is the honest way to buy it.
+
+The atomicity the big commit buys — readers never see a size that
+disagrees with the heads — is not needed. Substitute an invariant readers
+can tolerate: **an unsplit new bucket redirects to its parent.** With
+power-of-two in-place growth, bucket `h & (2N-1)` has parent `h & (N-1)`:
+
+- Publish "growing to 2N" as a one-slot txn. New heads `[N, 2N)` hold an
+  UNINIT sentinel (an odd immediate; the encoding has room — same family
+  as the §8 nulls values).
+- Readers hash with the wide mask; on UNINIT they re-mask to the parent
+  and read there. One extra load, only during growth.
+- Buckets split incrementally: seal the parent head (§5), resplice,
+  install both heads — one modest txn per bucket — driven lazily by
+  writers that touch an unsplit bucket (lfht's lazy bucket init,
+  transplanted) and/or a background drainer. Retire the "growing" state
+  once the drain completes.
+
+No txn exceeds one chain, and the split unit can shrink further. A
+per-bucket split is O(chain) edges — fine at expected O(1) occupancy, ugly
+under flooding — but the §5 cross-table move ({3-edge unlink + 2-edge
+insert} in one commit) works within a table too: seal the parent, migrate
+item-at-a-time in constant-size txns, readers checking
+new-bucket-then-parent. The move's atomicity keeps every item findable in
+exactly one of the two chains at every instant. Resize txns become O(1)
+regardless of chain pathology, and the drain parallelizes across buckets.
+
+What the VM reservation is really for is not the big commit — it is that
+**there is no second table**: no old/new table pointers for readers to
+resolve, no RCU handoff between arrays, no double-lookup structure. Growth
+is index arithmetic in one mapping, and parent fallback is a bit-mask.
+(lfht's bucket-node infrastructure exists partly to avoid reallocating the
+array; the reservation dissolves that problem instead.) Shrink is the same
+protocol mirrored: seal both children, splice into the parent, publish the
+narrower mask.
+
+Versus split-order, stated precisely: lfht makes resize cheap by making
+items *immobile* — a split moves zero items, the new bucket pointer aims
+into the shared ordered chain — where the txn hlist pays real resplice
+work per split. What that price buys back: unordered chains, growth and
+shrink with no ordering infrastructure in the nodes, constant-size txns
+via item-granularity migration, a drain that scales with drainers, and —
+the capability split-order structurally forecloses — rehash under a
+*changed* hash function. Parent fallback only works when the new placement
+refines the old (same hash, more bits); a full rehash has no parent
+relation and needs the cross-table drain of the txn-rehash design, for
+which this section's machinery is the per-bucket building block.
+
+## 7. What it gives up — and why that is acceptable
 
 No O(1) tail, no backward iteration (pprev points at a slot, not a node).
 Buckets need neither: chains are unordered, insert-at-head. The bidir
@@ -99,7 +160,7 @@ sentinel list remains for order-dependent uses — the
 [rbtree threaded list](rcu-txn-rbtree.md) needs true prev, LRU needs a
 tail. The two are complements, exactly as list/hlist in the kernel.
 
-## 7. Future option: hlist_nulls
+## 8. Future option: hlist_nulls
 
 With call_rcu/grace-period frees (the liburcu discipline), plain NULL
 termination is correct. If SLAB_TYPESAFE_BY_RCU-style immediate reuse is
@@ -109,7 +170,7 @@ node reuse detects the wrong-chain termination and retries. The encoding
 leaves room (nulls values are odd immediates, distinguishable from node
 pointers). Out of scope for the first cut.
 
-## 8. Packaging
+## 9. Packaging
 
 Sibling headers, not same-file cohabitation: `rcu-txn-hlist.h` (mw) and
 `rcu-txn-sw-hlist.h` (sw), mirroring the existing pair; hoist the shared
@@ -118,7 +179,7 @@ op signature differ from the sentinel list, so a shared file saves nothing,
 and the (already subtle) coherency comment blocks stay each about one
 structure. Naming: `urcu_txn_hlist_*` / `urcu_txn_sw_hlist_*`.
 
-## 9. Benchmark plan
+## 10. Benchmark plan
 
 - Swap the bench's hash-of-lists engines to hlist heads; measure read-side
   gain from head density (read-mostly, large bucket count) and writer-side
@@ -127,4 +188,9 @@ structure. Naming: `urcu_txn_hlist_*` / `urcu_txn_sw_hlist_*`.
 - Bucket-sealing drain prototype as the first step of the txn-rehash
   experiment (seal → drain → unseal-to-new-table on one bucket, measured
   against readers).
+- Incremental in-place growth prototype (§6: size publish + parent
+  fallback + lazy per-bucket splits) vs cds_lfht auto-resize on a
+  growth-heavy churn workload; measure the reader penalty of the UNINIT
+  fallback during the drain, and per-bucket-split vs per-item-move txn
+  variants under a flooded chain.
 - Footprint: table RSS at 1M/16M buckets vs sentinel heads.
