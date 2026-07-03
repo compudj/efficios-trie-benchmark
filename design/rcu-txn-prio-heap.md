@@ -43,8 +43,14 @@ operation becomes one transaction over one root-to-leaf path.
   install latch: the engine tolerates all slot-value ABA.
 - **Grow.** Cannot transact an O(n) copy. Either fix the capacity (the
   babeltrace usage is one slot per stream — effectively static), or treat grow
-  like a `cds_lfht` resize: rare, mutex-guarded, RCU-swap the array, and every
-  transaction carries the array pointer as one extra read-set member.
+  like a `cds_lfht` resize: rare, RCU-swap the array, every transaction
+  carrying the array pointer as one extra read-set member. Beware: a mutex
+  on grow excludes other *growers* only — lock-free writers keep committing
+  into the old array during the copy, and the read-set member kills only
+  transactions that straddle the swap, not updates committed mid-copy and
+  absent from the new array. A correct copy needs a writer drain (the
+  bulk-STW regime) around it. §5 dissolves the problem instead (VM
+  reservation — no copy exists).
 - **Cherrypick.** As a transaction it is disqualifying: an O(n) scan puts the
   whole array in the read set. The fix is use-case B composition: maintain a
   node→position index updated *in the same transaction* as each sift move.
@@ -117,8 +123,14 @@ commit — roughly well-behaved-lock throughput, not scaling. §5 removes it.
 ## 5. NULL-sentinel sparse-tail heap: making writers scale
 
 Proposal: drop `len` as a transacted count; the array is NULL-terminated and
-`alloc_len` (power of 2, calloc'd → tail pre-NULLed) changes only on rare
-grow.
+`alloc_len` (power of 2) changes only on rare grow. Allocate the array as a
+`MAP_NORESERVE` reservation of the maximum capacity — the in-place-growth
+trick of [rcu-txn-hlist §6](rcu-txn-hlist.md): demand-zero pages *are* the
+NULL sentinel, so the tail arrives pre-NULLed by the kernel and grow
+degenerates to a one-slot capacity publish — no copy, no array swap, no
+grace-period free, no array pointer in any read set. The NULL-sentinel
+design and zero-filled demand paging compose exactly. (Size accounting —
+grow trigger, stats — moves to an approximate untransacted counter.)
 
 **Warning — the literal version buys nothing.** With strict contiguity, "where
 does the heap end" is still one shared datum, reified into the boundary slots:
@@ -138,11 +150,13 @@ via **local validation** and **transient holes**:
    (binary probe for the NULL boundary, or an advisory hint updated with plain
    relaxed stores) runs **outside** the transaction — it only picks a
    candidate; a stale guess loses the old=NULL check and retries.
-3. **Pop = take a leaf, validated locally.** The victim's two child slots go
-   in the read set (must be NULL); store NULL to the victim, move its value to
-   the root, sift down. "Last non-NULL" degrades from correctness requirement
-   to search heuristic; the single popper keeps a thread-private position
-   hint.
+3. **Pop = take a leaf, validated locally.** The victim's child slots — all
+   d of them at §6's arity — go in the read set (must be NULL); store NULL to
+   the victim, move its value to the root, sift down. "Last non-NULL"
+   degrades from correctness requirement to search heuristic; the single
+   popper keeps a thread-private position hint. Because pop backfills the
+   root from a leaf rather than NULLing it, `root == NULL` ⇔ empty — the
+   emptiness test `len` used to provide.
 4. **Tolerate holes near the frontier.** Pop NULLing slot t concurrent with an
    insert claiming t+1 commits *both* — transient hole at t. A missing node
    never breaks heap order (every live element ≤ its live descendants);
@@ -154,6 +168,14 @@ via **local validation** and **transient holes**:
    small randomized offset among the empty frontier slots (Hunt-style path
    scattering, with the transaction engine replacing all of Hunt's tag/lock
    machinery for the interleavings).
+6. **Remote removal must backfill, not hole-punch.** §4's position-index
+   removal (kill, affinity change) carries over only amended: NULLing an
+   arbitrary interior victim plants a hole *above* live descendants —
+   violating holes-near-frontier and orphaning the subtree from sift-downs
+   (a NULL child reads as +∞, so sifts never descend past it). Instead, in
+   one txn: take a frontier leaf (children-NULL validated, as in pop), move
+   its value into the victim's slot, NULL the leaf, sift from the victim's
+   position.
 
 Resulting conflict graph:
 
@@ -161,10 +183,10 @@ Resulting conflict graph:
 - insert vs pop: only genuine slot overlap (pop's sift path crossing an
   insert's ~one-level sift-up, or same tail slot). Rare for random priorities.
 - insert vs insert: only same-slot claims; scatter makes them mostly disjoint.
-- Universal residue: the array pointer (read-only, changes only on grow — and
-  grow is simpler now, the new tail arrives pre-NULLed) and *physical* line
-  sharing at the frontier — bandwidth, not serialization; no aborts. §6 kills
-  that too.
+- Universal residue: the capacity word (read-only, bumps only on rare grow;
+  the array pointer itself is immutable under the VM reservation) and
+  *physical* line sharing at the frontier — bandwidth, not serialization; no
+  aborts. §6 kills that too.
 
 Invariant to state (and prove) explicitly: *heap-ordered forest of live slots;
 holes confined near the frontier; leaf-ness of a pop victim certified by its
@@ -179,10 +201,13 @@ alignment is purely about coherence traffic — but naive one-slot-per-line
 padding destroys traversal locality (2 misses/level for sift-down; the dense
 top-of-heap line spreads over seven). The right layout:
 
-- **d = 8-ary heap, sibling group = one 64 B line** (`aligned_alloc`).
-  Sift-down fetches one line per level; depth drops to log₈ n (256 entries →
-  3 levels). Shorter paths → smaller read/write sets → fewer logical
-  conflicts, on top of the bandwidth win.
+- **d = 8-ary heap, sibling group = one 64 B line** (the §5 reservation is
+  page-aligned, so group alignment is free). Sift-down fetches one line per
+  level; depth drops to log₈ n (256 entries → 3 levels). Shorter paths →
+  smaller read/write sets → fewer logical conflicts, on top of the
+  bandwidth win. Child indices past the current capacity read as NULL for
+  free (still inside the zero-filled reservation); only the reservation's
+  absolute end needs an index clamp.
 - **Scatter at group granularity** (stride 8): concurrent inserters never
   write the same line — false sharing eliminated by construction, no padding.
 - **Root + hot metadata (advisory frontier hint) on a dedicated line**, so

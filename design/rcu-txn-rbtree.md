@@ -67,7 +67,10 @@ Three observations gut the file:
    search") is preserved — identical to the 2010 semantics.
 2. **Only misses need validation.** Single-writer variant: per-tree even/odd
    generation counter (seqlock); a reader reaching nil re-reads it and
-   retries the descent if it changed. Hit path stays tier-1, zero cost.
+   retries the descent if it changed. The counter bumps per *commit*, not
+   per logical operation — Design 2 deliberately splits one insert/remove
+   into several commits — so the miss-retry rate is a multiple of the op
+   rate (§7 measures the tax accordingly). Hit path stays tier-1, zero cost.
    `max_end` pruning errors also only manufacture misses → same validation
    covers interval search. (Multi-writer replaces this — §5.3.)
 3. **In-order traversal is rotation-invariant.** Rotations never change the
@@ -139,6 +142,12 @@ A miss for key k landing at `y->_left == nil` is certified by
 guarded read** ({v→v} commit), validating purely local state, indifferent to
 distant commits. Same trick that makes optimistic descent safe in leaf-linked
 B-trees / B-link trees. No global word; miss cost O(1) CASes, hit cost zero.
+(Symmetric right form: `y->_right == nil` AND `list_next(y).key > k`.) Note
+the certification leans on §5.4's dead-marks: for a concurrently *removed*
+y, soundness requires the nil child slot to have been tombstoned — an
+un-tombstoned nil would certify a miss against a node no longer in the
+tree. Lemmas 1 and 3 of §6 must therefore be proven jointly, not
+independently.
 
 ### 5.4 The keystone: descents must not be validated
 
@@ -154,9 +163,12 @@ out is order-theoretic, not topological:
 - The one hole: y removed concurrently (its child slots survive with stale
   nil). Plug with **dead-marks**: the removal transaction also tombstones the
   victim's two child slots (2 extra words, same commit), so a racing attach
-  fails its old=nil check. (Teleport relocates y in place — y's key and its
-  slot's key interval are unchanged; and teleport writes `y->_left` anyway,
-  so racing attaches conflict on the slot naturally.)
+  fails its old=nil check. (Two-child removal needs no marks on the
+  detached node z — with two live children z has no nil slot to attract an
+  attach — and the teleported successor stays in the tree with its key
+  unchanged: its child slots are either rewritten by the teleport itself,
+  so racing attaches conflict on the slot naturally, or remain *valid*
+  attach targets, their key intervals surviving the relocation.)
 
 Resulting transactions: insert = {attach slot (old nil→z) + O(1) fixup
 slots}; remove = {~6 splice slots + 2 dead-marks + O(1) fixup slots};

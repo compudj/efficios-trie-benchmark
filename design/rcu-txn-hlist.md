@@ -53,11 +53,16 @@ next slots, as today.
   - `&next->pprev : &elem->next → elem->pprev`   (unlink backward)
 
   When elem is last (`next == NULL`) the third edge vanishes: a **2-edge
-  delete**, cheaper than the circular list's invariable 3.
+  delete**, cheaper than the circular list's invariable 3. (Its first edge
+  then stores MARK(NULL) — exotic-looking but legal; readers strip the
+  mark per hop and terminate as usual.)
 - **insert-at-head(new)** — 2-edge commit (new's own fields plain,
   unpublished):
   - `head slot    : first → new`
   - `&first->pprev: &head → &new->next`
+
+  Into an empty bucket the second edge vanishes: a **1-edge insert**, the
+  mirror of the 2-edge tail delete.
 - **insert-before / insert-after** — same shapes as kernel
   `hlist_add_before/behind`, 2-edge commits against the anchor's slots.
 - Readers: forward next-chain traversal only, tier-1 (resolve proxy, strip
@@ -112,15 +117,27 @@ can tolerate: **an unsplit new bucket redirects to its parent.** With
 power-of-two in-place growth, bucket `h & (2N-1)` has parent `h & (N-1)`:
 
 - Publish "growing to 2N" as a one-slot txn. New heads `[N, 2N)` hold an
-  UNINIT sentinel (an odd immediate; the encoding has room — same family
-  as the §8 nulls values).
+  UNINIT sentinel — an immediate, same family as the §8 nulls values, with
+  the encoding caveat stated there: bit 0 alone is *not* available for
+  immediates (it is the engine's proxy discriminator), so sentinels need a
+  reserved pattern the resolve-proxy path checks before chasing (e.g. bits
+  0–1 both set — a committed proxy value is never marked). An engine-level
+  carve-out, not a local hlist decision.
 - Readers hash with the wide mask; on UNINIT they re-mask to the parent
   and read there. One extra load, only during growth.
-- Buckets split incrementally: seal the parent head (§5), resplice,
-  install both heads — one modest txn per bucket — driven lazily by
-  writers that touch an unsplit bucket (lfht's lazy bucket init,
-  transplanted) and/or a background drainer. Retire the "growing" state
-  once the drain completes.
+- Buckets split incrementally: resplice the chain and install both heads
+  in one modest txn per bucket — no separate seal needed; the txn's
+  old-value check on the parent head already conflicts with any racing
+  insert (sealing earns its keep only in the multi-txn item-move variant
+  below). Splits are driven lazily by writers that touch an unsplit
+  bucket (lfht's lazy bucket init, transplanted) and/or a background
+  drainer. Retire the "growing" state once the drain completes.
+- **Invariant: only a split may de-UNINIT a head.** An insert that finds
+  its target bucket UNINIT must help-split the parent first (or insert
+  into the parent chain, where fallback keeps it findable) — never claim
+  the UNINIT slot with its item, or readers stop falling back while
+  unmigrated keys still sit in the parent: false misses for present keys.
+  This is §6's analogue of the §4 lemma.
 
 No txn exceeds one chain, and the split unit can shrink further. A
 per-bucket split is O(chain) edges — fine at expected O(1) occupancy, ugly
@@ -130,6 +147,14 @@ item-at-a-time in constant-size txns, readers checking
 new-bucket-then-parent. The move's atomicity keeps every item findable in
 exactly one of the two chains at every instant. Resize txns become O(1)
 regardless of chain pathology, and the drain parallelizes across buckets.
+Note the variant changes the *reader* protocol: once one item has moved,
+the child head is live but partial, so UNINIT no longer signals "also
+check the parent". A miss on the child must re-check the parent chain,
+gated either per bucket (the parent head stays sealed until its drain
+completes, and the child-side miss path tests it) or bluntly (while the
+global growing state is set, every miss re-checks the parent). The "one
+extra load" claim above belongs to the whole-bucket-split variant; the
+two reader protocols are distinct and measured separately (§10).
 
 What the VM reservation is really for is not the big commit — it is that
 **there is no second table**: no old/new table pointers for readers to
@@ -137,8 +162,11 @@ resolve, no RCU handoff between arrays, no double-lookup structure. Growth
 is index arithmetic in one mapping, and parent fallback is a bit-mask.
 (lfht's bucket-node infrastructure exists partly to avoid reallocating the
 array; the reservation dissolves that problem instead.) Shrink is the same
-protocol mirrored: seal both children, splice into the parent, publish the
-narrower mask.
+protocol mirrored, with the ordering load-bearing: splice first, leaving
+the child head UNINIT — wide-mask readers then fall back to the parent,
+the growth fallback running in reverse — and publish the narrower mask
+only once every pair is spliced. (Heads `[N, 2N)` must be re-UNINITed
+before any later regrowth.)
 
 Versus split-order, stated precisely: lfht makes resize cheap by making
 items *immobile* — a split moves zero items, the new bucket pointer aims
@@ -167,8 +195,13 @@ termination is correct. If SLAB_TYPESAFE_BY_RCU-style immediate reuse is
 ever wanted (nf_conntrack does this), the extension is an `hlist_nulls`
 variant: per-bucket nulls sentinels so a reader migrated mid-traversal by
 node reuse detects the wrong-chain termination and retries. The encoding
-leaves room (nulls values are odd immediates, distinguishable from node
-pointers). Out of scope for the first cut.
+leaves room, with one caveat: nulls values must be distinguishable from
+*proxies*, not just from node pointers — bit 0 set is exactly how the
+engine encodes an in-flight descriptor, and a resolver that chases a nulls
+immediate as a descriptor address crashes. Reserve a pattern the resolve
+path checks before chasing (e.g. bits 0–1 both set; a committed proxy
+value is never marked) — an engine-level carve-out shared with §6's UNINIT
+sentinel. Out of scope for the first cut.
 
 ## 9. Packaging
 
@@ -190,7 +223,8 @@ structure. Naming: `urcu_txn_hlist_*` / `urcu_txn_sw_hlist_*`.
   against readers).
 - Incremental in-place growth prototype (§6: size publish + parent
   fallback + lazy per-bucket splits) vs cds_lfht auto-resize on a
-  growth-heavy churn workload; measure the reader penalty of the UNINIT
-  fallback during the drain, and per-bucket-split vs per-item-move txn
-  variants under a flooded chain.
+  growth-heavy churn workload; measure the two reader protocols
+  separately (UNINIT fallback for whole-bucket splits vs
+  miss-re-checks-parent for the item-move drain), and per-bucket-split vs
+  per-item-move txn variants under a flooded chain.
 - Footprint: table RSS at 1M/16M buckets vs sentinel heads.
