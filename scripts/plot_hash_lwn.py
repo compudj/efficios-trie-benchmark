@@ -38,7 +38,7 @@ def series(pct, ekey):
 
 plt.rcParams.update({"font.size": 10, "axes.edgecolor": "#888888",
                      "axes.linewidth": 0.8, "figure.facecolor": "white"})
-fig, axes = plt.subplots(2, 2, figsize=(11, 7.2), dpi=150, sharex=True)
+fig, axes = plt.subplots(2, 2, figsize=(11, 7.2), dpi=150)
 xticks = [1, 8, 32, 64, 128, 192]
 
 for ax, (pct, title) in zip(axes.flat, PCTS):
@@ -57,13 +57,12 @@ for ax, (pct, title) in zip(axes.flat, PCTS):
     ax.xaxis.set_minor_locator(NullLocator())
     ax.set_xticklabels([str(t) for t in xticks])
     ax.set_ylim(0, ymax * 1.08)
+    ax.set_xlabel("threads (each = one op mix)", fontsize=9.5)
     ax.grid(True, color="#ececec", lw=0.7, zorder=0)
     ax.set_axisbelow(True)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
 
-for ax in axes[-1]:
-    ax.set_xlabel("threads (each = one op mix)", fontsize=10)
 for ax in axes[:, 0]:
     ax.set_ylabel("total throughput (Mops/s)", fontsize=10)
 
