@@ -901,7 +901,7 @@ Mops/s by allocator, writers 1/8/32/64/128/192 (this box: 192 cores / 384 PUs):
 and out after spread anchors: a list insert/delete (2–3-edge MCAS), so the op is
 allocation-dominated.
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` |
+| writers | glibc | jemalloc `percpu_arena:percpu` |
 |---------|------:|------:|
 | 1   | 3.6 | 7.8 |
 | 8   | 22  | 42  |
@@ -918,7 +918,7 @@ so the per-slot collision rate is `~ writers / CHURN`. Best-of-2 (the
 per-hwthread reclaim pin removed the high-writer bistability that used to require
 best-of-3), current engine, `URCU_TXN_FALLBACK=256`:
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` |
+| writers | glibc | jemalloc `percpu_arena:percpu` |
 |---------|------:|------:|
 | 1   | 2.7 | 2.5 |
 | 8   | 14  | 16  |
@@ -1035,7 +1035,7 @@ no external allocator](figures/list_scale_alloc.png)
 
 **Plain churn** (2–3-edge MCAS, allocation-light once reclaim is co-located):
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` | glibc + descriptor slab |
+| writers | glibc | jemalloc `percpu_arena:percpu` | glibc + descriptor slab |
 |--------:|------:|------------------------------:|------------------------:|
 | 1   | 9   | 6   | 6   |
 | 8   | 51  | 31  | 40  |
@@ -1047,7 +1047,7 @@ no external allocator](figures/list_scale_alloc.png)
 **Composable random 100 k-slot index** (index + list folded into one MCAS — heavier,
 more descriptor pressure):
 
-| writers | glibc | jemalloc `percpu_arena:phycpu` | glibc + descriptor slab |
+| writers | glibc | jemalloc `percpu_arena:percpu` | glibc + descriptor slab |
 |--------:|------:|------------------------------:|------------------------:|
 | 1   | 3   | 3       | 4       |
 | 8   | 14  | 16      | 16      |
@@ -1087,12 +1087,12 @@ counters, not the slab).
 MCAS transaction engine meets the reference multi-word-update scheme on identical
 ground. RLU is shown in both modes — **defer** (`BENCH_RLU_WS=100`, batched
 writeback, how RLU is meant to run) and **sync** (`BENCH_RLU_WS=1`, writeback every
-section, the floor). Best-of-2, `DURATION_SEC=3`, jemalloc `percpu_arena:phycpu` for
+section, the floor). Best-of-2, `DURATION_SEC=3`, jemalloc `percpu_arena:percpu` for
 both schemes, 0 coherence violations throughout.
 
 ![RLU vs txn (MCAS) across three workloads: disjoint writes (txn ~12× RLU-defer at
-192), random-access writes on a hot 64-slot index (RLU wins ≤8 writers, txn owns the
-16–32 mid-range, both converge at the full box), and hash-of-lists (txn ~1.8×
+192), random-access writes on a hot 64-slot index (RLU wins the lowest writer counts, txn
+owns the mid-range, both converge at the full box), and hash-of-lists (txn ~1.7×
 RLU-defer)](figures/rlu_vs_txn.png)
 
 **Disjoint churn** — each writer owns a strided set of slots so writers almost
@@ -1100,9 +1100,9 @@ never collide (`LIST_SIZE=4096`, `CHURN=3072`, jemalloc, write Mops/s):
 
 | writers      |   1 |  8 | 32 | 64 | 128 |     192 |
 |--------------|----:|---:|---:|---:|----:|--------:|
-| `txn_list`   | 6.0 | 29 | 66 | 100 | 125 | **185** |
-| RLU-defer    |  15 | 34 | 22 |  26 |  20 |      16 |
-| RLU-sync     |  18 | 10 | 7.6| 9.1| 8.2 |     7.9 |
+| `txn_list`   | 7.2 | 32 | 70 | 105 | 123 | **186** |
+| RLU-defer    |  15 | 34 | 24 |  26 |  19 |      16 |
+| RLU-sync     |  18 | 10 | 7.6| 9.0| 8.2 |     7.9 |
 
 RLU wins at 1 writer (its per-thread write-log + batched writeback is cheap
 uncontended), but `txn_list` overtakes by ~16 writers and reaches **~12× RLU** at the
@@ -1114,29 +1114,31 @@ while RLU's global write-clock serializes commit ordering.
 
 | writers      |    1 |    8 |  16 |  32 |  64 |  192 |
 |--------------|-----:|-----:|----:|----:|----:|-----:|
-| `txn_list`   |  3.0 | 16.0 | 12.6| 11.8| 5.1 | 1.1  |
-| RLU-defer    | 11.9 | 12.3 | 5.5 | 4.3 | 3.2 | 1.2  |
-| RLU-sync     | 12.7 |  9.5 | 5.2 | 4.6 | 3.5 | 1.2  |
+| `txn_list`   |  4.1 | 17.2 | 15.4| 15.8| 7.2 | 1.6  |
+| RLU-defer    | 12.1 | 12.3 | 5.6 | 4.4 | 3.2 | 1.3  |
+| RLU-sync     | 12.7 |  9.5 | 5.3 | 4.7 | 3.5 | 1.3  |
 
-Under real contention the two trade places: RLU owns the low-writer regime (≤8),
-`txn_list` owns the mid-range (16–32, ~2.3–2.7× RLU-defer — which falls off after 8
-writers), and they converge at the high end (~1.1–1.2 Mops, within ~10 %). Both degrade
+Under real contention the two trade places: RLU owns the lowest writer counts,
+`txn_list` takes over by ~8 and owns the mid-range (16–32, ~2.7–3.6× RLU-defer — which
+falls off after 8 writers), and they converge at the high end (~1.3–1.6 Mops, within ~20 %). Both degrade
 **gracefully**; the `txn_list` cliff of the previous section appears only under the
 former escalation default (`URCU_TXN_FALLBACK=64`) — at the current `256` it tracks
 RLU.
 
-**Hash-of-lists** — RLU's native showcase; per-bucket escalation domains (write
-Mops/s):
+**Hash-of-lists** — RLU's native showcase, now with `txn_hlist` on the same
+**singly-linked** structure as RLU (the 8-byte hlist head — see § *Dataset size*); one
+shared escalation domain for the whole table (write Mops/s):
 
 | writers      |   1 |   8 | 32 | 64 | 128 |    192 |
 |--------------|----:|----:|---:|---:|----:|-------:|
-| `txn_hlist`  | 0.9 | 6.5 | 12 | 17 |  24 | **29** |
-| RLU-defer    | 1.3 | 9.1 | 11 | 15 |  16 |     16 |
-| RLU-sync     | 1.3 | 4.6 | 4.5| 5.6| 6.3 |    6.4 |
+| `txn_hlist`  | 0.9 | 6.7 | 11 | 17 |  23 | **29** |
+| RLU-defer    | 1.3 | 9.1 | 11 | 15 |  16 |     17 |
+| RLU-sync     | 1.3 | 4.6 | 4.4| 5.6| 6.3 |    6.3 |
 
-Even on RLU's home turf `txn_hlist` scales to **~1.8× RLU-defer** at 192 writers
-(per-bucket domains keep each queue shallow, so writers rarely serialize); RLU-defer
-plateaus ~16 and RLU-sync ~6.4.
+Even on RLU's home turf `txn_hlist` scales to **~1.7× RLU-defer** at 192 writers
+(at 1000 buckets writers rarely land on the same chain, so commits stay on the parallel
+optimistic MCAS path and the single shared domain's fair lane is seldom entered); RLU-defer
+plateaus ~17 and RLU-sync ~6.3.
 
 **Reads: near-parity on a tiny list, txn ahead on a real one.** On the 1 000-node
 list read throughput is within ~15 % across all four (Mvisits/s @191 readers:
@@ -1145,7 +1147,9 @@ traversal is dominated by per-op overhead, so RLU's per-node lock check barely s
 But that check is a *per-visit* cost that does not amortize: on a representative
 10 000-node list `txn_list` reads pull **1.6–1.8× ahead** (next subsection) — txn
 amortizes per-op overhead over the longer walk while RLU pays validation on every
-node. On the hash RLU reads still edge ~15 % ahead (136 k vs 118 k lookups/s @191).
+node. On the hash the singly-linked hlist head reads a touch faster than the old bidir
+bucket (smaller nodes): txn reaches 126 k @191, so RLU-sync edges only ~8 % ahead (136)
+and txn slightly *leads* RLU-defer (124).
 
 (One benchmark bug surfaced here: the multi-slot-random RLU driver read a neighbour
 pointer before `RLU_TRY_LOCK`-ing it, so a concurrent unlink+free at the same
@@ -1439,7 +1443,7 @@ cross-structure commits — isn't even exercised here. (Regenerate:
   percentile through p99.9.
 - Against reference **RLU**: RLU wins uncontended / at very low writer counts (its
   batched writeback), but `txn_list` **scales past it with writers** — ~12× on
-  disjoint churn, ~18× on a 10k-node/2%-update write sweep, ~1.8× on the hash — and
+  disjoint churn, ~18× on a 10k-node/2%-update write sweep, ~1.7× on the hash — and
   on a representative (non-tiny) list its **reads also lead ~1.6–1.8×** (RLU pays a
   per-node validation the tiny-list microbench hid). RLU stays competitive only in
   the low-writer / read-mostly-on-tiny-structures corner.
