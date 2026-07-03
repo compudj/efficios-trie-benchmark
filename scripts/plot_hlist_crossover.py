@@ -90,7 +90,7 @@ ax.set_ylabel("throughput  (Mops/s, higher is better)", fontsize=10.5)
 ax.set_title("Hash-of-lists throughput vs dataset size — the 8-byte head wins past cache",
              fontsize=13, fontweight="bold", pad=30)
 ax.text(0.0, 1.045,
-        "64 threads, 10% updates, mean of 5 runs (band = min–max) · 2× AMD EPYC 9654",
+        "64 threads, 10% updates, mean of 5 runs (band = min–max) · 2× AMD EPYC 9654 · log-scale x",
         transform=ax.transAxes, fontsize=9.5, color="#666666")
 
 ax.grid(axis="y", color="#e6e6e6", lw=0.8, zorder=0)

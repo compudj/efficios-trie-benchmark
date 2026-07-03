@@ -50,7 +50,7 @@ axL.set_xscale("log", base=2); axL.xaxis.set_major_locator(FixedLocator(bticks))
 axL.xaxis.set_minor_locator(NullLocator()); axL.set_xticklabels([str(b) for b in bticks])
 axL.set_xlabel("buckets = independent write lanes (~100 nodes each)", fontsize=10)
 axL.set_ylabel("total throughput (Mops/s)", fontsize=10)
-axL.set_title("Write contention: throughput vs #buckets\n(192 threads, 40 % updates)",
+axL.set_title("Write contention: throughput vs #buckets\n(192 threads, 40 % updates · log-scale x)",
               fontsize=11, fontweight="bold")
 
 # Right: thread scaling at 16 buckets
@@ -61,9 +61,9 @@ for label, ekey, color, marker in ENGINES:
     axR.fill_between(xs, lo, hi, color=color, alpha=0.15, lw=0, zorder=2)
     axR.plot(xs, best, color=color, lw=1.9, marker=marker, ms=6.5,
              markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
-tticks = [1, 8, 32, 64, 128, 192]
-axR.set_xscale("log", base=2); axR.xaxis.set_major_locator(FixedLocator(tticks))
-axR.xaxis.set_minor_locator(NullLocator()); axR.set_xticklabels([str(t) for t in tticks])
+tticks = [0, 32, 64, 96, 128, 160, 192]
+axR.set_xlim(0, 196); axR.xaxis.set_major_locator(FixedLocator(tticks))
+axR.set_xticklabels([str(t) for t in tticks])
 axR.set_xlabel("threads", fontsize=10)
 axR.set_ylabel("total throughput (Mops/s)", fontsize=10)
 axR.set_title("Heavily contended: thread scaling\n(16 buckets, 40 % updates)",

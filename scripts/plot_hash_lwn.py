@@ -39,7 +39,7 @@ def series(pct, ekey):
 plt.rcParams.update({"font.size": 10, "axes.edgecolor": "#888888",
                      "axes.linewidth": 0.8, "figure.facecolor": "white"})
 fig, axes = plt.subplots(2, 2, figsize=(11, 7.2), dpi=150)
-xticks = [1, 8, 32, 64, 128, 192]
+xticks = [0, 32, 64, 96, 128, 160, 192]
 
 for ax, (pct, title) in zip(axes.flat, PCTS):
     ymax = 0
@@ -52,9 +52,8 @@ for ax, (pct, title) in zip(axes.flat, PCTS):
         ax.plot(xs, best, color=color, lw=1.8, marker=marker, ms=5.5,
                 markeredgecolor="white", markeredgewidth=0.9, zorder=4, label=label)
     ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.set_xscale("log", base=2)
+    ax.set_xlim(0, 196)
     ax.xaxis.set_major_locator(FixedLocator(xticks))
-    ax.xaxis.set_minor_locator(NullLocator())
     ax.set_xticklabels([str(t) for t in xticks])
     ax.set_ylim(0, ymax * 1.08)
     ax.set_xlabel("threads (each = one op mix)", fontsize=9.5)
