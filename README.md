@@ -1347,6 +1347,70 @@ stay robust — txn's smooth degradation down to a single hot bucket is the
 `URCU_TXN_FALLBACK=256` escalation fix (the old `64` default cliffed here). `txn_hlist` is
 the one engine that both **tracks RCU at low contention** *and* **stays contention-robust**.
 
+#### Dataset size: the single-pointer head past the cache hierarchy
+
+The sections above hold the table at 1 000 × 100 and vary the update rate, the thread mode,
+or the bucket count. This one holds the **load factor** (`HL_INIT = HL_BUCKETS`, ~1 key per
+bucket, chains ≈ 1) and grows the **dataset**, so the bucket array — and with it the
+per-lookup working set — climbs from L2-resident to well past L3. It also swaps the
+`txn_hlist` bucket from the bidirectional sentinel list (a 16 B `next`+`prev` head node) to
+the kernel-shaped **single-pointer hlist** (`<urcu/rcu-txn-hlist.h>`): an **8 B**,
+NULL-terminated head with **no sentinel node**, `pprev`-encoded so the head slot is an
+ordinary "next" slot (see `design/rcu-txn-hlist.md`). That makes txn_hlist touch the
+**fewest cache lines per lookup** of the four — one dense head line (8 heads/line) plus the
+chain node — where `lfht` pays an extra split-order bucket node, `rlu_hlist` a head+tail
+sentinel pair, and `rcu_hlist` a per-bucket lock.
+
+64 threads, 10 % updates, mean of 5 runs (the figure's band is min–max), 2× AMD EPYC 9654
+(**L2 1 MB/core, L3 32 MB/CCD**). Absolute values are soft (shared machine), but the
+ordering is monotonic across all five repeats and the bands are tight.
+
+![Hash throughput vs dataset size: txn_hlist runs nearly flat while rcu_hlist starts highest
+and crosses below it at ~1M buckets (past L3); lfht collapses fastest and rlu_hlist sits low;
+the 8-byte head touches the fewest cache lines so it wins once the working set exceeds
+cache](figures/hlist_crossover.png)
+
+**Total ops/s vs dataset size** (Mops/s, leader in **bold**; head-array = 8 B × buckets):
+
+| buckets (heads) | `txn_hlist` | `rcu_hlist` | `lfht` | `rlu_hlist` |
+|-----------------|------------:|------------:|-------:|------------:|
+| 64K (512 KB)    |         449 |     **549** |    352 |         141 |
+| 512K (4 MB)     |         432 |     **471** |    334 |         206 |
+| 1M (8 MB)       |     **408** |         407 |    287 |         199 |
+| 2M (16 MB)      |     **386** |         356 |    239 |         197 |
+| 4M (32 MB)      |     **360** |         324 |    210 |         188 |
+| 8M (64 MB)      |     **330** |         327 |    194 |         183 |
+
+While the table is **cache-resident** (≤ 512K buckets) `rcu_hlist`'s cheap uncontended
+per-bucket lock wins and `txn_hlist` runs 2nd. The **crossover lands at ~1M buckets** — where
+the working set (heads + nodes) spills past L3 — and from there txn_hlist leads. Its clearest
+margin is the **just-past-L3 band, 2M–4M**, where the two engines' min–max ranges do not
+overlap (2M: 377–391 vs 351–361; 4M: 351–367 vs 317–328). Against `lfht` the gap widens
+monotonically to **~1.7×** (330 vs 194 at 8M): the split-order dummy bucket node is a
+guaranteed extra miss per lookup that the bare 8 B head simply does not have. At 8M both
+txn and rcu are fully memory-bound on the *node* set and reconverge to a tie — but both stay
+far above `lfht` and `rlu_hlist`. txn_hlist also **degrades most gracefully** overall
+(449 → 330, a 1.4× drop across a 256× dataset increase, vs lfht's 1.8× and rcu's 1.7×).
+
+The same 8 B sentinel-free head is a **footprint** win on the other axis. Table RSS at
+**1 000 000 buckets / 10 000 keys** (isolating the head array; single-threaded so the per-CPU
+MCAS slab stays minimal):
+
+| engine       | RSS      | vs txn_hlist |
+|--------------|---------:|-------------:|
+| `txn_hlist`  | **10.5 MB** |         1× |
+| `lfht`       |    27 MB |         2.6× |
+| `rlu_hlist`  |    78 MB |         7.5× |
+| `rcu_hlist`  |   151 MB |          14× |
+
+txn_hlist is **2.6–14× leaner**: no per-bucket sentinel (`rlu_hlist` carries head+tail
+*nodes* per bucket), no per-bucket lock (`rcu_hlist`), no split-order bucket node (`lfht`) —
+just an 8-byte pointer. That density is exactly what buys the throughput lead once nothing
+fits in cache. So on pure hash-of-lists ops txn_hlist is **mid-pack when cache-resident but
+the leader once the working set exceeds L3**, and its real differentiator — composable atomic
+cross-structure commits — isn't even exercised here. (Regenerate:
+`python3 scripts/plot_hlist_crossover.py`, data in `scripts/hlist_crossover.csv`.)
+
 ### Takeaways
 
 - Coherent **bidirectional** RCU iteration is **free** vs forward-only `rculist`,
@@ -1384,6 +1448,13 @@ the one engine that both **tracks RCU at low contention** *and* **stays contenti
   still scale to 192 (RCU/RLU peak ~8 threads). `txn_hlist` is the only engine that both
   tracks RCU at low contention *and* stays robust under it — its smooth degradation to a
   single hot bucket being the `URCU_TXN_FALLBACK=256` escalation fix.
+- The **single-pointer hlist head** (8 B, no sentinel; `<urcu/rcu-txn-hlist.h>`) turns the
+  hash comparison on **dataset size**. While the table is cache-resident `rcu_hlist` leads
+  and `txn_hlist` is 2nd, but past L3 (~1M buckets) txn_hlist **crosses into the lead** — it
+  touches the fewest cache lines per lookup, so it degrades most gracefully and beats
+  `cds_lfht` up to **~1.7×** once the working set no longer fits in cache. The same density is
+  a **2.6–14× smaller table** at 1M buckets (10.5 MB vs 27 / 78 / 151 MB for lfht / RLU /
+  RCU+lock). Mid-pack in cache, leader beyond it — on both throughput and footprint.
 
 Where these results could apply beyond the benchmark — candidate data structures
 for the urcu-txn API across the kernel, low-level libraries, databases and

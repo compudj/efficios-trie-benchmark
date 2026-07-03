@@ -62,6 +62,7 @@
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn-sw-list.h>
 #include <urcu/rcu-txn-list.h>
+#include <urcu/rcu-txn-hlist.h>
 #include <urcu/rcu-txn.h>
 #include <urcu/rculist.h>
 #include <urcu/rculfhash.h>
@@ -1191,7 +1192,7 @@ static void lf_write_random(uint64_t *rng)
 
 		urcu_txn_begin(&txn);
 		/* Flip-latch load of the transacted index slot (resolves any proxy). */
-		raw = urcu_txn_load(&txn, (void **) &g_lf_index[i]);
+		raw = urcu_txn_load(&txn, (void **) &g_lf_index[i], URCU_MCAS_TAG);
 		cur = (raw == NULL) ? NULL : IDX_DEC(raw);
 		if (cur == NULL) {		/* empty -> insert + publish index, one flip */
 			int a = (int) (xorshift64(rng) % (uint64_t) LIST_SIZE);
@@ -1209,7 +1210,7 @@ static void lf_write_random(uint64_t *rng)
 					&fresh->node, &g_lf_stable[a]->node);
 			if (prep == 0)
 				urcu_txn_store(&txn, (void **) &g_lf_index[i],
-						NULL, IDX_ENC(&fresh->node));
+						NULL, IDX_ENC(&fresh->node), URCU_MCAS_TAG);
 		} else {			/* full -> unlink + clear index, one flip */
 #ifdef BENCH_LTTNG
 			del_cur = cur;
@@ -1219,7 +1220,7 @@ static void lf_write_random(uint64_t *rng)
 			prep = urcu_txn_list_del_prepare(&txn, cur);
 			if (prep == 0)
 				urcu_txn_store(&txn, (void **) &g_lf_index[i],
-						raw, NULL);
+						raw, NULL, URCU_MCAS_TAG);
 		}
 		if (prep != 0) {		/* del: cur was concurrently removed */
 			urcu_txn_end(&txn);
@@ -1354,7 +1355,7 @@ static void lf_reset_index(void)
 		urcu_txn_begin(&txn);
 		if (urcu_txn_list_del_prepare(&txn, cur) == 0) {
 			urcu_txn_store(&txn, (void **) &g_lf_index[i],
-					raw, NULL);
+					raw, NULL, URCU_MCAS_TAG);
 			removed = urcu_txn_commit(&txn) ==
 					URCU_TXN_STATUS_OK;
 		}
@@ -1795,21 +1796,24 @@ static inline unsigned hl_hash(long key)
 	return (unsigned) ((unsigned long) key % (unsigned) HL_BUCKETS);
 }
 
-/* ── txn_hlist: rcu-txn hash-of-lists on ITS OWN bidir list ──
+/* ── txn_hlist: rcu-txn hash-of-lists on the SINGLE-POINTER-HEAD hlist ──
  *
- * Option 1 (each engine uses its idiomatic list): rcu-txn buckets are sorted
- * COHERENT BIDIR lists (urcu_txn_list), not a hand-rolled singly-linked list.
- * Removal uses the engine's validated urcu_txn_list_del_rcu, so the engine owns
- * the mark-and-reclaim and the node lifecycle is clean (an earlier hand-rolled
- * singly-linked version raced -- it guarded cur->next while hand-reclaiming cur;
- * forcing rcu-txn into RLU's list shape was both unrepresentative and unsafe).
- * A sorted insert PINS pred->next via load-validate before insert_after_prepare:
- * a concurrent insert of a smaller key (or a delete of pred) then changes that
- * slot and poisons/aborts the commit, so we retry -- which keeps the bucket
- * sorted AND dedups (two adds of the same key contend on pred->next; the loser
- * re-finds it present). */
-struct thl_node { struct urcu_txn_list_node node; long key; struct rcu_head rh; };
-static struct urcu_txn_list_head *g_thl_bkt;	/* [HL_BUCKETS] */
+ * Buckets are sorted urcu_txn_hlist chains (<urcu/rcu-txn-hlist.h>): a
+ * kernel-hlist-shaped head that is ONE pointer (8 B) instead of the bidir list's
+ * 16 B sentinel node, so the bucket array is half the footprint and twice as
+ * dense per cache line -- matching rlu_hlist's 8 B head pointer for a fair
+ * head-density comparison.  The escalation domain is NOT per bucket (that would
+ * bloat the head): ONE domain serves the whole table (escalation is rare, so a
+ * single shared lane costs nothing on the optimistic path and keeps the head at
+ * 8 B).  Removal uses the engine's validated urcu_txn_hlist_del_rcu, which needs
+ * only the node (pprev names the slot -- no bucket lookup).  A sorted insert PINS
+ * the exact validated successor via insert_at_slot_prepare: a concurrent insert
+ * of a smaller key (or a delete at the slot) then changes *slot and aborts the
+ * commit, so we retry -- which keeps the bucket sorted AND dedups (two adds of
+ * the same key contend on the same slot; the loser re-finds it present). */
+struct thl_node { struct urcu_txn_hlist_node node; long key; struct rcu_head rh; };
+static struct urcu_txn_hlist_head *g_thl_bkt;	/* [HL_BUCKETS], 8 B each */
+static struct urcu_txn_domain g_thl_dom;	/* one domain for the whole table */
 
 static void thl_node_free(struct rcu_head *h)
 {
@@ -1822,12 +1826,10 @@ static struct thl_node *thl_alloc(long key)
 	n->key = key;
 	return n;
 }
-/* Key of a list node, or +inf for the bucket's circular sentinel (wrap point). */
-static inline long thl_key(struct urcu_txn_list_head *head,
-		struct urcu_txn_list_node *p)
+/* Key of a chain node (hlist chains terminate on NULL, not a sentinel). */
+static inline long thl_key(struct urcu_txn_hlist_node *p)
 {
-	return p == &head->node ? LONG_MAX :
-		caa_container_of(p, struct thl_node, node)->key;
+	return caa_container_of(p, struct thl_node, node)->key;
 }
 static void thl_build(void)
 {
@@ -1836,42 +1838,48 @@ static void thl_build(void)
 	int i;
 
 	hl_config();
+	urcu_txn_domain_init(&g_thl_dom);
 	g_thl_bkt = calloc((size_t) HL_BUCKETS, sizeof(*g_thl_bkt));
 	for (i = 0; i < HL_BUCKETS; i++)
-		urcu_txn_list_init(&g_thl_bkt[i]);
+		urcu_txn_hlist_init(&g_thl_bkt[i]);
 	while (inserted < HL_INIT) {			/* sorted initial fill, single-threaded */
 		long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
-		struct urcu_txn_list_head *head = &g_thl_bkt[hl_hash(key)];
-		struct urcu_txn_list_node *pred = &head->node, *cur;
+		struct urcu_txn_hlist_head *head = &g_thl_bkt[hl_hash(key)];
+		struct urcu_txn_hlist_node *pred = NULL, *cur;
 		struct thl_node *n;
 
 		rcu_read_lock();
-		for (cur = urcu_txn_list_next_rcu(pred); cur != &head->node;
-				cur = urcu_txn_list_next_rcu(cur)) {
-			if (thl_key(head, cur) >= key) break;
+		for (cur = urcu_txn_hlist_first_rcu(head); cur != NULL;
+				cur = urcu_txn_hlist_next_rcu(cur)) {
+			if (thl_key(cur) >= key) break;
 			pred = cur;
 		}
 		rcu_read_unlock();
-		if (cur != &head->node && thl_key(head, cur) == key)
+		if (cur != NULL && thl_key(cur) == key)
 			continue;			/* dup */
 		n = thl_alloc(key);
-		if (urcu_txn_list_insert_after_rcu(&n->node, pred, head))
+		if (pred == NULL) {			/* smallest key: insert at head */
+			if (urcu_txn_hlist_add_rcu(&n->node, head, &g_thl_dom))
+				abort();
+		} else if (urcu_txn_hlist_insert_after_rcu(&n->node, pred,
+				&g_thl_dom)) {
 			abort();
+		}
 		inserted++;
 	}
 }
-static int thl_contains(struct urcu_txn_list_head *head, long key, long *viol)
+static int thl_contains(struct urcu_txn_hlist_head *head, long key, long *viol)
 {
-	struct urcu_txn_list_node *p = urcu_txn_list_next_rcu(&head->node);
+	struct urcu_txn_hlist_node *p = urcu_txn_hlist_first_rcu(head);
 	long pk = LONG_MIN;
 	int steps = 0;
 
-	while (p != &head->node) {
-		long k = thl_key(head, p);
+	while (p != NULL) {
+		long k = thl_key(p);
 		if (k < pk || ++steps > STEP_LIMIT) { (*viol)++; return 0; }
 		pk = k;
 		if (k >= key) return k == key;
-		p = urcu_txn_list_next_rcu(p);
+		p = urcu_txn_hlist_next_rcu(p);
 	}
 	return 0;
 }
@@ -1894,8 +1902,8 @@ static void thl_write(int slot)
 {
 	uint64_t r = hl_rng();
 	long key = (long) (xorshift64(&r) % (uint64_t) HL_RANGE);
-	struct urcu_txn_list_head *head = &g_thl_bkt[hl_hash(key)];
-	struct urcu_txn_list_node *p;
+	struct urcu_txn_hlist_head *head = &g_thl_bkt[hl_hash(key)];
+	struct urcu_txn_hlist_node *p;
 	struct thl_node *victim = NULL, *n;
 	struct urcu_mcas_txn txn;
 	int mem_err = 0;
@@ -1904,58 +1912,56 @@ static void thl_write(int slot)
 	g_hl_rng = r;
 	rcu_read_lock();
 	/* Locate the key. */
-	for (p = urcu_txn_list_next_rcu(&head->node); p != &head->node;
-			p = urcu_txn_list_next_rcu(p)) {
-		long k = thl_key(head, p);
+	for (p = urcu_txn_hlist_first_rcu(head); p != NULL;
+			p = urcu_txn_hlist_next_rcu(p)) {
+		long k = thl_key(p);
 		if (k >= key) {
 			if (k == key)
 				victim = caa_container_of(p, struct thl_node, node);
 			break;
 		}
 	}
-	if (victim) {					/* present -> remove via the engine's del */
-		if (urcu_txn_list_del_rcu(&victim->node, head) == 1)
+	if (victim) {					/* present -> remove (del needs no bucket: pprev) */
+		if (urcu_txn_hlist_del_rcu(&victim->node, &g_thl_dom) == 1)
 			call_rcu(&victim->rh, thl_node_free);
 		rcu_read_unlock();
 		return;
 	}
-	/* absent -> sorted insert with a pinned predecessor edge */
+	/* absent -> sorted insert pinning the EXACT validated successor. */
 	n = thl_alloc(key);
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, &g_thl_dom);
 	for (;;) {
-		struct urcu_txn_list_node *pred = &head->node, *cur;
+		/* @slotp names the insertion point; @cur is the first node with
+		 * key >= @key (or NULL), pinned by insert_at_slot's *slot old-value. */
+		struct urcu_txn_hlist_node **slotp = &head->first;
+		struct urcu_txn_hlist_node *pred = NULL, *cur;
 		void *raw;
 		enum urcu_txn_status st;
-		int prep;
+		int prep, restart = 0;
 
 		urcu_txn_begin(&txn);
-		for (;;) {				/* walk (unpinned) to the approx predecessor */
-			raw = urcu_txn_load(&txn, (void **) &pred->next);
-			if (urcu_txn_list_is_marked(raw))
-				break;			/* pred being deleted: re-check under the pin */
-			cur = (struct urcu_txn_list_node *) raw;
-			if (thl_key(head, cur) >= key)
-				break;
+		raw = urcu_txn_load(&txn, (void **) slotp, URCU_MCAS_TAG);
+		cur = urcu_txn_hlist_unmark(raw);	/* head->first: never marked */
+		while (cur != NULL && thl_key(cur) < key) {
 			pred = cur;
+			slotp = &pred->next;
+			raw = urcu_txn_load(&txn, (void **) slotp, URCU_MCAS_TAG);
+			if (urcu_txn_hlist_is_marked(raw)) {	/* pred being deleted */
+				restart = 1;
+				break;
+			}
+			cur = (struct urcu_txn_hlist_node *) raw;
 		}
-		/* Pin pred->next: a concurrent insert of a smaller key or a delete of
-		 * pred changes this slot, poisoning the commit so we retry. */
-		raw = urcu_txn_load_validate(&txn, (void **) &pred->next);
-		if (urcu_txn_list_is_marked(raw)) {		/* pred deleted under us */
+		if (restart) {
 			urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
 		}
-		cur = (struct urcu_txn_list_node *) raw;
-		if (cur != &head->node) {
-			long ck = thl_key(head, cur);
-			if (ck == key) {			/* someone else added it: done */
-				urcu_txn_end(&txn); free(n); rcu_read_unlock(); return;
-			}
-			if (ck < key) {				/* a closer predecessor appeared */
-				urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
-			}
+		if (cur != NULL && thl_key(cur) == key) {	/* someone else added it */
+			urcu_txn_end(&txn); free(n); rcu_read_unlock(); return;
 		}
-		prep = urcu_txn_list_insert_after_prepare(&txn, &n->node, pred);
-		if (prep) {				/* -EAGAIN succ moved / -ENOENT pred gone */
+		/* Insert between @pred (or the head) and @cur, pinning *slotp == cur. */
+		prep = urcu_txn_hlist_insert_at_slot_prepare(&txn, &n->node,
+				slotp, cur);
+		if (prep) {				/* -EAGAIN: succ mid-delete */
 			urcu_txn_conflict(&txn); urcu_txn_end(&txn); continue;
 		}
 		st = urcu_txn_commit(&txn);
