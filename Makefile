@@ -64,7 +64,7 @@ SCALE_BENCHES := bench_scale_hotrowex bench_scale_masstree \
                  bench_scale_artolc bench_scale_artrowex
 
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9 \
-        urcu-bidir check-urcu-bidir clean-urcu-bidir
+        urcu-txn check-urcu-txn clean-urcu-txn
 all: $(BENCHES) $(SCALE_BENCHES) bench_wormhole_gpl
 
 # HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
@@ -282,9 +282,13 @@ check-urcu:
 #
 # Compares the NEW userspace-rcu bidirectional RCU lists (single-updater +
 # concurrent, from the urcu-txn-dev branch) against lock/seqlock lists at
-# scale.  Those lists live on a DIFFERENT userspace-rcu branch than the FT, so
-# they get their own in-tree clone+build, urcu-bidir-build/ (analogous to
-# urcu-build/).  Run `make urcu-bidir` first, then `make bench_list_scale`.
+# scale.  This is the shared urcu-txn ENGINE build (rcu-mcas / rcu-txn, the
+# per-record proxy-tag API): bench_list_scale and any other txn-engine consumer
+# link it.  It is a reproducible in-tree clone+build, urcu-txn-build/, DERIVED
+# from the local reference tree URCU_TXN_UPSTREAM @ urcu-txn-dev (analogous to
+# urcu-build/ for the FT).  Run `make urcu-txn` first, then the consumer target
+# (e.g. `make bench_list_scale`).  `make urcu-txn` re-fetches + ff-merges to
+# keep the clone current with the reference tree.
 #
 # Engines: txn_sw_list txn_list rculist mutex fairmutex rwlock_r rwlock_w iscrw
 # seqlock.  The iscrw engine links bind9's real isc_rwlock (C-RW-WP) from
@@ -293,11 +297,14 @@ check-urcu:
 # macros never reach the main TU and no libisc constructor runs.  `make bind9`
 # is what populates bind9-src/ (only the isc headers + rwlock.c are needed).
 # ---------------------------------------------------------------------------
-URCU_BIDIR_UPSTREAM ?= https://github.com/compudj/userspace-rcu-dev
-URCU_BIDIR_BRANCH   ?= urcu-txn-dev
-URCU_BIDIR_BUILD    ?= $(CURDIR)/urcu-bidir-build
-URCU_BIDIR_INC      := $(URCU_BIDIR_BUILD)/include
-URCU_BIDIR_LIB      := $(URCU_BIDIR_BUILD)/src/.libs
+# Reference tree we derive the engine build from (offline --local clone).  This
+# is the canonical txn engine tree (urcu-txn-dev); override to a URL/other path
+# if needed.  Kept in sync via `make urcu-txn`.
+URCU_TXN_UPSTREAM ?= /home/efficios/git/userspace-rcu-txn
+URCU_TXN_BRANCH   ?= urcu-txn-dev
+URCU_TXN_BUILD    ?= $(CURDIR)/urcu-txn-build
+URCU_TXN_INC      := $(URCU_TXN_BUILD)/include
+URCU_TXN_LIB      := $(URCU_TXN_BUILD)/src/.libs
 
 ISC_INC  := bind9-src/lib/isc/include
 ISC_SHIM := src/iscrw-shim
@@ -346,25 +353,25 @@ ifdef TXN_FALLBACK
   LIST_POOL_CFLAGS += -DURCU_TXN_FALLBACK=$(TXN_FALLBACK)
 endif
 
-urcu-bidir:
-	@if [ ! -d "$(URCU_BIDIR_BUILD)/.git" ]; then \
-	  echo ">> cloning $(URCU_BIDIR_UPSTREAM) ($(URCU_BIDIR_BRANCH)) -> $(URCU_BIDIR_BUILD)"; \
-	  git clone --branch "$(URCU_BIDIR_BRANCH)" --single-branch "$(URCU_BIDIR_UPSTREAM)" "$(URCU_BIDIR_BUILD)"; \
+urcu-txn:
+	@if [ ! -d "$(URCU_TXN_BUILD)/.git" ]; then \
+	  echo ">> cloning $(URCU_TXN_UPSTREAM) ($(URCU_TXN_BRANCH)) -> $(URCU_TXN_BUILD)"; \
+	  git clone --no-hardlinks --branch "$(URCU_TXN_BRANCH)" --single-branch "$(URCU_TXN_UPSTREAM)" "$(URCU_TXN_BUILD)"; \
 	else \
-	  echo ">> fetching $(URCU_BIDIR_BRANCH)"; \
-	  git -C "$(URCU_BIDIR_BUILD)" fetch origin "$(URCU_BIDIR_BRANCH)" && \
-	  git -C "$(URCU_BIDIR_BUILD)" checkout "$(URCU_BIDIR_BRANCH)" && \
-	  git -C "$(URCU_BIDIR_BUILD)" merge --ff-only "origin/$(URCU_BIDIR_BRANCH)"; \
+	  echo ">> fetching $(URCU_TXN_BRANCH)"; \
+	  git -C "$(URCU_TXN_BUILD)" fetch origin "$(URCU_TXN_BRANCH)" && \
+	  git -C "$(URCU_TXN_BUILD)" checkout "$(URCU_TXN_BRANCH)" && \
+	  git -C "$(URCU_TXN_BUILD)" merge --ff-only "origin/$(URCU_TXN_BRANCH)"; \
 	fi
-	@test -x "$(URCU_BIDIR_BUILD)/configure" || ( cd "$(URCU_BIDIR_BUILD)" && ./bootstrap )
-	@test -f "$(URCU_BIDIR_BUILD)/config.status" || \
-	  ( cd "$(URCU_BIDIR_BUILD)" && CFLAGS="$(URCU_CFLAGS)" ./configure )
-	$(MAKE) -C "$(URCU_BIDIR_BUILD)/src"
+	@test -x "$(URCU_TXN_BUILD)/configure" || ( cd "$(URCU_TXN_BUILD)" && ./bootstrap )
+	@test -f "$(URCU_TXN_BUILD)/config.status" || \
+	  ( cd "$(URCU_TXN_BUILD)" && CFLAGS="$(URCU_CFLAGS)" ./configure )
+	$(MAKE) -C "$(URCU_TXN_BUILD)/src"
 
-check-urcu-bidir:
-	@test -f "$(URCU_BIDIR_LIB)/liburcu-qsbr.so" || { \
-	  echo "ERROR: liburcu (bidir branch) not found under $(URCU_BIDIR_LIB)"; \
-	  echo "       Run 'make urcu-bidir' to clone + build it."; exit 1; }
+check-urcu-txn:
+	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: liburcu (urcu-txn engine) not found under $(URCU_TXN_LIB)"; \
+	  echo "       Run 'make urcu-txn' to clone + build it."; exit 1; }
 	@test -f "$(ISC_INC)/isc/rwlock.h" || { \
 	  echo "ERROR: bind9 isc headers not found under $(ISC_INC)"; \
 	  echo "       Run 'make bind9' to populate bind9-src/ (for the iscrw engine)."; exit 1; }
@@ -375,8 +382,8 @@ check-jemalloc:
 	  echo "       Install it (e.g. 'apt install libjemalloc-dev') or drop JEMALLOC=1."; exit 1; }
 
 bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
-		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-bidir $(LIST_JE_CHECK)
-	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) $(LIST_POOL_CFLAGS) -I$(URCU_BIDIR_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
+		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-txn $(LIST_JE_CHECK)
+	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) $(LIST_POOL_CFLAGS) -I$(URCU_TXN_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
 	  -c src/bench_list_scale.c -o src/bench_list_scale.o
 	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(RLU_DIR) \
 	  -c $(RLU_DIR)/rlu.c -o src/rlu.o
@@ -388,11 +395,11 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
 	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/rlu.o src/bench_iscrw.o \
 	  src/iscrw.o src/bench_topology_list.o $(LIST_POOL_LIBS) \
-	  -L$(URCU_BIDIR_LIB) -Wl,-rpath,$(URCU_BIDIR_LIB) \
+	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
 
-clean-urcu-bidir:
-	rm -rf "$(URCU_BIDIR_BUILD)"
+clean-urcu-txn:
+	rm -rf "$(URCU_TXN_BUILD)"
 
 clean:
 	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) bench_list_scale \

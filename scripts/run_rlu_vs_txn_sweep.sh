@@ -26,7 +26,7 @@ TXN_TREE=/mnt/data/efficios/git/userspace-rcu-txn
 
 echo ">> building JEMALLOC=1 against the local txn tree (forced clean) ..." >&2
 rm -f bench_list_scale src/bench_list_scale.o
-make bench_list_scale JEMALLOC=1 URCU_BIDIR_BUILD="$TXN_TREE" >/dev/null 2>&1 \
+make bench_list_scale JEMALLOC=1 URCU_TXN_BUILD="$TXN_TREE" >/dev/null 2>&1 \
   || { echo "BUILD FAILED" >&2; exit 1; }
 ldd bench_list_scale 2>/dev/null | grep -qi jemalloc \
   || { echo "jemalloc NOT linked -- aborting" >&2; exit 1; }

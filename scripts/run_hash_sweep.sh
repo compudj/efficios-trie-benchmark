@@ -17,7 +17,7 @@ DED=scripts/hash_dedicated.csv
 CON=scripts/hash_contention.csv
 
 echo ">> rebuilding bench_list_scale against the local txn tree ..." >&2
-make bench_list_scale URCU_BIDIR_BUILD=/mnt/data/efficios/git/userspace-rcu-txn >/dev/null 2>&1 \
+make bench_list_scale URCU_TXN_BUILD=/mnt/data/efficios/git/userspace-rcu-txn >/dev/null 2>&1 \
   || { echo "BUILD FAILED" >&2; exit 1; }
 
 # engine-config table: label | engine | extra-env

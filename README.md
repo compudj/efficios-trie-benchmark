@@ -784,7 +784,7 @@ showcase structure. See the [RLU comparison](#rlu-read-log-update-comparison) be
 ### Building
 
 ```sh
-make urcu-bidir          # clone rcu-bidir-list-dev into urcu-bidir-build/ + build liburcu
+make urcu-txn            # clone urcu-txn-dev into urcu-txn-build/ + build liburcu
 make bench_list_scale    # needs bind9-src/ isc headers (make bind9) for the iscrw engine
 ```
 
@@ -1503,7 +1503,7 @@ src/bench_iscrw.c                isolation wrapper linking the real bind9 isc_rw
 src/iscrw-shim/probes-isc.h      no-op SystemTap probes shim for that standalone build
 datasets/                        names CSVs (1M shuffled / trie-sorted + smoke)
 urcu-build/                      our liburcu clone (fractal-trie-dev), gitignored
-urcu-bidir-build/                our liburcu clone (rcu-bidir-list-dev), gitignored
+urcu-txn-build/                  our liburcu clone (urcu-txn-dev engine), gitignored
 bind9-src/                       our bind9 clone + overlay + build, gitignored
 scripts/build-bind9.sh           clones/overlays/builds the bind9 MT benches
 scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined table

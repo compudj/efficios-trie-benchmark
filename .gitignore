@@ -1,8 +1,8 @@
 # Our own out-of-tree liburcu build (the Fractal Trie); rebuild with `make urcu`
 /urcu-build/
 
-# Our liburcu clone on the bidir-list branch; rebuild with `make urcu-bidir`
-/urcu-bidir-build/
+# Our liburcu clone on the urcu-txn-dev branch; rebuild with `make urcu-txn`
+/urcu-txn-build/
 
 # Our clean bind9 clone + overlay + build (the MT benchmarks); make bind9
 /bind9-src/
