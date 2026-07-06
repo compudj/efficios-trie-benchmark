@@ -82,6 +82,10 @@ two split-out Judy variants, `judyhs` is Judy's hash array.
 **String keys** (`dns` DNS names, `dict` words, `paths` filesystem paths),
 fastest-first by `dns`:
 
+![Single-threaded string-key lookup latency: hot fastest (77–106 ns) with
+wormhole, qp and ft_spec close behind; cuckoo slowest at ~3×; FT's ft_spec beats
+ft_eager on every dataset](figures/st_lookup_strings.png)
+
 | Engine     | `dns` | `dict` | `paths` |
 |------------|------:|-------:|--------:|
 | `hot`      |    99 |    106 |      77 |
@@ -98,6 +102,10 @@ fastest-first by `dns`:
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
+
+![Single-threaded integer-key lookup latency: judyl and art win dense keys
+(11 ns) but degrade 4–6× on sparse; qp is flat at ~13 ns on all four sets;
+ft_spec runs 14–33 ns; masstree and cuckoo trail](figures/st_lookup_ints.png)
 
 | Engine     | `u32d` | `u32s` | `u64d` | `u64s` |
 |------------|-------:|-------:|-------:|-------:|
@@ -221,6 +229,9 @@ memcmp validation) against BIND9's `dns_qpmulti` (`qp_il`), apples-to-apples:
 both use the same NUMA-interleaved (`il`) leaf/payload placement, and **both are
 cache-primed** (priming is on by default for every engine — see above).
 
+![FT vs BIND9 QP at 192 cores: ft_spec_il ≈1246 Mops/s vs qp_il ≈938 — about
+1.3×, whiskers spanning the min–max of 5 runs](figures/loadnames_ft_vs_qp.png)
+
 | Engine        | Query throughput @ 192 cores | vs BIND9-QP |
 |---------------|------------------------------|-------------|
 | `ft_spec_il`  | **≈ 1246 Mops/s** (1227–1273) | **≈ 1.3×** |
@@ -254,6 +265,10 @@ NUMA-interleaved arena (HOT keys on a NUL-terminated qpkey copy; Masstree on the
 binary qpkey bytes; both ARTs on a `\0`-terminated qpkey, since ART needs
 byte-prefix-free keys). Median of 4 runs, query Mops/s (fresh process per thread
 count):
+
+![load-names thread sweep: FT-spec and HOTRowex cross over at ~128 threads and
+FT leads ~19% at 192; both ARTs scale cleanly but trail ~1.5×; Masstree
+plateaus past 128](figures/loadnames_scaling.png)
 
 | Threads | `ft_spec_il` | `hotrowex` | `artolc` | `artrowex` | `masstree` |
 |--------:|-------------:|-----------:|---------:|-----------:|-----------:|
@@ -384,6 +399,11 @@ every reader validates (FT via `cds_ft_speculative_lookup_key`, ART via
 `loadKey`, HOT via `contentEquals`) and force-reads the returned leaf, so each
 lookup pays a real validating compare against cold memory that is never
 dead-code-eliminated. Two workloads, each filling all 192 cores:
+
+![bench_scale read scaling with and without a churn writer, plus RSS:
+HOTRowex leads reads (~1.08× over FT) and footprint (110 MB); FT and FT-QSBR
+are a close second within ~1% of each other, ahead of ART-OLC, ART-ROWEX and
+Masstree; FT's RSS is the largest at 320 MB](figures/scale_rw_reads.png)
 
 **1 writer + N readers** — a writer churns insert/remove the whole window;
 readers cap at 191 so reader + writer = 192 threads. Medians (5–10 runs/cell), read Mops/s:
@@ -518,6 +538,11 @@ LD_LIBRARY_PATH=urcu-build/src/.libs BENCH_MUTATOR=1 \
     bind9-src/build/tests/bench/bench_scale_ft 200
 ```
 
+![Single-mutator insert throughput vs reader count, log scale: the three rwlock
+engines start fastest (~10M kops/s) then collapse ~1000–3000× the instant one
+reader appears; RCU (ft, b9qp) and the optimistic/ROWEX tries never collapse,
+staying within one order of magnitude out to 191 readers](figures/mutator_insert.png)
+
 **Insert (kops/s)** — readers across the top:
 
 | Engine | 0 | 1 | 16 | 64 | 191 | sync |
@@ -544,6 +569,11 @@ HOTRowex and both ARTs keep mutating within the same order of magnitude all the
 way to 191 readers, because their readers never hold a lock the writer needs.
 Masstree is barely touched (−16% over the whole sweep); FT is the noisiest of the
 robust set (RCU reclamation timing) but never starves.
+
+![Replace and remove throughput from 0 to 191 readers, log-scale dumbbells:
+the rwlock engines lose 13–26×, RCU and the optimistic engines degrade gently;
+Masstree's in-place replace barely moves and HOTRowex has no
+remove](figures/mutator_replace_remove.png)
 
 **Replace** and **Remove (kops/s)** at the endpoints (0 / 191 readers):
 
@@ -594,6 +624,11 @@ LD_LIBRARY_PATH=urcu-build/src/.libs FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64 \
     BENCH_ITERATE=1 bind9-src/build/tests/bench/bench_scale_ft 192
 ```
 
+![Ordered iteration scaling, log scale: every engine is near-linear from 1 to
+192 threads; FT's batched cell gather leads at 88,124 next-Mops/s at 192
+threads, ~3.2× HOTRowex and ~5.8× BIND9-QP; the key-materializing judy/qp
+cursors sit lowest](figures/ordered_iteration.png)
+
 Median of 3, next Mops/s — readers across the top:
 
 | Engine | 1 | 16 | 64 | 192 | traversal |
@@ -611,6 +646,10 @@ Median of 3, next Mops/s — readers across the top:
 **FT is now the fastest ordered iterator** — ~3.2× over hotrowex at 192T, a full
 reversal of the previous result (FT was *last*, 365 Mops/s). It got there in four
 steps, each measured on the same 1M-key set:
+
+![How FT ordered iteration got 252× faster, log-scale bars: cds_ft_next descent
+350 → ordered cell list 3,641 (×10.4) → compaction 20,008 (×5.5) → batched
+gather 88,124 Mops/s (×4.4)](figures/ft_iter_steps.png)
 
 | FT ordered-scan config | 192T Mops/s | what changed |
 |---|--:|:--|
@@ -702,6 +741,10 @@ two *fair* modes — **speculative** (skip-compressed descent + a validating key
 compare, the API contract, mirroring qp's `leaf_qpkey`+`qpkey_compare`) and
 **eager** (exact byte-by-byte descent). Aggregate read throughput (Mops/s), `loop`
 column, readers across:
+
+![qpmulti_ft in bind9's event loop, two panels: on the miss-heavy read-only
+sweep qp leads FT speculative ~9% at 192 readers; with concurrent mutators FT
+speculative pulls level to 1.31× ahead](figures/qpmulti_ft.png)
 
 **Read-only:**
 
@@ -1507,6 +1550,9 @@ urcu-txn-build/                  our liburcu clone (urcu-txn-dev engine), gitign
 bind9-src/                       our bind9 clone + overlay + build, gitignored
 scripts/build-bind9.sh           clones/overlays/builds the bind9 MT benches
 scripts/run_scale_rw.sh          runs the per-engine scaling benches, combined table
+scripts/plot_trie_tables.py      renders the trie result tables above as the
+                                   figures/ PNGs (data transcribed from the
+                                   README tables — no benchmark rerun needed)
 ```
 
 ## Licensing of vendored code
