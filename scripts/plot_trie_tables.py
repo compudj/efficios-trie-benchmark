@@ -312,9 +312,6 @@ for ax, (i0, i1), ptitle in [(axes[0], (1, 2), "replace"), (axes[1], (3, 4), "re
                 markeredgewidth=1.0, zorder=4)
         ax.plot(v1, y, "o", color=C191, ms=8, markeredgecolor="white",
                 markeredgewidth=1.0, zorder=5)
-        if v0 / v1 > 4:
-            ax.text(v1 * 0.82, y, f"÷{v0 / v1:.0f}", va="center", ha="right",
-                    fontsize=8.5, color="#333333")
     ax.set_xscale("log")
     ax.set_xlim(60, 40000)
     ax.set_title(ptitle, fontsize=11.5, fontweight="bold")
