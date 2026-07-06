@@ -295,17 +295,47 @@ RSS-vs-compaction economics.
 
 ## 10. The two adjacent funnels
 
-- **External (leaf) arena.** Different rules make it *easier*: leaves are
-  application-owned, the compactor never relocates them, and external ranges
-  are never reclaimed before destroy (`fractal-trie-alloc.c:2012-2024`). So
-  per-CPU size-class magazines in front of the buddy **are** safe out of the
-  box — §9 without needing the drain integration — flushed to the buddy on
-  watermark (merging stays global, under the
-  existing lock, off the fast path). Alternative: port the rcu-txn-slab
-  per-CPU superblock design (ties percpu jemalloc on the list benches) —
-  preserving the guard-tail over-read property
-  (`FT_EXT_ARENA_GUARD_SIZE`). This lock is hit once per insert: exactly as
-  hot as the node arenas.
+- **External (leaf) arena — the second slab cache, and the simpler one.**
+  The per-CPU cache here is a *distinct* cache from §9's — one per group's
+  external arena, sharded per (CPU, buddy order class) — not another
+  instance of the same design, because every §9 hard case is absent by
+  construction: external ranges are **pinned** — never `MADV_DONTNEED`'d,
+  recycled or compacted, only `munmap`'d wholesale at destroy
+  (`fractal-trie-alloc.c:2012`) — leaves are application-owned, the
+  compactor never relocates them, and there is no `nr_live`/drain
+  accounting to keep honest. So none of §9's five rules apply: no
+  invisible-live bookkeeping, no fill-bypass, no drain-at-begin, no
+  private-range routing.
+
+  The clean shape: **intercept the free before the buddy sees it.** A
+  magazine-cached block keeps its `cells[]` entry as "allocated @ order k"
+  — that cell is immutable while the block is allocated
+  (`fractal-trie-alloc.c:1958`) — so magazine reuse is metadata-free: pop +
+  `memset`, no arena lock, skipping the alloc path's freelist scan + split
+  loop and the free path's merge loop entirely. Spill/flush = real
+  `cds_ft_external_arena_free` calls on watermark (merging stays global,
+  under the existing lock, off the fast path). The fill flow matches §9
+  rule 2: leaves are freed post-GP (call_rcu workers, per-CPU pinned)
+  while allocs run on writer CPUs — same plain-atomic wfstack
+  push / pop primitive.
+
+  Honest costs, both bounded by the cap: cached blocks stall buddy
+  coalescing (the merge guard requires the buddy *free*, so an
+  allocated-looking cached block blocks its whole merge chain) and pin
+  their order class against redistribution to other sizes — a shifting
+  size profile leans on the watermark flush. With 19 classes
+  (16 B–4 MiB, `FT_EXT_ARENA_{MIN,MAX}_ORDER`), caps must be byte-, not
+  slot-denominated — a few cached 4 MiB blocks per CPU is real RSS —
+  or caching disabled above a threshold order (the far-metadata question
+  again). Destroy discards magazine contents (the ranges die wholesale).
+
+  Alternative: port the rcu-txn-slab per-CPU superblock design outright
+  (ties percpu jemalloc on the list benches) — unlike the node arenas
+  (§2), the external arena *is* replaceable, since `ft_ext_arena_range_of`
+  masking and the guard-tail over-read property
+  (`FT_EXT_ARENA_GUARD_SIZE`) are implementation-internal — but fronting
+  the existing buddy is less new code for the same lock-free fast path.
+  This lock is hit once per insert: exactly as hot as the node arenas.
 - **flip-txn descriptors.** Raw `malloc` per update
   (`ft-mutation-helpers.h:134,177`) should route to rcu-txn-slab
   (`urcu/rcu-txn-slab.h`, already generic and per-CPU). Same disease,
@@ -343,9 +373,11 @@ then A/B's the two roadmaps:
 
 §9 is allocator-local (no trie-semantics change), so it can be prototyped and
 falsified against the microbench alone before committing either way. Either
-roadmap keeps: **§10** (external-arena magazines / slab port, flip-txn →
-rcu-txn-slab), **§11** (demand reduction), and the long game of **§8-style
-concurrent incremental compaction via txn**.
+roadmap ends with **two slab caches** — the internal-node magazines (compact-
+integrated, §9, or the layered A+B+C equivalent) and the simpler pinned-range
+external cache (§10) — plus **§10**'s flip-txn → rcu-txn-slab routing, **§11**
+(demand reduction), and the long game of **§8-style concurrent incremental
+compaction via txn**.
 
 Open questions:
 
