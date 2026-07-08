@@ -25,12 +25,13 @@ ENGINES = [
 ]
 rows = list(csv.DictReader(open(CSV)))
 
-# The buckets sweep is measured out to 8192, but past ~4096 the fixed ~100
-# nodes/bucket makes the working set outgrow the LLC, so every cache-bound engine
-# sags together (footprint-bound, not contention-bound) -- a different effect than
-# this figure isolates.  Cap the left panel at 4096, the low-contention plateau
-# where rcu_hlist's per-bucket lock has recovered to the lock-free ceiling.
-XMAX = 4096
+# The buckets sweep runs out to 8192.  Past ~4096 the fixed ~100 nodes/bucket
+# makes the working set outgrow the LLC, so every cache-bound engine sags together
+# (footprint-bound, not contention-bound) -- a different effect than the rest of
+# the panel isolates.  That 4096->8192 segment is shaded below so the shared dip
+# is read as a memory-footprint wall, not a contention one.
+XMAX = 8192
+FOOTPRINT_X0 = 4096		# left edge of the footprint-bound (working-set > LLC) band
 
 def series(mode, ekey):
     acc = defaultdict(list)
@@ -44,7 +45,11 @@ plt.rcParams.update({"font.size": 10, "axes.edgecolor": "#888888",
                      "axes.linewidth": 0.8, "figure.facecolor": "white"})
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.8), dpi=150)
 
-# Left: throughput vs #buckets @192 threads
+# Left: throughput vs #buckets @192 threads.  Shade the footprint-bound tail
+# (working set outgrows the LLC) so its shared downturn is not misread as contention.
+axL.axvspan(FOOTPRINT_X0, XMAX, color="#9a9a9a", alpha=0.10, lw=0, zorder=1)
+axL.text(FOOTPRINT_X0 * 1.42, 3.2, "working set > LLC\n(footprint-bound)",
+         ha="center", va="bottom", fontsize=8.0, color="#666666", style="italic", zorder=3)
 for label, ekey, color, marker in ENGINES:
     xs, best, lo, hi = series("buckets", ekey)
     if not xs:
@@ -52,9 +57,11 @@ for label, ekey, color, marker in ENGINES:
     axL.fill_between(xs, lo, hi, color=color, alpha=0.15, lw=0, zorder=2)
     axL.plot(xs, best, color=color, lw=1.9, marker=marker, ms=6.5,
              markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
-bticks = [1, 4, 16, 64, 256, 1024, 4096]
+bticks = [1, 4, 16, 64, 256, 1024, 4096, 8192]
 axL.set_xscale("log", base=2); axL.xaxis.set_major_locator(FixedLocator(bticks))
-axL.xaxis.set_minor_locator(NullLocator()); axL.set_xticklabels([str(b) for b in bticks])
+axL.xaxis.set_minor_locator(NullLocator())
+# 4096 and 8192 sit one octave apart and their 4-digit labels collide; angle them.
+axL.set_xticklabels([str(b) for b in bticks], rotation=30, ha="right", fontsize=9)
 axL.set_xlabel("buckets = independent write lanes (~100 nodes each)", fontsize=10)
 axL.set_ylabel("total throughput (Mops/s)", fontsize=10)
 axL.set_title("Write contention: throughput vs #buckets\n(192 threads, 40 % updates · log-scale x)",

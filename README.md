@@ -1369,29 +1369,31 @@ of independent write lanes — at 40 % updates. Fewer lanes → more writers per
 
 ![Write contention: as buckets shrink, RCU+lock collapses (its per-bucket lock becomes a
 global lock) while txn and cds_lfht degrade gracefully; once buckets outnumber the 192
-writers all three converge at the lock-free ceiling; at 16 buckets only txn and lfht keep
-scaling to 192](figures/hash_contention.png)
+writers all three converge at the lock-free ceiling, then dip together in the shaded
+footprint-bound tail (working set > LLC); at 16 buckets only txn and lfht keep scaling to
+192](figures/hash_contention.png)
 
 **Throughput vs #buckets at 192 threads** (total Mops/s, 40 % updates):
 
-| buckets      |   1 |   4 |  16 |  64 | 256 | 1024 | 4096 |
-|--------------|----:|----:|----:|----:|----:|-----:|-----:|
-| `lfht`       |  13 |  29 |  46 |  52 |  53 |   53 |   51 |
-| `txn_hlist`  | 6.7 |  20 |  34 |  40 |  42 |   44 |   44 |
-| `rcu_hlist`  | 1.0 | 1.1 | 6.0 |  19 |  39 |   52 |   56 |
-| RLU-defer    | 1.9 | 4.7 | 8.4 |  13 |  18 |   24 |   32 |
-| RLU-sync     | 1.9 | 5.4 | 8.3 | 9.5 |  10 |   11 |   11 |
+| buckets      |   1 |   4 |  16 |  64 | 256 | 1024 | 4096 | 8192 |
+|--------------|----:|----:|----:|----:|----:|-----:|-----:|-----:|
+| `lfht`       |  13 |  29 |  46 |  52 |  53 |   53 |   51 |   42 |
+| `txn_hlist`  | 6.7 |  20 |  34 |  40 |  42 |   44 |   44 |   37 |
+| `rcu_hlist`  | 1.0 | 1.1 | 6.0 |  19 |  39 |   52 |   56 |   44 |
+| RLU-defer    | 1.9 | 4.7 | 8.4 |  13 |  18 |   24 |   32 |   36 |
+| RLU-sync     | 1.9 | 5.4 | 8.3 | 9.5 |  10 |   11 |   11 |   11 |
 
 At the article's **1024 buckets** (low contention) `rcu_hlist` ties `lfht` at the top
 (52–53) — the article's result — and by **4096** it has fully caught the lock-free ceiling
 band (56 vs `lfht` 51, `txn_hlist` 44): once the lanes outnumber the 192 writers the
 per-bucket lock is essentially uncontended and costs no more than a lock-free CAS, so all
 three plateau together. (`rcu_hlist` even nudges *ahead* there — its 3-word node has a
-smaller cache footprint than `lfht`'s split-order node, so it hits the memory wall last. The
-plot stops at 4096 because past that point the fixed ~100 nodes/bucket pushes the working
-set out of the LLC and every cache-bound engine sags in lockstep — footprint-, not
-contention-bound: at 8192 all three drop ~18 % together, to 44 / 42 / 37.) But as the bucket
-count *shrinks*, **`rcu_hlist` collapses**: its per-bucket lock becomes a *global* lock, and throughput falls from 52 to
+smaller cache footprint than `lfht`'s split-order node, so it hits the memory wall last. Past
+4096 the fixed ~100 nodes/bucket pushes the working set out of the LLC, so every cache-bound
+engine sags in lockstep — the **shaded 4096→8192 band**, footprint- not contention-bound: at
+8192 all three drop ~18 % together, to 44 / 42 / 37. Only RLU-defer, still contention-limited
+rather than cache-bound, keeps climbing there.) But as the bucket count *shrinks*,
+**`rcu_hlist` collapses**: its per-bucket lock becomes a *global* lock, and throughput falls from 52 to
 **1.0** at a single bucket — best to worst, a ~52× drop. `txn_hlist` and `lfht` degrade
 **gracefully** (44 → 6.7 and 53 → 13), staying on top under contention; txn overtakes rcu
 below ~500 buckets (it already leads by 256). RLU sits low-to-mid throughout — even at 1024 buckets its global
