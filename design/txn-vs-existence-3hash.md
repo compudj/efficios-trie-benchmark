@@ -76,30 +76,25 @@ Reading:
 - (Pre-fix, with the single default `call_rcu` worker, 4U was ~2× slower — the
   lone reclaim thread, not the commit, was the bottleneck.)
 
-### Scaling to 192 cores — ⚠ PRELIMINARY, pending a clean-machine rerun
+### Scaling to 192 cores (clean best-of-5, idle box)
 
-Sweep: `scripts/run_txn_vs_existence_scale.sh` (worker i → core i; best-of-N max)
+Sweep: `scripts/run_txn_vs_existence_scale.sh` (worker i → core i; best-of-5 max)
 → `scripts/txn_vs_existence_scale.csv`; `scripts/plot_txn_vs_existence_scale.py`
-→ `figures/txn_vs_existence_scale.png`. **Numbers below were collected on a
-shared 384-core box under external load (load avg reached ~57 during the run),
-so the high-core-count points are NOT trustworthy** — a clean-machine best-of-5
-rerun (glibc + jemalloc) is TODO. No scaling figure/README results are committed
-until then. Recorded here only as direction:
+→ `figures/txn_vs_existence_scale.png` (3 panels). Full tables + narrative are in
+the README section "urcu-txn vs. McKenney's 'existence structure'".
 
-- **Update, glibc (indicative):** tie at 1 core (~7.4 M moves/s); under
-  contention existence's throughput saturates and regresses past ~64 cores while
-  urcu-txn keeps climbing — a large gap, but the exact factor needs the clean run.
-- **Update, jemalloc — the robust finding (the reason for the rerun):** a
-  back-to-back A/B at 128 updaters gives existence **glibc 97 → jemalloc 405
-  Mmoves/s (~4.2×)** and txn **glibc 310 → jemalloc 588 (~1.9×)**. This 4× rescue
-  is far beyond the noise: **existence's update-side collapse was glibc malloc
-  arena contention, not the mechanism** — it allocates a group + 3×192 B nodes
-  per rotation. The fair (both-jemalloc) comparison is much closer than glibc
-  suggested. jemalloc *default* even edged out `percpu_arena` for existence.
-- **Read (N readers + 1 updater):** readers do not allocate, so this side is
-  allocator-neutral; both scaled near-linearly toward ~3 G queries/s with
-  urcu-txn leading at low counts and converging at scale — re-confirm on the
-  clean run.
+- **Update — most of the glibc gap is an allocator artifact.** Under glibc the
+  two tie at 1 core, then existence peaks ~120 M moves/s at 96 cores and declines
+  while urcu-txn reaches ~327 M at 128 — a 3.4× gap at 192. But existence
+  allocates a group + 3×192 B nodes per rotation, colliding on glibc arena locks.
+  Under **jemalloc** existence is rescued (→ ~412 M at 128, 4× its glibc self)
+  and urcu-txn's lead shrinks to **~1.1–1.4×** (leaner nodes + descriptor slab,
+  not the commit), within **7 % at 192** (416 vs 388). Single-threaded existence
+  is actually *faster* under jemalloc (9.5 vs 7.0 M/s). This is the fair result;
+  the earlier glibc-only "3.4×" overstated urcu-txn by measuring allocator pain.
+- **Read (N readers + 1 updater):** allocator-neutral (readers don't allocate);
+  both scale near-linearly to ~3 G queries/s at 191 readers; urcu-txn leads
+  ~1.3–1.44× at low counts, converging to ~parity (bandwidth-bound) at scale.
 
 ## Fairness audit (answers to three review questions)
 

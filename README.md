@@ -1526,6 +1526,97 @@ for the urcu-txn API across the kernel, low-level libraries, databases and
 networking — is surveyed in
 [design/rcu-txn-use-cases.md](design/rcu-txn-use-cases.md).
 
+## urcu-txn vs. McKenney's "existence structure" — 3-hash atomic move
+
+Paul E. McKenney's *existence structure* (perfbook `CodeSamples/datastruct/`,
+vendored under [`perfbook/`](perfbook/)) solves the same problem urcu-txn does —
+making a multi-structure update atomic to readers — by the **opposite**
+mechanism. existence puts the atomicity on the **read** side: one shared commit
+word (`existence_flip`) flips the existence of an arbitrarily large batch of
+elements at once, and every lookup pays a fixed tagged-load "existence check."
+urcu-txn puts it in the **write** primitive: a single multi-word CAS commits the
+touched slots, and readers traverse tax-free. This is the dual worth measuring.
+
+The workload mirrors McKenney's `existence_3hash_uperf`: three chained hash
+tables, each updater on a disjoint key range repeatedly moving a batch of keys
+around the three tables in one atomic step (one MCAS for urcu-txn; one flip for
+existence), plus optional reader threads doing a 3-table membership query. Both
+harnesses report the same work-unit-normalized metrics — `ns/key-move` (update)
+and `Mqueries/s` (read). The urcu-txn engine is
+[`src/bench_txn_3hash.c`](src/bench_txn_3hash.c) (`make bench_txn_3hash`); the
+existence side is the vendored uperf (patched to add readers + the per-move
+metric). Mechanism comparison and fairness audit:
+[design/txn-vs-existence-3hash.md](design/txn-vs-existence-3hash.md).
+
+**Fair by construction:** both engines get one per-CPU real-time `call_rcu`
+worker per updater; urcu-txn's MCAS descriptors come from its per-CPU
+size-classed slab; and the urcu-txn node is 48 B / 1 cacheline vs existence's
+192 B / 3 cachelines (the `existence_head` machinery is intrinsic to that
+approach, not carried by urcu-txn). Worker `i` pins to CPU `i` (distinct
+physical cores 0–191). Because the update side allocates (existence: a group +
+three 192 B nodes per rotation), it is run under **both glibc and jemalloc**;
+the read side does not allocate, so it is allocator-neutral.
+
+### Result — atomic-move scaling to 192 cores
+
+```sh
+make urcu-txn && make bench_txn_3hash
+make -C perfbook/datastruct/existence existence_3hash_uperf
+ALLOCS=glibc    MODES="update read" RUNS=5 scripts/run_txn_vs_existence_scale.sh
+ALLOCS=jemalloc MODES="update"      RUNS=5 APPEND=1 scripts/run_txn_vs_existence_scale.sh
+python3 scripts/plot_txn_vs_existence_scale.py   # -> figures/txn_vs_existence_scale.png
+```
+
+![urcu-txn vs. existence scaling: under glibc malloc existence's atomic-move
+throughput peaks ~120 M/s at 96 cores and declines while urcu-txn reaches
+~327 M at 128 (a 3.4× gap); under jemalloc both scale far better — existence to
+~410 M and urcu-txn to ~590 M at 128, converging to ~1.07× at 192 — showing the
+glibc gap was mostly allocator arena contention; reads scale near-linearly to
+~3 G queries/s for both](figures/txn_vs_existence_scale.png)
+
+**Update side — most of the gap is a glibc allocator artifact.** Under glibc
+malloc the two tie at one core, then diverge hard: existence's throughput peaks
+at ~120 M key-moves/s around 96 cores and **declines** past the socket boundary,
+while urcu-txn climbs to ~327 M — a **3.4× gap at 192**. But existence allocates
+a group + three 192 B nodes *per rotation*, and that traffic collides on glibc's
+arena locks. Switch both to jemalloc and existence is rescued — it scales to
+~410 M at 128 cores (4× its glibc self) — and urcu-txn's lead collapses to a
+modest, node-footprint-driven margin:
+
+| updater cores | glibc: txn | glibc: existence | glibc ratio | jemalloc: txn | jemalloc: existence | jemalloc ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1   | 7.4  | 7.5  | 0.98× | 7.0  | **9.5** | 0.74× |
+| 16  | 95   | 62   | 1.55× | 97   | 80  | 1.20× |
+| 32  | 170  | 87   | 1.95× | 190  | 143 | 1.33× |
+| 64  | 264  | 113  | 2.34× | 346  | 250 | 1.38× |
+| 128 | 327  | 102  | 3.22× | **591** | **412** | 1.43× |
+| 192 | 255  | 74   | 3.43× | 416  | 388 | 1.07× |
+
+(Mmoves/s, best-of-5.) Under the fair allocator urcu-txn leads by only ~1.1–1.4×
+— from its leaner nodes and the descriptor slab, not the commit mechanism — and
+the two are within **7 %** at 192 cores. Single-threaded, existence is actually
+*faster* under jemalloc (9.5 vs 7.0). Both dip at 192 as the second socket adds
+cross-NUMA traffic.
+
+**Read side — both scale, gap narrows.** One background updater + N readers:
+both scale near-linearly to ~3 G queries/s at 191 readers. urcu-txn's tax-free
+single-cacheline traversal leads ~1.3–1.44× at low reader counts, converging to
+~parity at scale where read throughput becomes memory-bandwidth-bound:
+
+| reader cores | urcu-txn (Mq/s) | existence (Mq/s) | ratio |
+|---|---:|---:|---:|
+| 1   | 42.8 | 29.6 | 1.44× |
+| 32  | 735  | 644  | 1.14× |
+| 64  | 1264 | 1149 | 1.10× |
+| 128 | 2151 | 2054 | 1.05× |
+| 191 | 2956 | 2955 | 1.00× |
+
+Caveats (see the design note): nodes are glibc/jemalloc `malloc` (not pooled;
+existence's `procon` mpool recycles its group/node structs); reader flavor
+differs (urcu-txn QSBR vs existence RCU_SIGNAL); and the tables are lightly
+filled (15 keys/updater), so the read result isolates per-lookup tax + footprint
+rather than deep-chain traversal.
+
 ## Layout
 
 ```
