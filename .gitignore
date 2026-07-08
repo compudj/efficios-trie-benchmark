@@ -21,6 +21,7 @@
 /bench_list_scale
 /bench_list_scale.default
 /bench_list_scale.pooled
+/bench_txn_3hash
 
 # Benchmark output / results
 /results/

@@ -64,7 +64,7 @@ SCALE_BENCHES := bench_scale_hotrowex bench_scale_masstree \
                  bench_scale_artolc bench_scale_artrowex
 
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9 \
-        urcu-txn check-urcu-txn clean-urcu-txn
+        urcu-txn check-urcu-txn check-urcu-txn-lib clean-urcu-txn
 all: $(BENCHES) $(SCALE_BENCHES) bench_wormhole_gpl
 
 # HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
@@ -397,6 +397,29 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	  src/iscrw.o src/bench_topology_list.o $(LIST_POOL_LIBS) \
 	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
+
+# ---------------------------------------------------------------------------
+# bench_txn_3hash: urcu-txn (rcu-mcas) analogue of perfbook's existence 3-hash
+# atomic-move microbench (perfbook/datastruct/existence/existence_3hash_uperf.c),
+# for the urcu-txn-vs-existence comparison.  Links the urcu-txn engine build
+# (run `make urcu-txn` first), like bench_list_scale, but needs no bind9/RLU/
+# topology deps -- hence check-urcu-txn-lib (lib only) rather than check-urcu-txn.
+# See design/txn-vs-existence-3hash.md.  The bench defines _GNU_SOURCE/_LGPL_SOURCE
+# and the QSBR flavor itself.
+# ---------------------------------------------------------------------------
+TXN3H_CFLAGS := -O2 -pthread -Wall
+
+check-urcu-txn-lib:
+	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: liburcu (urcu-txn engine) not found under $(URCU_TXN_LIB)"; \
+	  echo "       Run 'make urcu-txn' to clone + build it."; exit 1; }
+
+bench_txn_3hash: src/bench_txn_3hash.c | check-urcu-txn-lib
+	$(CC) $(TXN3H_CFLAGS) -I$(URCU_TXN_INC) -c src/bench_txn_3hash.c \
+	  -o src/bench_txn_3hash.o
+	$(CC) -O2 -pthread -o $@ src/bench_txn_3hash.o \
+	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
+	  -lurcu-qsbr -lurcu-cds -lurcu-common -lpthread
 
 clean-urcu-txn:
 	rm -rf "$(URCU_TXN_BUILD)"
