@@ -1,0 +1,40 @@
+perfbook datastruct code vendored from Paul E. McKenney's "perfbook"
+(git://git.kernel.org/pub/scm/linux/kernel/git/paulmck/perfbook.git, GPLv2),
+HEAD a1d3bc7e ("toolsoftrade: Fix off-by-one error WRT Listing 4.14's line
+count", 2026-06-28), imported 2026-07-08.
+
+Purpose: compare urcu-txn (rcu-mcas / transactional multi-word CAS) against
+McKenney's "existence structure" / "kaleidoscope" approach for atomically
+moving an item between data structures.
+
+WHAT WAS COPIED (all from CodeSamples/, ../.. relative paths preserved)
+  datastruct/               CodeSamples/datastruct/ -- source only, from git
+                            (working-tree build artifacts excluded).
+  api.h, Makefile.arch      Pre-generated x86_64 build products.  Upstream
+                            mechanically generates these; copied verbatim.
+  depends.mk, recipes.mk    Arch-detection + (here no-op) regeneration rules
+                            that datastruct/Issaquah/Makefile includes.
+  arch-x86/, api-pthreads/, Regeneration prerequisites named by depends.mk,
+  linux/common.h            present so make never tries to regenerate the
+                            vendored api.h / Makefile.arch (they are newest).
+  lib/random.{c,h}          Used by the skiplist and torture harnesses.
+  defer/hazptr.{c,h}        Used by datastruct/hash/hash_bkt_hazptr.c.
+
+WHAT WAS DROPPED
+  datastruct/hash/data/     ~29 MB of Paul's historical gnuplot result
+                            artifacts (.dat/.eps/.gz/.out, 2013-2020 runs);
+                            irrelevant to a code comparison.
+  Everything under CodeSamples/ outside the datastruct build closure.
+
+LOCAL PATCHES
+  datastruct/existence/Makefile: the two *_uperf scalability targets hardcoded
+  -ltcmalloc (that dev lib is absent here).  Replaced with an overridable
+  $(MALLOC) variable defaulting to empty (glibc malloc), matching this tree's
+  glibc-by-default / explicit-opt-in-to-a-scalable-allocator convention.
+  Scalable-allocator run:  make MALLOC=-ljemalloc   (libjemalloc-dev present).
+
+BUILD VERIFIED 2026-07-08 (gcc, liburcu 0.15.0, x86_64):
+  cd datastruct/existence && make   # 10 targets, all built + smoke-run OK
+  cd datastruct/Issaquah  && make   # existence_test, treetorture
+
+License: GPL-2.0, see ./COPYING.  Original copyright Paul E. McKenney et al.
