@@ -86,8 +86,13 @@ done
 # Section 3 -- write contention: shrink bucket count at 40% updates
 ########################################################################
 export BENCH_UPDATE_PCT=40
-# 3a throughput vs #buckets at 192 threads, ~100 nodes/bucket
-for b in 1 4 16 64 256 1024; do
+# 3a throughput vs #buckets at 192 threads, ~100 nodes/bucket.
+# Swept out to 8192 so the low-contention plateau is visible: rcu_hlist's
+# per-bucket lock recovers to the lock-free ceiling once buckets >> threads.
+# Note >~4096 the fixed ~100 nodes/bucket makes the working set outgrow the LLC,
+# so all cache-bound engines sag together (footprint-, not contention-bound); the
+# plot deliberately stops at 4096 (see plot_hash_contention.py XMAX).
+for b in 1 4 16 64 256 1024 4096 8192; do
   export HL_BUCKETS=$b HL_INIT=$((100*b)) HL_RANGE=$((200*b)) BENCH_FIXED_THREADS=192
   for c in "${CONFIGS[@]}"; do IFS='|' read -r lbl eng extra <<<"$c"
     for r in $(seq 1 $RUNS); do

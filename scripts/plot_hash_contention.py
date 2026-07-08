@@ -25,10 +25,17 @@ ENGINES = [
 ]
 rows = list(csv.DictReader(open(CSV)))
 
+# The buckets sweep is measured out to 8192, but past ~4096 the fixed ~100
+# nodes/bucket makes the working set outgrow the LLC, so every cache-bound engine
+# sags together (footprint-bound, not contention-bound) -- a different effect than
+# this figure isolates.  Cap the left panel at 4096, the low-contention plateau
+# where rcu_hlist's per-bucket lock has recovered to the lock-free ceiling.
+XMAX = 4096
+
 def series(mode, ekey):
     acc = defaultdict(list)
     for r in rows:
-        if r["mode"] == mode and r["engine"] == ekey:
+        if r["mode"] == mode and r["engine"] == ekey and int(r["x"]) <= XMAX:
             acc[int(r["x"])].append(float(r["total_mops"]))
     xs = sorted(acc)
     return xs, [max(acc[x]) for x in xs], [min(acc[x]) for x in xs], [max(acc[x]) for x in xs]
@@ -45,7 +52,7 @@ for label, ekey, color, marker in ENGINES:
     axL.fill_between(xs, lo, hi, color=color, alpha=0.15, lw=0, zorder=2)
     axL.plot(xs, best, color=color, lw=1.9, marker=marker, ms=6.5,
              markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
-bticks = [1, 4, 16, 64, 256, 1024]
+bticks = [1, 4, 16, 64, 256, 1024, 4096]
 axL.set_xscale("log", base=2); axL.xaxis.set_major_locator(FixedLocator(bticks))
 axL.xaxis.set_minor_locator(NullLocator()); axL.set_xticklabels([str(b) for b in bticks])
 axL.set_xlabel("buckets = independent write lanes (~100 nodes each)", fontsize=10)
