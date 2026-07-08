@@ -33,6 +33,12 @@ LOCAL PATCHES
   glibc-by-default / explicit-opt-in-to-a-scalable-allocator convention.
   Scalable-allocator run:  make MALLOC=-ljemalloc   (libjemalloc-dev present).
 
+  datastruct/existence/existence_3hash_uperf.c: added a --nreaders membership-
+  query engine and a work-unit-normalized ns/key-move metric, for the urcu-txn
+  comparison (design/txn-vs-existence-3hash.md).  Also fixes a latent upstream
+  bug: --nreaders was parsed and gated on but no reader threads were ever
+  spawned, so --nreaders>0 hung.  All changes are marked "LOCAL PATCH".
+
 BUILD VERIFIED 2026-07-08 (gcc, liburcu 0.15.0, x86_64):
   cd datastruct/existence && make   # 10 targets, all built + smoke-run OK
   cd datastruct/Issaquah  && make   # existence_test, treetorture
