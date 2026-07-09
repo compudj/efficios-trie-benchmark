@@ -945,6 +945,7 @@ struct lf_elem {
 #endif
 };
 static struct urcu_txn_list_head g_lf_head;
+static struct urcu_txn_domain g_lf_dom;	/* one escalation domain for the list */
 static struct lf_elem **g_lf_stable;
 static struct lf_elem **g_lf_churn;
 /*
@@ -1005,6 +1006,7 @@ static void lf_build(void)
 {
 	int i;
 	urcu_txn_list_init(&g_lf_head);
+	urcu_txn_domain_init(&g_lf_dom);
 	g_lf_stable = calloc(LIST_SIZE, sizeof(*g_lf_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 	struct lf_elem *arena = calloc(LIST_SIZE, sizeof(struct lf_elem));
@@ -1016,7 +1018,7 @@ static void lf_build(void)
 		struct lf_elem *e = calloc(1, sizeof(*e));
 #endif
 		e->key = 2 * i;
-		if (urcu_txn_list_add_tail_rcu(&e->node, &g_lf_head))
+		if (urcu_txn_list_add_tail_rcu(&e->node, &g_lf_head, &g_lf_dom))
 			abort();
 		g_lf_stable[i] = e;
 	}
@@ -1066,7 +1068,7 @@ static void lf_write(int slot)
 		struct lf_elem *e = g_lf_churn[slot];
 		int r;
 		rcu_read_lock();
-		r = urcu_txn_list_del_rcu(&e->node, &g_lf_head);
+		r = urcu_txn_list_del_rcu(&e->node, &g_lf_dom);
 		rcu_read_unlock();
 		if (r < 0)
 			abort();		/* -ENOMEM */
@@ -1089,7 +1091,7 @@ static void lf_write(int slot)
 		e->key = 2 * a + 1;
 		rcu_read_lock();
 		r = urcu_txn_list_insert_after_rcu(&e->node,
-				&g_lf_stable[a]->node, &g_lf_head);
+				&g_lf_stable[a]->node, &g_lf_dom);
 		rcu_read_unlock();
 		if (r != 0)			/* anchor is permanent: never -ENOENT */
 			abort();
@@ -1167,7 +1169,7 @@ static void lf_write_random(uint64_t *rng)
 	struct urcu_mcas_txn txn;
 	struct lf_elem *reclaim = NULL;		/* published cell to free (delete path) */
 
-	urcu_txn_init(&txn, &g_lf_head.domain);
+	urcu_txn_init(&txn, &g_lf_dom);
 	/*
 	 * Hold ONE read-side section around the whole operation (all retry
 	 * attempts), as the engine's existence model requires ("rcu_read_lock
@@ -1351,7 +1353,7 @@ static void lf_reset_index(void)
 		 * here, so there is no contention (commit cannot ABORT and del_prepare
 		 * cannot observe a peer's mark): one attempt suffices.
 		 */
-		urcu_txn_init(&txn, &g_lf_head.domain);
+		urcu_txn_init(&txn, &g_lf_dom);
 		urcu_txn_begin(&txn);
 		if (urcu_txn_list_del_prepare(&txn, cur) == 0) {
 			urcu_txn_store(&txn, (void **) &g_lf_index[i],
