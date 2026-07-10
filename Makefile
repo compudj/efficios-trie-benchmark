@@ -407,7 +407,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 # See design/txn-vs-existence-3hash.md.  The bench defines _GNU_SOURCE/_LGPL_SOURCE
 # and the QSBR flavor itself.
 # ---------------------------------------------------------------------------
-TXN3H_CFLAGS := -O2 -pthread -Wall
+TXN3_CFLAGS := -O2 -pthread -Wall
 
 check-urcu-txn-lib:
 	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
@@ -415,15 +415,43 @@ check-urcu-txn-lib:
 	  echo "       Run 'make urcu-txn' to clone + build it."; exit 1; }
 
 bench_txn_3hash: src/bench_txn_3hash.c | check-urcu-txn-lib
-	$(CC) $(TXN3H_CFLAGS) -I$(URCU_TXN_INC) -c src/bench_txn_3hash.c \
+	$(CC) $(TXN3_CFLAGS) -I$(URCU_TXN_INC) -c src/bench_txn_3hash.c \
 	  -o src/bench_txn_3hash.o
 	$(CC) -O2 -pthread -o $@ src/bench_txn_3hash.o \
 	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common -lpthread
+
+# ---------------------------------------------------------------------------
+# bench_txn_3skiplist: the ORDERED-map dual of bench_txn_3hash -- three
+# urcu_txn_skiplists instead of three hlist tables, matching perfbook's
+# existence_3skiplist_uperf knobs and its ns/key-move metric.  A key move is one
+# composed skiplist_del_prepare(src) + skiplist_insert_prepare(dst) committed as
+# a single txn.  --movesper is LOCKED to 1: batching >1 ordered edits per commit
+# is not correct with independent _prepare forms (each searches the committed
+# structure, blind to the txn's own buffered writes, so two moves collide on one
+# pred->next[L] slot; the engine keeps one record per slot, the olds match, and
+# the upgrade silently destroys the insert's edge -- leaving a torn tower whose
+# next[0] aims at a tombstoned node, after which insert_prepare -EAGAINs forever).
+# A wide-batch ordered move needs read-your-own-writes plus chained same-slot
+# stores; until then 1 move/commit is the honest ordered unit (and it matches
+# existence's per-object flip).  See the header comment of the bench for the
+# full mechanism.
+#
+# Header-only skiplist over rcu-txn: no cds_* symbols, hence no -lurcu-cds.
+# See design/rcu-txn-skiplist.md and design/txn-vs-existence-3hash.md.
+# ---------------------------------------------------------------------------
+bench_txn_3skiplist: src/bench_txn_3skiplist.c | check-urcu-txn-lib
+	$(CC) $(TXN3_CFLAGS) -I$(URCU_TXN_INC) -c src/bench_txn_3skiplist.c \
+	  -o src/bench_txn_3skiplist.o
+	$(CC) -O2 -pthread -o $@ src/bench_txn_3skiplist.o \
+	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
+	  -lurcu-qsbr -lurcu-common -lpthread
 
 clean-urcu-txn:
 	rm -rf "$(URCU_TXN_BUILD)"
 
 clean:
 	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) bench_list_scale \
+	  bench_txn_3hash src/bench_txn_3hash.o \
+	  bench_txn_3skiplist src/bench_txn_3skiplist.o \
 	  src/bench_list_scale.o src/rlu.o src/bench_iscrw.o src/iscrw.o src/bench_topology_list.o
