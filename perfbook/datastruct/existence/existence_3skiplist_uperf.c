@@ -66,6 +66,7 @@ struct perftest_attr {
 	long long nlookups;
 	long long nlookupfails;
 	long long nrotations;
+	long long nmoves;	/* LOCAL PATCH: exact key-moves, for ns/key-move */
 	long long nadds;
 	long long ndels;
 	int mycpu;
@@ -76,13 +77,37 @@ struct perftest_attr {
 };
 
 /*
+ * LOCAL PATCH (efficios-trie-benchmark): reader threads + a per-key-move metric
+ * for the urcu-txn comparison, mirroring the same patch in
+ * existence_3hash_uperf.c.  Upstream parses --nreaders but never spawns
+ * readers, so --nreaders>0 hangs on the nthreads_running gate; this adds the
+ * missing reader engine and fixes that.
+ */
+struct reader_attr {
+	int myid;
+	int mycpu;
+	long long nqueries;
+	long long nhits;
+};
+
+static inline unsigned long xrand(unsigned long *s)
+{
+	unsigned long x = *s;
+	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+	return (*s = x);
+}
+
+/*
  * Rotate values through the three skiplists, shifting in the key
  * specified by nextkey.
  */
-void skiplist_rotate(struct skiplist slp[], struct skiplist_exists *sei[],
+/* LOCAL PATCH: returns the number of key-moves committed by this flip, so the
+ * caller can report ns/key-move (the work-unit-normalized metric). */
+long skiplist_rotate(struct skiplist slp[], struct skiplist_exists *sei[],
 		     struct skiplist_exists *seo[])
 {
 	struct existence_group *egp;
+	long nmoves = 0;
 	int i;
 
 	egp = existence_group__procon_alloc();
@@ -99,6 +124,7 @@ void skiplist_rotate(struct skiplist slp[], struct skiplist_exists *sei[],
 		BUG_ON(existence_head_set_outgoing(&sei[i + 0]->se_eh, egp));
 		BUG_ON(existence_head_set_outgoing(&sei[i + 1]->se_eh, egp));
 		BUG_ON(existence_head_set_outgoing(&sei[i + 2]->se_eh, egp));
+		nmoves += 3;
 	}
 	rcu_read_unlock();
 	existence_flip(egp);
@@ -107,6 +133,46 @@ void skiplist_rotate(struct skiplist slp[], struct skiplist_exists *sei[],
 	if (atomic_read(&seo[0]->se_kv->refcnt) > 10000)
 		poll(NULL, 0, 1);
 #endif
+	return nmoves;
+}
+
+/*
+ * LOCAL PATCH: reader engine — membership query for a known-present key across
+ * the three skiplists via skiplist_exists_lookup() (which pays
+ * existence_exists() on the hit).  Read-side counterpart to
+ * bench_txn_3skiplist's query().
+ */
+void *perftest_reader(void *arg)
+{
+	struct reader_attr *rp = arg;
+	unsigned long seed = 0x9e3779b97f4a7c15UL ^ (unsigned long)(rp->myid + 1);
+	long long nq = 0LL, nh = 0LL;
+
+	rcu_register_thread();
+	run_on(rp->mycpu);
+	atomic_inc(&nthreads_running);
+	while (ACCESS_ONCE(goflag) == GOFLAG_INIT)
+		poll(NULL, 0, 1);
+	while (ACCESS_ONCE(goflag) == GOFLAG_RUN) {
+		int u = (int)(xrand(&seed) % (unsigned long)nupdaters);
+		long off = (long)(xrand(&seed) % (unsigned long)(3 * nobjects));
+		unsigned long key = (unsigned long)(u * updatespacing) +
+				    (unsigned long)off;
+		int t, hit = 0;
+
+		rcu_read_lock();
+		for (t = 0; t < 3; t++)
+			if (skiplist_exists_lookup(&sl_array[t], key))
+				hit = 1;
+		rcu_read_unlock();
+		nq++;
+		nh += hit;
+	}
+	rcu_unregister_thread();
+	rp->nqueries = nq;
+	rp->nhits = nh;
+	atomic_inc(&nthreads_done);
+	return NULL;
 }
 
 void *perftest_child(void *arg)
@@ -118,6 +184,7 @@ void *perftest_child(void *arg)
 	struct skiplist_exists **seo;
 	int i;
 	long long nrotations = 0LL;
+	long long nmoves = 0LL;		/* LOCAL PATCH */
 
 	rcu_register_thread();
 	run_on(childp->mycpu);
@@ -143,7 +210,7 @@ void *perftest_child(void *arg)
 	while (ACCESS_ONCE(goflag) == GOFLAG_INIT)
 		poll(NULL, 0, 1);
 	while (ACCESS_ONCE(goflag) == GOFLAG_RUN) {
-		skiplist_rotate(sl_array, sei, seo);
+		nmoves += skiplist_rotate(sl_array, sei, seo);	/* LOCAL PATCH */
 		for (i = 0; i < 3 * nobjects; i++)
 			sei[i] = seo[i];
 		nrotations++;
@@ -152,6 +219,7 @@ void *perftest_child(void *arg)
 	free(seo);
 	rcu_unregister_thread();
 	childp->nrotations = nrotations;
+	childp->nmoves = nmoves;		/* LOCAL PATCH */
 	rcu_barrier();
 	keyvalue__procon_stats(&childp->kv_ps);
 	skiplist_exists__procon_stats(&childp->se_ps);
@@ -166,8 +234,12 @@ void *perftest_child(void *arg)
 void perftest(void)
 {
 	struct perftest_attr *childp = calloc(sizeof(*childp), nupdaters);
+	struct reader_attr *readp = nreaders ?			/* LOCAL PATCH */
+		calloc(sizeof(*readp), nreaders) : NULL;
 	int i;
 	long long nrotations = 0LL;
+	long long nmoves = 0LL;		/* LOCAL PATCH */
+	long long nqueries = 0LL, nhits = 0LL;	/* LOCAL PATCH */
 	long long starttime;
 	long long endtime;
 	struct procon_stats kv_pst = { 0 };
@@ -198,6 +270,11 @@ void perftest(void)
 		childp[i].firstkey = i * updatespacing;
 		create_thread(perftest_child, &childp[i]);
 	}
+	for (i = 0; i < nreaders; i++) {		/* LOCAL PATCH */
+		readp[i].myid = i;
+		readp[i].mycpu = (nupdaters + i) * cpustride;
+		create_thread(perftest_reader, &readp[i]);
+	}
 	rcu_unregister_thread();
 
 	/* Wait for all threads to initialize. */
@@ -219,14 +296,29 @@ void perftest(void)
 	rcu_register_thread();
 	for (i = 0; i < nupdaters; i++) {
 		nrotations += childp[i].nrotations;
+		nmoves += childp[i].nmoves;		/* LOCAL PATCH */
 		procon_stats_accumulate(&kv_pst, &childp[i].kv_ps);
 		procon_stats_accumulate(&se_pst, &childp[i].se_ps);
 		procon_stats_accumulate(&eg_pst, &childp[i].eg_ps);
+	}
+	for (i = 0; i < nreaders; i++) {		/* LOCAL PATCH */
+		nqueries += readp[i].nqueries;
+		nhits += readp[i].nhits;
 	}
 	printf("duration (s): %g  rotations: %lld  ns/rotation: %g  obj/sl/thread: %d\n",
 	       starttime / 1000. / 1000., nrotations,
 	       (starttime * 1000. * (double)nupdaters) / (double)nrotations,
 	       nobjects);
+	/* LOCAL PATCH: work-unit-normalized update metric + reader throughput. */
+	printf("UPDATE  updaters: %d  key-moves: %lld  Mmoves/s: %g  ns/key-move: %g\n",
+	       nupdaters, nmoves,
+	       (double)nmoves / (starttime / 1000. / 1000.) / 1e6,
+	       nmoves ? (starttime * 1000. * (double)nupdaters) / (double)nmoves : 0.0);
+	if (nreaders)
+		printf("READ    readers: %d  queries: %lld  Mqueries/s: %g  hit%%: %.1f\n",
+		       nreaders, nqueries,
+		       (double)nqueries / (starttime / 1000. / 1000.) / 1e6,
+		       nqueries ? 100.0 * (double)nhits / (double)nqueries : 0.0);
 	if (dump_procon_stats) {
 		printf("Key-value producer-consumer statistics:\n");
 		procon_stats_print(&kv_pst);
@@ -236,6 +328,7 @@ void perftest(void)
 		procon_stats_print(&eg_pst);
 	}
 	free(childp);
+	free(readp);		/* LOCAL PATCH (NULL-safe) */
 	rcu_unregister_thread();
 	rcu_barrier();
 }
@@ -252,6 +345,9 @@ void usage(char *progname, const char *format, ...)
 	fprintf(stderr, "\t--nupdaters\n");
 	fprintf(stderr, "\t\tNumber of updaters, defaults to 1.  Must be 1\n");
 	fprintf(stderr, "\t\tor greater, or skiplist will be empty.\n");
+	fprintf(stderr, "\t--nreaders\n");		/* LOCAL PATCH */
+	fprintf(stderr, "\t\tNumber of membership-query readers, defaults\n");
+	fprintf(stderr, "\t\tto 0.\n");
 	fprintf(stderr, "\t--updatewait\n");
 	fprintf(stderr, "\t\tNumber of spin-loop passes per update,\n");
 	fprintf(stderr, "\t\tdefaults to -1.  If 0, the updater will not.\n");
