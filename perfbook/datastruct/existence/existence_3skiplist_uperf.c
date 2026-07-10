@@ -188,6 +188,14 @@ void *perftest_child(void *arg)
 
 	rcu_register_thread();
 	run_on(childp->mycpu);
+	/* LOCAL PATCH: seed this thread's Park-Miller state.  randseed is a
+	 * __thread variable that defaults to 0, and Schrage's algorithm maps
+	 * 0 -> 2^31-1, which is a FIXED POINT.  Unseeded, random() therefore
+	 * returns 2^31-1 forever, random_level() sees 31 trailing 1-bits and
+	 * always returns SL_MAX_LEVELS-1, every node gets a full-height tower,
+	 * every level becomes the complete list, and the skiplist degenerates
+	 * to a sorted linked list with O(n) search.  Seed must be in [1, 2^31-2]. */
+	setrandom((unsigned int)(childp->mycpu * 2654435761U + 12345U) % 0x7ffffffeU + 1U);
 	crdp = create_call_rcu_data(URCU_CALL_RCU_RT, childp->mycpu);
 	set_thread_call_rcu_data(crdp);
 	keyvalue__procon_init();
