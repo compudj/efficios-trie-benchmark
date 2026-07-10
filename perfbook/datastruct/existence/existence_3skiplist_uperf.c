@@ -45,6 +45,10 @@ int nreaders = 0;
 int nupdaters = 1;
 int updatewait = -1;
 long updatespacing = 32;
+/* LOCAL PATCH: objects per existence group; 0 = the whole rotation, which is
+ * upstream's behaviour.  Decouples the atomic-commit width from nobjects so a
+ * scaling sweep can hold the commit width fixed while the key count varies. */
+long groupobjs = 0;
 int cpustride = 1;
 long duration = 10; /* in milliseconds. */
 long dump_procon_stats = 0;
@@ -108,27 +112,48 @@ long skiplist_rotate(struct skiplist slp[], struct skiplist_exists *sei[],
 {
 	struct existence_group *egp;
 	long nmoves = 0;
+	/* LOCAL PATCH: rotate ALL 3*nobjects resident keys, not just nobjects of
+	 * them.  sei[]/seo[] are allocated with 3*nobjects entries, but upstream's
+	 * loop bound is `i < nobjects` with a stride of 3, so it moves only
+	 * 3*ceil(nobjects/3) keys -- 6 of 15 at the default updatespacing 32.  After
+	 * the first sei/seo swap the untouched entries are NULL and never read
+	 * again, so those 9 keys become permanent static residents: present in the
+	 * skiplists, traversed, never inserted or deleted.  bench_txn_3skiplist
+	 * rotates all K = 3*nobjects keys, so comparing the two normalized per
+	 * key-move still hands existence a 2.5x smaller mutation footprint (hotter
+	 * nodes and predecessor lines, fewer allocations, fewer call_rcu).  The
+	 * 3-cycle is well-formed for any i that is a multiple of 3 -- indices i,
+	 * i+1, i+2 reside in sl[0], sl[1], sl[2] -- so widening the bound is safe. */
+	const int nres = 3 * nobjects;			/* resident keys per updater */
+	int chunk = groupobjs > 0 ? (int)groupobjs : nres;
+	int base;
 	int i;
 
-	egp = existence_group__procon_alloc();
-	BUG_ON(!egp);
-	existence_group_init(egp);
-	rcu_read_lock();
-	for (i = 0; i < nobjects; i += 3) {
-		seo[i + 0] = skiplist_exists_alloc(egp, &slp[0],
-						   sei[i + 2]->se_kv, ~0, ~0);
-		seo[i + 1] = skiplist_exists_alloc(egp, &slp[1],
-						   sei[i + 0]->se_kv, ~0, ~0);
-		seo[i + 2] = skiplist_exists_alloc(egp, &slp[2],
-						   sei[i + 1]->se_kv, ~0, ~0);
-		BUG_ON(existence_head_set_outgoing(&sei[i + 0]->se_eh, egp));
-		BUG_ON(existence_head_set_outgoing(&sei[i + 1]->se_eh, egp));
-		BUG_ON(existence_head_set_outgoing(&sei[i + 2]->se_eh, egp));
-		nmoves += 3;
+	for (base = 0; base < nres; base += chunk) {
+		int end = base + chunk;
+
+		if (end > nres)
+			end = nres;
+		egp = existence_group__procon_alloc();
+		BUG_ON(!egp);
+		existence_group_init(egp);
+		rcu_read_lock();
+		for (i = base; i < end; i += 3) {
+			seo[i + 0] = skiplist_exists_alloc(egp, &slp[0],
+							   sei[i + 2]->se_kv, ~0, ~0);
+			seo[i + 1] = skiplist_exists_alloc(egp, &slp[1],
+							   sei[i + 0]->se_kv, ~0, ~0);
+			seo[i + 2] = skiplist_exists_alloc(egp, &slp[2],
+							   sei[i + 1]->se_kv, ~0, ~0);
+			BUG_ON(existence_head_set_outgoing(&sei[i + 0]->se_eh, egp));
+			BUG_ON(existence_head_set_outgoing(&sei[i + 1]->se_eh, egp));
+			BUG_ON(existence_head_set_outgoing(&sei[i + 2]->se_eh, egp));
+			nmoves += 3;
+		}
+		rcu_read_unlock();
+		existence_flip(egp);
+		call_rcu(&egp->eg_rh, existence_group_rcu_cb);
 	}
-	rcu_read_unlock();
-	existence_flip(egp);
-	call_rcu(&egp->eg_rh, existence_group_rcu_cb);
 #if 0
 	if (atomic_read(&seo[0]->se_kv->refcnt) > 10000)
 		poll(NULL, 0, 1);
@@ -409,6 +434,12 @@ int main(int argc, char *argv[])
 			if (updatespacing < 20)
 				usage(argv[0],
 				      "%s must be >= 32\n", argv[i - 1]);
+		} else if (strcmp(argv[i], "--groupobjs") == 0) {
+			groupobjs = strtol(argv[++i], NULL, 0);
+			if (groupobjs < 0 || groupobjs % 3 != 0)
+				usage(argv[0],
+				      "%s must be a non-negative multiple of 3\n",
+				      argv[i - 1]);
 		} else if (strcmp(argv[i], "--cpustride") == 0) {
 			cpustride = strtol(argv[++i], NULL, 0);
 		} else if (strcmp(argv[i], "--duration") == 0) {
