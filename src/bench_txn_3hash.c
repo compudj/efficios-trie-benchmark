@@ -30,6 +30,39 @@
 //   the whole rotation in a single transaction, the true existence analogue;
 //   a small value trades away batch-atomicity to stay within a cheap MCAS).
 //
+//   Two edits in one commit are unsafe when they name the SAME SLOT, and the
+//   hlist is not structurally immune to that.  A head insert always stores to
+//   &head->first; del(X) stores to *X->pprev, which IS &head->first exactly when
+//   X is the bucket's first node.  Compose those two and the olds agree (the
+//   insert's `succ` load reads memory, unaware this same txn is unlinking X), so
+//   the engine's one-record-per-slot upgrade wins and X ends up MARK-ed yet still
+//   linked -- its delete silently did not happen, and the caller reclaims it.
+//   Verified in isolation: with the victim first the chain becomes 9,3(MARKED),2,1;
+//   with the victim middle or last both edits land and the chain is correct.  Two
+//   inserts into one bucket, and two adjacent deletes (del(A) then del(B=A->next),
+//   whose write site *B->pprev is the &A->next that del(A) tombstones), alias the
+//   same way.  Head insertion is not the cure: at the tail the trigger would move
+//   to "victim is last".
+//
+//   Necessary precondition: the two edits must share a bucket chain at all.  A
+//   chunk's keys are CONSECUTIVE and a bucket is key % nbuckets, so that needs
+//   chunk > nbuckets -- which the default (nbuckets 4096, movesper 4) never
+//   reaches, and why the published figures were sound without any of this.  That
+//   is a property of the configuration, not of the design.  Where a chunk can
+//   share a bucket, --ryw enables the engine's read-your-own-writes plus chained
+//   same-slot stores (on by default exactly there, and required: --ryw 0 is
+//   refused).  Note the condition assumes the consecutive-key layout below; a
+//   different key assignment would need it re-derived.
+//
+//   Corruption does not always announce itself: the reproducing config
+//   (--updatespacing 20 --nbuckets 2 --movesper 4 --ryw 0, one node per bucket so
+//   the victim is always first) LIVELOCKS rather than finishing, because a later
+//   del_prepare retries forever against an old-value check that can never pass.
+//   So the --ryw guard, not the check below, is what protects this bench.  Every
+//   run still ends with a conservation check -- each updater's keys must be
+//   linked where it left them -- which prints CONSERVATION FAILED and exits
+//   nonzero, catching the quieter drop-shaped failures.
+//
 // Build (after `make urcu-txn`), mirroring the bench_list_scale recipe:
 //   cc -O2 -pthread -D_GNU_SOURCE -D_LGPL_SOURCE \
 //      -Iurcu-txn-build/include -c src/bench_txn_3hash.c -o src/bench_txn_3hash.o
@@ -70,8 +103,13 @@ static long updatespacing = 32;	/* key stride between updaters; sets nobjects */
 static int  cpustride     = 1;
 static long duration_ms   = 1000;
 static int  movesper      = 4;	/* moves per MCAS commit; 0 = whole rotation */
+static int  use_ryw       = -1;	/* -1 = auto (on iff a chunk can alias a bucket) */
 static long nobjects;		/* = (updatespacing-16)/3, per existence */
 static long keys_per_thread;	/* K = 3*nobjects */
+
+/* Owned keys that were not linked where their updater believed, at drain time:
+ * the conservation check.  A commit that drops an edge shows up here. */
+static long long g_lost_keys;
 
 /* ── data structure ───────────────────────────────────────────────────── */
 struct hnode {
@@ -93,6 +131,25 @@ static struct urcu_txn_domain g_dom;
 static inline struct urcu_txn_hlist_head *bucket_of(int t, unsigned long key)
 {
 	return &ht[t].bucket[key % (unsigned long)nbuckets];
+}
+
+/*
+ * Is @n reachable in @head's chain?  Identity, not key: the conservation check
+ * asks whether THIS node is linked where its owner believes, which a key lookup
+ * could not distinguish from a peer's node under the same key.  Call within an
+ * RCU read-side section; concurrent peers may be mutating other keys' nodes.
+ */
+static int node_linked(struct urcu_txn_hlist_head *head,
+		struct urcu_txn_hlist_node *n)
+{
+	struct urcu_txn_hlist_node *p;
+
+	for (p = urcu_txn_hlist_first_rcu(head); p != NULL;
+			p = urcu_txn_hlist_next_rcu(p)) {
+		if (p == n)
+			return 1;
+	}
+	return 0;
 }
 
 static void free_hnode_cb(struct rcu_head *rh)
@@ -149,6 +206,17 @@ static int commit_moves(struct hnode **olds, struct hnode **news,
 	int i, prep, st;
 
 	urcu_txn_init(&txn, &g_dom);
+	/*
+	 * Read-your-own-writes + chained same-slot stores, needed only when two
+	 * moves in one commit can touch the SAME bucket chain (see main(): that
+	 * requires chunk > nbuckets, since a chunk's keys are consecutive and the
+	 * bucket is key % nbuckets).  Without it, an insert at a bucket head and a
+	 * delete of the node that head names both store &head->first with the same
+	 * old, and the engine's one-record-per-slot upgrade leaves the victim
+	 * MARK-ed but still linked -- its delete lost, then reclaimed under readers.
+	 */
+	if (use_ryw)
+		urcu_txn_enable_ryw(&txn);
 	for (;;) {
 		int retry = 0;
 
@@ -266,9 +334,36 @@ static void *updater(void *arg)
 		rcu_quiescent_state();	/* let call_rcu grace periods advance */
 	}
 
-	/* Drain this thread's remaining nodes. */
-	for (j = 0; j < K; j++)
-		(void)urcu_txn_hlist_del_rcu(&cur[j]->node, &g_dom);
+	/*
+	 * Drain this thread's remaining nodes -- and CHECK conservation while doing
+	 * it.  Every owned key must still be linked in the bucket its updater
+	 * believes (curtab[j]); anything else means a commit dropped or duplicated
+	 * an edge.  Silently ignoring this is how a corrupted run could still print
+	 * a plausible ns/key-move.
+	 *
+	 * Check by walking the chain for the NODE, not by deleting and inspecting
+	 * the result: an orphaned node keeps a pprev naming its old slot, and
+	 * del_rcu() on it would retry forever against an old-value check that can
+	 * never pass.  So never hand a node we cannot see to del_rcu().
+	 *
+	 * This catches drop-shaped failures.  It does NOT catch the bucket-aliasing
+	 * corruption, which livelocks long before any drain -- the --ryw guard in
+	 * main() is what prevents that one.
+	 */
+	for (j = 0; j < K; j++) {
+		int linked;
+
+		rcu_read_lock();
+		linked = node_linked(bucket_of(curtab[j], cur[j]->key),
+				&cur[j]->node);
+		rcu_read_unlock();
+		if (!linked) {
+			uatomic_inc(&g_lost_keys);
+			continue;		/* orphaned: do NOT del_rcu it */
+		}
+		if (urcu_txn_hlist_del_rcu(&cur[j]->node, &g_dom) != 1)
+			uatomic_inc(&g_lost_keys);	/* 1 == this call removed it */
+	}
 	for (j = 0; j < K; j++)
 		call_rcu(&cur[j]->rh, free_hnode_cb);
 
@@ -424,9 +519,10 @@ static void run(void)
 	printf("engine: urcu-txn (rcu-mcas)  nbuckets: %ld  keys/thread: %ld  "
 	       "moves/commit: ", nbuckets, keys_per_thread);
 	if (movesper > 0)
-		printf("%d\n", movesper);
+		printf("%d", movesper);
 	else
-		printf("whole-rotation (%ld)\n", keys_per_thread);
+		printf("whole-rotation (%ld)", keys_per_thread);
+	printf("  ryw: %s\n", use_ryw ? "on" : "off");
 	printf("duration (s): %g\n", secs);
 	printf("UPDATE  updaters: %d  rotations: %lld  key-moves: %lld  "
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
@@ -440,6 +536,20 @@ static void run(void)
 		       "hit%%: %.1f\n", nreaders, total_q, mq_s, hitpct);
 	}
 
+	/*
+	 * Conservation: every owned key had to be linked exactly where its updater
+	 * left it.  Report loudly -- a dropped edge otherwise hides behind a
+	 * perfectly plausible throughput number.
+	 */
+	if (g_lost_keys) {
+		printf("CONSERVATION FAILED: %lld key(s) not linked where the "
+		       "updater believed -- the run is CORRUPT, ignore the numbers "
+		       "above\n", g_lost_keys);
+	} else {
+		printf("CHECK   conservation: OK (all %lld owned keys accounted for)\n",
+		       (long long)keys_per_thread * nupdaters);
+	}
+
 	for (t = 0; t < 3; t++)
 		free(ht[t].bucket);
 	free(utid); free(uat); free(rtid); free(rat);
@@ -450,9 +560,13 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--nbuckets N] [--nupdaters N] [--nreaders N]\n"
 	    "          [--updatespacing N] [--cpustride N] [--duration MS] [--movesper N]\n"
+	    "          [--ryw 0|1]\n"
 	    "  --nreaders N => concurrent membership-query threads (read-side)\n"
 	    "  --movesper 0 => attempt the whole rotation in one MCAS commit\n"
-	    "                  (true existence_flip analogue; may exceed MCAS width)\n",
+	    "                  (true existence_flip analogue; may exceed MCAS width)\n"
+	    "  --ryw 0|1    => force read-your-own-writes off/on.  Default: on iff a\n"
+	    "                  commit can touch one bucket twice (chunk > nbuckets),\n"
+	    "                  which is the only way batched hlist moves alias.\n",
 	    p);
 	exit(2);
 }
@@ -469,9 +583,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))    cpustride = (int)strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--duration"))     duration_ms = strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--movesper"))     movesper = (int)strtol(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--ryw"))          use_ryw = (int)strtol(argv[++i], NULL, 0);
 		else usage(argv[0]);
 	}
-	if (nupdaters < 1 || nbuckets < 1 || updatespacing < 20)
+	if (nupdaters < 1 || nbuckets < 1 || updatespacing < 20 || movesper < 0)
 		usage(argv[0]);
 
 	nobjects = (updatespacing - 16) / 3;		/* mirror existence */
@@ -479,6 +594,45 @@ int main(int argc, char **argv)
 	if (keys_per_thread < 1)
 		keys_per_thread = 3;
 
+	/*
+	 * When can two moves in one commit alias?  Only by landing in the same
+	 * bucket chain.  A commit's keys are CONSECUTIVE (firstkey + j) and span at
+	 * most `span` of them; a bucket is key % nbuckets, so two collide iff their
+	 * difference is a nonzero multiple of nbuckets -- impossible while the span
+	 * stays at or below nbuckets.  Hence aliasing is possible iff span > nbuckets.
+	 * That is a NECESSARY precondition, not a sufficient one (the two edits must
+	 * then also name the same slot), so enabling RYW on it is conservative.
+	 *
+	 * This is why the default config (nbuckets 4096, movesper 4) has always been
+	 * sound WITHOUT read-your-own-writes, and why the published figures stay
+	 * reproducible: RYW is enabled only where it is actually required, leaving
+	 * the historical measurement path untouched.  A property of the
+	 * configuration, though, not of the design -- and it assumes the consecutive
+	 * key layout above.
+	 */
+	{
+		long chunk = movesper > 0 ? movesper : keys_per_thread;
+		long span = chunk < keys_per_thread ? chunk : keys_per_thread;
+		int ryw_required = span > nbuckets;
+
+		if (use_ryw < 0)
+			use_ryw = ryw_required;
+		if (ryw_required && !use_ryw) {
+			fprintf(stderr,
+			    "error: --ryw 0 with a %ld-key commit span > --nbuckets %ld is\n"
+			    "  unsound.  Two moves in one commit can then share a bucket, and\n"
+			    "  two edits naming one slot (an insert at a head plus a delete of\n"
+			    "  the node that head names, two inserts at one head, or two\n"
+			    "  adjacent deletes) both present the same old.  The engine keeps\n"
+			    "  one record per slot, so the upgrade destroys an edge: the victim\n"
+			    "  stays MARK-ed but linked, its delete lost, and it is reclaimed\n"
+			    "  under readers.  In practice the run then livelocks.  Use --ryw 1,\n"
+			    "  or raise --nbuckets above %ld, or lower --movesper.\n",
+			    span, nbuckets, span);
+			exit(2);
+		}
+	}
+
 	run();
-	return 0;
+	return g_lost_keys ? 1 : 0;	/* a corrupt run must not exit 0 */
 }
