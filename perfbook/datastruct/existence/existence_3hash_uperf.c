@@ -45,6 +45,10 @@ int nreaders = 0;
 int nupdaters = 1;
 int updatewait = -1;
 long updatespacing = 32;
+/* LOCAL PATCH: objects per existence group; 0 = the whole rotation, which is
+ * upstream's behaviour.  Decouples the atomic-commit width from nobjects so a
+ * sweep can hold the commit width fixed while the key count varies. */
+long groupobjs = 0;
 int cpustride = 1;
 long duration = 10; /* in milliseconds. */
 long dump_procon_stats = 0;
@@ -107,27 +111,49 @@ long hash_rotate(struct hashtab *htp[],
 {
 	struct existence_group *egp;
 	long nmoves = 0;
+	/* LOCAL PATCH: rotate ALL 3*nobjects resident keys, not just nobjects of
+	 * them.  hei[]/heo[] are allocated with 3*nobjects entries, but upstream's
+	 * loop bound is `i < nobjects` with a stride of 3, so it moves only
+	 * 3*ceil(nobjects/3) keys -- 6 of 15 at the default updatespacing 32.  After
+	 * the first hei/heo swap the untouched entries are NULL and never read
+	 * again, so those 9 keys become permanent static residents: present in the
+	 * tables, hashed over, never inserted or deleted.  bench_txn_3hash rotates
+	 * all K = 3*nobjects keys, so normalizing both per key-move still amortized
+	 * existence's one group alloc + flip + call_rcu over 6 moves against txn's
+	 * 15.  The 3-cycle is well-formed for any i that is a multiple of 3 --
+	 * indices i, i+1, i+2 reside in ht[0], ht[1], ht[2] -- so widening the bound
+	 * is safe.  Identical defect to skiplist_rotate() in
+	 * existence_3skiplist_uperf.c. */
+	const int nres = 3 * nobjects;			/* resident keys per updater */
+	int chunk = groupobjs > 0 ? (int)groupobjs : nres;
+	int base;
 	int i;
 
-	egp = existence_group__procon_alloc();
-	BUG_ON(!egp);
-	existence_group_init(egp);
-	rcu_read_lock();
-	for (i = 0; i < nobjects; i += 3) {
-		heo[i + 0] = hash_exists_alloc(egp, htp[0], hei[i + 2]->he_kv,
-					       ~0, ~0);
-		heo[i + 1] = hash_exists_alloc(egp, htp[1], hei[i + 0]->he_kv,
-					       ~0, ~0);
-		heo[i + 2] = hash_exists_alloc(egp, htp[2], hei[i + 1]->he_kv,
-					       ~0, ~0);
-		BUG_ON(existence_head_set_outgoing(&hei[i + 0]->he_eh, egp));
-		BUG_ON(existence_head_set_outgoing(&hei[i + 1]->he_eh, egp));
-		BUG_ON(existence_head_set_outgoing(&hei[i + 2]->he_eh, egp));
-		nmoves += 3;
+	for (base = 0; base < nres; base += chunk) {
+		int end = base + chunk;
+
+		if (end > nres)
+			end = nres;
+		egp = existence_group__procon_alloc();
+		BUG_ON(!egp);
+		existence_group_init(egp);
+		rcu_read_lock();
+		for (i = base; i < end; i += 3) {
+			heo[i + 0] = hash_exists_alloc(egp, htp[0], hei[i + 2]->he_kv,
+						       ~0, ~0);
+			heo[i + 1] = hash_exists_alloc(egp, htp[1], hei[i + 0]->he_kv,
+						       ~0, ~0);
+			heo[i + 2] = hash_exists_alloc(egp, htp[2], hei[i + 1]->he_kv,
+						       ~0, ~0);
+			BUG_ON(existence_head_set_outgoing(&hei[i + 0]->he_eh, egp));
+			BUG_ON(existence_head_set_outgoing(&hei[i + 1]->he_eh, egp));
+			BUG_ON(existence_head_set_outgoing(&hei[i + 2]->he_eh, egp));
+			nmoves += 3;
+		}
+		rcu_read_unlock();
+		existence_flip(egp);
+		call_rcu(&egp->eg_rh, existence_group_rcu_cb);
 	}
-	rcu_read_unlock();
-	existence_flip(egp);
-	call_rcu(&egp->eg_rh, existence_group_rcu_cb);
 #if 0
 	if (atomic_read(&heo[0]->he_kv->refcnt) > 10000)
 		poll(NULL, 0, 1);
@@ -353,6 +379,7 @@ void usage(char *progname, const char *format, ...)
 	fprintf(stderr, "\t\tcorresponding number of milliseconds\n");
 	fprintf(stderr, "\t\tbetween updates.\n");
 	fprintf(stderr, "\t--updatespacing\n");
+	fprintf(stderr, "\t--groupobjs\n");
 	fprintf(stderr, "\t\tKey values between successive updaters,\n");
 	fprintf(stderr, "\t\tdefaults to 32.  Must be greater than 19.\n");
 	fprintf(stderr, "\t--cpustride\n");
@@ -400,6 +427,12 @@ int main(int argc, char *argv[])
 			if (updatespacing < 20)
 				usage(argv[0],
 				      "%s must be >= 32\n", argv[i - 1]);
+		} else if (strcmp(argv[i], "--groupobjs") == 0) {
+			groupobjs = strtol(argv[++i], NULL, 0);
+			if (groupobjs < 0 || groupobjs % 3 != 0)
+				usage(argv[0],
+				      "%s must be a non-negative multiple of 3\n",
+				      argv[i - 1]);
 		} else if (strcmp(argv[i], "--cpustride") == 0) {
 			cpustride = strtol(argv[++i], NULL, 0);
 		} else if (strcmp(argv[i], "--duration") == 0) {
