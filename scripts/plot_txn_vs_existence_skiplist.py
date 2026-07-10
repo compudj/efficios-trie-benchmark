@@ -59,19 +59,34 @@ PANELS = [
      "aggregate queries/s (millions)", "reader cores"),
 ]
 
+"""Core counts are shown on a LINEAR axis with plain integer labels: the sweep is
+about behaviour at high core counts, and a log2 axis compresses exactly the 64-192
+range where the curves separate."""
+MAJOR_TICKS = (1, 32, 64, 96, 128, 191, 192)
+
 fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.0))
 for ax, (title, alloc, mode, ycol, ylab, xlab) in zip(axes, PANELS):
+    seen_x = set()
     for label, ekey, color, marker in ENGINES:
         xs, ys = series(alloc, mode, ekey, ycol)
         if not xs:
             continue
+        seen_x.update(xs)
         ax.plot(xs, ys, marker=marker, color=color, label=label,
                 lw=1.8, ms=5, alpha=0.9)
-    ax.set_xscale("log", base=2)
+    xs_all = sorted(seen_x)
+    major = [x for x in xs_all if x in MAJOR_TICKS]
+    ax.set_xlim(0, max(xs_all) * 1.03)
+    ax.set_xticks(major)
+    ax.set_xticklabels([str(x) for x in major])
+    ax.set_xticks(xs_all, minor=True)     # every measured point, unlabelled
+    ax.set_ylim(bottom=0)
+    ax.ticklabel_format(axis="y", style="plain")
     ax.set_xlabel(xlab)
     ax.set_ylabel(ylab)
     ax.set_title(title, fontsize=11)
     ax.grid(alpha=0.3, ls=":")
+    ax.grid(alpha=0.15, ls=":", which="minor", axis="x")
     ax.legend(fontsize=8, loc="best")
 
 fig.suptitle("urcu-txn (MCAS) vs. existence (flip) — three-skiplist atomic key-move, "
