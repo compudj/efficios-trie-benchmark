@@ -154,10 +154,39 @@ skiplist_end_writer(struct skiplist *head_slp)
  * probability due to truncation, which is in turn due to a finite number
  * of levels.
  */
+#ifdef SL_XORSHIFT_LEVEL
+/*
+ * LOCAL PATCH: draw tower heights from the same xorshift64 the urcu-txn
+ * skiplist benchmark uses, so a head-to-head comparison is not measuring the
+ * difference between two random-number generators.  Same geometric p=1/2
+ * distribution as random(); the only change is cost per draw (three shifts
+ * versus Schrage's two integer divisions).  Self-seeding from the address of
+ * the thread-local state, which is distinct per thread and never zero (zero is
+ * a fixed point of xorshift, just as it is of Park-Miller).
+ */
+static __thread unsigned long sl_rng_state;
+
+static inline unsigned long sl_xorshift64(void)
+{
+	unsigned long x = sl_rng_state;
+
+	if (!x)
+		x = 0x9e3779b97f4a7c15UL ^ (unsigned long)&sl_rng_state;
+	x ^= x << 13;
+	x ^= x >> 7;
+	x ^= x << 17;
+	return sl_rng_state = x;
+}
+#endif /* SL_XORSHIFT_LEVEL */
+
 static int random_level(void)
 {
 	int i = 0;
+#ifdef SL_XORSHIFT_LEVEL
+	unsigned long r = sl_xorshift64();
+#else
 	unsigned long r = random();
+#endif
 
 	while (r & 0x1) {
 		i++;
