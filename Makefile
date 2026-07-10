@@ -426,16 +426,13 @@ bench_txn_3hash: src/bench_txn_3hash.c | check-urcu-txn-lib
 # urcu_txn_skiplists instead of three hlist tables, matching perfbook's
 # existence_3skiplist_uperf knobs and its ns/key-move metric.  A key move is one
 # composed skiplist_del_prepare(src) + skiplist_insert_prepare(dst) committed as
-# a single txn.  --movesper is LOCKED to 1: batching >1 ordered edits per commit
-# is not correct with independent _prepare forms (each searches the committed
-# structure, blind to the txn's own buffered writes, so two moves collide on one
-# pred->next[L] slot; the engine keeps one record per slot, the olds match, and
-# the upgrade silently destroys the insert's edge -- leaving a torn tower whose
-# next[0] aims at a tombstoned node, after which insert_prepare -EAGAINs forever).
-# A wide-batch ordered move needs read-your-own-writes plus chained same-slot
-# stores; until then 1 move/commit is the honest ordered unit (and it matches
-# existence's per-object flip).  See the header comment of the bench for the
-# full mechanism.
+# a single txn.  --movesper composes N moves per commit; N != 1 requires the
+# engine's read-your-own-writes + chained same-slot stores (urcu_txn_enable_ryw,
+# on by default there), because two batched ordered edits collide on one
+# pred->next[L] slot -- see the bench's header comment for the mechanism and
+# --ryw for the A/B.  movesper 1 is the like-for-like unit against existence's
+# per-object flip.  Needs an urcu-txn-build synced past the RYW commits
+# (rcu-txn.h urcu_txn_enable_ryw); run `make urcu-txn`.
 #
 # Header-only skiplist over rcu-txn: no cds_* symbols, hence no -lurcu-cds.
 # See design/rcu-txn-skiplist.md and design/txn-vs-existence-3hash.md.

@@ -25,39 +25,49 @@
  * a per-lookup read tax (skiplist_exists); urcu-txn pays it as the write-side
  * commit width -- the read-tax vs write-tax dual, on the ordered structure.
  *
- * --movesper is LOCKED to 1 (one structural move per commit).  Batching >1
- * ordered-skiplist edits in one MCAS is NOT correct with independent *_prepare
- * forms.  A chunk holds CONSECUTIVE keys j, j+1; key j rotates into sl[(j+1)%3],
- * which is exactly key j+1's source -- so one chunk always inserts and deletes in
- * the same skiplist, on adjacent keys, which therefore share a predecessor P.
- * Both edits then name the slot P->next[L]: the insert wants {succ -> newnode},
- * the delete wants {succ -> succ's successor}.  Each *_prepare searched the
- * COMMITTED structure (urcu_txn_load does not see the txn's own buffered writes),
- * so both present the same old value; the engine keeps at most one record per
- * slot (rcu-mcas.h urcu_mcas_record), matches on old, and the upgrade overwrites
- * new_ptr -- destroying the insert's edge.  The stale read does double harm: it
- * misdirects the write AND makes the delete's predecessor guard pass.
+ * --movesper composes N structural moves into one commit (0 = a whole rotation).
+ * Any N != 1 needs read-your-own-writes, which the bench turns on for you (and
+ * --ryw forces either way).  Why: a chunk holds CONSECUTIVE keys j, j+1; key j
+ * rotates into sl[(j+1)%3], which is exactly key j+1's source -- so one chunk
+ * always inserts and deletes in the same skiplist, on adjacent keys, which
+ * therefore share a predecessor P.  Both edits then name the slot P->next[L].
  *
- * The damage is not a lost key but a TORN TOWER: the coalesce only bites at the
- * levels both edits record, so a taller new node keeps its upper-level edges and
- * loses level 0, leaving next[0] aimed at the tombstoned (then reclaimed) victim.
- * Every later search descending through it adopts a marked predecessor, and
- * insert_prepare returns -EAGAIN forever -- a deterministic hang, reproducible
- * with a SINGLE updater and no readers (so it is composition, not contention).
- * Delete-first mirrors it: the victim ends marked but still linked, hence a
- * use-after-free plus a duplicate key.  (One move is safe: del from skiplist A
- * and insert into skiplist B touch disjoint slots.)
+ * Without RYW each *_prepare searches the COMMITTED structure (urcu_txn_load does
+ * not see the txn's own buffered writes), so both present the same old value; the
+ * engine keeps at most one record per slot (rcu-mcas.h urcu_mcas_record), matches
+ * on old, and the upgrade overwrites new_ptr -- destroying the insert's edge.  The
+ * stale read does double harm: it misdirects the write AND makes the delete's
+ * predecessor guard pass.  The damage is not a lost key but a TORN TOWER: the
+ * coalesce only bites at the levels both edits record, so a taller new node keeps
+ * its upper-level edges and loses level 0, leaving next[0] aimed at the tombstoned
+ * (then reclaimed) victim; every later search descending through it adopts a
+ * marked predecessor and insert_prepare returns -EAGAIN forever.  Deterministic,
+ * and reproducible with a SINGLE updater and no readers -- so it is composition,
+ * not contention.  Delete-first mirrors it: the victim ends marked but still
+ * linked, hence a use-after-free plus a duplicate key.
  *
- * The general fix is read-your-own-writes in the traversal -- so the second edit
- * lands on its true post-batch predecessor, often a txn-private node needing no
- * record at all -- plus chained same-slot stores {old -> mid -> new} where the
- * fused slot belongs to a published node.  Both are future work; until then one
- * move per commit is the honest ordered unit, and it matches the existence side's
- * per-object flip.  --nbuckets is accepted (CLI parity with the existence sweeps)
- * but IGNORED: a skiplist has no buckets.
+ * With RYW (urcu_txn_enable_ryw) the descent observes the txn's own pending edits,
+ * so the later edit lands on its true post-batch predecessor -- for insert-first
+ * that is the freshly inserted node, which is txn-private and needs no record at
+ * all, dissolving the collision -- and where the fused slot belongs to a PUBLISHED
+ * node the two records chain into one {committed_old -> final_new}.  movesper == 1
+ * needs none of this (del from skiplist A and insert into skiplist B touch
+ * disjoint slots), so RYW stays OFF there by default: --movesper 1 --ryw 1 is
+ * then the honest A/B of what RYW costs the single-move fast path.
+ *
+ * Note movesper > 1 is a DIFFERENT unit of atomicity, not merely a faster one: it
+ * makes several key-moves visible together.  It is not the like-for-like
+ * comparison against existence's per-object flip -- movesper 1 is.  Reach for it
+ * to measure what wider ordered commits cost, not to win the head-to-head.
+ *
+ * Every run ends with a conservation check (each updater's keys must be exactly
+ * where it left them); a failure prints CONSERVATION FAILED and exits nonzero, so
+ * a corrupted run cannot masquerade as a throughput result.  --nbuckets is
+ * accepted (CLI parity with the existence sweeps) but IGNORED: no buckets.
  *
  * Example:
  *   ./bench_txn_3skiplist --nupdaters 4 --duration 1000 --movesper 1
+ *   ./bench_txn_3skiplist --nupdaters 4 --duration 1000 --movesper 3   (ryw auto)
  */
 
 #ifndef _GNU_SOURCE
@@ -91,9 +101,14 @@ static int  nreaders      = 0;	/* concurrent membership-query threads */
 static long updatespacing = 32;	/* key stride between updaters; sets nobjects */
 static int  cpustride     = 1;
 static long duration_ms   = 1000;
-static int  movesper      = 1;	/* LOCKED to 1 (see main); >1 unsafe on ordered structure */
+static int  movesper      = 1;	/* structural moves composed into one commit; 0 = whole rotation */
+static int  use_ryw       = -1;	/* -1 = auto (on iff movesper != 1); else forced 0/1 */
 static long nobjects;		/* = (updatespacing-16)/3, per existence */
 static long keys_per_thread;	/* K = 3*nobjects */
+
+/* Keys that were not where the updater believed they were, at drain time: the
+ * conservation check.  A batched move that drops an edge shows up here. */
+static long long g_lost_keys;
 
 /* Element: key/val plus the transacted skiplist tower.  The tower's flexible
  * next[] runs past the struct, so a node is malloc'd sizeof(*e) +
@@ -199,6 +214,17 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 	int i, prep, st;
 
 	urcu_txn_init(&txn, &g_dom);
+	/*
+	 * Read-your-own-writes + chained same-slot stores.  Required whenever this
+	 * commit carries more than one ordered edit: without it a later _prepare
+	 * searches the committed structure, lands on a predecessor an earlier edit
+	 * already displaced, and the two stores collide on one pred->next[L] slot.
+	 * Left OFF at movesper == 1 by default so the single-move fast path keeps
+	 * its historical semantics (and so --ryw makes an honest A/B of what RYW
+	 * costs there).
+	 */
+	if (use_ryw)
+		urcu_txn_enable_ryw(&txn);
 	for (;;) {
 		int retry = 0;
 
@@ -334,12 +360,20 @@ static void *updater(void *arg)
 		rcu_quiescent_state();	/* let call_rcu grace periods advance */
 	}
 
-	/* Drain this thread's remaining nodes. */
+	/*
+	 * Drain this thread's remaining nodes -- and CHECK conservation while doing
+	 * it.  Every key this updater owns must still be exactly where it believes
+	 * (curtab[j]), so del_rcu must report 1 ("this call removed it").  Anything
+	 * else means a commit dropped or duplicated an edge: the failure mode of a
+	 * batched ordered move without RYW.  Silently ignoring this return is how a
+	 * corrupted run could still print a throughput number.
+	 */
 	for (j = 0; j < K; j++) {
 		struct urcu_txn_skiplist_node *rm = NULL;
 
-		(void) urcu_txn_skiplist_del_rcu(&g_sl[curtab[j]], &cur[j]->key,
-				&g_dom, &rm);
+		if (urcu_txn_skiplist_del_rcu(&g_sl[curtab[j]], &cur[j]->key,
+				&g_dom, &rm) != 1)
+			uatomic_inc(&g_lost_keys);
 	}
 	for (j = 0; j < K; j++)
 		call_rcu(&cur[j]->rh, free_snode_cb);
@@ -475,9 +509,10 @@ static void run(void)
 	printf("engine: urcu-txn (rcu-mcas) 3-skiplist  keys/thread: %ld  "
 	       "moves/commit: ", keys_per_thread);
 	if (movesper > 0)
-		printf("%d\n", movesper);
+		printf("%d", movesper);
 	else
-		printf("whole-rotation (%ld)\n", keys_per_thread);
+		printf("whole-rotation (%ld)", keys_per_thread);
+	printf("  ryw: %s\n", use_ryw ? "on" : "off");
 	printf("duration (s): %g\n", secs);
 	printf("UPDATE  updaters: %d  rotations: %lld  key-moves: %lld  "
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
@@ -491,6 +526,20 @@ static void run(void)
 		       "hit%%: %.1f\n", nreaders, total_q, mq_s, hitpct);
 	}
 
+	/*
+	 * Conservation: every owned key had to be exactly where its updater left
+	 * it.  Report loudly -- a dropped edge otherwise hides behind a perfectly
+	 * plausible throughput number.
+	 */
+	if (g_lost_keys) {
+		printf("CONSERVATION FAILED: %lld key(s) not where the updater "
+		       "believed -- the run is CORRUPT, ignore the numbers above\n",
+		       g_lost_keys);
+	} else {
+		printf("CHECK   conservation: OK (all %lld owned keys accounted for)\n",
+		       (long long) keys_per_thread * nupdaters);
+	}
+
 	for (t = 0; t < 3; t++)
 		urcu_txn_skiplist_destroy(&g_sl[t]);
 	free(utid); free(uat); free(rtid); free(rat);
@@ -501,10 +550,15 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--nbuckets N] [--nupdaters N] [--nreaders N]\n"
 	    "          [--updatespacing N] [--cpustride N] [--duration MS] [--movesper N]\n"
+	    "          [--ryw 0|1]\n"
 	    "  --nbuckets N  => accepted for CLI parity with existence; IGNORED (no buckets)\n"
 	    "  --nreaders N  => concurrent membership-query threads (read-side)\n"
-	    "  --movesper N  => LOCKED to 1; >1 is unsafe on the ordered structure\n"
-	    "                   (same-predecessor-slot collision; see source header)\n",
+	    "  --movesper N  => structural moves composed into one commit (0 = whole\n"
+	    "                   rotation).  N != 1 requires --ryw 1, which is the default\n"
+	    "                   there; see the source header for why.\n"
+	    "  --ryw 0|1     => force read-your-own-writes off/on (default: on iff\n"
+	    "                   movesper != 1).  --movesper 1 --ryw 1 is the A/B that\n"
+	    "                   measures what RYW costs the single-move fast path.\n",
 	    p);
 	exit(2);
 }
@@ -521,19 +575,23 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))     cpustride = (int) strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--movesper"))      movesper = (int) strtol(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--ryw"))           use_ryw = (int) strtol(argv[++i], NULL, 0);
 		else usage(argv[0]);
 	}
 	(void) nbuckets;			/* parsed for parity, not used */
-	if (nupdaters < 1 || updatespacing < 20)
+	if (nupdaters < 1 || updatespacing < 20 || movesper < 0)
 		usage(argv[0]);
-	if (movesper != 1) {
+	if (use_ryw < 0)
+		use_ryw = (movesper != 1);	/* auto: on for any batched commit */
+	if (movesper != 1 && !use_ryw) {
 		fprintf(stderr,
-		    "error: --movesper %d is unsupported; only 1 is correct for an\n"
-		    "  ordered structure.  Batching >1 skiplist edits per MCAS lets two\n"
-		    "  moves collide on a shared predecessor slot (independent _prepare\n"
-		    "  searches are blind to each other's pending edits); the engine\n"
-		    "  coalesces the same-slot records and silently drops one edge.  A\n"
-		    "  batch-aware composer is future work.\n", movesper);
+		    "error: --movesper %d with --ryw 0 is unsound.  Batching >1 ordered\n"
+		    "  edits per MCAS lets two moves collide on a shared predecessor slot:\n"
+		    "  each _prepare searches the COMMITTED structure, blind to the txn's\n"
+		    "  own pending edits, so the engine coalesces the same-slot records and\n"
+		    "  silently destroys one edge (a torn tower, then -EAGAIN forever).\n"
+		    "  Use --ryw 1 (the default at movesper != 1), or --movesper 1.\n",
+		    movesper);
 		exit(2);
 	}
 
@@ -543,5 +601,5 @@ int main(int argc, char **argv)
 		keys_per_thread = 3;
 
 	run();
-	return 0;
+	return g_lost_keys ? 1 : 0;	/* a corrupt run must not exit 0 */
 }
