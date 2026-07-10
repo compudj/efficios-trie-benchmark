@@ -64,7 +64,8 @@ SCALE_BENCHES := bench_scale_hotrowex bench_scale_masstree \
                  bench_scale_artolc bench_scale_artrowex
 
 .PHONY: all clean clean-urcu urcu check-urcu bind9 clean-bind9 \
-        urcu-txn check-urcu-txn check-urcu-txn-lib clean-urcu-txn
+        urcu-txn check-urcu-txn check-urcu-txn-lib clean-urcu-txn \
+        existence_3skiplist_uperf
 all: $(BENCHES) $(SCALE_BENCHES) bench_wormhole_gpl
 
 # HOT (Height Optimized Trie, third_party/hot, ISC): header-only C++14, compiled
@@ -443,6 +444,34 @@ bench_txn_3skiplist: src/bench_txn_3skiplist.c | check-urcu-txn-lib
 	$(CC) -O2 -pthread -o $@ src/bench_txn_3skiplist.o \
 	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-common -lpthread
+
+# ---------------------------------------------------------------------------
+# existence_3skiplist_uperf: the perfbook side of the ordered comparison.
+#
+# Built HERE rather than by perfbook's own Makefile because the comparison needs
+# -DSL_XORSHIFT_LEVEL: both skiplists must draw tower heights from the same
+# generator, or the figure is partly a plot of Park-Miller versus xorshift.  That
+# flag is not in perfbook/datastruct/existence/Makefile, and a plain `make` there
+# silently produces a binary the sweep must not use -- so the sweep script depends
+# on this target instead of on the binary's existence.
+#
+# Requires the seeding fix (perfbook: seed the per-thread PRNG ...): unseeded,
+# random_level() returns SL_MAX_LEVELS-1 forever and the "skiplist" is a sorted
+# linked list.  See scripts/run_txn_vs_existence_skiplist.sh.
+# ---------------------------------------------------------------------------
+EXISTENCE_DIR := perfbook/datastruct/existence
+existence_3skiplist_uperf: $(EXISTENCE_DIR)/existence_3skiplist_uperf.c \
+                           perfbook/datastruct/skiplist/skiplist.h
+	@# GCC_ARGS is invisible to make's timestamp check: a binary left behind by a
+	@# plain `make` in $(EXISTENCE_DIR) looks up to date but lacks the flag.  Force.
+	rm -f $(EXISTENCE_DIR)/existence_3skiplist_uperf
+	$(MAKE) -C $(EXISTENCE_DIR) existence_3skiplist_uperf \
+	  GCC_ARGS="-g -O3 -Wall -DSL_XORSHIFT_LEVEL"
+	@# Verify the flag took.  Probe the __thread state skiplist.h defines under it;
+	@# do NOT probe for 0x9e3779b97f4a7c15 -- existence_3skiplist_uperf.c seeds its
+	@# reader threads with the same golden-ratio constant, so that always matches.
+	@nm $(EXISTENCE_DIR)/existence_3skiplist_uperf | grep -q sl_rng_state \
+	  || { echo "ERROR: -DSL_XORSHIFT_LEVEL did not take"; exit 1; }
 
 clean-urcu-txn:
 	rm -rf "$(URCU_TXN_BUILD)"
