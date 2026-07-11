@@ -36,7 +36,7 @@ engines are within ~20% of each other at every core count, with no trend, and
 urcu-txn's 1->192 contention penalty is slightly SMALLER than existence's.
 
 Set that against the ORDERED structure (plot_txn_vs_existence_skiplist.py,
-`fixed` panel), where the same control puts txn ~1.4-1.85x behind existence
+`fixed` panel), where the same control puts txn ~1.3-1.8x behind existence
 from 1 core to 192 (with the expect_conflict knob that skips the doomed age-0
 attempt on the self-aliasing batched descent; ~2.2-2.3x without it).  That is
 the edges-per-mutation result: an hlist key-move transacts 3-5 pointers and the
