@@ -19,10 +19,10 @@ BEST=${BEST:-5}; DURATION=${DURATION:-800}
 CORES=${CORES:-"1 4 16 32 64 128 192"}
 BIN=$(mktemp)
 OUT=$HERE/disjoint_hash.csv
-# esc-smart: spinlatch + age-0 flat install + k=3/1024-bit filter compiled in.
-FLAGS="-DURCU_MCAS_NO_HELP -DURCU_MCAS_NO_STEAL -DURCU_TXN_BLOOM_K=3 \
--DURCU_TXN_BLOOM_WORDS=16 -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH"
-cc -O2 -pthread $FLAGS -I"$DEV/include" -I"$DEV/src" "$BENCH/src/bench_txn_3hash.c" \
+# The shipping default engine already IS this config (spinlatch install, age-0
+# flat install, k=3 / 1024-bit filter), so no engine -D flags are needed; only
+# the runtime --disjoint / --ryw variant below differs across the three curves.
+cc -O2 -pthread -I"$DEV/include" -I"$DEV/src" "$BENCH/src/bench_txn_3hash.c" \
 	-o "$BIN" -L"$DEV/src/.libs" -Wl,-rpath,"$DEV/src/.libs" \
 	-lurcu-qsbr -lurcu-cds -lurcu-common -lpthread
 trap 'rm -f "$BIN"' EXIT
