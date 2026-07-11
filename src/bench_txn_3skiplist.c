@@ -165,6 +165,13 @@ struct updater_attr {
 	long long nrotations;
 	long long ncommits;
 	long long naborts;
+#ifdef URCU_TXN_ESCALATION_STATS
+	long long esc_commits_true;	/* commits with >=1 real same-slot coincidence */
+	long long esc_commits_bloom;	/* commits the 64-bit bloom would escalate */
+	long long esc_raw_total;	/* sum of read-after-write hits */
+	long long esc_waw_total;	/* sum of write-after-write hits */
+	long long esc_bloom_total;	/* sum of bloom-would-escalate accesses */
+#endif
 };
 
 static void pin_cpu(int cpu)
@@ -208,7 +215,7 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 			struct urcu_txn_skiplist **dst_sl,
 			unsigned long *keys, struct snode **news,
 			struct urcu_txn_skiplist_node **rem, int cnt,
-			long long *naborts)
+			struct updater_attr *me)
 {
 	struct urcu_mcas_txn txn;
 	int i, prep, st;
@@ -255,11 +262,26 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 			continue;
 		}
 		st = urcu_txn_commit(&txn);
+#ifdef URCU_TXN_ESCALATION_STATS
+		if (st == URCU_TXN_STATUS_OK) {
+			unsigned int raw = urcu_txn_esc_raw(&txn);
+			unsigned int waw = urcu_txn_esc_waw(&txn);
+			unsigned int bl  = urcu_txn_esc_bloom(&txn);
+
+			me->esc_raw_total   += raw;
+			me->esc_waw_total   += waw;
+			me->esc_bloom_total += bl;
+			if (raw + waw > 0)
+				me->esc_commits_true++;
+			if (bl > 0)
+				me->esc_commits_bloom++;
+		}
+#endif
 		urcu_txn_end(&txn);
 		if (st == URCU_TXN_STATUS_OK)
 			return 0;
 		if (st == URCU_TXN_STATUS_ABORT) {	/* contention: retry */
-			(*naborts)++;
+			me->naborts++;
 			continue;
 		}
 		return -ENOMEM;				/* MEMORY_ERROR: too wide */
@@ -339,7 +361,7 @@ static void *updater(void *arg)
 				news[n]   = snode_alloc(e->key, e->val, lvl);
 			}
 			if (commit_moves(src_sl, dst_sl, keys, news, rem,
-						(int) n, &me->naborts)) {
+						(int) n, me)) {
 				fprintf(stderr,
 					"commit too wide at %ld moves; lower --movesper\n",
 					n);
@@ -490,10 +512,20 @@ static void run(void)
 		pthread_join(rtid[i], NULL);
 	rcu_barrier();		/* flush outstanding call_rcu reclamations */
 
+#ifdef URCU_TXN_ESCALATION_STATS
+	long long esc_ct = 0, esc_cb = 0, esc_r = 0, esc_w = 0, esc_b = 0;
+#endif
 	for (i = 0; i < nupdaters; i++) {
 		total_rot     += uat[i].nrotations;
 		total_commits += uat[i].ncommits;
 		total_aborts  += uat[i].naborts;
+#ifdef URCU_TXN_ESCALATION_STATS
+		esc_ct += uat[i].esc_commits_true;
+		esc_cb += uat[i].esc_commits_bloom;
+		esc_r  += uat[i].esc_raw_total;
+		esc_w  += uat[i].esc_waw_total;
+		esc_b  += uat[i].esc_bloom_total;
+#endif
 	}
 	for (i = 0; i < nreaders; i++) {
 		total_q    += rat[i].nqueries;
@@ -518,6 +550,24 @@ static void run(void)
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
 	       nupdaters, total_rot, total_moves, mmoves_s, ns_per_move,
 	       total_commits, total_aborts);
+#ifdef URCU_TXN_ESCALATION_STATS
+	/*
+	 * age-0/age-1 study: a commit "escalates" if any read or write inside it
+	 * lands on a slot the same txn already recorded.  'true' counts the real
+	 * same-slot coincidences (the FP-free lower bound, = the fundamental RYW
+	 * rate); 'bloom' is what the 64-bit filter would actually trip, real hits
+	 * plus false positives.  Low true-rate => age-0 fast path pays off.
+	 */
+	printf("ESCAL   commits: %lld  escalate-true: %lld (%.1f%%)  "
+	       "escalate-bloom64: %lld (%.1f%%)  |  per-commit hits: raw %.2f  "
+	       "waw %.2f  bloom %.2f\n",
+	       total_commits,
+	       esc_ct, total_commits ? 100.0 * (double) esc_ct / (double) total_commits : 0.0,
+	       esc_cb, total_commits ? 100.0 * (double) esc_cb / (double) total_commits : 0.0,
+	       total_commits ? (double) esc_r / (double) total_commits : 0.0,
+	       total_commits ? (double) esc_w / (double) total_commits : 0.0,
+	       total_commits ? (double) esc_b / (double) total_commits : 0.0);
+#endif
 	if (nreaders) {
 		double mq_s = secs > 0 ? (double) total_q / secs / 1e6 : 0.0;
 		double hitpct = total_q ?

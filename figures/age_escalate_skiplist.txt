@@ -1,0 +1,67 @@
+Age-0/age-1 optimistic RYW escalation vs baseline -- urcu-txn 3-skiplist
+2x96-core EPYC (384 hwthreads), jemalloc, --ryw 1, best-of-2 @ 800 ms.
+
+THE SCHEME
+  First attempt (retry==0, "age 0"): maintain the Bloom filter but NEVER call
+  find.  A load/store whose slot is already in the filter (RAW/WAW, true or a
+  false positive) sets esc_pending and reads optimistically (possibly stale);
+  esc_pending forces commit to ABORT and re-run at "age 1+", where the baseline
+  Bloom+find path resolves RYW correctly.  An age-0 attempt with NO coincidence
+  is a normal baseline commit.
+  Engine flag: -DURCU_TXN_AGE_ESCALATE.  Filter: -DURCU_TXN_BLOOM_K (# hash bits,
+  double-hashed for k>1) x -DURCU_TXN_BLOOM_WORDS (64 bits each).
+
+FILTERS COMPARED
+  esc-dumb  = 64-bit,   k=1  (the committed default filter)
+  esc-smart = 1024-bit, k=3  (double-hashed, two independent avalanche hashes)
+
+THROUGHPUT (Mmoves/s) and ratio to baseline
+=========================================================================
+BATCHED  (movesper 3, spacing 64)  -- 100% GENUINE RYW at every dataset size
+  cores   baseline   esc-dumb  (x)      esc-smart (x)
+      1      1.560     1.011  0.65        0.951  0.61
+      4      3.681     2.726  0.74        2.644  0.72
+     16      8.346     6.605  0.79        6.593  0.79
+     64     20.834    17.390  0.83       16.827  0.81
+    128     26.842    22.071  0.82       22.349  0.83
+    192     29.640    23.956  0.81       24.204  0.82
+  -> esc loses 17-39%.  The smart filter does NOT help (even hurts a hair):
+     there is no false positive to remove -- the RYW is genuine, so every
+     commit escalates no matter how good the filter is.
+
+SPARSE  (movesper 1, spacing 4096)  -- 0% GENUINE RYW; RYW forced on
+  cores   baseline   esc-dumb  (x)      esc-smart (x)
+      1      1.589     1.116  0.70        1.421  0.89
+      4      4.850     3.388  0.70        4.417  0.91
+     16     11.982     7.764  0.65       11.253  0.94
+     64     19.838    12.206  0.62       19.364  0.98
+    128     21.161    12.782  0.60       20.573  0.97
+    192     22.605    13.740  0.61       22.030  0.97
+  -> dumb filter loses 30-40% (all Bloom false positives).  Smart filter
+     recovers to 0.89-0.98x -- a near-tie at scale, but NEVER a win.
+
+ESCALATION RATE (aborts/commits, single updater, no contention aborts)
+  BATCHED mp3:  ~100% (per commit: raw 9.2 + waw 5.2 recorded-slot coincidences)
+                and it is 100.0% at spacing 64, 512, 4096, 16384 -- SIZE-INVARIANT
+                (adjacent-key batching always shares a predecessor slot).
+  SPARSE  mp1:  genuine RYW = 0.0% (measured); the whole rate is filter FP:
+                64-bit k=1   -> 80.7% escalate
+                256-bit k=3  ->  2.9% escalate
+                1024-bit k=3 ->  0.10% escalate
+
+WHY IT NEVER WINS
+  The age-0 fast path's only saving is skipping find.  But find is cheap exactly
+  when the write-set is small (sparse: 2-6 records -> find is a handful of
+  compares), and expensive only when the write-set is large (batched, the 30%
+  self-time in the perf profile).  Large write-sets are precisely where genuine
+  RYW is ~100%, which forces escalation regardless.  So the saving is never
+  available where it would matter: sparse = find already free (tie at best, and
+  only with an expensive wide k=3 filter whose hashing costs ~ the find it
+  avoids); batched = escalation forced by real RYW (strict loss).
+
+CORRECTNESS
+  bench conservation check passes at every core count / width / filter.
+  tests/unit/test_rcu_txn_skiplist_ryw: 12/12 default and with the smart filter
+  alone (the multi-hash filter is a pure accelerator).  Under AGE_ESCALATE the
+  age-0 whitebox chaining test (#3) fails BY DESIGN -- age 0 returns the stale
+  read and escalates instead of chaining; the age-1 retry commits correctly.
