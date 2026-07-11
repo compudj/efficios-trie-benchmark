@@ -1,67 +1,77 @@
 Age-0/age-1 optimistic RYW escalation vs baseline -- urcu-txn 3-skiplist
 2x96-core EPYC (384 hwthreads), jemalloc, --ryw 1, best-of-2 @ 800 ms.
+ALL curves on the CURRENT engine: the spinlatch install (-DURCU_MCAS_NO_HELP
+-DURCU_MCAS_NO_STEAL), which drops the decide/settle CAS to a release store and is
+~25% faster than the stock help/steal engine on this workload.  (An earlier version
+of this figure was on the slow default engine; regenerated on the spinlatch.)
 
 THE SCHEME
   First attempt (retry==0, "age 0"): maintain the Bloom filter but NEVER call
-  find.  A load/store whose slot is already in the filter (RAW/WAW, true or a
-  false positive) sets esc_pending and reads optimistically (possibly stale);
+  find, and at commit SKIP the record sort and install with a try-latch (fail
+  fast on a foreign proxy).  A load/store whose slot is already in the filter
+  (RAW/WAW, true or a false positive) sets esc_pending and reads optimistically;
   esc_pending forces commit to ABORT and re-run at "age 1+", where the baseline
-  Bloom+find path resolves RYW correctly.  An age-0 attempt with NO coincidence
-  is a normal baseline commit.
-  Engine flag: -DURCU_TXN_AGE_ESCALATE.  Filter: -DURCU_TXN_BLOOM_K (# hash bits,
-  double-hashed for k>1) x -DURCU_TXN_BLOOM_WORDS (64 bits each).
+  Bloom+find+sort path resolves RYW correctly.  An age-0 attempt with NO
+  coincidence installs directly.
+  Engine flags: -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH.  Filter:
+  -DURCU_TXN_BLOOM_K (# hash bits) x -DURCU_TXN_BLOOM_WORDS (64 bits each).
 
 FILTERS COMPARED
   esc-dumb  = 64-bit,   k=1  (the committed default filter)
   esc-smart = 1024-bit, k=3  (double-hashed, two independent avalanche hashes)
 
+THE DETERMINANT IS WRITE-SET DISJOINTNESS
+  The two panels bracket it.  BATCHED forces genuine RYW (adjacency); SPARSE is
+  disjoint.  Age 0's saving -- skip find, skip sort, try-latch install -- is only
+  available when the attempt does NOT hit a genuine same-slot coincidence, i.e.
+  when the write-set is disjoint.
+
 THROUGHPUT (Mmoves/s) and ratio to baseline
 =========================================================================
-BATCHED  (movesper 3, spacing 64)  -- 100% GENUINE RYW at every dataset size
+BATCHED  (movesper 3, spacing 64)  -- adjacency-forced ~100% GENUINE RYW
   cores   baseline   esc-dumb  (x)      esc-smart (x)
-      1      1.560     1.011  0.65        0.951  0.61
-      4      3.681     2.726  0.74        2.644  0.72
-     16      8.346     6.605  0.79        6.593  0.79
-     64     20.834    17.390  0.83       16.827  0.81
-    128     26.842    22.071  0.82       22.349  0.83
-    192     29.640    23.956  0.81       24.204  0.82
-  -> esc loses 17-39%.  The smart filter does NOT help (even hurts a hair):
-     there is no false positive to remove -- the RYW is genuine, so every
-     commit escalates no matter how good the filter is.
+      1      1.605     1.007  0.63        1.022  0.64
+      4      4.144     2.962  0.71        3.038  0.73
+     16     10.338     8.049  0.78        8.347  0.81
+     64     27.144    21.007  0.77       22.096  0.81
+    128     33.707    27.363  0.81       27.853  0.83
+    192     36.503    29.570  0.81       30.609  0.84
+  -> LOSES 16-37%.  Genuine RYW is ~100% at every dataset size, so age 0
+     pre-aborts in the descent before install ever runs -- the try-latch never
+     fires and the filter cannot help (the coincidences are real, not FPs).
 
-SPARSE  (movesper 1, spacing 4096)  -- 0% GENUINE RYW; RYW forced on
+SPARSE  (movesper 1, spacing 4096)  -- disjoint, ~0% GENUINE RYW; RYW forced on
   cores   baseline   esc-dumb  (x)      esc-smart (x)
-      1      1.589     1.116  0.70        1.421  0.89
-      4      4.850     3.388  0.70        4.417  0.91
-     16     11.982     7.764  0.65       11.253  0.94
-     64     19.838    12.206  0.62       19.364  0.98
-    128     21.161    12.782  0.60       20.573  0.97
-    192     22.605    13.740  0.61       22.030  0.97
-  -> dumb filter loses 30-40% (all Bloom false positives).  Smart filter
-     recovers to 0.89-0.98x -- a near-tie at scale, but NEVER a win.
+      1      1.666     1.141  0.69        1.763  1.06
+      4      4.998     3.444  0.69        5.273  1.06
+     16     12.456     8.075  0.65       13.144  1.06
+     64     20.761    12.771  0.62       21.549  1.04
+    128     22.101    13.430  0.61       22.670  1.03
+    192     23.497    14.357  0.61       24.042  1.02
+  -> esc-smart WINS 1-6% (best-of-3 confirms: 1.061x@1 -> 1.014x@192, decaying
+     with contention as install collisions return).  This is the SAME regime as
+     the disjoint 3-hash (see age_escalate_hash): a disjoint write-set lets age 0
+     reach install and skip the sort + blocking install.  esc-dumb LOSES 30-40%:
+     the k=1 filter false-positives on ~80% of commits (contiguous tower-slot
+     addresses collide in one 64-bit word) and escalates them.
 
-ESCALATION RATE (aborts/commits, single updater, no contention aborts)
-  BATCHED mp3:  ~100% (per commit: raw 9.2 + waw 5.2 recorded-slot coincidences)
-                and it is 100.0% at spacing 64, 512, 4096, 16384 -- SIZE-INVARIANT
-                (adjacent-key batching always shares a predecessor slot).
-  SPARSE  mp1:  genuine RYW = 0.0% (measured); the whole rate is filter FP:
-                64-bit k=1   -> 80.7% escalate
-                256-bit k=3  ->  2.9% escalate
-                1024-bit k=3 ->  0.10% escalate
+ESCALATION RATE (single updater, no contention aborts)
+  BATCHED mp3:  ~100% (per commit: raw 9.2 + waw 5.2 recorded-slot coincidences),
+                SIZE-INVARIANT -- adjacent-key batching always shares a slot.
+  SPARSE  mp1:  genuine RYW = 0%; the rate is all filter FP:
+                64-bit k=1   -> 80.7% escalate  (esc-dumb loses)
+                1024-bit k=3 ->  0.10% escalate  (esc-smart wins)
 
-WHY IT NEVER WINS
-  The age-0 fast path's only saving is skipping find.  But find is cheap exactly
-  when the write-set is small (sparse: 2-6 records -> find is a handful of
-  compares), and expensive only when the write-set is large (batched, the 30%
-  self-time in the perf profile).  Large write-sets are precisely where genuine
-  RYW is ~100%, which forces escalation regardless.  So the saving is never
-  available where it would matter: sparse = find already free (tie at best, and
-  only with an expensive wide k=3 filter whose hashing costs ~ the find it
-  avoids); batched = escalation forced by real RYW (strict loss).
+THE UNIFIED PICTURE
+  The scheme is NOT "always loses on the skiplist."  It wins on a DISJOINT
+  skiplist and loses only where adjacency FORCES genuine RYW.  Disjoint + good
+  filter -> age 0 reaches install, wins (sparse skiplist AND 3-hash).  Genuine
+  RYW -> age 0 pre-aborts, loses (batched skiplist).  The filter must be good
+  either way: a false positive escalates exactly like a real coincidence.
 
 CORRECTNESS
   bench conservation check passes at every core count / width / filter.
   tests/unit/test_rcu_txn_skiplist_ryw: 12/12 default and with the smart filter
-  alone (the multi-hash filter is a pure accelerator).  Under AGE_ESCALATE the
-  age-0 whitebox chaining test (#3) fails BY DESIGN -- age 0 returns the stale
-  read and escalates instead of chaining; the age-1 retry commits correctly.
+  alone.  Under AGE_ESCALATE the age-0 whitebox chaining test (#3) fails BY
+  DESIGN -- age 0 returns the stale read and escalates instead of chaining; the
+  age-1 retry commits correctly.

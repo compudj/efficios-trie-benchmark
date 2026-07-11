@@ -1,0 +1,56 @@
+Age-0/age-1 optimistic RYW escalation vs baseline -- urcu-txn 3-hash (POSITIVE half)
+2x96-core EPYC (384 hwthreads), jemalloc, --ryw 1, best-of-3 @ 800 ms.
+ALL curves on the CURRENT engine: the spinlatch install (-DURCU_MCAS_NO_HELP
+-DURCU_MCAS_NO_STEAL), decide/settle CAS -> release store.
+
+THE WORKLOAD (disjoint)
+  --nbuckets 16384 --updatespacing 512 --movesper 8, RYW FORCED ON (--ryw 1).
+  8 consecutive keys hit 8 DISTINCT buckets (chunk 8 < nbuckets 16384), so a
+  commit's write-set is disjoint and genuine read-your-own-writes is ~0.  RYW is
+  forced on so the escalation path is exercised; every escalation is therefore a
+  Bloom FALSE POSITIVE, not a real coincidence.  This is the mirror image of the
+  batched 3-skiplist (adjacency-forced ~100% genuine RYW) and the same regime as
+  the SPARSE 3-skiplist -- see age_escalate_skiplist.
+
+THE SCHEME
+  Age 0 (retry==0): skip the write-set find, skip the record sort, install with a
+  try-latch (fail fast on a foreign proxy).  A Bloom coincidence sets esc_pending
+  -> commit ABORTS -> re-run at age 1+ (Bloom+find+sort).  On a disjoint write-set
+  with a good filter, age 0 almost never escalates, so it reaches install and pays
+  neither the sort nor the blocking install.
+  Flags: -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH; filter -DURCU_TXN_BLOOM_K
+  x -DURCU_TXN_BLOOM_WORDS.  esc-dumb = 64-bit k=1; esc-smart = 1024-bit k=3.
+
+THROUGHPUT (Mmoves/s) and ratio to baseline
+=========================================================================
+  cores   baseline   esc-dumb  (x)      esc-smart (x)   esc-smart escalations
+      1      7.364     5.924  0.80        7.717  1.05          2,000  (0.03%)
+      4     27.253    22.547  0.83       27.887  1.02          7,500
+     16     99.601    82.630  0.83      105.035  1.05         44,098  (0.4%)
+     32    191.076   161.426  0.84      201.769  1.06         63,957
+     64    214.978   167.104  0.78      204.859  0.95      1,471,971  (7%)
+    128    196.290   173.984  0.89      192.728  0.98      2,849,328
+    192    257.901   224.456  0.87      253.281  0.98      2,882,292  (11%)
+
+  -> esc-smart WINS 1.02-1.06x at 1-32 cores (peak 1.056x @32), then fades to
+     ~0.98x parity at 64-192.  The escalation count is the story: near zero
+     (0.03-0.4%) while age 0 almost always commits, then jumping ~20x across the
+     32->64 boundary as cross-socket install collisions make age 0 fail-fast and
+     escalate -- which erodes the win to parity but never turns it into a loss.
+  -> esc-dumb LOSES 0.78-0.89x EVERYWHERE.  The k=1 64-bit filter false-positives
+     on contiguous calloc'd bucket-head addresses (~all commits collide in one
+     word), so it escalates almost everything -- the filter, not the mechanism, is
+     what sinks it.  The good filter is load-bearing.
+
+WHY IT WINS HERE AND NOT ON THE BATCHED SKIPLIST
+  The only precondition age 0 needs is a DISJOINT write-set so it reaches install
+  without hitting a genuine coincidence.  The hash (and the sparse skiplist)
+  provide it; the batched skiplist (adjacency) does not, so there age 0 pre-aborts
+  and loses.  Given disjointness, the win is bounded by (a) the filter quality
+  (k=1 escalates on FPs -> loses; k=3 -> wins) and (b) contention (install
+  collisions at high core counts reintroduce escalation).
+
+CORRECTNESS
+  bench conservation check passes at every core count / filter.  The disjoint
+  workload never aliases a bucket, so RYW is not needed for correctness here
+  (--ryw 1 is forced only to exercise the escalation path).

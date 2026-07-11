@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+Positive half of the age-0/age-1 optimistic RYW escalation study, on the DISJOINT
+urcu-txn 3-hash workload (the opposite of the adjacency-forced 3-skiplist).
+
+All curves run on the current engine -- the spinlatch install (NO_HELP + NO_STEAL,
+decide/settle CAS -> release store).  The write-set is disjoint (8 consecutive
+keys hit 8 distinct buckets), so genuine read-your-own-writes is ~0 and every
+escalation is a Bloom false positive:
+  - esc-dumb  (64-bit k=1) trips on ~all commits -- contiguous calloc'd bucket-head
+    addresses collide in a single-bit filter -- so it escalates everything and loses.
+  - esc-smart (1024-bit k=3) drives false positives toward zero, so age 0 almost
+    always reaches install and skips the ~O(nr) record sort + blocking install.
+
+Left: absolute throughput.  Right: ratio to baseline, where the small effect is
+legible -- age 0 wins at low-moderate contention (install collisions rare) and
+fades to parity as core count rises (fail-fast escalations return).
+"""
+import csv, os
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSV = os.environ.get("CSV", os.path.join(HERE, "age_escalate_hash.csv"))
+OUT = os.environ.get("OUT", os.path.join(HERE, "..", "figures",
+                                         "age_escalate_hash.png"))
+
+COLOR = {"baseline": "#0072B2", "esc-dumb": "#D55E00", "esc-smart": "#009E73"}
+MARKER = {"baseline": "o", "esc-dumb": "v", "esc-smart": "^"}
+LABEL = {
+    "baseline":  "baseline RYW (Bloom+find every load)",
+    "esc-dumb":  "age-0 escalate, 64-bit k=1 filter",
+    "esc-smart": "age-0 escalate, 1024-bit k=3 filter",
+}
+rows = list(csv.DictReader(open(CSV)))
+
+
+def series(eng):
+    acc = {int(r["cores"]): float(r["mmoves_s"]) for r in rows
+           if r["engine"] == eng and float(r["mmoves_s"]) > 0}
+    xs = sorted(acc)
+    return xs, [acc[x] for x in xs]
+
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+base = dict(zip(*series("baseline")))
+
+for eng in ("baseline", "esc-dumb", "esc-smart"):
+    xs, ys = series(eng)
+    ax1.plot(xs, ys, color=COLOR[eng], marker=MARKER[eng], lw=1.9, ms=6,
+             label=LABEL[eng], alpha=0.92)
+    if eng != "baseline":
+        ax2.plot(xs, [ys[i] / base[xs[i]] for i in range(len(xs))],
+                 color=COLOR[eng], marker=MARKER[eng], lw=1.9, ms=6,
+                 label=LABEL[eng], alpha=0.92)
+
+ax1.set_ylabel("Mmoves/s   (higher is better)")
+ax1.set_title("throughput", fontsize=10)
+ax2.axhline(1.0, color="#0072B2", lw=1.0, ls="--", alpha=0.7)
+ax2.set_ylabel("ratio to baseline   (>1 = age-0 wins)")
+ax2.set_title("age-0 escalate ÷ baseline", fontsize=10)
+for ax in (ax1, ax2):
+    ax.set_xscale("log", base=2)
+    xt = sorted({int(r["cores"]) for r in rows})
+    ax.set_xticks(xt)
+    ax.set_xticklabels(xt)
+    ax.set_xlabel("updater cores")
+    ax.grid(alpha=0.3, ls=":")
+    ax.legend(fontsize=8, loc="best")
+
+fig.suptitle("Age-0/age-1 optimistic RYW escalation on the disjoint urcu-txn 3-hash "
+             "(2×96-core EPYC, spinlatch engine, jemalloc)\n"
+             "disjoint write-set: age 0 skips the record sort + blocking install and "
+             "wins at low contention — but only with a filter (k=3) whose false "
+             "positives don't force escalation anyway",
+             fontsize=11)
+fig.tight_layout(rect=[0, 0, 1, 0.92])
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+fig.savefig(OUT, dpi=140)
+print("wrote", OUT)

@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
 Age-0/age-1 optimistic RYW escalation vs the baseline RYW path, on the urcu-txn
-3-skiplist.  The age-0 fast path skips the write-set find and, on any Bloom
-coincidence, ESCALATES (aborts, re-runs at age 1 with full Bloom+find).
+3-skiplist, all curves on the current spinlatch engine (NO_HELP + NO_STEAL).  The
+age-0 fast path skips the write-set find and the record sort and, on any Bloom
+coincidence, ESCALATES (aborts, re-runs at age 1 with full Bloom+find+sort).
 
-Two regimes:
-  - BATCHED  (movesper 3): every commit has genuine read-your-own-writes
-    (adjacent keys share a predecessor) -> escalation is forced on ~100% of
-    commits regardless of dataset size or filter quality.
-  - SPARSE   (movesper 1, RYW forced on): zero genuine RYW; every escalation is
-    a Bloom false positive.  A dumb 64-bit k=1 filter escalates ~80% of commits;
-    a 1024-bit k=3 double-hashed filter escalates ~0.1%.
+The determinant is write-set DISJOINTNESS, and the two panels bracket it:
+  - BATCHED (movesper 3): adjacent keys share a predecessor, so every commit has
+    genuine read-your-own-writes -> age 0 pre-aborts in the descent on ~100% of
+    commits, regardless of dataset size or filter quality.  It LOSES 16-37%.
+  - SPARSE (movesper 1, RYW forced on): the write-set is disjoint, genuine RYW is
+    ~0, so with a good filter age 0 almost never escalates -- it reaches install
+    and skips the sort + blocking install.  It WINS 1-6% with the k=3 filter; the
+    k=1 filter false-positives on ~80% of commits and loses 30-40%.
 
-Conclusion the figure shows: the scheme never beats baseline.  Batched loses
-17-39% (genuine RYW).  Sparse loses 30-40% with the dumb filter and, with the
-smart filter, only reaches PARITY -- because find is cheap exactly when the
-write-set is small (sparse), so skipping it saves nothing; find is expensive
-only for large write-sets (batched), which is where genuine RYW forces
-escalation anyway.
+So the scheme is not "always loses on the skiplist": on a DISJOINT skiplist it
+wins, exactly as it does on the disjoint 3-hash (see age_escalate_hash).  It
+loses only where adjacency FORCES genuine RYW.  The filter must be good either
+way -- a false positive escalates just like a real coincidence.
 """
 import csv, os
 from collections import defaultdict
@@ -53,12 +53,12 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
 panels = [
     (ax1, "batched",
-     "BATCHED  (movesper 3, dense)  —  100% genuine RYW\n"
-     "every commit escalates; the filter cannot help",
+     "BATCHED  (movesper 3)  —  adjacency-forced ~100% genuine RYW\n"
+     "age 0 pre-aborts in the descent; loses regardless of filter",
      [1, 4, 16, 64, 128, 192]),
     (ax2, "sparse",
-     "SPARSE  (movesper 1, 4096-spacing)  —  0% genuine RYW\n"
-     "all escalation is Bloom false-positive; smart filter recovers to parity",
+     "SPARSE  (movesper 1, disjoint)  —  ~0% genuine RYW\n"
+     "age 0 reaches install; k=3 filter WINS, k=1 false-positives and loses",
      [1, 4, 16, 64, 128, 192]),
 ]
 
@@ -97,9 +97,9 @@ ax1.annotate("escalation rate (nu=1):\n"
              bbox=dict(boxstyle="round", fc="#f4f4f4", ec="#cccccc"))
 
 fig.suptitle("Age-0/age-1 optimistic RYW escalation vs baseline — urcu-txn 3-skiplist "
-             "(2×96-core EPYC, jemalloc)\n"
-             "the fast path never wins: it skips find, but find is cheap where "
-             "the write-set is small and dear only where genuine RYW forces escalation",
+             "(2×96-core EPYC, spinlatch engine, jemalloc)\n"
+             "write-set disjointness decides it: age 0 wins on the disjoint (sparse) "
+             "skiplist and loses where adjacency forces genuine RYW (batched)",
              fontsize=11)
 fig.tight_layout(rect=[0, 0, 1, 0.93])
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
