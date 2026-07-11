@@ -1133,22 +1133,22 @@ writeback, how RLU is meant to run) and **sync** (`BENCH_RLU_WS=1`, writeback ev
 section, the floor). Best-of-2, `DURATION_SEC=3`, jemalloc `percpu_arena:percpu` for
 both schemes, 0 coherence violations throughout.
 
-![RLU vs txn (MCAS) across three workloads: disjoint writes (txn ~12× RLU-defer at
-192), random-access writes on a hot 64-slot index (RLU wins the lowest writer counts, txn
-owns the mid-range, both converge at the full box), and hash-of-lists (txn ~1.7×
-RLU-defer)](figures/rlu_vs_txn.png)
+![RLU vs txn (MCAS) across three workloads: disjoint writes (txn ~14× RLU-defer at
+192), random-access writes on a hot 64-slot index (RLU wins only the single lowest
+writer count, txn leads ~5× across the whole contended range), and hash-of-lists
+(txn ~1.8× RLU-defer)](figures/rlu_vs_txn.png)
 
 **Disjoint churn** — each writer owns a strided set of slots so writers almost
 never collide (`LIST_SIZE=4096`, `CHURN=3072`, jemalloc, write Mops/s):
 
 | writers      |   1 |  8 | 32 | 64 | 128 |     192 |
 |--------------|----:|---:|---:|---:|----:|--------:|
-| `txn_list`   | 7.2 | 32 | 70 | 105 | 123 | **186** |
-| RLU-defer    |  15 | 34 | 24 |  26 |  19 |      16 |
-| RLU-sync     |  18 | 10 | 7.6| 9.0| 8.2 |     7.9 |
+| `txn_list`   | 8.5 | 40 | 76 | 118 | 138 | **222** |
+| RLU-defer    |  15 | 34 | 23 |  26 |  20 |      16 |
+| RLU-sync     |  18 | 10 | 7.6| 9.0| 8.3 |     7.9 |
 
 RLU wins at 1 writer (its per-thread write-log + batched writeback is cheap
-uncontended), but `txn_list` overtakes by ~16 writers and reaches **~12× RLU** at the
+uncontended), but `txn_list` overtakes by ~16 writers and reaches **~14× RLU** at the
 full box: disjoint slots never escalate, so every MCAS commit runs in parallel,
 while RLU's global write-clock serializes commit ordering.
 
@@ -1157,16 +1157,18 @@ while RLU's global write-clock serializes commit ordering.
 
 | writers      |    1 |    8 |  16 |  32 |  64 |  192 |
 |--------------|-----:|-----:|----:|----:|----:|-----:|
-| `txn_list`   |  4.1 | 17.2 | 15.4| 15.8| 7.2 | 1.6  |
-| RLU-defer    | 12.1 | 12.3 | 5.6 | 4.4 | 3.2 | 1.3  |
-| RLU-sync     | 12.7 |  9.5 | 5.3 | 4.7 | 3.5 | 1.3  |
+| `txn_list`   |  4.4 | 19.8 | 13.2| 14.8| 16.0| 7.3  |
+| RLU-defer    | 11.9 | 12.3 | 5.5 | 4.4 | 3.2 | 1.3  |
+| RLU-sync     | 12.7 |  9.5 | 5.2 | 4.6 | 3.4 | 1.3  |
 
-Under real contention the two trade places: RLU owns the lowest writer counts,
-`txn_list` takes over by ~8 and owns the mid-range (16–32, ~2.7–3.6× RLU-defer — which
-falls off after 8 writers), and they converge at the high end (~1.3–1.6 Mops, within ~20 %). Both degrade
-**gracefully**; the `txn_list` cliff of the previous section appears only under the
-former escalation default (`URCU_TXN_FALLBACK=64`) — at the current `256` it tracks
-RLU.
+Under real contention RLU owns only the single lowest writer count (12 vs 4.4 @1);
+`txn_list` takes over by ~8 and now owns the **entire** contended range above it — 16
+Mops @64 and 7.3 @192 against RLU's ~3.2 and ~1.3, a steady **~5× lead** that no longer
+converges. The `txn_list` cliff of earlier drafts — a collapse to ~1.6 Mops @192 under
+the former escalation default (`URCU_TXN_FALLBACK=64`) — is gone: the escalation-funnel
+fix (only the initiating writer republishes the domain, so one size-escalation no
+longer captures the whole domain) plus the shipping install config keep every disjoint
+commit on the parallel MCAS path.
 
 **Hash-of-lists** — RLU's native showcase, now with `txn_hlist` on the same
 **singly-linked** structure as RLU (the 8-byte hlist head — see § *Dataset size*); one
@@ -1174,14 +1176,14 @@ shared escalation domain for the whole table (write Mops/s):
 
 | writers      |   1 |   8 | 32 | 64 | 128 |    192 |
 |--------------|----:|----:|---:|---:|----:|-------:|
-| `txn_hlist`  | 0.9 | 6.7 | 11 | 17 |  23 | **29** |
-| RLU-defer    | 1.3 | 9.1 | 11 | 15 |  16 |     17 |
-| RLU-sync     | 1.3 | 4.6 | 4.4| 5.6| 6.3 |    6.3 |
+| `txn_hlist`  | 1.0 | 7.0 | 12 | 17 |  24 | **30** |
+| RLU-defer    | 1.3 | 9.1 | 11 | 15 |  17 |     16 |
+| RLU-sync     | 1.3 | 4.6 | 4.4| 5.7| 6.3 |    6.4 |
 
-Even on RLU's home turf `txn_hlist` scales to **~1.7× RLU-defer** at 192 writers
+Even on RLU's home turf `txn_hlist` scales to **~1.8× RLU-defer** at 192 writers
 (at 1000 buckets writers rarely land on the same chain, so commits stay on the parallel
 optimistic MCAS path and the single shared domain's fair lane is seldom entered); RLU-defer
-plateaus ~17 and RLU-sync ~6.3.
+plateaus ~16 and RLU-sync ~6.4.
 
 **Reads: near-parity on a tiny list, txn ahead on a real one.** On the 1 000-node
 list read throughput is within ~15 % across all four (Mvisits/s @191 readers:
@@ -1495,8 +1497,8 @@ cross-structure commits — isn't even exercised here. (Regenerate:
   the cliff becomes graceful degradation, and write latency improves at every
   percentile through p99.9.
 - Against reference **RLU**: RLU wins uncontended / at very low writer counts (its
-  batched writeback), but `txn_list` **scales past it with writers** — ~12× on
-  disjoint churn, ~18× on a 10k-node/2%-update write sweep, ~1.7× on the hash — and
+  batched writeback), but `txn_list` **scales past it with writers** — ~14× on
+  disjoint churn, ~18× on a 10k-node/2%-update write sweep, ~1.8× on the hash — and
   on a representative (non-tiny) list its **reads also lead ~1.6–1.8×** (RLU pays a
   per-node validation the tiny-list microbench hid). RLU stays competitive only in
   the low-writer / read-mostly-on-tiny-structures corner.
@@ -1562,60 +1564,72 @@ the read side does not allocate, so it is allocator-neutral.
 ```sh
 make urcu-txn && make bench_txn_3hash
 make -C perfbook/datastruct/existence existence_3hash_uperf
-ALLOCS=glibc    MODES="update read" RUNS=5 scripts/run_txn_vs_existence_scale.sh
-ALLOCS=jemalloc MODES="update"      RUNS=5 APPEND=1 scripts/run_txn_vs_existence_scale.sh
-python3 scripts/plot_txn_vs_existence_scale.py   # -> figures/txn_vs_existence_scale.png
+scripts/run_txn_vs_existence_scale.sh             # four panels: grow / fixed / size / read
+python3 scripts/plot_txn_vs_existence_scale.py    # -> figures/txn_vs_existence_scale.png
 ```
 
-![urcu-txn vs. existence scaling: under glibc malloc existence's atomic-move
-throughput peaks ~120 M/s at 96 cores and declines while urcu-txn reaches
-~327 M at 128 (a 3.4× gap); under jemalloc both scale far better — existence to
-~410 M and urcu-txn to ~590 M at 128, converging to ~1.07× at 192 — showing the
-glibc gap was mostly allocator arena contention; reads scale near-linearly to
-~3 G queries/s for both](figures/txn_vs_existence_scale.png)
+![urcu-txn vs. existence, four panels. (1) Growing problem (keys/table = 5×cores):
+both climb together to ~560 M key-moves/s — but the structure grows 192× along the
+axis, so this is not a scaling curve. (2) Fixed problem (960 keys/table, commit width
+matched at 3): under jemalloc the two engines track within ~10% at every core count
+(ns/key-move), while the dotted glibc control shows existence's per-rotation allocation
+blowing up to 3000 ns as urcu-txn holds ~810. (3) Size dependence at 192 cores (load
+factor 0.25): flat ~parity across a 16× size range (txn ÷ existence ≈ 0.97×). (4) Reads:
+urcu-txn's tax-free single-cacheline traversal leads ~1.3× at every reader count to
+~7.6 G queries/s](figures/txn_vs_existence_scale.png)
 
-**Update side — most of the gap is a glibc allocator artifact.** Under glibc
-malloc the two tie at one core, then diverge hard: existence's throughput peaks
-at ~120 M key-moves/s around 96 cores and **declines** past the socket boundary,
-while urcu-txn climbs to ~327 M — a **3.4× gap at 192**. But existence allocates
-a group + three 192 B nodes *per rotation*, and that traffic collides on glibc's
-arena locks. Switch both to jemalloc and existence is rescued — it scales to
-~410 M at 128 cores (4× its glibc self) — and urcu-txn's lead collapses to a
-modest, node-footprint-driven margin:
+**Update side — at equal structure and equal width, the commit is a tie.** The
+earlier draft compared a *growing* problem (keys/table = 5×cores, so the structure
+grows 192× along the x-axis) under *glibc*, and reported urcu-txn ~3.4× ahead at 192.
+Two corrections dissolve that gap. First, hold the problem **fixed** — 960 keys/table
+at every core count, so the load factor is constant — and match the commit **width** (an
+existence flip moves a whole group, so pit it against a matched 3-key-move urcu-txn
+transaction rather than a 1-key move). Second, use a **per-CPU allocator** (jemalloc),
+because existence allocates a group + three 192 B nodes *per rotation*. With all three,
+the two engines track within ~10% at every core count (ns/key-move, lower is better;
+`ex ÷ txn` > 1 means urcu-txn is faster):
 
-| updater cores | glibc: txn | glibc: existence | glibc ratio | jemalloc: txn | jemalloc: existence | jemalloc ratio |
-|---|---:|---:|---:|---:|---:|---:|
-| 1   | 7.4  | 7.5  | 0.98× | 7.0  | **9.5** | 0.74× |
-| 16  | 95   | 62   | 1.55× | 97   | 80  | 1.20× |
-| 32  | 170  | 87   | 1.95× | 190  | 143 | 1.33× |
-| 64  | 264  | 113  | 2.34× | 346  | 250 | 1.38× |
-| 128 | 327  | 102  | 3.22× | **591** | **412** | 1.43× |
-| 192 | 255  | 74   | 3.43× | 416  | 388 | 1.07× |
+| updater cores | urcu-txn | existence | ratio (ex ÷ txn) |
+|---|---:|---:|---:|
+| 1   | 121 | 119 | 0.99× |
+| 16  | 165 | 166 | 1.01× |
+| 32  | 170 | 175 | 1.03× |
+| 64  | 195 | 213 | 1.09× |
+| 96  | 256 | 281 | 1.10× |
+| 192 | 364 | 377 | 1.04× |
 
-(Mmoves/s, best-of-5.) Under the fair allocator urcu-txn leads by only ~1.1–1.4×
-— from its leaner nodes and the descriptor slab, not the commit mechanism — and
-the two are within **7 %** at 192 cores. Single-threaded, existence is actually
-*faster* under jemalloc (9.5 vs 7.0). Both dip at 192 as the second socket adds
-cross-NUMA traffic.
+(ns/key-move, jemalloc, best-of-5.) The ratio never exceeds 1.10×: at equal structure,
+equal width, and a fair allocator the two commit mechanisms are a wash. The old 3.4×
+lead was the **glibc control** (dotted in the figure), where existence's per-rotation
+allocation collides on glibc's arena locks and its ns/key-move blows up from 159 @1 to
+**3007 @192** while urcu-txn holds 111→810 — an allocator artifact, not a commit-cost
+difference. And the tie is not a single-size coincidence: sweeping the structure from
+960 to 15 360 keys/table at 192 cores (load factor held at 0.25) the ratio stays flat
+at ~0.97× (existence marginally ahead). This is the hash-specific result — a 3-hash
+key-move transacts a fixed 3–5 pointers regardless of *n*; the ordered skiplist
+([design/rcu-txn-skiplist.md](design/rcu-txn-skiplist.md)), whose key-move transacts
+O(log n) pointers (delete costs two records per level), is the case where the same
+fixed-size control leaves urcu-txn a standing factor behind rather than tied.
 
-**Read side — both scale, gap narrows.** One background updater + N readers:
-both scale near-linearly to ~3 G queries/s at 191 readers. urcu-txn's tax-free
-single-cacheline traversal leads ~1.3–1.44× at low reader counts, converging to
-~parity at scale where read throughput becomes memory-bandwidth-bound:
+**Read side — urcu-txn leads throughout.** One background updater + N readers: both
+scale near-linearly to billions of queries/s, but urcu-txn's tax-free single-cacheline
+traversal leads **~1.3× at every reader count** — the advantage does *not* converge,
+because existence pays its per-lookup existence check on every visit while urcu-txn
+reads the raw node:
 
 | reader cores | urcu-txn (Mq/s) | existence (Mq/s) | ratio |
 |---|---:|---:|---:|
-| 1   | 42.8 | 29.6 | 1.44× |
-| 32  | 735  | 644  | 1.14× |
-| 64  | 1264 | 1149 | 1.10× |
-| 128 | 2151 | 2054 | 1.05× |
-| 191 | 2956 | 2955 | 1.00× |
+| 1   | 49.3 | 35.3 | 1.40× |
+| 32  | 1541 | 1181 | 1.30× |
+| 64  | 3005 | 2333 | 1.29× |
+| 96  | 3944 | 3111 | 1.27× |
+| 191 | 7649 | 5971 | 1.28× |
 
 Caveats (see the design note): nodes are glibc/jemalloc `malloc` (not pooled;
 existence's `procon` mpool recycles its group/node structs); reader flavor
-differs (urcu-txn QSBR vs existence RCU_SIGNAL); and the tables are lightly
-filled (15 keys/updater), so the read result isolates per-lookup tax + footprint
-rather than deep-chain traversal.
+differs (urcu-txn QSBR vs existence RCU_SIGNAL); and at 960 keys/table over 4096
+buckets the tables run at a ~0.06 load factor, so the read result isolates per-lookup
+tax + footprint rather than deep-chain traversal.
 
 ## Layout
 

@@ -36,10 +36,12 @@ engines are within ~20% of each other at every core count, with no trend, and
 urcu-txn's 1->192 contention penalty is slightly SMALLER than existence's.
 
 Set that against the ORDERED structure (plot_txn_vs_existence_skiplist.py,
-`fixed` panel), where the same control puts txn a flat 2.2-2.3x behind from 1
-core to 192.  That is the edges-per-mutation result: an hlist key-move
-transacts 3-5 pointers and the count does not grow with n; a skiplist key-move
-transacts 8.70, growing as O(log n) because delete costs two records per level.
+`fixed` panel), where the same control puts txn ~1.4-1.85x behind existence
+from 1 core to 192 (with the expect_conflict knob that skips the doomed age-0
+attempt on the self-aliasing batched descent; ~2.2-2.3x without it).  That is
+the edges-per-mutation result: an hlist key-move transacts 3-5 pointers and the
+count does not grow with n; a skiplist key-move transacts 8.70, growing as
+O(log n) because delete costs two records per level.
 MCAS coordinates per transacted edge, at four atomic RMWs each; existence
 coordinates per node and writes its pointers with plain stores outside the
 atomic step, because it has an invisibility state to build the destination into.
