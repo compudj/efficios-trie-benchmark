@@ -353,6 +353,18 @@ endif
 ifdef TXN_FALLBACK
   LIST_POOL_CFLAGS += -DURCU_TXN_FALLBACK=$(TXN_FALLBACK)
 endif
+# Regression control.  The urcu-txn engine defaults to its shipping configuration
+# in the headers (single-driver spinlatch install, age-0/age-1 escalation, k=3 /
+# 1024-bit Bloom -- see <urcu/rcu-mcas.h>), so the normal build passes NO engine
+# flags and every txn number is measured on that.  TXN_STOCK=1 passes the single
+# opt-out macro to rebuild the txn benches against the historical help+steal / k=1
+# / no-escalation engine, for an A/B against the shipping default.  As with
+# JEMALLOC / PCPU, the bench targets are not flag-sensitive -- run `make clean`
+# (or rm the target + its .o) when toggling TXN_STOCK so the binary is rebuilt.
+ifdef TXN_STOCK
+  URCU_TXN_STOCK_CFLAGS := -DURCU_MCAS_STOCK
+  LIST_POOL_CFLAGS += -DURCU_MCAS_STOCK
+endif
 
 urcu-txn:
 	@if [ ! -d "$(URCU_TXN_BUILD)/.git" ]; then \
@@ -408,7 +420,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 # See design/txn-vs-existence-3hash.md.  The bench defines _GNU_SOURCE/_LGPL_SOURCE
 # and the QSBR flavor itself.
 # ---------------------------------------------------------------------------
-TXN3_CFLAGS := -O2 -pthread -Wall
+TXN3_CFLAGS := -O2 -pthread -Wall $(URCU_TXN_STOCK_CFLAGS)
 
 check-urcu-txn-lib:
 	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \

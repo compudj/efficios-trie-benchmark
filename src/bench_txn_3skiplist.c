@@ -232,6 +232,20 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 	 */
 	if (use_ryw)
 		urcu_txn_enable_ryw(&txn);
+	/*
+	 * Age-0 hint (engine's AGE_ESCALATE builds; a no-op elsewhere).  A batched
+	 * move (movesper > 1) is densely self-aliasing: the rotation maps consecutive
+	 * keys onto a shared predecessor slot, so the age-0 optimistic attempt reads
+	 * its own pending write and aborts every time -- expect_conflict skips it and
+	 * runs the sorted, RYW-resolved, blocking path from the first attempt.  A
+	 * single move (movesper == 1) instead touches distinct slots (del in src_sl,
+	 * insert in dst_sl -- different skiplists), so it is disjoint and keeps the
+	 * age-0 fast path; claim that only when RYW is not forced on for the A/B.
+	 */
+	if (movesper != 1)
+		urcu_txn_expect_conflict(&txn);
+	else if (!use_ryw)
+		urcu_txn_declare_disjoint(&txn);
 	for (;;) {
 		int retry = 0;
 
