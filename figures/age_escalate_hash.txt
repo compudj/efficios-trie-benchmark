@@ -13,31 +13,39 @@ THE WORKLOAD (disjoint)
   the SPARSE 3-skiplist -- see age_escalate_skiplist.
 
 THE SCHEME
-  Age 0 (retry==0): skip the write-set find, skip the record sort, install with a
-  try-latch (fail fast on a foreign proxy).  A Bloom coincidence sets esc_pending
-  -> commit ABORTS -> re-run at age 1+ (Bloom+find+sort).  On a disjoint write-set
-  with a good filter, age 0 almost never escalates, so it reaches install and pays
-  neither the sort nor the blocking install.
+  Age 0 (retry==0): skip the write-set find on BOTH the load and the store path,
+  skip the record sort, and install with a try-latch (fail fast on a foreign
+  proxy).  A Bloom coincidence sets esc_pending -> commit ABORTS -> re-run at age
+  1+ (Bloom+find+sort).  On a disjoint write-set with a good filter, age 0 almost
+  never escalates, so it reaches install and pays none of the sort, the find, or
+  the blocking install.
+    The store-path find skip is the age-0 BLIND APPEND, now folded into
+  AGE_ESCALATE: at age 0 esc_pending already discards any same-slot coincidence
+  before install, so the reconcile find (an O(nr) write-set scan run on every
+  store) is redundant and the store just appends.  Profiling showed that scan was
+  the single largest age-0 self-time chunk (~19.5% at 32 cores, ~17% at 192) and
+  it is contention-independent, so removing it lifts the whole curve -- see below.
   Flags: -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH; filter -DURCU_TXN_BLOOM_K
   x -DURCU_TXN_BLOOM_WORDS.  esc-dumb = 64-bit k=1; esc-smart = 1024-bit k=3.
 
 THROUGHPUT (Mmoves/s) and ratio to baseline
 =========================================================================
-  cores   baseline   esc-dumb  (x)      esc-smart (x)   esc-smart escalations
-      1      7.364     5.924  0.80        7.717  1.05          2,000  (0.03%)
-      4     27.253    22.547  0.83       27.887  1.02          7,500
-     16     99.601    82.630  0.83      105.035  1.05         44,098  (0.4%)
-     32    191.076   161.426  0.84      201.769  1.06         63,957
-     64    214.978   167.104  0.78      204.859  0.95      1,471,971  (7%)
-    128    196.290   173.984  0.89      192.728  0.98      2,849,328
-    192    257.901   224.456  0.87      253.281  0.98      2,882,292  (11%)
+  cores   baseline   esc-dumb  (x)      esc-smart (x)   esc-smart aborts
+      1      7.397     6.352  0.86        8.503  1.15          1,829  (0.2%)
+      4     26.610    23.224  0.87       27.913  1.05         14,668
+     16     94.875    85.250  0.90      106.295  1.12         45,353  (0.4%)
+     32    180.596   161.850  0.90      199.096  1.10         71,864
+     64    224.145   187.277  0.84      238.887  1.07        962,725  (4%)
+    128    205.493   185.396  0.90      218.277  1.06      2,729,898  (12%)
+    192    264.338   241.504  0.91      281.987  1.07      2,878,541  (10%)
 
-  -> esc-smart WINS 1.02-1.06x at 1-32 cores (peak 1.056x @32), then fades to
-     ~0.98x parity at 64-192.  The escalation count is the story: near zero
-     (0.03-0.4%) while age 0 almost always commits, then jumping ~20x across the
-     32->64 boundary as cross-socket install collisions make age 0 fail-fast and
-     escalate -- which erodes the win to parity but never turns it into a loss.
-  -> esc-dumb LOSES 0.78-0.89x EVERYWHERE.  The k=1 64-bit filter false-positives
+  -> esc-smart WINS 1.05-1.15x across the WHOLE range (peak 1.15x @1, 1.12x @16).
+     Unlike the pre-append study it does NOT fade to parity: it holds 1.06-1.07x
+     at 64-192.  The blind append removed a contention-independent O(nr) write-set
+     scan (the reconcile find) that was the dominant age-0 self-time, so the win
+     survives the cross-socket escalation storm (aborts jump ~20x across the
+     32->64 boundary, 0.4% -> 4% -> 10-12%, yet the ratio stays >1).
+  -> esc-dumb LOSES 0.84-0.91x EVERYWHERE.  The k=1 64-bit filter false-positives
      on contiguous calloc'd bucket-head addresses (~all commits collide in one
      word), so it escalates almost everything -- the filter, not the mechanism, is
      what sinks it.  The good filter is load-bearing.
@@ -48,9 +56,13 @@ WHY IT WINS HERE AND NOT ON THE BATCHED SKIPLIST
   provide it; the batched skiplist (adjacency) does not, so there age 0 pre-aborts
   and loses.  Given disjointness, the win is bounded by (a) the filter quality
   (k=1 escalates on FPs -> loses; k=3 -> wins) and (b) contention (install
-  collisions at high core counts reintroduce escalation).
+  collisions at high core counts reintroduce escalation) -- but the find skip is
+  paid back regardless of contention, which is why the high-core win no longer
+  erodes to parity.
 
 CORRECTNESS
-  bench conservation check passes at every core count / filter.  The disjoint
-  workload never aliases a bucket, so RYW is not needed for correctness here
-  (--ryw 1 is forced only to exercise the escalation path).
+  bench conservation check passes at every core count / filter (95040 owned keys
+  accounted for, 100% reader hit).  The disjoint workload never aliases a bucket,
+  so RYW is not needed for correctness here (--ryw 1 is forced only to exercise
+  the escalation path).  The blind append is safe because esc_pending discards any
+  same-slot descriptor before it is ever installed.

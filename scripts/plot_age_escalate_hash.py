@@ -10,11 +10,18 @@ escalation is a Bloom false positive:
   - esc-dumb  (64-bit k=1) trips on ~all commits -- contiguous calloc'd bucket-head
     addresses collide in a single-bit filter -- so it escalates everything and loses.
   - esc-smart (1024-bit k=3) drives false positives toward zero, so age 0 almost
-    always reaches install and skips the ~O(nr) record sort + blocking install.
+    always reaches install and skips the O(nr) record sort, the O(nr) reconcile
+    find (the write-set scan on every store), and the blocking install.
 
-Left: absolute throughput.  Right: ratio to baseline, where the small effect is
-legible -- age 0 wins at low-moderate contention (install collisions rare) and
-fades to parity as core count rises (fail-fast escalations return).
+The reconcile-find skip is the age-0 blind append now folded into AGE_ESCALATE:
+at age 0 esc_pending already discards any same-slot coincidence before install,
+so the find is redundant and the store just appends.  That scan was the dominant
+age-0 self-time and is contention-independent, so it lifts the WHOLE curve.
+
+Left: absolute throughput.  Right: ratio to baseline.  Age 0 now wins across the
+entire range -- +5 to +15% -- rather than fading to parity at high core counts as
+it did before the blind append: it holds +6-7% at 64-192 where the sort/find skip
+still pays even as install collisions reintroduce some escalation.
 """
 import csv, os
 import matplotlib
@@ -71,9 +78,9 @@ for ax in (ax1, ax2):
 
 fig.suptitle("Age-0/age-1 optimistic RYW escalation on the disjoint urcu-txn 3-hash "
              "(2×96-core EPYC, spinlatch engine, jemalloc)\n"
-             "disjoint write-set: age 0 skips the record sort + blocking install and "
-             "wins at low contention — but only with a filter (k=3) whose false "
-             "positives don't force escalation anyway",
+             "disjoint write-set: age 0 skips the record sort, the reconcile find, and "
+             "the blocking install — a +5–15% win across the whole range with a filter "
+             "(k=3) whose false positives don't force escalation",
              fontsize=11)
 fig.tight_layout(rect=[0, 0, 1, 0.92])
 os.makedirs(os.path.dirname(OUT), exist_ok=True)

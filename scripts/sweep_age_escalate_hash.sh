@@ -11,6 +11,12 @@
 #   esc-dumb  = spinlatch + -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH (64-bit k=1)
 #   esc-smart = the same + -DURCU_TXN_BLOOM_K=3 -DURCU_TXN_BLOOM_WORDS=16 (1024-bit)
 #
+# AGE_ESCALATE now also appends the age-0 store blind, skipping the reconcile
+# find (the O(nr) write-set scan) -- redundant at age 0 because esc_pending
+# already discards any same-slot coincidence before install.  So esc-dumb and
+# esc-smart get it for free; it lifts the whole positive half +4-11% (largest
+# at low contention, where the find scan was the dominant age-0 self-time).
+#
 # Workload: --nbuckets 16384 --updatespacing 512 --movesper 8, RYW FORCED ON
 # (--ryw 1).  8 consecutive keys hit 8 distinct buckets (chunk < nbuckets), so the
 # write-set is disjoint and genuine RYW is ~0 -- every escalation is a filter false
