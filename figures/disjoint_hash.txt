@@ -1,0 +1,73 @@
+Disjoint-write-set hint -- RYW-free age-0 blind append -- urcu-txn 3-hash
+2x96-core EPYC (384 hwthreads), jemalloc, spinlatch, median-of-5 @ 800 ms.
+Engine: userspace-rcu-txn urcu_txn_declare_disjoint() (commit 72ae6027).
+
+THE HINT
+  The age-0 blind append (skip the O(nr) reconcile find on every store) was
+  gated on read-your-own-writes: RYW's Bloom test_and_set is what made the
+  shortcut safe, flagging a same-slot coincidence with esc_pending so commit
+  discards the descriptor before install.  A mutator whose write set is
+  DISJOINT by construction -- a hash add/remove over distinct buckets -- has no
+  coincidence to catch, yet could only reach the fast path by enabling RYW,
+  dragging in the whole filter (per-store hash-and-set, per-load test, 128
+  bytes to zero per attempt).  urcu_txn_declare_disjoint() lets the handle
+  assert the guarantee and blind-append at age 0 WITHOUT the filter: the store
+  gate becomes retry==0 && (ryw || disjoint), everything else stays ryw-only.
+  Contract is the caller's -- a store onto a recorded slot corrupts (dup
+  record); -DURCU_TXN_DEBUG_DISJOINT traps it (find != NULL -> abort).
+
+THE WORKLOAD (disjoint)
+  --nbuckets 16384 --updatespacing 512 --movesper 8.  8 consecutive keys hit 8
+  DISTINCT buckets (chunk 8 < nbuckets 16384), so a commit's write set is
+  disjoint and genuine read-your-own-writes is ~0.  Measured directly: 0 true
+  WAW over 18.4M commits (vs 5.36M on an aliasing control) -- the Bloom never
+  resolves anything here; every escalation it drives is a false positive.
+
+THREE CURVES (one esc-smart binary; only the runtime flag differs, so there is
+no code-layout confound)
+  find : --ryw 0             -- blind append off -> reconcile find every store
+                               (today's ryw-off default)
+  disj : --disjoint 1 --ryw 0 -- blind append, NO Bloom (the new hint)
+  ryw1 : --ryw 1             -- Bloom + blind append
+
+THROUGHPUT (Mmoves/s), median-of-5, and ratio to the ryw-off find
+=========================================================================
+  cores    find      disj   (x)        ryw1   (x)      disj vs ryw1
+      1     8.81    10.09  1.145       9.02  1.024        +11.9%
+      4    31.41    32.54  1.036      31.68  1.009         +2.7%
+     16   113.86   125.51  1.102     117.24  1.030         +7.1%
+     32   212.30   240.54  1.133     215.32  1.014        +11.7%
+     64   231.23   258.51  1.118     265.21  1.147         -2.5%
+    128   225.04   271.46  1.206     245.70  1.092        +10.5%
+    192   288.61   337.70  1.170     309.82  1.073         +9.0%
+
+  -> disj BEATS the reconcile-find path at EVERY core count (+3.6% to +20.6%):
+     the find avoidance is the real lever, and it needs no filter.
+  -> disj BEATS ryw-on everywhere EXCEPT 64 cores (-2.5%).  It skips the find
+     like ryw-on but pays none of the Bloom's low-contention tax (at 1-32 cores
+     ryw-on is barely above find), and at 128-192 cores it also sheds the
+     Bloom's now-counterproductive false-positive escalations (ryw-on carries
+     the MOST aborts there: 3.01M vs disj 2.56M at 192c).
+  -> The 64c dip is the one place the Bloom's interleaved, data-dependent RMW
+     buys a small microarchitectural throttle at that contention resonance --
+     real but unharvestable by a plain spin or by the find (both of which only
+     cut aborts by crashing throughput), and a net loss everywhere else.
+
+WHY THE RYW-ON 64c EDGE WAS NOT ADMISSION CONTROL
+  With the 1024-bit k=3 filter the within-commit false-positive rate is ~1e-4
+  per slot, so <0.4% of commits escalate (measured: 38K/11.4M at 16 cores).
+  That cannot explain ryw-on's abort gap.  Same-binary isolation decomposed the
+  64c "throttle" advantage into ~+6.6% find avoidance (nothing to do with the
+  filter) and ~+3% a microarchitectural incidental (not reproducible by a
+  pre-commit spin, jittered or uniform).  Removing find at all ages made ryw-off
+  WORSE, not better -- find at age 1+ is another mild incidental throttle, not
+  an amplifier.  The disjoint hint captures the find-avoidance half cleanly.
+
+CORRECTNESS
+  Conservation passes at every core count with --disjoint 1 --ryw 0 (all owned
+  keys accounted, 100% reader hit).  -DURCU_TXN_DEBUG_DISJOINT run on the
+  aliasing config (movesper 4, nbuckets 2, --disjoint 1) traps immediately with
+  a diagnostic (SIGABRT), confirming the contract check catches a mis-declared
+  handle; the same build on the disjoint config runs clean.  Engine unit tests
+  (test_rcu_mcas, test_rcu_txn, test_rcu_txn_hlist_ryw, test_rcu_txn_skiplist_ryw)
+  stay green -- disjoint defaults 0, so non-disjoint callers are unchanged.

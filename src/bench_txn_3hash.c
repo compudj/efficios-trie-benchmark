@@ -104,6 +104,9 @@ static int  cpustride     = 1;
 static long duration_ms   = 1000;
 static int  movesper      = 4;	/* moves per MCAS commit; 0 = whole rotation */
 static int  use_ryw       = -1;	/* -1 = auto (on iff a chunk can alias a bucket) */
+static int  use_disjoint  = 0;	/* declare the write set disjoint: age-0 blind
+				 * append WITHOUT the RYW Bloom (sound iff no
+				 * two moves in a commit alias a bucket) */
 static long nobjects;		/* = (updatespacing-16)/3, per existence */
 static long keys_per_thread;	/* K = 3*nobjects */
 
@@ -217,6 +220,8 @@ static int commit_moves(struct hnode **olds, struct hnode **news,
 	 */
 	if (use_ryw)
 		urcu_txn_enable_ryw(&txn);
+	if (use_disjoint)
+		urcu_txn_declare_disjoint(&txn);
 	for (;;) {
 		int retry = 0;
 
@@ -522,7 +527,8 @@ static void run(void)
 		printf("%d", movesper);
 	else
 		printf("whole-rotation (%ld)", keys_per_thread);
-	printf("  ryw: %s\n", use_ryw ? "on" : "off");
+	printf("  ryw: %s  disjoint: %s\n", use_ryw ? "on" : "off",
+	       use_disjoint ? "on" : "off");
 	printf("duration (s): %g\n", secs);
 	printf("UPDATE  updaters: %d  rotations: %lld  key-moves: %lld  "
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
@@ -584,6 +590,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--duration"))     duration_ms = strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--movesper"))     movesper = (int)strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--ryw"))          use_ryw = (int)strtol(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--disjoint"))     use_disjoint = (int)strtol(argv[++i], NULL, 0);
 		else usage(argv[0]);
 	}
 	if (nupdaters < 1 || nbuckets < 1 || updatespacing < 20 || movesper < 0)
