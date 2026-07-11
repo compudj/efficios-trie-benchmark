@@ -11,12 +11,22 @@ escalation is a Bloom false positive:
     addresses collide in a single-bit filter -- so it escalates everything and loses.
   - esc-smart (1024-bit k=3) drives false positives toward zero, so age 0 almost
     always reaches install and skips the O(nr) record sort, the O(nr) reconcile
-    find (the write-set scan on every store), and the blocking install.
+    find (the write-set scan on every store), and pays a FLAT install.
 
 The reconcile-find skip is the age-0 blind append now folded into AGE_ESCALATE:
 at age 0 esc_pending already discards any same-slot coincidence before install,
 so the find is redundant and the store just appends.  That scan was the dominant
 age-0 self-time and is contention-independent, so it lifts the WHOLE curve.
+
+The install itself is now FLAT under the spinlatch + AGE0_TRYLATCH: one try-CAS
+per record, OR the outcomes, bail at the first conflict, decide arithmetically --
+no install latch, no self-settle, no pre-CAS slot load (the latch machinery is
+dead when no helper/thief can touch a record).  The point is not "no branches"
+but no MISPREDICTED branches: the latched install's per-record is-proxy/slot-
+still-old tests are data-dependent on a freshly loaded slot value, so they
+mispredict exactly when a slot is contended; the flat install OR-accumulates the
+CAS outcome and its only branch is a well-predicted after-CAS bail.  Adds +2-10%
+over the latched age-0 install across the whole range.
 
 Left: absolute throughput.  Right: ratio to baseline.  Age 0 now wins across the
 entire range -- +5 to +15% -- rather than fading to parity at high core counts as
@@ -76,13 +86,12 @@ for ax in (ax1, ax2):
     ax.grid(alpha=0.3, ls=":")
     ax.legend(fontsize=8, loc="best")
 
-fig.suptitle("Age-0/age-1 optimistic RYW escalation on the disjoint urcu-txn 3-hash "
-             "(2×96-core EPYC, spinlatch engine, jemalloc)\n"
-             "disjoint write-set: age 0 skips the record sort, the reconcile find, and "
-             "the blocking install — a +5–15% win across the whole range with a filter "
-             "(k=3) whose false positives don't force escalation",
-             fontsize=11)
-fig.tight_layout(rect=[0, 0, 1, 0.92])
+fig.suptitle("Age-0 optimistic RYW escalation — disjoint urcu-txn 3-hash "
+             "(2×96-core EPYC, spinlatch, jemalloc)\n"
+             "age 0 skips the reconcile find + sort and installs flat: "
+             "+13–22% over baseline with a k=3 filter",
+             fontsize=10)
+fig.tight_layout(rect=[0, 0, 1, 0.90])
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 fig.savefig(OUT, dpi=140)
 print("wrote", OUT)

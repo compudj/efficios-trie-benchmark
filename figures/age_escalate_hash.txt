@@ -12,40 +12,49 @@ THE WORKLOAD (disjoint)
   batched 3-skiplist (adjacency-forced ~100% genuine RYW) and the same regime as
   the SPARSE 3-skiplist -- see age_escalate_skiplist.
 
-THE SCHEME
-  Age 0 (retry==0): skip the write-set find on BOTH the load and the store path,
-  skip the record sort, and install with a try-latch (fail fast on a foreign
-  proxy).  A Bloom coincidence sets esc_pending -> commit ABORTS -> re-run at age
-  1+ (Bloom+find+sort).  On a disjoint write-set with a good filter, age 0 almost
-  never escalates, so it reaches install and pays none of the sort, the find, or
-  the blocking install.
-    The store-path find skip is the age-0 BLIND APPEND, now folded into
-  AGE_ESCALATE: at age 0 esc_pending already discards any same-slot coincidence
-  before install, so the reconcile find (an O(nr) write-set scan run on every
-  store) is redundant and the store just appends.  Profiling showed that scan was
-  the single largest age-0 self-time chunk (~19.5% at 32 cores, ~17% at 192) and
-  it is contention-independent, so removing it lifts the whole curve -- see below.
+THE SCHEME (three age-0 wins compose, all auto-derived under the spinlatch)
+  Age 0 (retry==0) commits optimistically: a Bloom coincidence sets esc_pending
+  -> commit ABORTS -> re-run at age 1+ (Bloom+find+sort, latched blocking install).
+  On a disjoint write-set with a good filter it almost never escalates, so it pays
+  none of the age-1 machinery.  What it skips, in order:
+   1. the write-set FIND on every store -- the age-0 blind append (esc_pending
+      already discards any same-slot coincidence before install, so the O(nr)
+      reconcile scan is redundant);
+   2. the record SORT (no blocking wait -> no slot-address order needed);
+   3. the latched install -- age 0 installs FLAT: one try-CAS per record, OR the
+      outcomes, bail at the first conflict, decide arithmetically (SUCCEEDED +
+      (fail!=0)).  No install latch, no self-settle, no pre-CAS slot load.  The
+      point is not "no branches" but no MISPREDICTED branches: the latched
+      install's per-record is-proxy / slot-still-old tests are data-dependent on a
+      freshly loaded slot value, so they mispredict exactly WHEN a slot is
+      contended -- the costly case.  The flat install's try-CAS is itself the
+      contention check, its outcome is OR-accumulated, and the one branch left
+      (the bail) sits after the CAS and is not-taken every committing iteration,
+      so it does not mispredict and does not gate the CAS pipeline.
   Flags: -DURCU_TXN_AGE_ESCALATE -DURCU_MCAS_AGE0_TRYLATCH; filter -DURCU_TXN_BLOOM_K
-  x -DURCU_TXN_BLOOM_WORDS.  esc-dumb = 64-bit k=1; esc-smart = 1024-bit k=3.
+  x -DURCU_TXN_BLOOM_WORDS.  esc-dumb = 64-bit k=1; esc-smart = 1024-bit k=3.  The
+  blind append and the flat install are both auto-derived from those flags -- no
+  extra knob -- so esc-dumb and esc-smart get all three wins for free.
 
 THROUGHPUT (Mmoves/s) and ratio to baseline
 =========================================================================
   cores   baseline   esc-dumb  (x)      esc-smart (x)   esc-smart aborts
-      1      7.397     6.352  0.86        8.503  1.15          1,829  (0.2%)
-      4     26.610    23.224  0.87       27.913  1.05         14,668
-     16     94.875    85.250  0.90      106.295  1.12         45,353  (0.4%)
-     32    180.596   161.850  0.90      199.096  1.10         71,864
-     64    224.145   187.277  0.84      238.887  1.07        962,725  (4%)
-    128    205.493   185.396  0.90      218.277  1.06      2,729,898  (12%)
-    192    264.338   241.504  0.91      281.987  1.07      2,878,541  (10%)
+      1      7.541     6.491  0.86        9.196  1.22          2,241  (0.2%)
+      4     27.592    23.960  0.87       31.981  1.16          8,856
+     16    102.908    90.933  0.88      119.289  1.16         40,932  (0.3%)
+     32    199.485   175.629  0.88      224.882  1.13         73,962
+     64    234.823   182.621  0.78      270.715  1.15        833,991  (3%)
+    128    204.922   190.628  0.93      248.081  1.21      2,720,304  (11%)
+    192    263.546   245.932  0.93      309.560  1.18      3,014,357  (10%)
 
-  -> esc-smart WINS 1.05-1.15x across the WHOLE range (peak 1.15x @1, 1.12x @16).
-     Unlike the pre-append study it does NOT fade to parity: it holds 1.06-1.07x
-     at 64-192.  The blind append removed a contention-independent O(nr) write-set
-     scan (the reconcile find) that was the dominant age-0 self-time, so the win
-     survives the cross-socket escalation storm (aborts jump ~20x across the
-     32->64 boundary, 0.4% -> 4% -> 10-12%, yet the ratio stays >1).
-  -> esc-dumb LOSES 0.84-0.91x EVERYWHERE.  The k=1 64-bit filter false-positives
+  -> esc-smart WINS 1.13-1.22x across the WHOLE range (append + flat install on
+     top of the earlier +5-15%).  The flat install adds ~+2-10% over the latched
+     age-0 install and, crucially, does NOT amplify aborts: at 64 cores esc-smart
+     aborts (834K) match the baseline (721K) rather than doubling -- the flat
+     install bails at the FIRST conflict, so a doomed txn plants only a prefix and
+     parks few transient proxies.  (Planting the whole write-set past a conflict
+     regressed ~10% at 64 cores with ~2x aborts; the early bail is what avoids it.)
+  -> esc-dumb LOSES 0.78-0.93x EVERYWHERE.  The k=1 64-bit filter false-positives
      on contiguous calloc'd bucket-head addresses (~all commits collide in one
      word), so it escalates almost everything -- the filter, not the mechanism, is
      what sinks it.  The good filter is load-bearing.
@@ -55,14 +64,16 @@ WHY IT WINS HERE AND NOT ON THE BATCHED SKIPLIST
   without hitting a genuine coincidence.  The hash (and the sparse skiplist)
   provide it; the batched skiplist (adjacency) does not, so there age 0 pre-aborts
   and loses.  Given disjointness, the win is bounded by (a) the filter quality
-  (k=1 escalates on FPs -> loses; k=3 -> wins) and (b) contention (install
-  collisions at high core counts reintroduce escalation) -- but the find skip is
-  paid back regardless of contention, which is why the high-core win no longer
-  erodes to parity.
+  (k=1 escalates on FPs -> loses; k=3 -> wins) and (b) contention -- but the find
+  skip, the sort skip, and the flat install are all paid back regardless of
+  contention, so the win holds from 1 to 192 cores.
 
 CORRECTNESS
-  bench conservation check passes at every core count / filter (95040 owned keys
-  accounted for, 100% reader hit).  The disjoint workload never aliases a bucket,
-  so RYW is not needed for correctness here (--ryw 1 is forced only to exercise
-  the escalation path).  The blind append is safe because esc_pending discards any
-  same-slot descriptor before it is ever installed.
+  bench conservation passes at every core count / filter (95040 owned keys
+  accounted for, 100% reader hit), including nbuckets=256 high-collision stress.
+  The disjoint workload never aliases a bucket, so RYW is not needed for
+  correctness here (--ryw 1 is forced only to exercise the escalation path).  The
+  flat install is safe because under NO_HELP + NO_STEAL the owner is the sole
+  driver: the install latch / self-settle it drops are dead code (every hazard
+  they close needs a foreign helper or thief), and a FAILED drive's prefix plant
+  is reverted load-free by the owner's settle.

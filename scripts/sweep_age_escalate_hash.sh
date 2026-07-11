@@ -17,6 +17,14 @@
 # esc-smart get it for free; it lifts the whole positive half +4-11% (largest
 # at low contention, where the find scan was the dominant age-0 self-time).
 #
+# And under the spinlatch + AGE0_TRYLATCH the age-0 INSTALL is now FLAT
+# (auto-derived, no extra flag): one try-CAS per record, OR the outcomes, bail at
+# the first conflict, decide arithmetically -- no install latch, no self-settle,
+# no pre-CAS slot load, and no MISPREDICTED branch (the latched install's per-
+# record is-proxy/slot-still-old tests mispredict exactly when a slot is contended;
+# the flat install's only branch is a well-predicted after-CAS bail).  esc-dumb and
+# esc-smart get this for free too; it adds +2-10% over the latched age-0 install.
+#
 # Workload: --nbuckets 16384 --updatespacing 512 --movesper 8, RYW FORCED ON
 # (--ryw 1).  8 consecutive keys hit 8 distinct buckets (chunk < nbuckets), so the
 # write-set is disjoint and genuine RYW is ~0 -- every escalation is a filter false
