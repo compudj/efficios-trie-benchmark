@@ -33,10 +33,13 @@
 #          KEYS_FIXED/cores).  The honest scaling curve: perfect scaling is
 #          FLAT ns/key-move; any rise is writer interference and nothing else.
 #   size   cores pinned at 192, sweep b.  The headline correction -- the
-#          existence/txn gap is a strong function of structure size (3.98x at
-#          960 keys/skiplist, 2.02x at 7680).  With 192 writers on 960 keys a
-#          level-7 predecessor slot is written by ~26 distinct cores; the old
-#          single point sat at the worst case for an optimistic engine.
+#          existence/txn gap is a strong function of structure size (2.57x at
+#          960 keys/skiplist, 1.64x at 7680, 1.60x at 15360).  With 192 writers
+#          on 960 keys a level-7 predecessor slot is written by ~26 distinct
+#          cores; the old single point sat at the worst case for an optimistic
+#          engine.  (These ratios were 3.98x/2.02x when this comment was first
+#          written; the txn side has since gained on the small end -- most
+#          recently from the cost-scaled escalation budget, urcu-txn d4150ee8.)
 #   read   N readers + 1 updater.  existence taxes every lookup with an
 #          eh_egi check; txn's plain RCU readers do not.
 #
