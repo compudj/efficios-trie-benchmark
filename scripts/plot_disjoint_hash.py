@@ -2,22 +2,29 @@
 """
 The DISJOINT-write-set hint on the urcu-txn 3-hash.
 
+HISTORICAL: the "find" curve is the retired ryw-off (invisible-writes) mode.
+Read-your-own-writes is now the engine's unconditional default, so ryw=0 can no
+longer be produced and this figure is preserved as-is; a re-run of the sweep
+yields only the "disj" and "ryw1" curves.  See the userspace-rcu-txn commit that
+retires the invisible-writes mode.
+
 A mutator whose write set touches distinct slots -- a hash add/remove over
 distinct buckets -- can take the age-0 blind append (skip the O(nr) reconcile
-find on every store) WITHOUT enabling read-your-own-writes, via
+find on every store) WITHOUT the read-your-own-writes Bloom, via
 urcu_txn_declare_disjoint().  It then maintains no Bloom filter at all: no
 per-store hash-and-set, no per-load test, nothing to zero per attempt.
 
-Three curves, all from ONE esc-smart binary (spinlatch + AGE0 flat install +
-k=3/1024-bit filter compiled in), differing ONLY by runtime flag, so there is
-no code-layout confound:
-  find : --ryw 0             -- blind append OFF, so every store runs the
-                               reconcile find; this is today's ryw-off default.
-  disj : --disjoint 1 --ryw 0 -- blind append, NO Bloom (the new hint).
-  ryw1 : --ryw 1             -- Bloom + blind append; the filter is pure cost
-                               here (the disjoint write set has zero true WAW),
-                               taxing low contention and, at 128-192 cores,
-                               adding counterproductive false-positive escalations.
+Three curves in the committed CSV, all from ONE binary (spinlatch + AGE0 flat
+install + k=3/1024-bit filter compiled in), differing ONLY by runtime flag, so
+there is no code-layout confound:
+  find : --ryw 0        -- RETIRED: blind append OFF, so every store ran the
+                           reconcile find.  This was the invisible-writes default;
+                           it can no longer be produced (see the header note).
+  disj : --disjoint 1   -- blind append, NO Bloom (urcu_txn_declare_disjoint).
+  ryw1 : --disjoint 0   -- the default read-your-own-writes: Bloom + blind append;
+                           the filter is pure cost here (the disjoint write set has
+                           zero true WAW), taxing low contention and, at 128-192
+                           cores, adding counterproductive false-positive escalations.
 
 The disjoint hint beats the reconcile-find path at EVERY core count (+3.6% at
 4 cores to +20.6% at 128) and beats ryw-on everywhere except a 2.5% dip at 64
@@ -37,9 +44,9 @@ OUT = os.environ.get("OUT", os.path.join(HERE, "..", "figures", "disjoint_hash.p
 COLOR = {"find": "#D55E00", "disj": "#009E73", "ryw1": "#0072B2"}
 MARK = {"find": "v", "disj": "^", "ryw1": "o"}
 LABEL = {
-    "find": "ryw off (reconcile find) — today's disjoint default",
-    "disj": "declare_disjoint: blind-append, NO Bloom  (new)",
-    "ryw1": "ryw on (Bloom + blind-append) — low-contention tax",
+    "find": "ryw off (reconcile find) — RETIRED mode (historical)",
+    "disj": "declare_disjoint: blind-append, NO Bloom  (the fast knob)",
+    "ryw1": "ryw on (Bloom + blind-append) — now the default",
 }
 rows = list(csv.DictReader(open(CSV)))
 

@@ -1,18 +1,19 @@
 #!/bin/sh
-# run_txn_skiplist_width_ryw.sh — two txn-only sweeps on bench_txn_3skiplist.
+# run_txn_skiplist_width_ryw.sh — commit-width sweep on bench_txn_3skiplist.
 #
-#   width : commit-width curve.  x = --movesper (1,2,3,4,6,8,15), RYW FORCED ON
-#           for every width so that width is the only variable (auto-RYW would
-#           otherwise flip on at movesper != 1 and confound the curve).
-#           15 == the whole rotation (K = 3*nobjects = 15 at updatespacing 32),
-#           passed as --movesper 0.  Existence's atomic unit is 6 -> that column
-#           is the width-matched one.
+#   width : commit-width curve.  x = --movesper (1,2,3,4,6,8,15).  Read-your-own-
+#           writes is now the engine's unconditional default, so width is the only
+#           variable with no flag to force.  15 == the whole rotation
+#           (K = 3*nobjects = 15 at updatespacing 32), passed as --movesper 0.
+#           Existence's atomic unit is 6 -> that column is the width-matched one.
 #
-#   ryw   : the RYW cost A/B on the fast path.  --movesper 1, --ryw 0 vs 1.
-#           Measured: 10.0% at 1 updater, 3.7% at 4, 1.6% at 16, ~0% at >= 32 --
-#           the scan is a per-attempt cost, so contention swamps it.
+# The pure updaters run with nreaders 0; worker i pins to CPU i.
 #
-# Both sweeps are pure updaters (nreaders 0).  Worker i pins to CPU i.
+# HISTORICAL: this script also carried a "ryw" sweep -- the fast-path A/B of
+# read-your-own-writes ON vs OFF (--movesper 1, --ryw 0 vs 1; measured 10.0% at 1
+# updater, ~0% at >= 32).  The invisible-writes (ryw-off) mode is retired, so that
+# A/B can no longer be produced and the sweep is gone.  The CSV keeps its `ryw`
+# column (now always 1, the default) for schema stability.
 #
 # NOTE: the width curve must be run against an engine carrying urcu-txn-dev
 # c7d86222.  Before it, a 15-move commit's record count (mean 72, max 133)
@@ -42,8 +43,7 @@ RUNS=${RUNS:-3}
 ALLOCS=${ALLOCS:-"jemalloc"}
 WIDTHS=${WIDTHS:-"1 2 3 4 6 8 15"}
 WIDTH_UPDATERS=${WIDTH_UPDATERS:-"1 4 16 64"}
-RYW_UPDATERS=${RYW_UPDATERS:-"1 2 4 8 16 32 64 96 128 192"}
-SWEEPS=${SWEEPS:-"width ryw"}
+SWEEPS=${SWEEPS:-"width"}
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 APPEND=${APPEND:-}
 
@@ -65,7 +65,7 @@ run_one() {
 	r=1
 	while [ "$r" -le "$RUNS" ]; do
 		out=$(LD_PRELOAD="$pre" timeout 120 "$TXN" --nupdaters "$u" --nreaders 0 \
-			--cpustride 1 --movesper "$arg_mp" --ryw "$ryw" --duration "$DUR" 2>/dev/null)
+			--cpustride 1 --movesper "$arg_mp" --duration "$DUR" 2>/dev/null)
 		rc=$?
 		if [ "$rc" -ne 0 ]; then
 			echo "!! $sw u=$u mp=$mp ryw=$ryw run=$r FAILED rc=$rc" >&2
@@ -94,12 +94,6 @@ for alloc in $ALLOCS; do
 					echo ">> $alloc width u=$u movesper=$mp" >&2
 					run_one width "$alloc" "$u" "$mp" 1
 				done
-			done ;;
-		ryw)
-			for u in $RYW_UPDATERS; do
-				echo ">> $alloc ryw u=$u" >&2
-				run_one ryw "$alloc" "$u" 1 0
-				run_one ryw "$alloc" "$u" 1 1
 			done ;;
 		esac
 	done

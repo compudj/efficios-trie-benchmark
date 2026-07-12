@@ -26,34 +26,34 @@
  * commit width -- the read-tax vs write-tax dual, on the ordered structure.
  *
  * --movesper composes N structural moves into one commit (0 = a whole rotation).
- * Any N != 1 needs read-your-own-writes, which the bench turns on for you (and
- * --ryw forces either way).  Why: a chunk holds CONSECUTIVE keys j, j+1; key j
- * rotates into sl[(j+1)%3], which is exactly key j+1's source -- so one chunk
- * always inserts and deletes in the same skiplist, on adjacent keys, which
- * therefore share a predecessor P.  Both edits then name the slot P->next[L].
+ * Any N != 1 relies on read-your-own-writes -- the engine's default.  Why: a
+ * chunk holds CONSECUTIVE keys j, j+1; key j rotates into sl[(j+1)%3], which is
+ * exactly key j+1's source -- so one chunk always inserts and deletes in the same
+ * skiplist, on adjacent keys, which therefore share a predecessor P.  Both edits
+ * then name the slot P->next[L].
  *
- * Without RYW each *_prepare searches the COMMITTED structure (urcu_txn_load does
- * not see the txn's own buffered writes), so both present the same old value; the
- * engine keeps at most one record per slot (rcu-mcas.h urcu_mcas_record), matches
- * on old, and the upgrade overwrites new_ptr -- destroying the insert's edge.  The
- * stale read does double harm: it misdirects the write AND makes the delete's
- * predecessor guard pass.  The damage is not a lost key but a TORN TOWER: the
- * coalesce only bites at the levels both edits record, so a taller new node keeps
- * its upper-level edges and loses level 0, leaving next[0] aimed at the tombstoned
- * (then reclaimed) victim; every later search descending through it adopts a
- * marked predecessor and insert_prepare returns -EAGAIN forever.  Deterministic,
- * and reproducible with a SINGLE updater and no readers -- so it is composition,
- * not contention.  Delete-first mirrors it: the victim ends marked but still
- * linked, hence a use-after-free plus a duplicate key.
+ * Were the buffered writes invisible (the retired pre-RYW mode) each *_prepare
+ * would search the COMMITTED structure, so both would present the same old value;
+ * the engine keeps at most one record per slot (rcu-mcas.h urcu_mcas_record_chain),
+ * matches on old, and the upgrade would overwrite new_ptr -- destroying the
+ * insert's edge.  The stale read does double harm: it misdirects the write AND
+ * makes the delete's predecessor guard pass.  The damage is not a lost key but a
+ * TORN TOWER: the coalesce only bites at the levels both edits record, so a taller
+ * new node keeps its upper-level edges and loses level 0, leaving next[0] aimed at
+ * the tombstoned (then reclaimed) victim; every later search descending through it
+ * adopts a marked predecessor and insert_prepare returns -EAGAIN forever.  That
+ * failure was deterministic and reproduced with a SINGLE updater and no readers --
+ * so it was composition, not contention.  Delete-first mirrored it: the victim
+ * ended marked but still linked, hence a use-after-free plus a duplicate key.
  *
- * With RYW (urcu_txn_enable_ryw) the descent observes the txn's own pending edits,
- * so the later edit lands on its true post-batch predecessor -- for insert-first
- * that is the freshly inserted node, which is txn-private and needs no record at
- * all, dissolving the collision -- and where the fused slot belongs to a PUBLISHED
- * node the two records chain into one {committed_old -> final_new}.  movesper == 1
- * needs none of this (del from skiplist A and insert into skiplist B touch
- * disjoint slots), so RYW stays OFF there by default: --movesper 1 --ryw 1 is
- * then the honest A/B of what RYW costs the single-move fast path.
+ * Read-your-own-writes is why this is sound: the descent observes the txn's own
+ * pending edits, so the later edit lands on its true post-batch predecessor -- for
+ * insert-first that is the freshly inserted node, which is txn-private and needs
+ * no record at all, dissolving the collision -- and where the fused slot belongs
+ * to a PUBLISHED node the two records chain into one {committed_old -> final_new}.
+ * movesper == 1 needs none of this (del from skiplist A and insert into skiplist B
+ * touch disjoint slots), so it declares its write set disjoint and takes the
+ * age-0 blind append.
  *
  * Note movesper > 1 is a DIFFERENT unit of atomicity, not merely a faster one: it
  * makes several key-moves visible together.  It is not the like-for-like
@@ -67,7 +67,7 @@
  *
  * Example:
  *   ./bench_txn_3skiplist --nupdaters 4 --duration 1000 --movesper 1
- *   ./bench_txn_3skiplist --nupdaters 4 --duration 1000 --movesper 3   (ryw auto)
+ *   ./bench_txn_3skiplist --nupdaters 4 --duration 1000 --movesper 3   (batched)
  */
 
 #ifndef _GNU_SOURCE
@@ -102,7 +102,6 @@ static long updatespacing = 32;	/* key stride between updaters; sets nobjects */
 static int  cpustride     = 1;
 static long duration_ms   = 1000;
 static int  movesper      = 1;	/* structural moves composed into one commit; 0 = whole rotation */
-static int  use_ryw       = -1;	/* -1 = auto (on iff movesper != 1); else forced 0/1 */
 static long nobjects;		/* = (updatespacing-16)/3, per existence */
 static long keys_per_thread;	/* K = 3*nobjects */
 
@@ -222,29 +221,23 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 
 	urcu_txn_init(&txn, &g_dom);
 	/*
-	 * Read-your-own-writes + chained same-slot stores.  Required whenever this
-	 * commit carries more than one ordered edit: without it a later _prepare
-	 * searches the committed structure, lands on a predecessor an earlier edit
-	 * already displaced, and the two stores collide on one pred->next[L] slot.
-	 * Left OFF at movesper == 1 by default so the single-move fast path keeps
-	 * its historical semantics (and so --ryw makes an honest A/B of what RYW
-	 * costs there).
-	 */
-	if (use_ryw)
-		urcu_txn_enable_ryw(&txn);
-	/*
-	 * Age-0 hint (engine's AGE_ESCALATE builds; a no-op elsewhere).  A batched
-	 * move (movesper > 1) is densely self-aliasing: the rotation maps consecutive
-	 * keys onto a shared predecessor slot, so the age-0 optimistic attempt reads
-	 * its own pending write and aborts every time -- expect_conflict skips it and
-	 * runs the sorted, RYW-resolved, blocking path from the first attempt.  A
-	 * single move (movesper == 1) instead touches distinct slots (del in src_sl,
-	 * insert in dst_sl -- different skiplists), so it is disjoint and keeps the
-	 * age-0 fast path; claim that only when RYW is not forced on for the A/B.
+	 * Read-your-own-writes + chained same-slot stores is the engine default,
+	 * and it is what composes more than one ordered edit per commit: a later
+	 * _prepare then observes the txn's own pending edits instead of searching
+	 * the committed structure and colliding on a shared pred->next[L] slot.
+	 *
+	 * A batched move (movesper > 1) is densely self-aliasing: the rotation maps
+	 * consecutive keys onto a shared predecessor slot, so an AGE_ESCALATE build's
+	 * age-0 optimistic attempt would read its own pending write and abort every
+	 * time -- expect_conflict skips it and runs the sorted, RYW-resolved, blocking
+	 * path from the first attempt (a no-op on other builds).  A single move
+	 * (movesper == 1) instead touches distinct slots (del in src_sl, insert in
+	 * dst_sl -- different skiplists), so its write set is disjoint by construction
+	 * and it declares that to take the age-0 blind append with no Bloom.
 	 */
 	if (movesper != 1)
 		urcu_txn_expect_conflict(&txn);
-	else if (!use_ryw)
+	else
 		urcu_txn_declare_disjoint(&txn);
 	for (;;) {
 		int retry = 0;
@@ -558,7 +551,8 @@ static void run(void)
 		printf("%d", movesper);
 	else
 		printf("whole-rotation (%ld)", keys_per_thread);
-	printf("  ryw: %s\n", use_ryw ? "on" : "off");
+	printf("  mode: %s\n",
+	       movesper != 1 ? "batched (chained)" : "single-move (disjoint)");
 	printf("duration (s): %g\n", secs);
 	printf("UPDATE  updaters: %d  rotations: %lld  key-moves: %lld  "
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
@@ -614,15 +608,11 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--nbuckets N] [--nupdaters N] [--nreaders N]\n"
 	    "          [--updatespacing N] [--cpustride N] [--duration MS] [--movesper N]\n"
-	    "          [--ryw 0|1]\n"
 	    "  --nbuckets N  => accepted for CLI parity with existence; IGNORED (no buckets)\n"
 	    "  --nreaders N  => concurrent membership-query threads (read-side)\n"
 	    "  --movesper N  => structural moves composed into one commit (0 = whole\n"
-	    "                   rotation).  N != 1 requires --ryw 1, which is the default\n"
-	    "                   there; see the source header for why.\n"
-	    "  --ryw 0|1     => force read-your-own-writes off/on (default: on iff\n"
-	    "                   movesper != 1).  --movesper 1 --ryw 1 is the A/B that\n"
-	    "                   measures what RYW costs the single-move fast path.\n",
+	    "                   rotation).  N != 1 composes several ordered edits under\n"
+	    "                   the default read-your-own-writes; see the source header.\n",
 	    p);
 	exit(2);
 }
@@ -639,25 +629,11 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))     cpustride = (int) strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--movesper"))      movesper = (int) strtol(argv[++i], NULL, 0);
-		else if (!strcmp(argv[i], "--ryw"))           use_ryw = (int) strtol(argv[++i], NULL, 0);
 		else usage(argv[0]);
 	}
 	(void) nbuckets;			/* parsed for parity, not used */
 	if (nupdaters < 1 || updatespacing < 20 || movesper < 0)
 		usage(argv[0]);
-	if (use_ryw < 0)
-		use_ryw = (movesper != 1);	/* auto: on for any batched commit */
-	if (movesper != 1 && !use_ryw) {
-		fprintf(stderr,
-		    "error: --movesper %d with --ryw 0 is unsound.  Batching >1 ordered\n"
-		    "  edits per MCAS lets two moves collide on a shared predecessor slot:\n"
-		    "  each _prepare searches the COMMITTED structure, blind to the txn's\n"
-		    "  own pending edits, so the engine coalesces the same-slot records and\n"
-		    "  silently destroys one edge (a torn tower, then -EAGAIN forever).\n"
-		    "  Use --ryw 1 (the default at movesper != 1), or --movesper 1.\n",
-		    movesper);
-		exit(2);
-	}
 
 	nobjects = (updatespacing - 16) / 3;		/* mirror existence */
 	keys_per_thread = 3 * nobjects;

@@ -128,8 +128,8 @@ run_one() {
 trio() {
 	panel=$1; alloc=$2; cores=$3; b=$4; nrd=$5
 	run_one "$panel" "$alloc" existence "$cores" "$b" "$nrd" 3 "$EX"  --groupobjs 3
-	run_one "$panel" "$alloc" txn-mp3   "$cores" "$b" "$nrd" 3 "$TXN" --movesper 3 --ryw 1
-	run_one "$panel" "$alloc" txn-mp1   "$cores" "$b" "$nrd" 1 "$TXN" --movesper 1 --ryw 0
+	run_one "$panel" "$alloc" txn-mp3   "$cores" "$b" "$nrd" 3 "$TXN" --movesper 3
+	run_one "$panel" "$alloc" txn-mp1   "$cores" "$b" "$nrd" 1 "$TXN" --movesper 1
 }
 
 echo "panel,alloc,engine,run,cores,nreaders,b,keys_per_sl,width,mmoves_s,ns_per_keymove,mqueries_s,hitpct" > "$CSV"
@@ -159,7 +159,7 @@ echo ">> panel 'read': 1 updater + N readers, keys/skiplist = $READ_B" >&2
 for n in $READERS; do
 	echo "   readers=$n" >&2
 	run_one read jemalloc existence 1 "$READ_B" "$n" 3 "$EX"  --groupobjs 3
-	run_one read jemalloc txn-mp3   1 "$READ_B" "$n" 3 "$TXN" --movesper 3 --ryw 1
+	run_one read jemalloc txn-mp3   1 "$READ_B" "$n" 3 "$TXN" --movesper 3
 done
 
 echo ">> wrote $CSV ($(($(wc -l < "$CSV") - 1)) rows)" >&2

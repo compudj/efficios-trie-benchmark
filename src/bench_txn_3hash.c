@@ -30,38 +30,36 @@
 //   the whole rotation in a single transaction, the true existence analogue;
 //   a small value trades away batch-atomicity to stay within a cheap MCAS).
 //
-//   Two edits in one commit are unsafe when they name the SAME SLOT, and the
-//   hlist is not structurally immune to that.  A head insert always stores to
-//   &head->first; del(X) stores to *X->pprev, which IS &head->first exactly when
-//   X is the bucket's first node.  Compose those two and the olds agree (the
-//   insert's `succ` load reads memory, unaware this same txn is unlinking X), so
-//   the engine's one-record-per-slot upgrade wins and X ends up MARK-ed yet still
-//   linked -- its delete silently did not happen, and the caller reclaims it.
-//   Verified in isolation: with the victim first the chain becomes 9,3(MARKED),2,1;
-//   with the victim middle or last both edits land and the chain is correct.  Two
+//   Two edits in one commit can name the SAME SLOT, and the hlist is not
+//   structurally immune to that.  A head insert always stores to &head->first;
+//   del(X) stores to *X->pprev, which IS &head->first exactly when X is the
+//   bucket's first node.  Were writes invisible (the retired pre-RYW mode),
+//   composing those two would let the olds agree (the insert's `succ` load would
+//   read memory, unaware this same txn is unlinking X), so the engine's
+//   one-record-per-slot upgrade would win and X would end up MARK-ed yet still
+//   linked -- its delete silently gone, and the caller reclaiming it.  Verified
+//   in isolation: with the victim first the chain became 9,3(MARKED),2,1; with the
+//   victim middle or last both edits landed and the chain was correct.  Two
 //   inserts into one bucket, and two adjacent deletes (del(A) then del(B=A->next),
 //   whose write site *B->pprev is the &A->next that del(A) tombstones), alias the
 //   same way.  Head insertion is not the cure: at the tail the trigger would move
 //   to "victim is last".
 //
-//   Necessary precondition: the two edits must share a bucket chain at all.  A
-//   chunk's keys are CONSECUTIVE and a bucket is key % nbuckets, so that needs
-//   chunk > nbuckets -- which the default (nbuckets 4096, movesper 4) never
-//   reaches, and why the published figures were sound without any of this.  That
-//   is a property of the configuration, not of the design.  Where a chunk can
-//   share a bucket, --ryw enables the engine's read-your-own-writes plus chained
-//   same-slot stores (on by default exactly there, and required: --ryw 0 is
-//   refused).  Note the condition assumes the consecutive-key layout below; a
-//   different key assignment would need it re-derived.
+//   The engine's default read-your-own-writes plus chained same-slot stores
+//   composes such aliasing edits correctly: the insert's `succ` load then sees the
+//   pending unlink, so the two edges chain instead of clobbering.  No configuration
+//   is unsafe.  A commit whose keys are CONSECUTIVE and whose span stays at or
+//   below nbuckets cannot share a bucket at all (a bucket is key % nbuckets), so
+//   its write set is disjoint by construction; it declares that --
+//   urcu_txn_declare_disjoint() -- and takes the age-0 blind append with no Bloom,
+//   the fast path the default config (nbuckets 4096, movesper 4) uses.  --disjoint
+//   forces it either way; forcing it ON where a chunk can share a bucket
+//   (span > nbuckets) is refused.  The span condition assumes the consecutive-key
+//   layout below; a different key assignment would need it re-derived.
 //
-//   Corruption does not always announce itself: the reproducing config
-//   (--updatespacing 20 --nbuckets 2 --movesper 4 --ryw 0, one node per bucket so
-//   the victim is always first) LIVELOCKS rather than finishing, because a later
-//   del_prepare retries forever against an old-value check that can never pass.
-//   So the --ryw guard, not the check below, is what protects this bench.  Every
-//   run still ends with a conservation check -- each updater's keys must be
-//   linked where it left them -- which prints CONSERVATION FAILED and exits
-//   nonzero, catching the quieter drop-shaped failures.
+//   Every run ends with a conservation check -- each updater's keys must be linked
+//   where it left them -- which prints CONSERVATION FAILED and exits nonzero,
+//   catching drop-shaped failures.
 //
 // Build (after `make urcu-txn`), mirroring the bench_list_scale recipe:
 //   cc -O2 -pthread -D_GNU_SOURCE -D_LGPL_SOURCE \
@@ -103,10 +101,10 @@ static long updatespacing = 32;	/* key stride between updaters; sets nobjects */
 static int  cpustride     = 1;
 static long duration_ms   = 1000;
 static int  movesper      = 4;	/* moves per MCAS commit; 0 = whole rotation */
-static int  use_ryw       = -1;	/* -1 = auto (on iff a chunk can alias a bucket) */
-static int  use_disjoint  = 0;	/* declare the write set disjoint: age-0 blind
-				 * append WITHOUT the RYW Bloom (sound iff no
-				 * two moves in a commit alias a bucket) */
+static int  use_disjoint  = -1;	/* -1 = auto (declare iff the write set is
+				 * disjoint by construction: span <= nbuckets).
+				 * Declaring it takes the age-0 blind append
+				 * WITHOUT the RYW Bloom. */
 static long nobjects;		/* = (updatespacing-16)/3, per existence */
 static long keys_per_thread;	/* K = 3*nobjects */
 
@@ -210,16 +208,12 @@ static int commit_moves(struct hnode **olds, struct hnode **news,
 
 	urcu_txn_init(&txn, &g_dom);
 	/*
-	 * Read-your-own-writes + chained same-slot stores, needed only when two
-	 * moves in one commit can touch the SAME bucket chain (see main(): that
-	 * requires chunk > nbuckets, since a chunk's keys are consecutive and the
-	 * bucket is key % nbuckets).  Without it, an insert at a bucket head and a
-	 * delete of the node that head names both store &head->first with the same
-	 * old, and the engine's one-record-per-slot upgrade leaves the victim
-	 * MARK-ed but still linked -- its delete lost, then reclaimed under readers.
+	 * The default read-your-own-writes + chained same-slot stores composes two
+	 * moves that touch the SAME bucket chain (an insert at a bucket head and a
+	 * delete of the node that head names -- see main()).  A commit whose moves
+	 * cannot alias a bucket (span <= nbuckets) has a disjoint write set, so it
+	 * declares that and takes the age-0 blind append with no Bloom.
 	 */
-	if (use_ryw)
-		urcu_txn_enable_ryw(&txn);
 	if (use_disjoint)
 		urcu_txn_declare_disjoint(&txn);
 	for (;;) {
@@ -351,9 +345,10 @@ static void *updater(void *arg)
 	 * del_rcu() on it would retry forever against an old-value check that can
 	 * never pass.  So never hand a node we cannot see to del_rcu().
 	 *
-	 * This catches drop-shaped failures.  It does NOT catch the bucket-aliasing
-	 * corruption, which livelocks long before any drain -- the --ryw guard in
-	 * main() is what prevents that one.
+	 * This catches drop-shaped failures.  Bucket-aliasing edits are composed by
+	 * the default read-your-own-writes, so they no longer corrupt; the only
+	 * remaining unsound configuration -- --disjoint 1 where a chunk can alias --
+	 * is refused in main().
 	 */
 	for (j = 0; j < K; j++) {
 		int linked;
@@ -527,8 +522,7 @@ static void run(void)
 		printf("%d", movesper);
 	else
 		printf("whole-rotation (%ld)", keys_per_thread);
-	printf("  ryw: %s  disjoint: %s\n", use_ryw ? "on" : "off",
-	       use_disjoint ? "on" : "off");
+	printf("  disjoint: %s\n", use_disjoint ? "on" : "off");
 	printf("duration (s): %g\n", secs);
 	printf("UPDATE  updaters: %d  rotations: %lld  key-moves: %lld  "
 	       "Mmoves/s: %g  ns/key-move: %g  (commits: %lld  aborts: %lld)\n",
@@ -566,13 +560,14 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--nbuckets N] [--nupdaters N] [--nreaders N]\n"
 	    "          [--updatespacing N] [--cpustride N] [--duration MS] [--movesper N]\n"
-	    "          [--ryw 0|1]\n"
-	    "  --nreaders N => concurrent membership-query threads (read-side)\n"
-	    "  --movesper 0 => attempt the whole rotation in one MCAS commit\n"
-	    "                  (true existence_flip analogue; may exceed MCAS width)\n"
-	    "  --ryw 0|1    => force read-your-own-writes off/on.  Default: on iff a\n"
-	    "                  commit can touch one bucket twice (chunk > nbuckets),\n"
-	    "                  which is the only way batched hlist moves alias.\n",
+	    "          [--disjoint 0|1]\n"
+	    "  --nreaders N   => concurrent membership-query threads (read-side)\n"
+	    "  --movesper 0   => attempt the whole rotation in one MCAS commit\n"
+	    "                    (true existence_flip analogue; may exceed MCAS width)\n"
+	    "  --disjoint 0|1 => declare the write set disjoint (age-0 blind append, no\n"
+	    "                    Bloom).  Default: on iff a commit cannot touch one\n"
+	    "                    bucket twice (span <= nbuckets); forcing it on where it\n"
+	    "                    can is refused.\n",
 	    p);
 	exit(2);
 }
@@ -589,7 +584,6 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))    cpustride = (int)strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--duration"))     duration_ms = strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--movesper"))     movesper = (int)strtol(argv[++i], NULL, 0);
-		else if (!strcmp(argv[i], "--ryw"))          use_ryw = (int)strtol(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--disjoint"))     use_disjoint = (int)strtol(argv[++i], NULL, 0);
 		else usage(argv[0]);
 	}
@@ -607,34 +601,30 @@ int main(int argc, char **argv)
 	 * most `span` of them; a bucket is key % nbuckets, so two collide iff their
 	 * difference is a nonzero multiple of nbuckets -- impossible while the span
 	 * stays at or below nbuckets.  Hence aliasing is possible iff span > nbuckets.
-	 * That is a NECESSARY precondition, not a sufficient one (the two edits must
-	 * then also name the same slot), so enabling RYW on it is conservative.
 	 *
-	 * This is why the default config (nbuckets 4096, movesper 4) has always been
-	 * sound WITHOUT read-your-own-writes, and why the published figures stay
-	 * reproducible: RYW is enabled only where it is actually required, leaving
-	 * the historical measurement path untouched.  A property of the
-	 * configuration, though, not of the design -- and it assumes the consecutive
-	 * key layout above.
+	 * A commit that cannot alias (span <= nbuckets) has a write set that is
+	 * disjoint by construction, so it declares that and takes the age-0 blind
+	 * append with no Bloom -- the fast path the default config (nbuckets 4096,
+	 * movesper 4) uses.  Where a chunk CAN alias, the default read-your-own-writes
+	 * composes the colliding edits via chained same-slot stores, so declaring the
+	 * write set disjoint there would be unsound and is refused.  This assumes the
+	 * consecutive key layout above.
 	 */
 	{
 		long chunk = movesper > 0 ? movesper : keys_per_thread;
 		long span = chunk < keys_per_thread ? chunk : keys_per_thread;
-		int ryw_required = span > nbuckets;
+		int can_alias = span > nbuckets;	/* two moves may share a bucket */
 
-		if (use_ryw < 0)
-			use_ryw = ryw_required;
-		if (ryw_required && !use_ryw) {
+		if (use_disjoint < 0)
+			use_disjoint = !can_alias;	/* disjoint by construction */
+		if (use_disjoint && can_alias) {
 			fprintf(stderr,
-			    "error: --ryw 0 with a %ld-key commit span > --nbuckets %ld is\n"
-			    "  unsound.  Two moves in one commit can then share a bucket, and\n"
-			    "  two edits naming one slot (an insert at a head plus a delete of\n"
-			    "  the node that head names, two inserts at one head, or two\n"
-			    "  adjacent deletes) both present the same old.  The engine keeps\n"
-			    "  one record per slot, so the upgrade destroys an edge: the victim\n"
-			    "  stays MARK-ed but linked, its delete lost, and it is reclaimed\n"
-			    "  under readers.  In practice the run then livelocks.  Use --ryw 1,\n"
-			    "  or raise --nbuckets above %ld, or lower --movesper.\n",
+			    "error: --disjoint 1 with a %ld-key commit span > --nbuckets %ld\n"
+			    "  is unsound.  Two moves in one commit can then share a bucket, and\n"
+			    "  the blind append would insert a duplicate record and corrupt the\n"
+			    "  commit.  Raise --nbuckets above %ld, lower --movesper, or drop\n"
+			    "  --disjoint -- the default read-your-own-writes composes aliasing\n"
+			    "  edits via chained same-slot stores.\n",
 			    span, nbuckets, span);
 			exit(2);
 		}

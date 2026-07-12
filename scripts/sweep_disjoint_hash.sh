@@ -1,12 +1,15 @@
 #!/bin/sh
 # Disjoint-write-set hint on the urcu-txn 3-hash: compare, at matched width and
-# from ONE esc-smart binary (only the runtime flag differs), the RYW-free
-# disjoint blind-append against today's ryw-off reconcile find and against
-# ryw-on (Bloom + blind-append).
+# from ONE binary (only the runtime flag differs), the Bloom-free disjoint
+# blind-append against the default read-your-own-writes (Bloom + blind-append).
 #
-#   find : --ryw 0             -- blind append off -> reconcile find every store
-#   disj : --disjoint 1 --ryw 0 -- blind append, NO Bloom (urcu_txn_declare_disjoint)
-#   ryw1 : --ryw 1             -- Bloom + blind append
+#   disj : --disjoint 1  -- blind append, NO Bloom (urcu_txn_declare_disjoint)
+#   ryw1 : --disjoint 0  -- the default read-your-own-writes: Bloom + blind append
+#
+# HISTORICAL: the committed scripts/disjoint_hash.csv also carries a third "find"
+# curve (ryw off, reconcile find).  That invisible-writes mode is retired -- read-
+# your-own-writes is now the engine's unconditional default -- so this sweep no
+# longer produces it; re-running overwrites the CSV with just the two curves above.
 #
 # The engine hint is urcu_txn_declare_disjoint() (userspace-rcu-txn commit
 # 72ae6027).  Writes scripts/disjoint_hash.csv; plot with plot_disjoint_hash.py.
@@ -21,7 +24,7 @@ BIN=$(mktemp)
 OUT=$HERE/disjoint_hash.csv
 # The shipping default engine already IS this config (spinlatch install, age-0
 # flat install, k=3 / 1024-bit filter), so no engine -D flags are needed; only
-# the runtime --disjoint / --ryw variant below differs across the three curves.
+# the runtime --disjoint variant below differs across the two curves.
 cc -O2 -pthread -I"$DEV/include" -I"$DEV/src" "$BENCH/src/bench_txn_3hash.c" \
 	-o "$BIN" -L"$DEV/src/.libs" -Wl,-rpath,"$DEV/src/.libs" \
 	-lurcu-qsbr -lurcu-cds -lurcu-common -lpthread
@@ -44,8 +47,7 @@ med() { # variant cores flags...
 	echo "$1,$2,$res" | tee -a "$OUT"
 }
 for c in $CORES; do
-	med find "$c" "--ryw 0"
-	med disj "$c" "--disjoint 1 --ryw 0"
-	med ryw1 "$c" "--ryw 1"
+	med disj "$c" "--disjoint 1"
+	med ryw1 "$c" "--disjoint 0"
 done
 echo ">> wrote $OUT" >&2
