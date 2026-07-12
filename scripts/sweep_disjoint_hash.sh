@@ -6,10 +6,10 @@
 #   disj : --disjoint 1  -- blind append, NO Bloom (urcu_txn_declare_disjoint)
 #   ryw1 : --disjoint 0  -- the default read-your-own-writes: Bloom + blind append
 #
-# HISTORICAL: the committed scripts/disjoint_hash.csv also carries a third "find"
-# curve (ryw off, reconcile find).  That invisible-writes mode is retired -- read-
-# your-own-writes is now the engine's unconditional default -- so this sweep no
-# longer produces it; re-running overwrites the CSV with just the two curves above.
+# The invisible-writes "find" mode (ryw off, a reconcile find on every store) is
+# retired -- read-your-own-writes is now the engine's unconditional default -- so
+# this sweep produces only the two curves above; the reconcile-find baseline can
+# no longer be measured.
 #
 # The engine hint is urcu_txn_declare_disjoint() (userspace-rcu-txn commit
 # 72ae6027).  Writes scripts/disjoint_hash.csv; plot with plot_disjoint_hash.py.
