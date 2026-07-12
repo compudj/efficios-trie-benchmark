@@ -347,12 +347,37 @@ endif
 ifeq ($(PCPU),1)
   LIST_POOL_CFLAGS += -DLIST_RCU_INLINE_RCU_HEAD -DBENCH_PCPU_ALLOC_DEFAULT
 endif
-# Optimistic-retry budget before a starved txn escalates into the serialized
-# fair lane (urcu/rcu-txn.h URCU_TXN_FALLBACK, default 64).  Higher = stay on the
-# parallel MCAS/priority path longer before serializing.  For collapse studies.
-ifdef TXN_FALLBACK
-  LIST_POOL_CFLAGS += -DURCU_TXN_FALLBACK=$(TXN_FALLBACK)
+# Optimistic-retry budget before a starved txn escalates into the serialized fair
+# lane.  The budget is no longer flat: the engine scales it by the transaction's
+# own COST -- its loads plus its write-set records -- as
+#
+#   budget = cost * URCU_TXN_FALLBACK_PER_COST_NUM / URCU_TXN_FALLBACK_PER_COST_DEN
+#
+# (urcu/rcu-txn.h, default 11/4).  Raising it keeps a txn on the parallel MCAS
+# path longer before serializing; lowering it rescues a starved txn sooner.  For
+# collapse studies.
+TXN_TUNE_CFLAGS :=
+ifdef TXN_PER_COST_NUM
+  TXN_TUNE_CFLAGS += -DURCU_TXN_FALLBACK_PER_COST_NUM=$(TXN_PER_COST_NUM)
 endif
+ifdef TXN_PER_COST_DEN
+  TXN_TUNE_CFLAGS += -DURCU_TXN_FALLBACK_PER_COST_DEN=$(TXN_PER_COST_DEN)
+endif
+# Floor under the scaled budget.  It is what keeps a CHEAP txn on a HOT domain off
+# the lane: a bidir-list delete costs ~2 slots, so scaling alone would hand it a
+# budget of 5 retries and it would escalate on ordinary contention, serializing a
+# domain running at 225 Mops/s (-17% on the list churn panel).
+ifdef TXN_FALLBACK_MIN
+  TXN_TUNE_CFLAGS += -DURCU_TXN_FALLBACK_MIN=$(TXN_FALLBACK_MIN)
+endif
+# TXN_FALLBACK selects the FLAT budget instead.  It must turn the cost scaling
+# OFF as well: with PER_COST_NUM non-zero the engine never consults
+# URCU_TXN_FALLBACK at all, so setting it alone would silently do nothing.
+ifdef TXN_FALLBACK
+  TXN_TUNE_CFLAGS += -DURCU_TXN_FALLBACK_PER_COST_NUM=0 \
+                     -DURCU_TXN_FALLBACK=$(TXN_FALLBACK)
+endif
+LIST_POOL_CFLAGS += $(TXN_TUNE_CFLAGS)
 # The urcu-txn engine defaults to its shipping configuration in the headers
 # (single-driver spinlatch install, age-0/age-1 escalation, k=3 / 1024-bit Bloom
 # -- see <urcu/rcu-mcas.h>), so the build passes NO engine flags and every txn
@@ -414,7 +439,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 # See design/txn-vs-existence-3hash.md.  The bench defines _GNU_SOURCE/_LGPL_SOURCE
 # and the QSBR flavor itself.
 # ---------------------------------------------------------------------------
-TXN3_CFLAGS := -O2 -pthread -Wall
+TXN3_CFLAGS := -O2 -pthread -Wall $(TXN_TUNE_CFLAGS)
 
 check-urcu-txn-lib:
 	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
