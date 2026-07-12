@@ -2459,6 +2459,28 @@ static void run_point(int nr_readers, int nr_writers,
 	stop_flag = 0;
 	prime_done_count = 0;
 
+	/*
+	 * Writer wid owns the churn slots { wid, wid+nw, wid+2nw, ... }, and that
+	 * disjointness is what makes the per-slot g_present[]/g_anchor[] bookkeeping
+	 * race-free: no two writers ever toggle the same slot.  With CHURN <
+	 * nr_writers a writer with wid >= CHURN owns NONE of them and its very first
+	 * index is already past the end -- the toggle loop's wrap resets the index to
+	 * `first`, which is still out of bounds -- so it reads g_*_churn[] off the
+	 * end, hands the garbage it finds there to the engine as a list node, and
+	 * segfaults.  Wrapping the index instead would silently make writers SHARE
+	 * churn slots and race on that bookkeeping (double delete -> use-after-free),
+	 * so the only sound answer is to refuse the configuration.
+	 */
+	if (!(g_random_pos && g_eng->write_random) && nr_writers > 0 &&
+			CHURN < nr_writers) {
+		fprintf(stderr,
+			"ERROR: CHURN (%d) < writers (%d): each writer must own at least one\n"
+			"       churn slot (writer wid owns slots wid, wid+nw, wid+2nw, ...).\n"
+			"       Raise CHURN to >= the writer count.\n",
+			CHURN, nr_writers);
+		exit(1);
+	}
+
 	if (g_eng->point_reset)
 		g_eng->point_reset();			/* rewind engine thread registry (RLU) */
 
