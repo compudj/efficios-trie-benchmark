@@ -1,0 +1,12 @@
+# experiments/dcache -- track sources only; everything else in this directory is
+# build output (the Makefile's binaries + *.o) or editor scratch.  Whitelist the
+# source kinds so a newly-added binary never needs a matching ignore line.
+*
+!*.c
+!*.h
+!*.md
+!Makefile
+!.gitignore
+!figures/
+figures/*
+!figures/.gitkeep

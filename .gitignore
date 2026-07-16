@@ -3,6 +3,9 @@
 
 # Our liburcu clone on the urcu-txn-dev branch; rebuild with `make urcu-txn`
 /urcu-txn-build/
+# TSAN-instrumented liburcu (compiler atomic builtins + -fsanitize=thread), for
+# experiments/dcache stress-tsan; built by copying + reconfiguring urcu-txn-build.
+/urcu-txn-tsan-build/
 
 # Our clean bind9 clone + overlay + build (the MT benchmarks); make bind9
 /bind9-src/
@@ -27,3 +30,6 @@
 # Benchmark output / results
 /results/
 *.data
+
+# dcache experiment build output (binaries + *.o) is ignored by
+# experiments/dcache/.gitignore (a sources-only whitelist).
