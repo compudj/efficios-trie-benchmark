@@ -1,9 +1,10 @@
 # S4 — simplification & invariant-surface analysis
 
 What the urcu-txn port *removes* versus the faithful `rename_lock` + `d_seq`
-baseline, and — just as important — what it deliberately *keeps* and why. This
-is the qualitative half of S4; the LOC diff and the scaling figures land beside
-it (TODO markers below).
+baseline, and — just as important — what it deliberately *keeps* and why. The
+qualitative analysis (§1–4), the cache-line locality work (§5), the correctness
+invariants the per-node counter rests on (§6), and the S3 scaling curves that
+measure the payoff (§7); the mechanical LOC diff is the one remaining TODO.
 
 The thesis this file defends: the port replaces **two kernel seqcount mechanisms
 plus a global mutator serialization** with **one uniform node type discriminated
@@ -367,5 +368,91 @@ node hashed under a *different* key; were `d_host` mutable, a reader could resol
 to a different host. Sampling the child's counter is sound *because* these two
 edges above it cannot silently change identity.
 
-> TODO(S4-figures): fold the S3 + readdir scaling figures in here with a
-> one-paragraph reading each, so this file is the standalone S4 writeup.
+## 7. The simplification's payoff — S3 scaling curves
+
+The point of dissolving `d_seq` and demoting `rename_lock` is not fewer lines;
+it is that the reader path stops sharing a whole-tree cacheline. §7.1–7.2 fold in
+the S3 sweeps that measure it (full data + method in `rename-shell-transition.md`
+§S3 / readdir; 2×96-core EPYC 9654, threads pinned one-per-physical-core via an
+`hwloc-calc core:all.pu:0 → --cpulist`, best-of-5, every run gated on namespace
+conservation — 0 failures). The `.png` renders are not committed; these tables
+are the record.
+
+### 7.1 Path-lookup reader scaling
+
+The homogeneous rename-fraction mix is the *wrong* instrument: a rename is ≈50×
+a lookup, so throughput is writer-bound and the reader-generation difference is
+masked (per-node only ~25% ahead at the high-frac end). The **role-split** mode
+(dedicated readers + writers) isolates the reader path, and the localization
+appears. Two axes, all figures Mops/s:
+
+*8 writers, sweep readers toward the full machine (reported anchors):*
+
+| readers | seqlock | txn-global | txn-per-node |
+|---|--:|--:|--:|
+| 2 (low end) | — | — | ~8 |
+| 160 (per-node peak) | noisy 40–93 | ~110–120 (saturated) | **451** |
+| 184 (all 192 cores) | ~73 | ~114 | **422** |
+| ratio @184 | 5.8× | 3.7× | **1×** |
+
+*32 readers, sweep writers (per-node lead over global):*
+
+| writers | txn-global | txn-per-node | lead |
+|---|--:|--:|--:|
+| 1 | 141 | 205 | 1.45× |
+| 4 | 50 | 101 | 2.0× |
+| 1→24 (range) | | | **1.3–2.1×** |
+
+**Reading.** The per-node host counter — read only by walks that pass through the
+*moved* entry (§6) — has no shared ceiling, so reader throughput keeps climbing to
+**451 Mops/s** as cores are added. The global `rename_gen`, read by every walk and
+written by every rename, is one contended cacheline and **saturates ~110–120**;
+seqlock never scales cleanly (reader-retry storms under the fixed rename load).
+This is the split the port's headline hides: `d_seq` **dissolves outright** and is
+independent of the counter choice, but the whole-walk-causality role of
+`rename_lock` **dissolves only under the per-node arm** — the global counter
+reimports exactly the contention it was meant to remove. The scaling win is a
+property of *where the counter lives*, which §6's two invariants are what license.
+
+### 7.2 Directory-listing (`readdir`) scaling
+
+`readdir` is a reader fast path in its own right (an in-memory dcache lists
+straight from the child index). The seqlock baseline is upgraded to the honest
+kernel analogue — a **per-directory rwsem** (`iterate_dir` under the inode rwsem),
+not a global lock — so different dirs and concurrent readers of one dir don't
+serialize on paper. Readers enumerate a random dir (~32 children) while writers
+rename; namespace owned by writers, so dir size is fixed as readers scale.
+Figures listings/s:
+
+*Reader scaling, 8 writers, sweep readers:*
+
+| readers | per-dir rwsem | txn walk |
+|---|--:|--:|
+| 160 | ~15–29 (saturated) | **355** |
+| 184 | ~15–29 | 310 |
+| ratio @160 | 1× | **~12×** |
+
+*Writer load, 32 readers, sweep writers (namespace fixed):*
+
+| writers | rwsem | txn walk | lead |
+|---|--:|--:|--:|
+| light | ~ | ~ | **6–7×** |
+| 48 (saturating) | ~14 | ~27–35 | **~2×** |
+
+**Reading.** `readdir` is the *easy* case: it reads **no generation counter at
+all**, so `txn-global` and `txn-per-node` run near-identical listing code and the
+global-vs-per-node question that decided the lookup path is **moot** here. It
+dissolves to a bare, `rcu_read_lock`-only child-hlist walk — no `rename_gen`, no
+`d_seq`, no cursor. The rwsem baseline saturates ~15–29 because its read-side is a
+shared cacheline that bounces among readers of the same dir; the lock-free walk
+**leads at every reader count**, even two. Crucially the txn walk pays no
+per-child chain walk: the write-once **`d_host` skip pointer overlaid on `d_id`**
+(§3) resolves each child's content host in O(1), which is what erased the earlier
+low-reader crossover and the churn-sensitivity — under saturating write load the
+walk still leads ~2× and its residual decline is *write-side* MCAS churn, not the
+reader path. So the same union that costs one branch on the lookup fast path (§2)
+is what makes listing O(1) in chain depth.
+
+> TODO(S4-figures): the `.png` renders (`dcache_s3.png`, `dcache_readdir.png`) are
+> not committed — the tables above are the standalone record. Rendering them from
+> a fresh sweep + `plot_dcache.py` is optional polish, not a data gap.
