@@ -71,6 +71,19 @@
  */
 extern unsigned long dc_seq_walk_retries __attribute__((weak));
 
+/*
+ * Weak ref: 1 in a txn engine built -DDC_SPLIT_ELIDE_ID (dc_lookup returns the
+ * host ADDRESS, not the logical d_id), else 0/absent.  When set, the id-VALUE
+ * checks below are meaningless (the returned id is a pointer), so they are
+ * skipped -- the dc_walk census (which reads the real stored d_id) remains the
+ * conservation gate, and the DC_POSITIVE/absent presence checks still run.
+ */
+extern const int dc_lookup_id_is_address __attribute__((weak));
+static inline int id_is_address(void)
+{
+	return &dc_lookup_id_is_address && dc_lookup_id_is_address;
+}
+
 /* ---- knobs (argv-overridable) ------------------------------------------- */
 static int    nthreads     = 4;
 static double rename_frac  = 0.10;	/* fraction of ops that are renames */
@@ -428,9 +441,10 @@ static void *worker(void *arg)
 
 			mk_leaf_path(&p, dr, g);
 			if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
+			    !id_is_address() &&
 			    (id < (uint64_t) owner_base ||
 			     id >= (uint64_t) (owner_base + leaves)))
-				me->lk_wrong++;
+				me->lk_wrong++;	/* value check: logical-id builds only */
 			me->nlookups++;
 		}
 		if (pollute) {			/* co-tenant: touch app cachelines */
@@ -713,8 +727,10 @@ int main(int argc, char **argv)
 		if (c.seen[i] != 1)
 			anomaly++;		/* id i missing or duplicated */
 		mk_leaf_path(&p, g_final_dir[i], i);
+		/* presence always; id-VALUE match only on logical-id builds (an
+		 * address-return build validates conservation via the census above). */
 		if (dc_lookup(g_dc, &p, &id) != DC_POSITIVE ||
-		    id != g_final_id[i])
+		    (!id_is_address() && id != g_final_id[i]))
 			anomaly++;
 	}
 

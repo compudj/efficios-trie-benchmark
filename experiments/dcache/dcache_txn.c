@@ -73,6 +73,18 @@ void (*dc_test_walk_hook)(int depth);
 void (*dc_test_fold_hook)(void);
 #endif
 
+/*
+ * The 1-CL split hot-path layout (simplification-s4.md §5) is the DEFAULT.
+ * Opt out with -DDC_NO_HOT1CL_SPLIT (legacy 3-CL layout) or -DDC_HOT1CL (the
+ * fair-weather pack that leaves d_hash cold).  Under split the reader returns
+ * the host ADDRESS only with -DDC_SPLIT_ELIDE_ID (the pure 1-CL, footprint
+ * minimum); the default keeps the (cold) d_id read so every harness's logical-id
+ * and torn-read/wrong-host checks keep working on the split layout.
+ */
+#if !defined(DC_NO_HOT1CL_SPLIT) && !defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
+#define DC_HOT1CL_SPLIT 1
+#endif
+
 #ifdef DC_HOT1CL_SPLIT
 #define DC_HOT1CL 1		/* SPLIT reuses all the HOT1CL tag machinery */
 #endif
@@ -203,15 +215,18 @@ static inline int node_is_positive(const struct dentry *d)
 #define DC_IPARENT(d)     iparent_of(d)
 #define DC_IS_POSITIVE(d) node_is_positive(d)
 #ifdef DC_HOT1CL_SPLIT
-#ifdef DC_SPLIT_KEEPID
-/* validation build: keep the straddle layout but read the (now cold) d_id, so
- * the harnesses' id checks pass -- proves the reorder+tags are correct. */
-#define DC_FAST_ID(node)  ((node)->d_id)
-#else
-/* elide d_id from the fast path: the host ADDRESS is a stable, write-once
- * identity here, so return it directly (no cold-line d_id read).  See the
- * seqcount note -- d_id is payload, not an ordering edge. */
+#ifdef DC_SPLIT_ELIDE_ID
+/* pure 1-CL: elide d_id from the fast path -- the host ADDRESS is a stable,
+ * write-once identity here, so return it directly (no cold-line d_id read).  See
+ * the seqcount note -- d_id is payload, not an ordering edge.  Harnesses that
+ * assert logical ids detect this via the dc_lookup_id_is_address capability
+ * (weak symbol) and skip their value checks; the census (dc_walk, real d_id) is
+ * the conservation gate. */
 #define DC_FAST_ID(node)  ((uint64_t) (uintptr_t) (node))
+#else
+/* default under split: keep the (cold) d_id read so the straddle+tags layout is
+ * measured while every harness's logical-id and torn-read checks keep working. */
+#define DC_FAST_ID(node)  ((node)->d_id)
 #endif
 #else
 #define DC_FAST_ID(node)  ((node)->d_id)
@@ -298,6 +313,19 @@ const char *dc_engine_name(void)
 	return "txn";
 #endif
 }
+
+/*
+ * Capability flag for harnesses: 1 when dc_lookup returns the host ADDRESS as the
+ * id (the -DDC_SPLIT_ELIDE_ID pure-1-CL build), 0 when it returns the logical
+ * d_id.  A harness reads it via a weak reference (absent => 0 => logical id) and,
+ * when set, skips its id-VALUE checks and relies on the dc_walk census (which
+ * reads the real stored d_id) for conservation.  See bench_dcache.c.
+ */
+#if defined(DC_HOT1CL_SPLIT) && defined(DC_SPLIT_ELIDE_ID)
+const int dc_lookup_id_is_address = 1;
+#else
+const int dc_lookup_id_is_address = 0;
+#endif
 
 static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 				   const struct qstr *name, uint64_t id)

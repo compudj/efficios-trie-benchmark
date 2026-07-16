@@ -180,6 +180,11 @@ bench_dcache_seqlock: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_seqlock.c \
 	  $(LDFLAGS) $(LDLIBS)
 
+# The txn arms now build the DEFAULT layout, which is the 1-CL SPLIT (straddle +
+# d_iparent tags) returning the logical d_id -- so conservation's value checks and
+# the correctness suites keep working.  The per-node _nosplit / _elide variants
+# below A/B the layout: _nosplit = legacy 3-CL baseline, _elide = pure 1-CL
+# (address-return, footprint minimum, census-gated conservation).
 bench_dcache_txn: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_txn.c \
 	  $(LDFLAGS) $(LDLIBS)
@@ -188,16 +193,28 @@ bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
+# Per-node reader on the LEGACY 3-CL layout (the §7 baseline): the split-vs-stock
+# A/B partner for the reader sweep.
+bench_dcache_txn_pernode_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# Per-node reader on the PURE 1-CL split (d_id elided, host address returned): the
+# footprint minimum.  Conservation is census-gated (see dc_lookup_id_is_address).
+bench_dcache_txn_pernode_elide: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_SPLIT_ELIDE_ID $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
 # 1-cacheline hot-path layout (global gen): d_iparent low-bit tags remove the
 # d_fwd/d_inode reads, so a settled lookup touches one CL.  A/B vs bench_dcache_txn.
 bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-# TRUE 1-CL: d_hash straddles so next lands on CL0 (collision walks stay hot) +
-# d_id elided (return host addr).  A/B vs bench_dcache_txn / _hot1cl.
+# PURE 1-CL (global gen): d_hash straddles so next lands on CL0 + d_id elided
+# (return host addr).  A/B vs bench_dcache_txn (now split+logical) / _hot1cl.
 bench_dcache_txn_hot1cl_split: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
+	$(CC) $(CFLAGS) -DDC_HOT1CL_SPLIT -DDC_SPLIT_ELIDE_ID $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 # Quick smoke: a short contended run on all three arms; nonzero exit on any
@@ -239,7 +256,9 @@ bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 clean:
 	rm -f *.o test_dcache test_dcache_asan repro_dcache repro_dcache_asan \
 	  bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
-	  bench_dcache_txn_hot1cl test_dcache_hot1cl test_dcache_hot1cl_asan \
+	  bench_dcache_txn_pernode_nosplit bench_dcache_txn_pernode_elide \
+	  bench_dcache_txn_hot1cl bench_dcache_txn_hot1cl_split \
+	  test_dcache_hot1cl test_dcache_hot1cl_asan \
 	  bench_dcache_seqlock_asan bench_dcache_txn_asan \
 	  test_dcache_pernode repro_dcache_pernode stress_dcache_pernode_asan \
 	  repro_fold repro_fold_asan repro_foldahead_on repro_foldahead_off \
