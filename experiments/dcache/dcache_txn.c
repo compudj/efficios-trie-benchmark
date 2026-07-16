@@ -110,7 +110,22 @@ struct dentry {
 	struct urcu_txn_hlist_head d_child_head;
 	struct urcu_txn_hlist_node d_sib;
 
-	uint64_t d_id;
+	/*
+	 * Identity id (HOST) OR skip pointer to the content host (SHELL), overlaid:
+	 * a host reads it as d_id, a shell as d_host.  Which is live is fixed by the
+	 * STABLE per-node property d_fwd==NULL (host) vs !=NULL (shell) -- a node is
+	 * born a host or a shell and never crosses over, so each node only ever
+	 * touches ONE member (no type-punning).  A reader resolves the host in O(1)
+	 * with host_of_rcu().  The shell's d_host is WRITE-ONCE (the tail is fold-
+	 * invariant), so it's a plain rcu_dereference.  This reuses the old
+	 * "cosmetic" shell d_id slot -- shells never needed their own id (readers use
+	 * the host's) and hosts never need a self skip pointer -- so the struct does
+	 * not grow and the identity slot keeps its original offset.
+	 */
+	union {
+		uint64_t       d_id;	/* host: stable identity */
+		struct dentry *d_host;	/* shell: skip pointer to the tail host */
+	};
 	int d_inode;
 
 	/*
@@ -324,6 +339,22 @@ static inline struct dentry *chain_host_rcu(struct dentry *d)
 }
 
 /*
+ * Resolve @top's content host in O(1) (readers).  A settled top (d_fwd == NULL)
+ * IS its own host.  A shell (d_fwd != NULL) holds a WRITE-ONCE skip pointer to
+ * the tail host in its d_id/d_host union slot -- read as a pointer only because
+ * d_fwd != NULL proves @top is a shell (a stable per-node property).  The d_fwd
+ * load is the discriminator and is ordered before the union access, so a host's
+ * id is never dereferenced as a pointer.  Unlike chain_host_rcu()'s O(depth)
+ * walk, this is one hop regardless of chain depth.
+ */
+static inline struct dentry *host_of_rcu(struct dentry *top)
+{
+	struct dentry *fwd = urcu_mcas_read((void **) &top->d_fwd, DC_FWD_TAG);
+
+	return fwd ? rcu_dereference(top->d_host) : top;
+}
+
+/*
  * SYNCHRONOUS FOLD-AHEAD (liveness relief valve).  The async fold worker drains
  * only as fast as grace periods advance; if a registered thread stops quiescing
  * under write load -- e.g. blocked in pthread_join while still RCU-online -- GPs
@@ -434,7 +465,7 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
 {
 	struct dentry *top = find_top_rcu(dc, parent, name);
 
-	return top ? chain_host_rcu(top) : NULL;
+	return top ? host_of_rcu(top) : NULL;		/* O(1) skip to host */
 }
 
 /*
@@ -570,7 +601,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 				res = DC_ABSENT;
 				break;
 			}
-			host = chain_host_rcu(top);
+			host = host_of_rcu(top);	/* O(1) skip to host */
 			s = urcu_mcas_read(&host->d_seq, DC_GEN_TAG);	/* sample */
 			cmm_smp_rmb();		/* sample gen before the confirm */
 			if (top_unhashed_rcu(top)) {	/* top left the index */
@@ -904,7 +935,7 @@ static int stack_shell(struct dcache *dc,
 			goto out_free;
 		}
 		host = chain_host_depth_rcu(top, &depth);
-		shell->d_id = host->d_id;	/* cosmetic; readers use the host */
+		shell->d_host = host;		/* union slot = skip pointer to the tail host */
 		shell->d_fwd = top;		/* new top forwards to the old top */
 
 		urcu_txn_begin(&txn);
@@ -1236,9 +1267,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		}
 		hosta = chain_host_depth_rcu(topa, &depa);
 		hostb = chain_host_depth_rcu(topb, &depb);
-		sa->d_id = hosta->d_id;
+		sa->d_host = hosta;		/* union slot: A's new top -> A's tail host */
 		sa->d_fwd = topa;
-		sb->d_id = hostb->d_id;
+		sb->d_host = hostb;		/* union slot: B's new top -> B's tail host */
 		sb->d_fwd = topb;
 
 		urcu_txn_begin(&txn);
@@ -1305,7 +1336,7 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 	for (n = urcu_txn_hlist_first_rcu(&d->d_child_head); n;
 	     n = urcu_txn_hlist_next_rcu(n)) {
 		struct dentry *top = sib_dentry(n);
-		struct dentry *host = chain_host_rcu(top);
+		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
 		if (path->ndepth >= DC_PATH_MAX)
 			continue;
@@ -1358,7 +1389,7 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 	for (n = urcu_txn_hlist_first_rcu(&dir->d_child_head); n;
 	     n = urcu_txn_hlist_next_rcu(n)) {
 		struct dentry *top = sib_dentry(n);
-		struct dentry *host = chain_host_rcu(top);
+		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
 		if (fn)
 			fn(host->d_id, &top->d_iname, arg);
