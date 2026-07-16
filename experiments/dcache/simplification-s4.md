@@ -454,11 +454,11 @@ the S3 sweeps that measure it (full data + method in `rename-shell-transition.md
 conservation — **0 failures across 141 rows**). Figures `figures/dcache_s3.png`
 and `figures/dcache_readdir.png` (regenerate with `scripts/run_dcache.sh` →
 `scripts/plot_dcache*.py`); the tables below are the committed anchors. The
-plotted figures are the clean **baseline-vs-winner two-way** (seqlock vs
-per-node); the intermediate **txn-global** arm — a naive port that deletes
-`d_seq` but keeps *one* global `rename_gen` — is dropped from the lines to keep
-the headline uncluttered, but stays in the CSV and in the tables/reading below,
-because it is the evidence for *why* the counter must be per-node (§7.1).
+figures **and** the tables below are the clean **baseline-vs-winner two-way**
+(seqlock vs per-node); the intermediate **txn-global** arm — a naive port that
+deletes `d_seq` but keeps *one* global `rename_gen` — is kept in the CSV and cited
+inline in the readings, because it is the evidence for *why* the counter must be
+per-node (§7.1), but is not tabled, to keep the headline uncluttered.
 
 **Measured on the current default** — the true-1-CL split (§5 "Landed",
 `0f4f626`/`706e459`) with `--precomp` on, both applied identically to all three
@@ -484,35 +484,36 @@ appears. Two axes, all figures Mops/s:
 
 *8 writers, sweep readers toward the full machine (reported anchors, Mops/s):*
 
-| readers | seqlock | txn-global | txn-per-node |
-|---|--:|--:|--:|
-| 2 (low end) | 21 | 25 | 58 |
-| 32 | 100 | 156 | 637 |
-| 160 (per-node peak) | 69 | 198 | **2011** |
-| 184 (all 192 cores) | 61 | 262 | 1965 |
-| ratio @184 | 32× | 7.5× | **1×** |
+| readers | seqlock | txn-per-node |
+|---|--:|--:|
+| 2 (low end) | 21 | 58 |
+| 32 | 100 | 637 |
+| 160 (per-node peak) | 69 | **2011** |
+| 184 (all 192 cores) | 61 | 1965 |
+| ratio @184 | 1× | **32×** |
 
-*32 readers, sweep writers (per-node lead over global, Mops/s):*
+*32 readers, sweep writers (per-node lead over the seqlock baseline, Mops/s):*
 
-| writers | txn-global | txn-per-node | lead |
+| writers | seqlock | txn-per-node | lead |
 |---|--:|--:|--:|
-| 1 | 357 | 764 | 2.1× |
-| 4 | 119 | 693 | 5.8× |
-| 1→24 (range) | | | **2.1–6.0×** |
+| 1 | 45 | 764 | 16.9× |
+| 4 | 107 | 693 | 6.5× |
+| 1→48 (range) | | | **5–17×** |
 
 **Reading.** The per-node host counter — read only by walks that pass through the
 *moved* entry (§6) — has no shared ceiling, so reader throughput keeps climbing to
 **~2011 Mops/s** @160 readers (easing to 1965 @184 as the 8 writers share the last
-socket). The global `rename_gen`, read by every walk and written by every rename,
-is one contended cacheline and **plateaus around ~200–260** (noisy, no clean
-saturation but a firm ceiling ~8× below per-node); seqlock never scales cleanly
-(reader-retry storms under the fixed rename load — non-monotonic 60–100 past
-~32 readers). At the full machine (184) per-node = **7.5× global, 32× seqlock**.
-This is the split the port's headline hides: `d_seq` **dissolves outright** and is
-independent of the counter choice, but the whole-walk-causality role of
-`rename_lock` **dissolves only under the per-node arm** — the global counter
-reimports exactly the contention it was meant to remove. The scaling win is a
-property of *where the counter lives*, which §6's two invariants are what license.
+socket), while seqlock never scales cleanly (reader-retry storms under the fixed
+rename load — non-monotonic 60–100 past ~32 readers). At the full machine (184)
+per-node = **32× seqlock**. The decisive control is the intermediate **txn-global**
+arm (in the CSV, not tabled): deleting `d_seq` but keeping *one* global `rename_gen`
+— read by every walk, written by every rename — **plateaus ~200–260 Mops/s**, a
+firm ceiling ~8× below per-node. That is the split the port's headline hides:
+`d_seq` **dissolves outright** and is independent of the counter choice, but the
+whole-walk-causality role of `rename_lock` **dissolves only under the per-node
+arm** — a global counter reimports exactly the contention it was meant to remove.
+The scaling win is a property of *where the counter lives*, which §6's two
+invariants are what license.
 
 ### 7.2 Directory-listing (`readdir`) scaling
 
@@ -526,38 +527,33 @@ Figures listings/s:
 
 *Reader scaling, 8 writers, sweep readers (listings/s):*
 
-| readers | per-dir rwsem | txn-global | txn-per-node |
-|---|--:|--:|--:|
-| 32 | 17 | 92 | 113 |
-| 160 | ~18 (saturated) | 293 | 364 |
-| 184 | 18 | 317 | **400** |
-| ratio @184 vs rwsem | 1× | 18× | **~23×** |
+| readers | per-dir rwsem | txn-per-node |
+|---|--:|--:|
+| 32 | 17 | 113 |
+| 160 | ~18 (saturated) | 364 |
+| 184 | 18 | **400** |
+| ratio @184 | 1× | **~23×** |
 
 *Writer load, 32 readers, sweep writers (namespace fixed, listings/s):*
 
-| writers | rwsem | txn-global | txn-per-node | per-node lead |
-|---|--:|--:|--:|--:|
-| 1 (light) | 4.0 | 72 | 78 | **~19×** |
-| 48 (saturating) | 13.5 | 56 | 62 | **~4.6×** |
+| writers | rwsem | txn-per-node | per-node lead |
+|---|--:|--:|--:|
+| 1 (light) | 4.0 | 78 | **~19×** |
+| 48 (saturating) | 13.5 | 62 | **~4.6×** |
 
 **Reading.** `readdir`'s reader path reads **no generation counter at all** — the
 dir resolve is a bare `txn_child_lookup_rcu` walk (no `rename_gen`, no `d_seq`, no
-cursor) and the listing is an `rcu_read_lock`-only child-hlist walk — so the two
-txn arms run **identical reader code**. Yet they no longer perfectly overlap:
-per-node leads global by ~15–25% at scale. That gap is **not** the reader path; it
-is a second-order *writer-side* effect. In the global build the 8 concurrent
-writers all bump the single `rename_gen` cacheline, which throttles the writers
-themselves (per-node sustains a higher rename rate — 0.24 vs 0.21 Mrn/s @160rd)
-and, via coherence-bus pressure, indirectly the gen-free readers sharing the
-machine. So even where the reader path is identical, the global counter's writer
-contention leaves a visible mark — a smaller echo of the lookup-path story; the
-old 3-CL/no-precomp sweep, at ~4× lower throughput, had it below the noise floor.
-Both txn arms crush the rwsem (saturates ~18 — its read-side is a shared cacheline
-bouncing among readers of one dir); the lock-free walk **leads at every reader
-count**, even two. Crucially the txn walk pays no per-child chain walk: the
+cursor) and the listing is an `rcu_read_lock`-only child-hlist walk. The txn walk
+**crushes the rwsem** (saturates ~18 — its read-side is a shared cacheline bouncing
+among readers of one dir) and **leads at every reader count**, even two, scaling to
+**~23×** at the full machine. Crucially it pays no per-child chain walk: the
 write-once **`d_host` skip pointer overlaid on `d_id`** (§3) resolves each child's
 content host in O(1), which erased the earlier low-reader crossover and the
 churn-sensitivity — under saturating write load it still leads ~4.6× and its
-residual decline is *write-side* MCAS churn, not the reader walk. So the same
-union that costs one branch on the lookup fast path (§2) makes listing O(1) in
-chain depth.
+residual decline is *write-side* MCAS churn, not the reader walk. So the same union
+that costs one branch on the lookup fast path (§2) makes listing O(1) in chain
+depth. (One footnote from the CSV's untabled txn-global arm: since the readdir
+reader reads no counter, its global and per-node builds run identical reader code
+yet still differ ~15–25% at scale — a second-order *writer-side* echo, the global
+`rename_gen` cacheline the 8 writers contend costing even the gen-free readers via
+bus pressure; per-node sustains a higher rename rate, 0.24 vs 0.21 Mrn/s @160rd.)
