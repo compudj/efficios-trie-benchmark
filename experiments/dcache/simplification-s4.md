@@ -366,6 +366,39 @@ address-as-identity (VFS-faithful; harnesses that assert logical ids build with
 `-DDC_SPLIT_KEEPID`). Kept behind `-DDC_HOT1CL_SPLIT`; promoting it to default
 awaits migrating the harness id-checks to address identity.
 
+### Landed as the default — true 1-CL for *both* readers (2026-07-16)
+
+The split above got the **global** reader to 1 CL, but the **per-node** reader
+was still 2-CL: `pahole` put `d_seq`@152 on CL2 sharing the line with the (now
+cold) `d_id`, and the per-node walk samples `d_seq` every hop. Eliding `d_id`
+alone could not fix that — `d_seq` needed its own CL0 seat. The "Path to a 1-CL
+hot path" budget above named the price exactly, and it was paid: **`DC_NAME_MAX`
+40→32** (the kernel's `DNAME_INLINE_LEN`, so `qstr` 48→40 B) frees the 8 bytes
+for `d_seq`@48. New CL0 = `d_iparent`(8)+`d_iname`(40)+`d_seq`(8)+
+`d_hash.next`(8) = 64; struct 176→168. `pahole`-verified; both the global and
+per-node readers now touch CL0 only. Address identity became the **default**
+(harness id-checks migrated; `-DDC_SPLIT_KEEPID` reads the cold `d_id` for
+logical-id suites; a weak `dc_lookup_id_is_address` capability lets the bench
+check a seed-time address table instead). `DC_HOT1CL_SPLIT` is now default-on
+(`-DDC_NO_HOT1CL_SPLIT` restores the legacy 3-CL struct). 103/103 global +
+per-node, stress/xchg/dirs ASan+TSAN-clean, bench conserves under
+renames+exchanges (engine `0f4f626`).
+
+**Fairness — the reference gets the same layout.** A footprint A/B is only
+mechanism-vs-mechanism if both sides carry equal cacheline quality. The seqlock
+reference was still a 3-CL struct (`d_seq` scattered onto CL1, a separate
+`d_inode`/`d_unhashed` pair), so it was brought up to the identical 1-CL hot line
+— `{d_name, d_parent, d_seq, d_hash.next}` on CL0, `d_unhashed`/`d_inode` folded
+into `d_parent`'s low bits, address identity, same `DC_HOT1CL_SPLIT` gate and
+`DC_SPLIT_KEEPID`/capability plumbing (engine `706e459`; `make check` 103/103,
+ASan-clean, bench conserves). Note the seqlock's single-thread read-heavy A/B is
+a **wash** (split ~32.7 vs nosplit ~32.3 Mlookups/s): the 1-CL win is a
+*cross-core scaling* property (fewer reader lines a concurrent writer's stores
+can invalidate), not a lone-core one — consistent with the txn split's own
+"invisible on an isolated core" footprint story. What the equal layout buys is
+that §7's counter-axis comparison can be re-run with the *layout axis held fixed
+and 1-CL on every arm*.
+
 ## 6. Two invariants the per-node counter rests on
 
 The per-node reader (`-DDC_PER_NODE_GEN`) does something that, stated baldly,
@@ -421,12 +454,18 @@ the S3 sweeps that measure it (full data + method in `rename-shell-transition.md
 conservation — 0 failures). The `.png` renders are not committed; these tables
 are the record.
 
-These sweeps run on the **default 3-CL layout**, not the §5 `-DDC_HOT1CL_SPLIT`
-node — they isolate the *counter* axis (global vs per-node vs seqlock), which is
-orthogonal to the *layout* axis §5 measures. A split resweep at scale is unrun;
-if anything it would lift the txn curves further, since the split's footprint win
-is largest exactly at the high-reader-count / bandwidth-shared end of §7.1 — but
-that is unmeasured and not claimed here.
+These sweeps predate the true-1-CL default (§5 "Landed", `0f4f626`/`706e459`):
+they were taken with **all three arms on the then-current 3-CL layout**, which
+isolates the *counter* axis (global vs per-node vs seqlock) with the layout axis
+held equal — still a fair counter comparison, just not at the 1-CL operating
+point now shipped. One earlier note here was imprecise and is corrected: the old
+`-DDC_HOT1CL_SPLIT` would **not** have lifted the *per-node* curve, because it
+left `d_seq` on CL2 (the per-node reader stayed 2-CL); only the later name-trim
+(`DC_NAME_MAX` 40→32) seated `d_seq` on CL0. A resweep on the current default —
+where every arm is genuinely 1-CL — is the correct instrument for the compounded
+layout+counter effect and is deferred pending a quiet machine (a co-tenant qemu
+VM currently makes DRAM-bound at-scale numbers bistable); its direction is not
+claimed here.
 
 ### 7.1 Path-lookup reader scaling
 
