@@ -90,6 +90,25 @@ static int   *cpulist      = NULL;
 static int    cpulist_len  = 0;
 static unsigned int nbuckets = 4096;
 /*
+ * Co-tenant model (--pollute N [--pollute-kb K]): between lookups each thread
+ * streams N cachelines of its own K-KB "application" buffer.  This evicts the
+ * dentry's cold lines exactly as a real caller would -- the dcache never owns
+ * the cache alone in production -- so a smaller per-dentry footprint (the
+ * DC_HOT1CL_SPLIT 1-CL layout) is rewarded, which the isolated walk hides.
+ */
+static unsigned int pollute = 0;
+static unsigned int pollute_kb = 4096;
+static volatile uint64_t g_pollute_sink;
+/*
+ * --precomp: build the path component qstrs once and assemble each lookup's
+ * dc_path from them, so the timed loop pays NO per-lookup snprintf + FNV hash.
+ * A real VFS walks pre-parsed components; that per-op string building is equal
+ * for every engine and dilutes the layout A/B.  (The leaf-qstr table is itself
+ * a co-footprint, identical for both binaries.)
+ */
+static int precomp = 0;
+static struct qstr *g_prefix_q, *g_dir_q, *g_leaf_q;
+/*
  * Ops between QSBR quiescent-state announcements (dc_quiescent()).  Tunable via
  * --quiesce (power of two).  Default 16: the per-op cost of the quiescent smp_mb
  * is real but tiny, and MEASUREMENT shows a coarser cadence is a net *loss* for
@@ -201,6 +220,15 @@ static void mk_leaf_path(struct dc_path *p, int dir, int gid)
 	int i;
 
 	dc_path_reset(p);
+	if (precomp && g_leaf_q) {	/* assemble from prebuilt component qstrs
+					 * (NULL during build_tree seeding: setup
+					 * falls through to the snprintf path) */
+		for (i = 0; i < g_prefix_len; i++)
+			p->comp[p->ndepth++] = g_prefix_q[i];
+		p->comp[p->ndepth++] = g_dir_q[dir];
+		p->comp[p->ndepth++] = g_leaf_q[gid];
+		return;
+	}
 	for (i = 0; i < g_prefix_len; i++)
 		dc_path_push(p, g_prefix[i]);
 	{
@@ -210,6 +238,28 @@ static void mk_leaf_path(struct dc_path *p, int dir, int gid)
 		dc_path_push(p, buf);
 		snprintf(buf, sizeof(buf), "L%d", gid);
 		dc_path_push(p, buf);
+	}
+}
+
+/* Prebuild the path component qstrs for --precomp (once, after build_tree). */
+static void build_qstr_tables(void)
+{
+	char buf[DC_NAME_MAX];
+	int i;
+
+	g_prefix_q = calloc((size_t) (g_prefix_len > 0 ? g_prefix_len : 1),
+			    sizeof(*g_prefix_q));
+	g_dir_q = calloc((size_t) ndirs, sizeof(*g_dir_q));
+	g_leaf_q = calloc((size_t) g_nnames, sizeof(*g_leaf_q));
+	for (i = 0; i < g_prefix_len; i++)
+		dc_qstr_init(&g_prefix_q[i], g_prefix[i]);
+	for (i = 0; i < ndirs; i++) {
+		snprintf(buf, sizeof(buf), "d%d", i);
+		dc_qstr_init(&g_dir_q[i], buf);
+	}
+	for (i = 0; i < g_nnames; i++) {
+		snprintf(buf, sizeof(buf), "L%d", i);
+		dc_qstr_init(&g_leaf_q[i], buf);
 	}
 }
 
@@ -250,6 +300,11 @@ static void *worker(void *arg)
 	 * deterministic permutation of the seed for the end-of-run census. */
 	int *dir = calloc(leaves, sizeof(*dir));
 	uint64_t *who = calloc(leaves, sizeof(*who));
+	size_t pbytes = (size_t) pollute_kb * 1024;
+	volatile unsigned char *pbuf = pollute ? malloc(pbytes) : NULL;
+	size_t pcur = 0;
+	uint64_t psum = 0;
+	if (pbuf) memset((void *) pbuf, 1, pbytes);	/* fault in the app buffer */
 	uint64_t s = 0x9e3779b97f4a7c15ULL ^ ((uint64_t) (me->id + 1) * 0x100000001b3ULL);
 	struct call_rcu_data *crdp;
 	/* role: <0 homogeneous (per-op frac mix); 1 pure writer; 0 pure reader.
@@ -378,9 +433,20 @@ static void *worker(void *arg)
 				me->lk_wrong++;
 			me->nlookups++;
 		}
+		if (pollute) {			/* co-tenant: touch app cachelines */
+			unsigned int t;
+			for (t = 0; t < pollute; t++) {
+				psum += pbuf[pcur];
+				pcur += 64;
+				if (pcur >= pbytes)
+					pcur = 0;
+			}
+		}
 		if ((++ops & quiesce_mask) == 0)
 			dc_quiescent();		/* let grace periods advance */
 	}
+	g_pollute_sink = psum;			/* keep the pollution reads live */
+	free((void *) pbuf);
 
 	if (owns)
 		for (i = 0; i < leaves; i++) {
@@ -522,6 +588,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))   cpustride = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--pollute"))     pollute = (unsigned) atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--pollute-kb"))  pollute_kb = (unsigned) atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--precomp"))     precomp = 1;
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
 		else if (!strcmp(argv[i], "--quiesce")) {
@@ -575,6 +644,8 @@ int main(int argc, char **argv)
 		       nthreads, rename_frac, ndirs, depth, leaves, duration_ms, total);
 
 	build_tree();
+	if (precomp)
+		build_qstr_tables();
 	warm();
 
 	tid = calloc(nthreads, sizeof(*tid));

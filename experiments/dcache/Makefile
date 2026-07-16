@@ -188,6 +188,18 @@ bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
+# 1-cacheline hot-path layout (global gen): d_iparent low-bit tags remove the
+# d_fwd/d_inode reads, so a settled lookup touches one CL.  A/B vs bench_dcache_txn.
+bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# TRUE 1-CL: d_hash straddles so next lands on CL0 (collision walks stay hot) +
+# d_id elided (return host addr).  A/B vs bench_dcache_txn / _hot1cl.
+bench_dcache_txn_hot1cl_split: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
 # Quick smoke: a short contended run on all three arms; nonzero exit on any
 # conservation failure (each binary returns 1 on CONSERVATION FAILED).
 bench-check: bench
@@ -227,6 +239,7 @@ bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 clean:
 	rm -f *.o test_dcache test_dcache_asan repro_dcache repro_dcache_asan \
 	  bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
+	  bench_dcache_txn_hot1cl test_dcache_hot1cl test_dcache_hot1cl_asan \
 	  bench_dcache_seqlock_asan bench_dcache_txn_asan \
 	  test_dcache_pernode repro_dcache_pernode stress_dcache_pernode_asan \
 	  repro_fold repro_fold_asan repro_foldahead_on repro_foldahead_off \

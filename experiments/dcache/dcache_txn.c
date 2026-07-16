@@ -73,11 +73,31 @@ void (*dc_test_walk_hook)(int depth);
 void (*dc_test_fold_hook)(void);
 #endif
 
+#ifdef DC_HOT1CL_SPLIT
+#define DC_HOT1CL 1		/* SPLIT reuses all the HOT1CL tag machinery */
+#endif
+
 struct dentry {
-	/* reader hot line: inline identity + bucket linkage */
+	/* reader hot line: inline identity (+ payload under DC_HOT1CL) */
+#ifndef DC_HOT1CL
 	struct urcu_txn_hlist_node d_hash;	/* transacted; live only while named top */
-	struct dentry *d_iparent;		/* inline identity: parent addr (match) */
+#endif
+	struct dentry *d_iparent;		/* inline identity: parent addr (match);
+						 * DC_HOT1CL: low bits carry host/shell +
+						 * pos/neg tags (see iparent_of()) */
 	struct qstr    d_iname;			/* inline identity: name bytes (match) */
+#if defined(DC_HOT1CL_SPLIT)
+	/* SPLIT: d_hash straddles here -- next@offset56 lands in CL0 so collision
+	 * walks stay on the hot line; pprev@offset64 spills cold.  The union is
+	 * exiled cold and d_id is elided from the reader (returns the host addr). */
+	struct urcu_txn_hlist_node d_hash;
+#elif defined(DC_HOT1CL)
+	/* payload joins the hot line: d_iparent(8)+d_iname(48)+union(8) = 64 B */
+	union {
+		uint64_t       d_id;
+		struct dentry *d_host;
+	};
+#endif
 
 	/*
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
@@ -120,12 +140,15 @@ struct dentry {
 	 * invariant), so it's a plain rcu_dereference.  This reuses the old
 	 * "cosmetic" shell d_id slot -- shells never needed their own id (readers use
 	 * the host's) and hosts never need a self skip pointer -- so the struct does
-	 * not grow and the identity slot keeps its original offset.
+	 * not grow and the identity slot keeps its original offset.  (Under
+	 * DC_HOT1CL the union is hoisted onto the hot line above instead.)
 	 */
+#if !defined(DC_HOT1CL) || defined(DC_HOT1CL_SPLIT)
 	union {
-		uint64_t       d_id;	/* host: stable identity */
+		uint64_t       d_id;	/* host: stable identity (SPLIT: cold) */
 		struct dentry *d_host;	/* shell: skip pointer to the tail host */
 	};
+#endif
 	int d_inode;
 
 	/*
@@ -141,10 +164,63 @@ struct dentry {
 	 */
 	void *d_seq;
 
+#if defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
+	/* cold under DC_HOT1CL: reader touches d_hash.next only on collision
+	 * walks (the global build reads no mark); pprev is writer-only. */
+	struct urcu_txn_hlist_node d_hash;
+#endif
 	struct rcu_head d_rcu;
 };
 
 #define sib_dentry(n) caa_container_of((n), struct dentry, d_sib)
+
+#ifdef DC_HOT1CL
+/*
+ * DC_HOT1CL tag encoding in d_iparent's low bits.  The dentry is 16-byte aligned
+ * (calloc), so bits 0-3 are free; bit 0 stays reserved for the txn proxy tag, so
+ * host/shell and pos/neg ride bits 1 and 2.  Both are stable-or-identity
+ * properties (a node never changes kind; pos/neg travels with the identity a fold
+ * transfers), so the reader reads them off the already-loaded d_iparent instead
+ * of touching d_fwd / d_inode on other cachelines.  Non-HOT1CL builds fall back
+ * to the plain field reads.
+ */
+#define DC_TAG_SHELL	((uintptr_t) 0x2)	/* bit 1: node is a rename shell */
+#define DC_TAG_NEG	((uintptr_t) 0x4)	/* bit 2: negative dentry */
+#define DC_TAG_MASK	((uintptr_t) 0x7)
+
+static inline struct dentry *iparent_of(const struct dentry *d)
+{
+	return (struct dentry *) ((uintptr_t) d->d_iparent & ~DC_TAG_MASK);
+}
+static inline int node_is_shell(const struct dentry *d)
+{
+	return ((uintptr_t) d->d_iparent & DC_TAG_SHELL) != 0;
+}
+static inline int node_is_positive(const struct dentry *d)
+{
+	return ((uintptr_t) d->d_iparent & DC_TAG_NEG) == 0;
+}
+#define DC_IPARENT(d)     iparent_of(d)
+#define DC_IS_POSITIVE(d) node_is_positive(d)
+#ifdef DC_HOT1CL_SPLIT
+#ifdef DC_SPLIT_KEEPID
+/* validation build: keep the straddle layout but read the (now cold) d_id, so
+ * the harnesses' id checks pass -- proves the reorder+tags are correct. */
+#define DC_FAST_ID(node)  ((node)->d_id)
+#else
+/* elide d_id from the fast path: the host ADDRESS is a stable, write-once
+ * identity here, so return it directly (no cold-line d_id read).  See the
+ * seqcount note -- d_id is payload, not an ordering edge. */
+#define DC_FAST_ID(node)  ((uint64_t) (uintptr_t) (node))
+#endif
+#else
+#define DC_FAST_ID(node)  ((node)->d_id)
+#endif
+#else
+#define DC_IPARENT(d)     ((d)->d_iparent)
+#define DC_IS_POSITIVE(d) ((d)->d_inode)
+#define DC_FAST_ID(node)  ((node)->d_id)
+#endif
 
 #ifdef DC_STRESS_DEBUG
 /* Coarse counters for diagnosing fold drain / chain growth (not thread-exact). */
@@ -349,9 +425,15 @@ static inline struct dentry *chain_host_rcu(struct dentry *d)
  */
 static inline struct dentry *host_of_rcu(struct dentry *top)
 {
+#ifdef DC_HOT1CL
+	/* discriminate from the tag on the already-loaded d_iparent -- no d_fwd
+	 * read, so a settled hop never leaves the hot cacheline. */
+	return node_is_shell(top) ? rcu_dereference(top->d_host) : top;
+#else
 	struct dentry *fwd = urcu_mcas_read((void **) &top->d_fwd, DC_FWD_TAG);
 
 	return fwd ? rcu_dereference(top->d_host) : top;
+#endif
 }
 
 /*
@@ -449,7 +531,7 @@ static struct dentry *find_top_rcu(struct dcache *dc, struct dentry *parent,
 	for (n = urcu_txn_hlist_first_rcu(b); n; n = urcu_txn_hlist_next_rcu(n)) {
 		struct dentry *d = hnode_dentry(n);
 
-		if (d->d_iparent == parent && dc_qstr_eq(&d->d_iname, name))
+		if (DC_IPARENT(d) == parent && dc_qstr_eq(&d->d_iname, name))
 			return d;
 	}
 	return NULL;
@@ -546,7 +628,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 
 		g0 = urcu_mcas_read(&dc->rename_gen, DC_GEN_TAG);	/* acquire */
 		res = DC_POSITIVE;
-		id = cur->d_id;
+		id = DC_FAST_ID(cur);
 		for (i = 0; i < p->ndepth; i++) {
 			struct dentry *d = txn_child_lookup_rcu(dc, cur,
 							        &p->comp[i]);
@@ -556,8 +638,8 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 				break;
 			}
 			cur = d;
-			id = d->d_id;
-			res = d->d_inode ? DC_POSITIVE : DC_NEGATIVE;
+			id = DC_FAST_ID(d);
+			res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -590,7 +672,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		int stale = 0, moved = 0;
 
 		res = DC_POSITIVE;
-		id = cur->d_id;
+		id = DC_FAST_ID(cur);
 		nlatched = 0;
 		for (i = 0; i < p->ndepth; i++) {
 			struct dentry *top = find_top_rcu(dc, cur, &p->comp[i]);
@@ -612,8 +694,8 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			seqs[nlatched] = s;
 			nlatched++;
 			cur = host;
-			id = host->d_id;
-			res = host->d_inode ? DC_POSITIVE : DC_NEGATIVE;
+			id = DC_FAST_ID(host);
+			res = DC_IS_POSITIVE(host) ? DC_POSITIVE : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -922,6 +1004,10 @@ static int stack_shell(struct dcache *dc,
 
 	if (!shell)
 		return -ENOMEM;
+#ifdef DC_HOT1CL
+	shell->d_iparent = (struct dentry *)
+		((uintptr_t) shell->d_iparent | DC_TAG_SHELL);
+#endif
 
 	rcu_read_lock();			/* keeps top/host alive across commits */
 	urcu_txn_init(&txn, &dc->domain);
@@ -1046,7 +1132,15 @@ static void fold(struct dcache *dc, struct dentry *n)
 			/* TRANSFER: @n is the top; pull identity down into m. */
 			struct dentry *m = fwd;
 
+#ifdef DC_HOT1CL
+			/* adopt n's parent + pos/neg, keep m's OWN host/shell bit
+			 * (m may still be a middle relay of the remaining chain) */
+			m->d_iparent = (struct dentry *) (
+				((uintptr_t) n->d_iparent & ~DC_TAG_SHELL) |
+				((uintptr_t) m->d_iparent & DC_TAG_SHELL));
+#else
 			m->d_iparent = n->d_iparent;	/* pre-publish: m unindexed */
+#endif
 			m->d_iname = n->d_iname;
 
 			urcu_txn_begin(&txn);
@@ -1251,6 +1345,10 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		free(sb);
 		return -ENOMEM;
 	}
+#ifdef DC_HOT1CL
+	sa->d_iparent = (struct dentry *) ((uintptr_t) sa->d_iparent | DC_TAG_SHELL);
+	sb->d_iparent = (struct dentry *) ((uintptr_t) sb->d_iparent | DC_TAG_SHELL);
+#endif
 
 	rcu_read_lock();			/* keeps tops/hosts alive across commits */
 	urcu_txn_init(&txn, &dc->domain);
