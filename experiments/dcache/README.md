@@ -199,6 +199,16 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   global bracket saturates ~110–120 and seqlock never scales cleanly — **3.7×
   global, 5.8× seqlock at the full-machine point** (see `rename-shell-transition.md`
   S3 results).
+- **S3-readdir** ✅ — directory-listing companion (`bench_dcache --readdir`,
+  panels `readdir_scale`/`readdir_w` → `figures/dcache_readdir.png`). The seqlock
+  baseline was upgraded to an honest **per-directory rwsem** (the kernel inode-rwsem
+  analogue, not one global lock). **Finding: listing is the *easy* case — the txn
+  `readdir` reads no generation counter at all, so `txn-global` ≡ `txn-pernode`
+  (they overlap), and it dissolves to a bare lock-free RCU child-hlist walk.** It
+  **scales to ~216 listings/s at 160 readers (~9× the rwsem, which saturates ~25**
+  — its read-side is a shared cacheline); the one honest cost is a per-child
+  shell-resolution that makes the walk churn-sensitive, converging with the rwsem
+  under a saturating rename load. Both engines conservation-clean + ASan-clean.
 - **S4** — simplification analysis (LOC + invariant surface: which
   counters/fallbacks disappear) + scaling figures + writeup back into `design/`.
 

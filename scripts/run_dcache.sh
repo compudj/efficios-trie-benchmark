@@ -64,6 +64,10 @@ done
 
 # run <panel> <engine> <threads> <writers(-1=homog)> <rename_frac> -> best-of-RUNS
 # appends a CSV row; readers = threads-writers in split mode, else threads.
+# $RUN_EXTRA (global) appends extra flags, e.g. "--readdir --leaves 64"; a later
+# --leaves overrides the one baked into $COMMON (argv: last wins).  For readdir
+# panels the "Mlookups/s:" field carries the readdir CALL rate.
+RUN_EXTRA=""
 run() {
   local panel=$1 eng=$2 threads=$3 writers=$4 frac=$5
   local bin=$BIN/${BINOF[$eng]} split="" readers=$threads r
@@ -71,7 +75,7 @@ run() {
   if [[ "$writers" -ge 0 ]]; then split="--writers $writers"; readers=$((threads-writers)); fi
   for r in $(seq 1 $RUNS); do
     out=$(cd "$BIN" && ./"${BINOF[$eng]}" --nthreads "$threads" $split \
-          --rename-frac "$frac" $COMMON 2>/dev/null)
+          --rename-frac "$frac" $COMMON $RUN_EXTRA 2>/dev/null)
     if ! grep -q "conservation: OK" <<< "$out"; then
       cons=FAIL; echo "!! $panel/$eng threads=$threads w=$writers frac=$frac CONSERVATION FAILED" >&2
       continue
@@ -114,5 +118,32 @@ echo ">> split_scale panel: $WFIX writers, sweep readers up to $RMAX (fill $NCOR
 for rd in $RDPTS; do
   for e in $ENGINES; do run split_scale "$e" $((rd+WFIX)) "$WFIX" 1.0; done
 done
+
+# ---- Panel: READDIR reader scaling (directory listing under rename load) ----
+# Readers enumerate a random dir (dc_readdir) instead of a leaf lookup.  Only the
+# writers own the namespace, so dir size is fixed as readers scale.  Compares the
+# txn lock-free RCU child-walk against the seqlock per-directory rwsem (the honest
+# kernel-inode-rwsem analogue, not one global lock).  txn-global == txn-pernode
+# here by construction: readdir reads no generation counter at all.
+RDLEAVES=64                         # 64 leaves/writer * 8 writers / 16 dirs = 32 kids/dir
+RUN_EXTRA="--readdir --leaves $RDLEAVES"
+echo ">> readdir_scale panel: $WFIX writers, --readdir, sweep readers up to $RMAX" >&2
+for rd in $RDPTS; do
+  for e in $ENGINES; do run readdir_scale "$e" $((rd+WFIX)) "$WFIX" 1.0; done
+done
+RUN_EXTRA=""
+
+# ---- Panel: READDIR reader throughput vs writer (rename) load ---------------
+# Fixed reader pool, sweep writers.  Namespace is held constant (RDTOTAL leaves,
+# leaves=RDTOTAL/W), so dir size stays fixed while the rename RATE -- and thus the
+# per-dir wrlock exclusion the seqlock readdir suffers -- rises with W.  Isolates
+# the writer-exclusion axis (the txn RCU walk never blocks on a writer).
+RRD=32; RDTOTAL=1024
+echo ">> readdir_w panel: $RRD readers, --readdir, sweep writers (namespace fixed $RDTOTAL)" >&2
+for w in 1 2 4 8 16 24 32 48; do
+  RUN_EXTRA="--readdir --leaves $((RDTOTAL / w))"
+  for e in $ENGINES; do run readdir_w "$e" $((RRD+w)) "$w" 1.0; done
+done
+RUN_EXTRA=""
 
 echo ">> DONE: $(($(wc -l < "$CSV") - 1)) rows -> $CSV" >&2

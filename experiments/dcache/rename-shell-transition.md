@@ -374,14 +374,43 @@ walk-causality problem. The `-ENOTEMPTY` unlink check reads the same head
 (`first == NULL`); a concurrent-add-vs-unlink race is validated in the unlink
 commit (later).
 
-Cost note: the baseline seqlock engine serializes `readdir` on its global
-`mutator_lock` (faithful — the kernel takes the directory lock), so listing is
-another axis where the txn engine's lock-free child-hlist should win. Moving a node
-between two directories' child-hlists is a `del ∘ insert` on the *same* `d_sib`
-link — the same self-conflict the shell solves for the name-hash — but `readdir`'s
-soft consistency permits splitting it into two commits (a brief in-neither-list
-transient) or threading the two edges across the stack/fold commits; picked at
-implementation time.
+Moving a node between two directories' child-hlists is a `del ∘ insert` on the
+*same* `d_sib` link — the same self-conflict the shell solves for the name-hash —
+but `readdir`'s soft consistency permits splitting it into two commits (a brief
+in-neither-list transient) or threading the two edges across the stack/fold
+commits; picked at implementation time.
+
+### readdir results (`figures/dcache_readdir.png`, 2×96-core EPYC, best-of-5, conserved)
+
+To make the baseline honest, the seqlock arm's `readdir` was upgraded from the
+global `mutator_lock` to a **per-directory rwsem** — the faithful kernel analogue
+(`iterate_dir` under the inode rwsem): readers of a dir share a read-lock, a rename
+write-locks only its affected parent(s); different dirs and concurrent readers of
+one dir do not serialize. The txn arm is the lock-free RCU child-hlist walk. The
+readers enumerate a random dir while writers rename; the namespace is owned only by
+the writers, so dir size is fixed as readers scale. Two axes:
+
+- **Reader scaling** (8 writers, sweep readers to 184, ~32 children/dir): the txn
+  walk **scales to ~216 listings/s at 160 readers** (177 at 184, writers sharing
+  the last cores) while the per-dir rwsem **saturates at ~22–30** — its read-side
+  is a shared cacheline that bounces among readers listing the same dir. At the
+  peak that is **~9× the rwsem baseline**. Below ~24–32 readers the rwsem *leads*:
+  the txn walk pays a per-child `chain_host_rcu` shell-resolution that the plain
+  `d_sib` walk does not, so it only wins once the rwsem read-side contends.
+- **Writer load** (32 readers, sweep writers, namespace fixed): the txn walk leads
+  **~5–6×** at light write load, but that same per-child shell resolution is
+  **churn-sensitive** — under a saturating rename load it declines and converges
+  with, then dips *below*, the rwsem baseline (at 48 writers, txn ~6–13 vs rwsem
+  ~14). `readdir` is read-mostly in practice (directories are listed far more than
+  renamed), so the reader-scaling axis is the operative regime.
+
+**Gen-independence.** `readdir` reads **no generation counter at all**, so
+`txn-global` and `txn-pernode` run identical listing code and their curves overlap
+throughout — the global-vs-per-node distinction that decided the lookup path is
+**moot** for listing. Directory listing is thus the *easy* case for the port: it
+dissolves to a bare RCU child-hlist walk with no `rename_gen`, no `d_seq`, no
+cursor. The one honest cost is that walk's per-child shell resolution under heavy
+concurrent rename churn.
 
 ## Concurrent operations mid-transition
 

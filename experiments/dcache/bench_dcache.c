@@ -35,9 +35,9 @@
  * CONSERVATION FAILED and exits nonzero, so a corrupt run can't masquerade as a
  * fast one (same discipline as bench_txn_3skiplist).
  *
- * Usage: bench_dcache [--nthreads N] [--rename-frac F] [--ndirs N] [--depth N]
- *                     [--leaves N] [--duration MS] [--cpustride N]
- *                     [--cpulist c0,c1,...] [--nbuckets N]
+ * Usage: bench_dcache [--nthreads N] [--rename-frac F] [--writers K] [--readdir]
+ *                     [--ndirs N] [--depth N] [--leaves N] [--duration MS]
+ *                     [--cpustride N] [--cpulist c0,c1,...] [--nbuckets N]
  */
 
 #ifndef _GNU_SOURCE
@@ -97,6 +97,15 @@ static unsigned int nbuckets = 4096;
  * between the global and per-node generation shows up cleanly.
  */
 static int    nwriters     = -1;
+/*
+ * --readdir (split mode only): the reader threads enumerate a random target dir
+ * (dc_readdir of /pfx/d{k}) instead of a full-path leaf lookup.  To keep the
+ * directory size -- and thus the per-readdir cost -- INDEPENDENT of the reader
+ * count, the namespace is owned only by the writers: g_nnames = nwriters*leaves
+ * leaves total, so scaling the readers does not grow the dirs they list.
+ */
+static int    readdir_mode = 0;
+static int    g_nnames     = 0;		/* effective leaf namespace size */
 
 static unsigned int rename_thr;		/* rename_frac scaled into [0,1<<20) */
 #define FRAC_ONE (1u << 20)
@@ -211,7 +220,8 @@ static void mk_dir_path(struct dc_path *p, int dir)
 struct warg {
 	int id;
 	int cpu;
-	long long nlookups;
+	long long nlookups;	/* lookups, or readdir calls in --readdir mode */
+	long long ndirents;	/* children enumerated (--readdir mode) */
 	long long nrenames;	/* successful renames + exchanges */
 	long long nexch;
 	long long lk_wrong;	/* POSITIVE hit whose id left its owner's range */
@@ -221,8 +231,7 @@ struct warg {
 static void *worker(void *arg)
 {
 	struct warg *me = arg;
-	int base = me->id * leaves;
-	int total = nthreads * leaves;
+	int total = g_nnames;
 	/* Per name-token j (the leaf named L{base+j}): dir[j] = the dir it lives
 	 * in; who[j] = the id currently carrying that name.  A plain rename moves
 	 * dir[j]; a RENAME_EXCHANGE swaps who[] between two tokens (the ids trade
@@ -237,6 +246,16 @@ static void *worker(void *arg)
 	 * same low cpus regardless of writer count -- otherwise the readers' NUMA
 	 * placement would shift with W and confound the reader-throughput curve. */
 	int role = (nwriters >= 0) ? (me->id >= nthreads - nwriters) : -1;
+	/*
+	 * Leaf ownership.  Normally every thread owns leaves [id*leaves ..).  In
+	 * --readdir mode the readers own nothing (they only list dirs); the writers
+	 * own the whole fixed namespace, writer w (the w'th of the last nwriters
+	 * ids) owning [w*leaves ..).  So the namespace -- and dir sizes -- do not
+	 * grow with the reader count.
+	 */
+	int owns = !(readdir_mode && role == 0);
+	int base = readdir_mode ? (me->id - (nthreads - nwriters)) * leaves
+				: me->id * leaves;
 	long long ops = 0;
 	int i;
 
@@ -250,10 +269,11 @@ static void *worker(void *arg)
 	if (crdp)
 		set_thread_call_rcu_data(crdp);
 
-	for (i = 0; i < leaves; i++) {
-		dir[i] = (base + i) % ndirs;	/* mirror the seed distribution */
-		who[i] = (uint64_t) (base + i);	/* name L{base+i} starts on id base+i */
-	}
+	if (owns)
+		for (i = 0; i < leaves; i++) {
+			dir[i] = (base + i) % ndirs;	/* mirror the seed distribution */
+			who[i] = (uint64_t) (base + i);	/* name L{base+i} starts on base+i */
+		}
 
 	uatomic_inc(&nthreads_running);
 	rcu_thread_offline();			/* don't stall GPs while parked */
@@ -311,6 +331,24 @@ static void *worker(void *arg)
 					me->errs++;
 				}
 			}
+		} else if (readdir_mode) {
+			/* READDIR a random target dir /pfx/d{k}: enumerate its
+			 * current children.  Soft POSIX semantics -- a child mid-
+			 * rename may or may not appear -- but it must never tear or
+			 * crash.  dir size is fixed (writers own the namespace), so
+			 * readdir cost is independent of the reader count. */
+			int k = (int) (xrand(&s) % (uint64_t) ndirs);
+			struct dc_path p;
+			long n;
+
+			mk_dir_path(&p, k);
+			n = dc_readdir(g_dc, &p, NULL, NULL);
+			if (n < 0)
+				me->errs++;
+			else {
+				me->nlookups++;
+				me->ndirents += n;
+			}
 		} else {
 			/* LOOKUP a random full leaf path.  The walk cost is paid
 			 * hit or miss; a POSITIVE hit must carry an id from the
@@ -333,10 +371,11 @@ static void *worker(void *arg)
 			dc_quiescent();		/* let grace periods advance */
 	}
 
-	for (i = 0; i < leaves; i++) {
-		g_final_dir[base + i] = dir[i];
-		g_final_id[base + i] = who[i];
-	}
+	if (owns)
+		for (i = 0; i < leaves; i++) {
+			g_final_dir[base + i] = dir[i];
+			g_final_id[base + i] = who[i];
+		}
 	free(dir); free(who);
 	dc_unregister_thread();
 	if (crdp) {
@@ -397,7 +436,7 @@ static void build_tree(void)
 		}
 	}
 	/* Seed every leaf into its owner's starting dir. */
-	for (i = 0; i < nthreads * leaves; i++) {
+	for (i = 0; i < g_nnames; i++) {
 		mk_leaf_path(&p, i % ndirs, i);
 		if (dc_add(g_dc, &p, (uint64_t) i)) {
 			fprintf(stderr, "seed leaf %d failed\n", i);
@@ -409,7 +448,7 @@ static void build_tree(void)
 /* Uniform warm-up: touch every leaf once so both engines enter timing warm. */
 static void warm(void)
 {
-	int total = nthreads * leaves;
+	int total = g_nnames;
 	int i;
 
 	for (i = 0; i < total; i++) {
@@ -438,6 +477,9 @@ static void usage(const char *p)
 	    "                     the rest only lookups.  Isolates the reader path\n"
 	    "                     (overrides --rename-frac).  Reader Mlookups/s is\n"
 	    "                     then the clean global-vs-per-node headline.\n"
+	    "  --readdir       => (split mode) readers enumerate a random dir instead\n"
+	    "                     of a leaf lookup; only writers own the namespace so\n"
+	    "                     dir size is fixed as readers scale.\n"
 	    "  --depth N       => leaf path depth (>=2): a spine of N-2 static dirs,\n"
 	    "                     then d{k}, then the leaf.  Widens the walk window.\n",
 	    p);
@@ -450,9 +492,9 @@ int main(int argc, char **argv)
 	struct warg *wa;
 	struct census c;
 	long long t0, t1, total_lk = 0, total_rn = 0, total_ex = 0;
-	long long total_wrong = 0, total_err = 0;
+	long long total_wrong = 0, total_err = 0, total_dirents = 0;
 	unsigned long retries0 = 0, retries1 = 0;
-	double secs, mlk_s, mrn_s;
+	double secs, mlk_s, mrn_s, mdir_s;
 	int total, i, anomaly = 0;
 
 	for (i = 1; i < argc; i++) {
@@ -466,11 +508,17 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
 		else usage(argv[0]);
 	}
 	if (nthreads < 1 || ndirs < 2 || depth < 2 || leaves < 1 ||
 	    rename_frac < 0.0 || rename_frac > 1.0 || nwriters > nthreads)
 		usage(argv[0]);
+	if (readdir_mode && nwriters < 1) {
+		fprintf(stderr, "--readdir requires role-split with --writers >= 1 "
+			"(the writers own the fixed namespace the readers list)\n");
+		exit(2);
+	}
 	if (cpulist && nthreads > cpulist_len) {
 		fprintf(stderr, "--cpulist has %d cpus but --nthreads=%d "
 			"(would double up on a core)\n", cpulist_len, nthreads);
@@ -480,7 +528,10 @@ int main(int argc, char **argv)
 		depth = DC_PATH_MAX;		/* leave room for d{k} + leaf */
 	g_prefix_len = depth - 2;
 	rename_thr = (unsigned int) (rename_frac * (double) FRAC_ONE + 0.5);
-	total = nthreads * leaves;
+	/* In --readdir mode only the writers own leaves, so the namespace (and the
+	 * dirs the readers list) stays fixed as the reader count scales. */
+	g_nnames = readdir_mode ? nwriters * leaves : nthreads * leaves;
+	total = g_nnames;
 
 	rcu_register_thread();
 	g_dc = dc_create(nbuckets);
@@ -489,10 +540,12 @@ int main(int argc, char **argv)
 
 	printf("== bench_dcache (engine: %s) ==\n", dc_engine_name());
 	if (nwriters >= 0)
-		printf("threads=%d SPLIT(writers=%d readers=%d) ndirs=%d depth=%d "
-		       "leaves/thr=%d duration_ms=%ld total_leaves=%d\n",
-		       nthreads, nwriters, nthreads - nwriters, ndirs, depth,
-		       leaves, duration_ms, total);
+		printf("threads=%d SPLIT(writers=%d readers=%d) reader-op=%s ndirs=%d "
+		       "depth=%d leaves/thr=%d duration_ms=%ld total_leaves=%d "
+		       "children/dir~%d\n",
+		       nthreads, nwriters, nthreads - nwriters,
+		       readdir_mode ? "readdir" : "lookup", ndirs, depth,
+		       leaves, duration_ms, total, ndirs ? total / ndirs : 0);
 	else
 		printf("threads=%d rename_frac=%.4f ndirs=%d depth=%d leaves/thr=%d "
 		       "duration_ms=%ld total_leaves=%d\n",
@@ -536,6 +589,7 @@ int main(int argc, char **argv)
 		total_ex    += wa[i].nexch;
 		total_wrong += wa[i].lk_wrong;
 		total_err   += wa[i].errs;
+		total_dirents += wa[i].ndirents;
 	}
 	rcu_thread_online();
 	if (&dc_seq_walk_retries)
@@ -549,6 +603,7 @@ int main(int argc, char **argv)
 	secs = (t1 - t0) / 1e9;
 	mlk_s = secs > 0 ? (double) total_lk / secs / 1e6 : 0.0;
 	mrn_s = secs > 0 ? (double) total_rn / secs / 1e6 : 0.0;
+	mdir_s = secs > 0 ? (double) total_dirents / secs / 1e6 : 0.0;
 
 	/* Census: every leaf id reachable exactly once (dc_walk), and each name
 	 * L{g} resolves at its recorded final dir to the recorded final id (the
@@ -570,8 +625,15 @@ int main(int argc, char **argv)
 	}
 
 	printf("duration (s): %g\n", secs);
+	/* In --readdir mode Mlookups/s is the readdir CALL rate (kept under the
+	 * same field name so the sweep harness parses one column); the READDIR line
+	 * adds the enumerated-children rate and the average dir size actually seen. */
 	printf("LOOKUP  lookups: %lld  Mlookups/s: %g  wrong-id: %lld\n",
 	       total_lk, mlk_s, total_wrong);
+	if (readdir_mode)
+		printf("READDIR dirents: %lld  Mdirents/s: %g  children/readdir~%g\n",
+		       total_dirents, mdir_s,
+		       total_lk ? (double) total_dirents / (double) total_lk : 0.0);
 	printf("RENAME  renames: %lld  exchanges: %lld  Mrenames/s: %g  errors: %lld\n",
 	       total_rn, total_ex, mrn_s, total_err);
 	printf("OPS     Mops/s: %g\n",
