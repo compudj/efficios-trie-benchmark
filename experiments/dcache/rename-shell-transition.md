@@ -391,26 +391,33 @@ readers enumerate a random dir while writers rename; the namespace is owned only
 the writers, so dir size is fixed as readers scale. Two axes:
 
 - **Reader scaling** (8 writers, sweep readers to 184, ~32 children/dir): the txn
-  walk **scales to ~216 listings/s at 160 readers** (177 at 184, writers sharing
-  the last cores) while the per-dir rwsem **saturates at ~22–30** — its read-side
+  walk **scales to ~355 listings/s at 160 readers** (310 at 184, writers sharing
+  the last cores) while the per-dir rwsem **saturates at ~15–29** — its read-side
   is a shared cacheline that bounces among readers listing the same dir. At the
-  peak that is **~9× the rwsem baseline**. Below ~24–32 readers the rwsem *leads*:
-  the txn walk pays a per-child `chain_host_rcu` shell-resolution that the plain
-  `d_sib` walk does not, so it only wins once the rwsem read-side contends.
+  peak that is **~12× the rwsem baseline**, and the txn walk **leads at every
+  reader count** (even two readers). It no longer pays a per-child chain walk: the
+  `d_host` skip pointer (below) resolves the content host in O(1), so the earlier
+  low-reader crossover — where the rwsem's plain `d_sib` walk led — is gone.
 - **Writer load** (32 readers, sweep writers, namespace fixed): the txn walk leads
-  **~5–6×** at light write load, but that same per-child shell resolution is
-  **churn-sensitive** — under a saturating rename load it declines and converges
-  with, then dips *below*, the rwsem baseline (at 48 writers, txn ~6–13 vs rwsem
-  ~14). `readdir` is read-mostly in practice (directories are listed far more than
-  renamed), so the reader-scaling axis is the operative regime.
+  **~6–7×** at light write load and **stays ~2× above** the rwsem even under a
+  saturating rename load (48 writers: txn ~27–35 vs rwsem ~14). It still declines
+  as writers rise, but that is now **write-side** pressure — concurrent MCAS churn
+  on the child hlists plus coherence traffic — not the reader path, which is O(1)
+  in chain depth. (Before the skip pointer this axis was the one wrinkle: the
+  per-child chain walk made listing churn-sensitive and it dipped *below* the
+  rwsem at 48 writers. Now it does not.)
 
 **Gen-independence.** `readdir` reads **no generation counter at all**, so
-`txn-global` and `txn-pernode` run identical listing code and their curves overlap
-throughout — the global-vs-per-node distinction that decided the lookup path is
-**moot** for listing. Directory listing is thus the *easy* case for the port: it
-dissolves to a bare RCU child-hlist walk with no `rename_gen`, no `d_seq`, no
-cursor. The one honest cost is that walk's per-child shell resolution under heavy
-concurrent rename churn.
+`txn-global` and `txn-pernode` run near-identical listing code and their reader
+curves track together — the global-vs-per-node distinction that decided the lookup
+path is **moot** for listing (any divergence at saturating write load is a
+writer-side effect, not the walk). Directory listing is thus the *easy* case for
+the port: it dissolves to a bare, O(1)-resolved RCU child-hlist walk with no
+`rename_gen`, no `d_seq`, no cursor. The former per-child chain walk that made it
+churn-sensitive was removed by a **write-once `d_host` skip pointer overlaid on
+`d_id`** (`host_of_rcu`): a host reads the slot as its id, a shell as a pointer
+straight to the tail host, discriminated by `d_fwd==NULL` — one hop to the host at
+zero memory cost.
 
 ## Concurrent operations mid-transition
 

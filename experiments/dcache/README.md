@@ -205,10 +205,13 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   analogue, not one global lock). **Finding: listing is the *easy* case — the txn
   `readdir` reads no generation counter at all, so `txn-global` ≡ `txn-pernode`
   (they overlap), and it dissolves to a bare lock-free RCU child-hlist walk.** It
-  **scales to ~216 listings/s at 160 readers (~9× the rwsem, which saturates ~25**
-  — its read-side is a shared cacheline); the one honest cost is a per-child
-  shell-resolution that makes the walk churn-sensitive, converging with the rwsem
-  under a saturating rename load. Both engines conservation-clean + ASan-clean.
+  **scales to ~355 listings/s at 160 readers (~12× the rwsem, which saturates ~15–29**
+  — its read-side is a shared cacheline), and it **leads at every reader count**.
+  A **write-once `d_host` skip pointer overlaid on `d_id`** (`host_of_rcu`) resolves
+  the content host in O(1) regardless of chain depth, so the walk is no longer
+  churn-sensitive: under a saturating rename load it **stays ~2× above** the rwsem
+  (48 writers: ~27–35 vs ~14) instead of dipping below. Both engines
+  conservation-clean + ASan-clean.
 - **S4** — simplification analysis (LOC + invariant surface: which
   counters/fallbacks disappear) + scaling figures + writeup back into `design/`.
 

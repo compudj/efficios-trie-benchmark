@@ -90,34 +90,54 @@ run() {
     "$panel" "$eng" "$threads" "$writers" "$frac" "$best_lk" "$best_rn" "$cons" >&2
 }
 
-echo "panel,engine,threads,writers,readers,rename_frac,mlookups_s,mrenames_s,conserved" > "$CSV"
+# PANELS (env): space-separated subset of panels to (re)run.  Empty => all, with
+# a fresh CSV.  Non-empty => keep the CSV and re-run ONLY those panels, dropping
+# their old rows first -- so a single panel can be resswept without disturbing
+# the others (e.g. PANELS="readdir_scale readdir_w" after an engine change that
+# only affects listing).
+PANELS="${PANELS:-}"
+want() { [[ -z "$PANELS" || " $PANELS " == *" $1 "* ]]; }
+HDR="panel,engine,threads,writers,readers,rename_frac,mlookups_s,mrenames_s,conserved"
+if [[ -z "$PANELS" ]]; then
+  echo "$HDR" > "$CSV"
+else
+  [[ -f "$CSV" ]] || echo "$HDR" > "$CSV"
+  for p in $PANELS; do grep -v "^$p," "$CSV" > "$CSV.tmp" && mv "$CSV.tmp" "$CSV"; done
+fi
+
+# Shared reader-scaling sweep points (used by split_scale AND readdir_scale):
+# scale readers until readers+writers fill every physical core, one hw thread per
+# core.  On the 2x96 EPYC that is 184 readers + 8 writers = 192.
+WFIX=8
+RMAX=$((NCORE - WFIX))
+RDPTS=$(for rd in 2 4 8 16 32 48 64 96 128 160 $RMAX; do
+          (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
 
 # ---- Panel: HOMOGENEOUS rename-fraction sweep at fixed cores ---------------
+if want frac; then
 THREADS=48
 echo ">> frac panel: homogeneous mix, $THREADS threads, sweep rename fraction" >&2
 for f in 0 0.005 0.01 0.02 0.05 0.1 0.2 0.35 0.5; do
   for e in $ENGINES; do run frac "$e" "$THREADS" -1 "$f"; done
 done
+fi
 
 # ---- Panel: ROLE-SPLIT reader path vs writer load (THE headline) -----------
+if want split_w; then
 RSPLIT=32
 echo ">> split_w panel: $RSPLIT dedicated readers + W writers, reader Mlookups/s vs W" >&2
 for w in 1 2 4 8 16 24 32 48; do
   for e in $ENGINES; do run split_w "$e" $((RSPLIT+w)) "$w" 1.0; done
 done
+fi
 
 # ---- Panel: ROLE-SPLIT reader scaling at fixed writer load -----------------
-# Scale readers until readers+writers fill every physical core (RMAX=NCORE-WFIX),
-# one hw thread per core.  On the 2x96 EPYC that is 184 readers + 8 writers = 192
-# cores.  Cap each candidate point at RMAX and always include RMAX itself.
-WFIX=8
-RMAX=$((NCORE - WFIX))
-RDPTS=$(for rd in 2 4 8 16 32 48 64 96 128 160 $RMAX; do
-          (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
+if want split_scale; then
 echo ">> split_scale panel: $WFIX writers, sweep readers up to $RMAX (fill $NCORE cores)" >&2
 for rd in $RDPTS; do
   for e in $ENGINES; do run split_scale "$e" $((rd+WFIX)) "$WFIX" 1.0; done
 done
+fi
 
 # ---- Panel: READDIR reader scaling (directory listing under rename load) ----
 # Readers enumerate a random dir (dc_readdir) instead of a leaf lookup.  Only the
@@ -125,6 +145,7 @@ done
 # txn lock-free RCU child-walk against the seqlock per-directory rwsem (the honest
 # kernel-inode-rwsem analogue, not one global lock).  txn-global == txn-pernode
 # here by construction: readdir reads no generation counter at all.
+if want readdir_scale; then
 RDLEAVES=64                         # 64 leaves/writer * 8 writers / 16 dirs = 32 kids/dir
 RUN_EXTRA="--readdir --leaves $RDLEAVES"
 echo ">> readdir_scale panel: $WFIX writers, --readdir, sweep readers up to $RMAX" >&2
@@ -132,12 +153,14 @@ for rd in $RDPTS; do
   for e in $ENGINES; do run readdir_scale "$e" $((rd+WFIX)) "$WFIX" 1.0; done
 done
 RUN_EXTRA=""
+fi
 
 # ---- Panel: READDIR reader throughput vs writer (rename) load ---------------
 # Fixed reader pool, sweep writers.  Namespace is held constant (RDTOTAL leaves,
 # leaves=RDTOTAL/W), so dir size stays fixed while the rename RATE -- and thus the
 # per-dir wrlock exclusion the seqlock readdir suffers -- rises with W.  Isolates
 # the writer-exclusion axis (the txn RCU walk never blocks on a writer).
+if want readdir_w; then
 RRD=32; RDTOTAL=1024
 echo ">> readdir_w panel: $RRD readers, --readdir, sweep writers (namespace fixed $RDTOTAL)" >&2
 for w in 1 2 4 8 16 24 32 48; do
@@ -145,5 +168,6 @@ for w in 1 2 4 8 16 24 32 48; do
   for e in $ENGINES; do run readdir_w "$e" $((RRD+w)) "$w" 1.0; done
 done
 RUN_EXTRA=""
+fi
 
 echo ">> DONE: $(($(wc -l < "$CSV") - 1)) rows -> $CSV" >&2
