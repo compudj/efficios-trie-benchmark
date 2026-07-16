@@ -90,6 +90,17 @@ static int   *cpulist      = NULL;
 static int    cpulist_len  = 0;
 static unsigned int nbuckets = 4096;
 /*
+ * Ops between QSBR quiescent-state announcements (dc_quiescent()).  Tunable via
+ * --quiesce (power of two).  Default 16: the per-op cost of the quiescent smp_mb
+ * is real but tiny, and MEASUREMENT shows a coarser cadence is a net *loss* for
+ * the txn engine -- its async fold is grace-period-bound, so stretching the GP
+ * (16 -> 256 ops) starves the fold drain and the reader's chain_host walk pays
+ * for the longer shell chains (readdir -43%, lookup -10% at 256; the fold-less
+ * seqlock arm is flat).  Frequent quiescing is not overhead here; it keeps the
+ * fold healthy.  The knob exists to demonstrate exactly that sensitivity.
+ */
+static unsigned int quiesce_mask = 15;
+/*
  * -1 (default): HOMOGENEOUS -- every thread runs the rename-frac mix.  >=0:
  * ROLE-SPLIT -- the first `nwriters` threads do only renames (of their own
  * leaves), the rest do only lookups.  The split isolates the READER path from
@@ -367,7 +378,7 @@ static void *worker(void *arg)
 				me->lk_wrong++;
 			me->nlookups++;
 		}
-		if ((++ops & 15) == 0)
+		if ((++ops & quiesce_mask) == 0)
 			dc_quiescent();		/* let grace periods advance */
 	}
 
@@ -480,6 +491,10 @@ static void usage(const char *p)
 	    "  --readdir       => (split mode) readers enumerate a random dir instead\n"
 	    "                     of a leaf lookup; only writers own the namespace so\n"
 	    "                     dir size is fixed as readers scale.\n"
+	    "  --quiesce N     => announce a QSBR quiescent state every N ops (power\n"
+	    "                     of two, default 16); coarser trades a little smp_mb\n"
+	    "                     tax for longer GPs -- a net LOSS for the GP-bound\n"
+	    "                     txn fold (measure it).\n"
 	    "  --depth N       => leaf path depth (>=2): a spine of N-2 static dirs,\n"
 	    "                     then d{k}, then the leaf.  Widens the walk window.\n",
 	    p);
@@ -509,6 +524,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
+		else if (!strcmp(argv[i], "--quiesce")) {
+			int q = atoi(argv[++i]);
+			if (q < 1 || (q & (q - 1)) != 0) {
+				fprintf(stderr, "--quiesce N must be a power of two\n");
+				exit(2);
+			}
+			quiesce_mask = (unsigned) (q - 1);
+		}
 		else usage(argv[0]);
 	}
 	if (nthreads < 1 || ndirs < 2 || depth < 2 || leaves < 1 ||
