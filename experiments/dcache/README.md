@@ -193,8 +193,12 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   bar (103/103, walk-causality repro, ASan/TSAN-clean stress: `make check-pernode`).
   In the homogeneous mix the collapse is *writer*-bound (a rename ≈ 50× a lookup),
   so the reader-gen difference is masked; the role-split isolates it and the
-  per-node arm runs materially faster than global on the contended reader path
-  (see `rename-shell-transition.md` S3 results).
+  per-node arm runs materially faster than global on the contended reader path.
+  Sweeping readers to 184 (8 writers, filling all 192 cores one-thread-per-core via
+  an hwloc-derived pin list), per-node **keeps scaling to ~450 Mops/s** while the
+  global bracket saturates ~110–120 and seqlock never scales cleanly — **3.7×
+  global, 5.8× seqlock at the full-machine point** (see `rename-shell-transition.md`
+  S3 results).
 - **S4** — simplification analysis (LOC + invariant surface: which
   counters/fallbacks disappear) + scaling figures + writeup back into `design/`.
 

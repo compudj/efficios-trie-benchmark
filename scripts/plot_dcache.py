@@ -17,6 +17,36 @@ from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import (FuncFormatter, FixedLocator, FixedFormatter,
+                               LogLocator, NullFormatter)
+
+# plain decimal label: 0.2, 0.5, 1, 10, 100, 200 -- never 10^n, never "0" for 0.5
+_num = FuncFormatter(lambda v, pos: f"{v:g}")
+
+
+def plain_y(ax):
+    """log-SPACED y (the data spans decades) but PLAIN-NUMBER labels: 1, 10, 100
+    (with 2/5 subdivisions), never 10^n."""
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    ax.yaxis.set_major_formatter(_num)
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+
+def plain_thread_x(ax, ticks):
+    """log2-spaced thread-count x with plain integer labels at the sampled points."""
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+
+
+def percent_x(ax, fracs, labels):
+    """log-spaced rename-fraction x, labelled as percentages (0, 1%, 5%, ...)."""
+    ax.set_xscale("log")
+    ax.xaxis.set_major_locator(FixedLocator(fracs))
+    ax.xaxis.set_major_formatter(FixedFormatter(labels))
+    ax.xaxis.set_minor_formatter(NullFormatter())
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = os.path.join(HERE, "dcache_sweep.csv")
@@ -55,13 +85,15 @@ for e in ENGINES:
     ax1.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=1.9, ms=6,
              label=LABEL[e], alpha=0.92)
 if ax1.has_data():
-    ax1.set_xscale("log"); ax1.set_yscale("log")
+    percent_x(ax1, [0.003, 0.01, 0.05, 0.1, 0.2, 0.5],
+              ["0", "1%", "5%", "10%", "20%", "50%"])
+    plain_y(ax1)
 ax1.set_title("Homogeneous mix (48 threads) — lookup Mops/s vs rename fraction\n"
               "collapse is WRITER-bound (a rename ≈ 50× a lookup, so a small\n"
               "fraction eats a large time-share) — masks the reader-gen gap",
               fontsize=9.5)
-ax1.set_xlabel("rename fraction   (log; leftmost = 0)")
-ax1.set_ylabel("lookup Mops/s   (higher better, log)")
+ax1.set_xlabel("rename fraction   (leftmost = 0)")
+ax1.set_ylabel("lookup Mops/s   (higher is better)")
 
 # ---- Panel 2: ROLE-SPLIT -- reader throughput vs writer load (THE headline) --
 base = {}
@@ -82,13 +114,14 @@ for w in sorted(base["txn-pernode"]):
                          ha="center", fontsize=8, color=COLOR["txn-pernode"],
                          fontweight="bold")
 if ax2.has_data():
-    ax2.set_xscale("log", base=2); ax2.set_yscale("log")
+    plain_thread_x(ax2, [1, 2, 4, 8, 16, 24, 32, 48])
+    plain_y(ax2)
 ax2.set_title("Role-split: 32 dedicated readers + W writers — reader Mops/s vs W\n"
               "ISOLATES the reader path: global bracket contends one whole-tree\n"
               "cacheline; per-node host counter does not (× = per-node ÷ global)",
               fontsize=9.5)
-ax2.set_xlabel("concurrent writer threads (renaming)   (log)")
-ax2.set_ylabel("reader lookup Mops/s   (higher better, log)")
+ax2.set_xlabel("concurrent writer threads (renaming)")
+ax2.set_ylabel("reader lookup Mops/s   (higher is better)")
 
 # ---- Panel 3: ROLE-SPLIT reader scaling at fixed writer load ----------------
 for e in ENGINES:
@@ -98,13 +131,14 @@ for e in ENGINES:
     ax3.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=1.9, ms=6,
              label=LABEL[e], alpha=0.92)
 if ax3.has_data():
-    ax3.set_xscale("log", base=2); ax3.set_yscale("log")
-ax3.set_title("Role-split reader scaling — 8 writers fixed, sweep readers\n"
-              "reader Mops/s vs reader count under a constant rename load\n"
-              "(per-node keeps scaling; the global bracket saturates)",
+    plain_thread_x(ax3, [2, 8, 16, 32, 64, 96, 128, 184])
+    plain_y(ax3)
+ax3.set_title("Role-split reader scaling — 8 writers fixed, sweep readers to 184\n"
+              "reader Mops/s vs reader count under a constant rename load, one hw\n"
+              "thread per core (per-node keeps scaling; the global bracket saturates)",
               fontsize=9.5)
-ax3.set_xlabel("dedicated reader threads   (log)")
-ax3.set_ylabel("reader lookup Mops/s   (higher better, log)")
+ax3.set_xlabel("dedicated reader threads")
+ax3.set_ylabel("reader lookup Mops/s   (higher is better)")
 
 for ax in (ax1, ax2, ax3):
     ax.grid(alpha=0.3, ls=":")

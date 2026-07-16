@@ -314,8 +314,10 @@ results below.
 ### S3 results (`figures/dcache_s3.png`, 2×96-core EPYC, best-of-5, conserved)
 
 `bench_dcache` runs the three arms — `seqlock`, `txn` (global `rename_gen`), `txn`
-(`-DDC_PER_NODE_GEN`) — in two modes, every one of 375 runs gated on namespace
-conservation (**0 failures**).
+(`-DDC_PER_NODE_GEN`) — in two modes, every one of 420 runs gated on namespace
+conservation (**0 failures**). Threads are pinned one-per-physical-core via an
+hwloc-derived CPU list (`hwloc-calc core:all.pu:0` → `--cpulist`), so the SMT
+siblings stay idle and the reader sweep fills all 192 cores cleanly.
 
 - **Homogeneous mix** (48 threads, each doing `rename-frac` of its ops as renames):
   lookup throughput collapses from ~420 Mops/s at frac 0 to <1 Mops/s by frac 0.5
@@ -329,12 +331,16 @@ conservation (**0 failures**).
   - *32 readers, sweep writers*: per-node reader throughput leads global by
     **1.3–2.1×** across 1–24 writers (e.g. 205 vs 141 Mops/s at 1 writer, 101 vs 50
     at 4), converging only when writers ≈ readers (the rename load itself dominates).
-  - *8 writers, sweep readers*: the clean scaling result — per-node reader
-    throughput **keeps scaling** (7 → **309 Mops/s** from 2 → 96 readers) while the
-    global bracket **saturates** (~84–96 Mops/s past 48 readers). At 96 readers
-    per-node is **3.66× global and 2.9× seqlock**. The global `rename_gen`
-    cacheline, read by every walk and written by every rename, is the ceiling; the
-    per-node host counter — read only by walks through the moved entry — has none.
+  - *8 writers, sweep readers to 184 (filling all 192 cores)*: the clean scaling
+    result — per-node reader throughput **keeps scaling** (8 → **451 Mops/s** from
+    2 → 160 readers, easing to 422 at 184 where the writers share the last socket)
+    while the global bracket **saturates** (~110–120 Mops/s past ~128 readers) and
+    seqlock never scales cleanly at all (a noisy 40–93 Mops/s — reader-retry storms
+    under the fixed rename load). At the full-machine point (184 readers) per-node
+    is **3.7× global and 5.8× seqlock**; at its 160-reader peak, 3.7× global. The
+    global `rename_gen` cacheline, read by every walk and written by every rename,
+    is the ceiling; the per-node host counter — read only by walks through the
+    moved entry — has none.
 
 **Reading of the experiment:** the txn port's *simplification* win (`d_seq`
 deleted, one reader rule) is real and independent of the counter choice; the

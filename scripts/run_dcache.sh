@@ -32,8 +32,24 @@ LEAVES=32
 DUR=1000
 RUNS=5
 
+# Pin ONE hardware thread per physical core: ask hwloc for the first PU of every
+# core (core:all.pu:0), OS-indexed.  On this 2x96 EPYC that is cpus 0..191 (the
+# SMT siblings 192..383 are left idle), but deriving it from hwloc keeps the
+# sweep correct on any PU numbering.  NCORE bounds how many threads we can place
+# without doubling two threads onto one core.
+CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
+if [[ -n "$CPULIST" ]]; then
+  NCORE=$(tr ',' '\n' <<< "$CPULIST" | grep -c .)
+  PIN="--cpulist $CPULIST"
+  echo ">> hwloc: one hw thread per core, $NCORE cores (${CPULIST:0:24}...)" >&2
+else
+  NCORE=$(nproc)
+  PIN="--cpustride 1"
+  echo ">> hwloc-calc unavailable; falling back to --cpustride 1 over $NCORE cpus" >&2
+fi
+
 # tree geometry knobs held fixed across the sweep
-COMMON="--ndirs $NDIRS --depth $DEPTH --leaves $LEAVES --duration $DUR --cpustride 1"
+COMMON="--ndirs $NDIRS --depth $DEPTH --leaves $LEAVES --duration $DUR $PIN"
 
 declare -A BINOF=( [seqlock]=bench_dcache_seqlock \
                    [txn-global]=bench_dcache_txn \
@@ -87,9 +103,15 @@ for w in 1 2 4 8 16 24 32 48; do
 done
 
 # ---- Panel: ROLE-SPLIT reader scaling at fixed writer load -----------------
+# Scale readers until readers+writers fill every physical core (RMAX=NCORE-WFIX),
+# one hw thread per core.  On the 2x96 EPYC that is 184 readers + 8 writers = 192
+# cores.  Cap each candidate point at RMAX and always include RMAX itself.
 WFIX=8
-echo ">> split_scale panel: $WFIX writers, sweep reader count" >&2
-for rd in 2 4 8 16 32 48 64 96; do
+RMAX=$((NCORE - WFIX))
+RDPTS=$(for rd in 2 4 8 16 32 48 64 96 128 160 $RMAX; do
+          (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
+echo ">> split_scale panel: $WFIX writers, sweep readers up to $RMAX (fill $NCORE cores)" >&2
+for rd in $RDPTS; do
   for e in $ENGINES; do run split_scale "$e" $((rd+WFIX)) "$WFIX" 1.0; done
 done
 

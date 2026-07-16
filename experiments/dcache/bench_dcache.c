@@ -36,7 +36,8 @@
  * fast one (same discipline as bench_txn_3skiplist).
  *
  * Usage: bench_dcache [--nthreads N] [--rename-frac F] [--ndirs N] [--depth N]
- *                     [--leaves N] [--duration MS] [--cpustride N] [--nbuckets N]
+ *                     [--leaves N] [--duration MS] [--cpustride N]
+ *                     [--cpulist c0,c1,...] [--nbuckets N]
  */
 
 #ifndef _GNU_SOURCE
@@ -78,6 +79,15 @@ static int    depth        = 2;		/* leaf path depth (>=2) */
 static int    leaves       = 16;	/* leaves owned per thread */
 static long   duration_ms  = 1000;
 static int    cpustride    = 1;
+/*
+ * Explicit CPU map: thread i pins to cpulist[i], overriding the id*cpustride
+ * default.  Populated from `--cpulist c0,c1,...` -- run_dcache.sh fills it from
+ * `hwloc-calc core:all.pu:0` so the sweep uses exactly one hardware thread per
+ * physical core (no SMT sibling doubled up) regardless of how the kernel numbers
+ * the PUs.  NULL => fall back to i*cpustride.
+ */
+static int   *cpulist      = NULL;
+static int    cpulist_len  = 0;
 static unsigned int nbuckets = 4096;
 /*
  * -1 (default): HOMOGENEOUS -- every thread runs the rename-frac mix.  >=0:
@@ -129,6 +139,30 @@ static void pin_cpu(int cpu)
 	CPU_ZERO(&set);
 	CPU_SET(cpu, &set);
 	(void) sched_setaffinity(0, sizeof(set), &set);
+}
+
+/* Parse `c0,c1,c2,...` (commas or spaces) into the cpulist[] map. */
+static void parse_cpulist(const char *s)
+{
+	int cap = 16;
+
+	cpulist = malloc(cap * sizeof(*cpulist));
+	cpulist_len = 0;
+	while (*s) {
+		char *end;
+		long v = strtol(s, &end, 10);
+
+		if (end == s)
+			break;
+		if (cpulist_len == cap) {
+			cap *= 2;
+			cpulist = realloc(cpulist, cap * sizeof(*cpulist));
+		}
+		cpulist[cpulist_len++] = (int) v;
+		s = end;
+		while (*s == ',' || *s == ' ')
+			s++;
+	}
 }
 
 static inline uint64_t xrand(uint64_t *s)
@@ -394,7 +428,10 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--nthreads N] [--rename-frac F] [--writers K] [--ndirs N]\n"
 	    "          [--depth N] [--leaves N] [--duration MS] [--cpustride N]\n"
-	    "          [--nbuckets N]\n"
+	    "          [--cpulist c0,c1,...] [--nbuckets N]\n"
+	    "  --cpulist ...   => explicit CPU map (thread i -> ci), overriding\n"
+	    "                     --cpustride.  Feed it `hwloc-calc core:all.pu:0`\n"
+	    "                     to pin one hardware thread per physical core.\n"
 	    "  --rename-frac F => (homogeneous) fraction (0..1) of ops that are\n"
 	    "                     renames; the rest are full-path leaf lookups.\n"
 	    "  --writers K     => role-SPLIT: the first K threads do only renames,\n"
@@ -426,6 +463,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--leaves"))      leaves = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))    duration_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--cpustride"))   cpustride = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else usage(argv[0]);
@@ -433,6 +471,11 @@ int main(int argc, char **argv)
 	if (nthreads < 1 || ndirs < 2 || depth < 2 || leaves < 1 ||
 	    rename_frac < 0.0 || rename_frac > 1.0 || nwriters > nthreads)
 		usage(argv[0]);
+	if (cpulist && nthreads > cpulist_len) {
+		fprintf(stderr, "--cpulist has %d cpus but --nthreads=%d "
+			"(would double up on a core)\n", cpulist_len, nthreads);
+		exit(2);
+	}
 	if (depth - 2 > DC_PATH_MAX - 2)
 		depth = DC_PATH_MAX;		/* leave room for d{k} + leaf */
 	g_prefix_len = depth - 2;
@@ -462,7 +505,7 @@ int main(int argc, char **argv)
 	wa = calloc(nthreads, sizeof(*wa));
 	for (i = 0; i < nthreads; i++) {
 		wa[i].id = i;
-		wa[i].cpu = i * cpustride;
+		wa[i].cpu = cpulist ? cpulist[i] : i * cpustride;
 		pthread_create(&tid[i], NULL, worker, &wa[i]);
 	}
 	while (uatomic_read(&nthreads_running) < nthreads)
