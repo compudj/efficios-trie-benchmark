@@ -453,7 +453,12 @@ the S3 sweeps that measure it (full data + method in `rename-shell-transition.md
 `hwloc-calc core:all.pu:0 → --cpulist`, best-of-5, every run gated on namespace
 conservation — **0 failures across 141 rows**). Figures `figures/dcache_s3.png`
 and `figures/dcache_readdir.png` (regenerate with `scripts/run_dcache.sh` →
-`scripts/plot_dcache*.py`); the tables below are the committed anchors.
+`scripts/plot_dcache*.py`); the tables below are the committed anchors. The
+plotted figures are the clean **baseline-vs-winner two-way** (seqlock vs
+per-node); the intermediate **txn-global** arm — a naive port that deletes
+`d_seq` but keeps *one* global `rename_gen` — is dropped from the lines to keep
+the headline uncluttered, but stays in the CSV and in the tables/reading below,
+because it is the evidence for *why* the counter must be per-node (§7.1).
 
 **Measured on the current default** — the true-1-CL split (§5 "Landed",
 `0f4f626`/`706e459`) with `--precomp` on, both applied identically to all three

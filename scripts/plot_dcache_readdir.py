@@ -2,20 +2,23 @@
 """
 Directory listing (readdir) under a concurrent rename load -- the S3 companion.
 
-Same three engines as the lookup sweep, but the readers ENUMERATE a directory
-(dc_readdir) instead of doing a full-path leaf lookup:
+Headline two-way (the lookup figure's companion): the faithful kernel baseline
+vs the winning design, readers ENUMERATE a directory (dc_readdir) rather than
+doing a full-path leaf lookup:
 
   seqlock      per-DIRECTORY rwsem readdir (the honest kernel-inode-rwsem
                analogue: readers of a dir share a read-lock, a rename write-locks
                only its affected parents -- NOT one global lock)
-  txn-global   lock-free RCU walk of the MCAS child hlist, GLOBAL rename_gen
   txn-pernode  lock-free RCU walk of the MCAS child hlist, per-node host gen
 
-Key point: readdir reads NO generation counter at all (a concurrently renamed
-child may or may not appear -- POSIX-soft, but it never tears), so txn-global and
-txn-pernode run IDENTICAL readdir code and their curves overlap.  The global-vs-
-per-node axis that decided the lookup path is moot here; the contrast is a lock-
-free RCU walk vs a lock.
+Note: readdir's READER path reads NO generation counter at all (a concurrently
+renamed child may or may not appear -- POSIX-soft, but it never tears), so
+txn-pernode and txn-global run IDENTICAL readdir reader code.  They still differ
+by ~15-25% at scale -- a second-order WRITER-side effect (the global rename_gen
+cacheline the concurrent writers contend), documented in §7.2 -- but txn-global
+is dropped from this plot to keep the headline a clean baseline-vs-winner; it
+stays in the CSV.  The contrast that matters here is the lock-free RCU walk vs the
+per-directory lock.
 
 Data: scripts/dcache_sweep.csv (panels readdir_scale, readdir_w).  2x96 EPYC.
 """
@@ -55,7 +58,7 @@ LABEL = {
     "txn-global": "urcu-txn — GLOBAL rename_gen\n(lock-free RCU child-walk)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(lock-free RCU child-walk)",
 }
-ENGINES = ("seqlock", "txn-global", "txn-pernode")
+ENGINES = ("seqlock", "txn-pernode")
 rows = list(csv.DictReader(open(CSV)))
 
 

@@ -59,7 +59,11 @@ LABEL = {
     "txn-global": "urcu-txn — GLOBAL rename_gen\n(d_seq deleted, one global bracket)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(localized: moved entry only)",
 }
-ENGINES = ("seqlock", "txn-global", "txn-pernode")
+# Headline comparison: the faithful kernel baseline vs the winning design.  The
+# txn-global arm (an intermediate A/B showing a naive port that keeps one global
+# counter does NOT scale) stays in the CSV + the §7 prose, but is dropped from the
+# plotted lines to keep the figure a clean two-way.
+ENGINES = ("seqlock", "txn-pernode")
 rows = list(csv.DictReader(open(CSV)))
 
 
@@ -104,10 +108,10 @@ for e in ENGINES:
         continue
     ax2.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.1, ms=6.5,
              label=LABEL[e], alpha=0.94)
-# annotate the per-node lead over global-txn where both exist
+# annotate the per-node lead over the seqlock baseline where both exist
 for w in sorted(base["txn-pernode"]):
-    if w in base["txn-global"] and base["txn-global"][w] > 0:
-        r = base["txn-pernode"][w] / base["txn-global"][w]
+    if w in base["seqlock"] and base["seqlock"][w] > 0:
+        r = base["txn-pernode"][w] / base["seqlock"][w]
         if r >= 1.15:
             ax2.annotate(f"{r:.1f}×", (w, base["txn-pernode"][w]),
                          textcoords="offset points", xytext=(0, 8),
@@ -117,8 +121,9 @@ if ax2.has_data():
     plain_thread_x(ax2, [1, 2, 4, 8, 16, 24, 32, 48])
     plain_y(ax2)
 ax2.set_title("Role-split: 32 dedicated readers + W writers — reader Mops/s vs W\n"
-              "ISOLATES the reader path: global bracket contends one whole-tree\n"
-              "cacheline; per-node host counter does not (× = per-node ÷ global)",
+              "ISOLATES the reader path: seqlock retries the whole walk on any\n"
+              "rename; the per-node counter is touched only by walks through the\n"
+              "moved entry (× = per-node ÷ seqlock)",
               fontsize=9.5)
 ax2.set_xlabel("concurrent writer threads (renaming)")
 ax2.set_ylabel("reader lookup Mops/s   (higher is better)")
@@ -135,7 +140,7 @@ if ax3.has_data():
     plain_y(ax3)
 ax3.set_title("Role-split reader scaling — 8 writers fixed, sweep readers to 184\n"
               "reader Mops/s vs reader count under a constant rename load, one hw\n"
-              "thread per core (per-node keeps scaling; the global bracket saturates)",
+              "thread per core (per-node keeps scaling; seqlock never scales)",
               fontsize=9.5)
 ax3.set_xlabel("dedicated reader threads")
 ax3.set_ylabel("reader lookup Mops/s   (higher is better)")
@@ -146,7 +151,7 @@ for ax in (ax1, ax2, ax3):
         ax.legend(fontsize=7.5, loc="best")
 
 fig.suptitle("Userspace dcache — does urcu-txn dissolve rename_lock + d_seq?   "
-             "seqlock vs txn(global gen) vs txn(per-node host gen)   ·   2×96-core EPYC",
+             "seqlock (kernel baseline) vs txn(per-node host gen)   ·   2×96-core EPYC",
              fontsize=12)
 fig.tight_layout(rect=[0, 0, 1, 0.94])
 fig.savefig(OUT, dpi=140)
