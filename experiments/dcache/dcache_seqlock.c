@@ -45,6 +45,16 @@
 #include "seqcount.h"
 
 /*
+ * Fair 1-CL reader layout, DEFAULT-ON.  The reference baseline must carry the
+ * SAME cacheline-quality hot line as the txn port, so the footprint A/B is
+ * mechanism-vs-mechanism (seqlock vs rcu-txn), not layout-vs-layout.  Opt out
+ * with -DDC_NO_HOT1CL_SPLIT to measure the legacy 3-CL struct.
+ */
+#if !defined(DC_NO_HOT1CL_SPLIT) && !defined(DC_HOT1CL_SPLIT)
+#define DC_HOT1CL_SPLIT 1
+#endif
+
+/*
  * Total lookup-walk restarts forced by a concurrent rename (global rename_lock
  * or a stepped-into d_seq).  The benchmark reads this via a WEAK reference so it
  * stays engine-agnostic: the txn engine, which never retries a walk, simply does
@@ -66,6 +76,34 @@ struct dc_bucket {
 };
 
 struct dentry {
+#if defined(DC_HOT1CL_SPLIT)
+	/*
+	 * Fair 1-CL reader hot line -- the fields a lockless walk touches per hop,
+	 * clustered like the kernel's RCU-walk-touched dentry head:
+	 *   d_name(40) + d_parent(8) + d_seq(8) + d_hash.next(8) = 64 B = CL0.
+	 * d_parent's low bits carry the unhashed / negative tags (dparent_of /
+	 * d_is_unhashed / d_is_positive), so the per-hop compare reads them off the
+	 * already-loaded parent word rather than the cold d_inode / d_unhashed
+	 * fields.  d_seq lives ON the hot line (sampled every hop -- the seqlock's
+	 * whole mechanism).  d_hash straddles: next@56 stays in CL0 (collision walk
+	 * hot), pprev@64 spills cold.  d_id is a benchmark artifact (a real dentry's
+	 * identity IS its address) read cold only by the census / readdir /
+	 * -DDC_SPLIT_KEEPID; the lookup returns the dentry address.
+	 */
+	struct qstr d_name;		/* @0:  inline name (match) */
+	struct dentry *d_parent;	/* @40: parent addr + unhashed/neg tags */
+	seqcount_t d_seq;		/* @48: name/parent coherence -- ON CL0 */
+	struct dc_hnode d_hash;		/* @56: next@56 CL0, pprev@64 cold */
+
+	/* --- cold, below the reader hot line --- */
+	uint64_t d_id;			/* identity artifact; census/readdir/KEEPID */
+	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
+	struct dentry *d_sib;		/* next sibling under d_parent */
+	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
+
+	struct rcu_head d_rcu;		/* deferred free */
+#else
+	/* legacy fat layout (3 CL): the A/B baseline, -DDC_NO_HOT1CL_SPLIT */
 	struct qstr d_name;		/* current name under d_parent */
 	struct dentry *d_parent;	/* parent dir (root's parent is itself) */
 	uint64_t d_id;			/* stable identity, for verification */
@@ -80,6 +118,7 @@ struct dentry {
 	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
 
 	struct rcu_head d_rcu;		/* deferred free */
+#endif
 };
 
 struct dcache {
@@ -91,6 +130,69 @@ struct dcache {
 };
 
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
+
+/*
+ * 1-CL tag encoding in d_parent's low bits.  A dentry is 16-byte aligned
+ * (calloc), so bits 0-3 are free; unhashed and negative ride bits 0 and 1.  Both
+ * are read off the already-loaded parent word, keeping the removed-from-hash and
+ * positive/negative tests on CL0 instead of the cold d_unhashed / d_inode fields.
+ * The legacy (non-split) build falls back to those plain fields.
+ */
+#if defined(DC_HOT1CL_SPLIT)
+#define DC_TAG_UNHASHED	((uintptr_t) 0x1)	/* bit 0: removed from the hash */
+#define DC_TAG_NEG	((uintptr_t) 0x2)	/* bit 1: negative dentry */
+#define DC_TAG_MASK	((uintptr_t) 0x3)
+
+static inline struct dentry *dparent_of(const struct dentry *d)
+{
+	return (struct dentry *) ((uintptr_t) d->d_parent & ~DC_TAG_MASK);
+}
+static inline int d_is_unhashed(const struct dentry *d)
+{
+	return ((uintptr_t) d->d_parent & DC_TAG_UNHASHED) != 0;
+}
+static inline int d_is_positive(const struct dentry *d)
+{
+	return ((uintptr_t) d->d_parent & DC_TAG_NEG) == 0;
+}
+#define DC_DPARENT(d)      dparent_of(d)
+#define DC_IS_UNHASHED(d)  d_is_unhashed(d)
+#define DC_IS_POSITIVE(d)  d_is_positive(d)
+/* Mark a live node as removed from the hash: OR the tag into its parent word,
+ * under the node's d_seq bracket (the fat build stores the d_unhashed field). */
+#define DC_SET_UNHASHED(d) \
+	CMM_STORE_SHARED((d)->d_parent, \
+		(struct dentry *) ((uintptr_t) (d)->d_parent | DC_TAG_UNHASHED))
+#else
+#define DC_DPARENT(d)      ((d)->d_parent)
+#define DC_IS_UNHASHED(d)  ((d)->d_unhashed)
+#define DC_IS_POSITIVE(d)  ((d)->d_inode)
+#define DC_SET_UNHASHED(d) CMM_STORE_SHARED((d)->d_unhashed, 1)
+#endif
+
+/*
+ * 1-CL identity = the dentry ADDRESS (a real kernel dentry has no logical id;
+ * d_id is a benchmark artifact read cold by the census / readdir).  The
+ * -DDC_SPLIT_KEEPID validation build returns the cold d_id instead so a harness's
+ * id==gid torn-read checks keep working -- same hot LAYOUT, one extra cold read.
+ */
+#if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
+#define DC_FAST_ID(d)      ((uint64_t) (uintptr_t) (d))
+#else
+#define DC_FAST_ID(d)      ((d)->d_id)
+#endif
+
+/*
+ * Capability flag for harnesses: 1 when dc_lookup returns the dentry ADDRESS as
+ * the id (the DEFAULT 1-CL build), 0 when it returns the logical d_id.  Read via
+ * a weak reference (absent => 0 => logical id); mirrors the txn engine so the
+ * bench treats both identically.  See bench_dcache.c.
+ */
+#if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
+const int dc_lookup_id_is_address = 1;
+#else
+const int dc_lookup_id_is_address = 0;
+#endif
 
 /* ---- hashing ------------------------------------------------------------ */
 
@@ -198,10 +300,12 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 	if (!d)
 		return NULL;
 	d->d_name = *name;
-	d->d_parent = parent;
+	d->d_parent = parent;		/* clean low bits => hashed + positive */
 	d->d_id = id;
+#if !defined(DC_HOT1CL_SPLIT)
 	d->d_inode = 1;			/* phase 1: every dentry is positive */
 	d->d_unhashed = 0;
+#endif
 	seqcount_init(&d->d_seq);
 	d->d_children = NULL;
 	d->d_sib = NULL;
@@ -298,10 +402,23 @@ static struct dentry *__d_lookup_rcu(struct dcache *dc, struct dentry *parent,
 		if (CMM_LOAD_SHARED(d->d_name.hash) != name->hash)
 			continue;
 		seq = raw_read_seqcount(&d->d_seq);
+#if defined(DC_HOT1CL_SPLIT)
+		{
+			/* one load of the CL0 parent word: mask for the parent
+			 * edge, test the unhashed tag off the same bits. */
+			uintptr_t pw = (uintptr_t) CMM_LOAD_SHARED(d->d_parent);
+
+			if ((struct dentry *) (pw & ~DC_TAG_MASK) != parent)
+				continue;
+			if (pw & DC_TAG_UNHASHED)
+				continue;
+		}
+#else
 		if (CMM_LOAD_SHARED(d->d_parent) != parent)
 			continue;
 		if (CMM_LOAD_SHARED(d->d_unhashed))
 			continue;
+#endif
 		/*
 		 * Optimistic name compare: the bytes may be torn by a concurrent
 		 * rename, but the caller's read_seqcount_retry(d_seq, *seqp)
@@ -329,7 +446,7 @@ retry:
 	{
 		struct dentry *cur = dc->root;
 		enum dc_result res = DC_POSITIVE;
-		uint64_t id = cur->d_id;
+		uint64_t id = DC_FAST_ID(cur);
 		uint32_t i;
 
 		for (i = 0; i < p->ndepth; i++) {
@@ -347,8 +464,8 @@ retry:
 				goto retry_check;
 			}
 			cur = d;
-			id = d->d_id;
-			res = d->d_inode ? DC_POSITIVE : DC_NEGATIVE;
+			id = DC_FAST_ID(d);
+			res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
 		}
 
 		/* Global anchor: any rename during the walk => redo it. */
@@ -434,7 +551,7 @@ static struct dentry *__child_lookup(struct dcache *dc, struct dentry *parent,
 	for (n = b->first; n; n = n->next) {
 		struct dentry *d = hnode_dentry(n);
 
-		if (d->d_parent == parent && !d->d_unhashed &&
+		if (DC_DPARENT(d) == parent && !DC_IS_UNHASHED(d) &&
 		    dc_qstr_eq(&d->d_name, name))
 			return d;
 	}
@@ -464,9 +581,9 @@ static int is_subdir(struct dentry *a, struct dentry *b)
 	for (;;) {
 		if (cur == b)
 			return 1;
-		if (cur == cur->d_parent)	/* reached root */
+		if (cur == DC_DPARENT(cur))	/* reached root */
 			return 0;
-		cur = cur->d_parent;
+		cur = DC_DPARENT(cur);
 	}
 }
 
@@ -537,12 +654,12 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	/* Publish the removal under d_seq so a reader mid-compare on the victim
 	 * re-scans and misses it; hlist_del_rcu splices it for new readers. */
 	write_seqcount_begin(&victim->d_seq);
-	CMM_STORE_SHARED(victim->d_unhashed, 1);
+	DC_SET_UNHASHED(victim);
 	hlist_del_rcu(&victim->d_hash);
 	write_seqcount_end(&victim->d_seq);
-	dir_wlock(victim->d_parent);
-	children_remove(victim->d_parent, victim);
-	dir_wunlock(victim->d_parent);
+	dir_wlock(DC_DPARENT(victim));
+	children_remove(DC_DPARENT(victim), victim);
+	dir_wunlock(DC_DPARENT(victim));
 	call_rcu(&victim->d_rcu, dentry_free_cb);	/* honest deferred free */
 out:
 	pthread_mutex_unlock(&dc->mutator_lock);
@@ -558,7 +675,7 @@ out:
 static void __d_move(struct dcache *dc, struct dentry *victim,
 		     struct dentry *new_parent, const struct qstr *new_name)
 {
-	struct dentry *old_parent = victim->d_parent;
+	struct dentry *old_parent = DC_DPARENT(victim);
 
 	/*
 	 * Write-lock both affected dirs (one if unchanged) for the whole identity
@@ -607,7 +724,7 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 		ret = -EEXIST;			/* phase 1: no replace */
 		goto out;
 	}
-	if (victim->d_parent != to_parent && is_subdir(to_parent, victim)) {
+	if (DC_DPARENT(victim) != to_parent && is_subdir(to_parent, victim)) {
 		ret = -EINVAL;			/* would create a loop */
 		goto out;
 	}
@@ -638,8 +755,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 	}
 	if (da == db)
 		goto out;			/* exchanging a node with itself */
-	pa = da->d_parent;
-	pb = db->d_parent;
+	pa = DC_DPARENT(da);
+	pb = DC_DPARENT(db);
 	/* Neither may end up under the other (no loops in either direction). */
 	if (pa != pb && (is_subdir(pb, da) || is_subdir(pa, db))) {
 		ret = -EINVAL;
@@ -726,7 +843,7 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 {
 	struct dentry *c;
 
-	if (path->ndepth > 0 || d->d_parent != d)	/* skip emitting root */
+	if (path->ndepth > 0 || DC_DPARENT(d) != d)	/* skip emitting root */
 		fn(d->d_id, path, arg);
 
 	for (c = d->d_children; c; c = c->d_sib) {

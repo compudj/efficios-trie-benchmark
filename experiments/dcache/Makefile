@@ -52,10 +52,13 @@ test_dcache: test_dcache.o dcache_$(ENGINE).o | check-lib
 %.o: %.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-# test_dcache (ENGINE=txn) links this object; build it -DDC_SPLIT_KEEPID so the
-# suite's logical-id assertions hold on the split layout.  Only test_dcache uses
-# the .o -- the bench builds dcache_txn.c from source (address default).
+# test_dcache links this object; build it -DDC_SPLIT_KEEPID so the suite's
+# logical-id assertions hold on the 1-CL split layout.  Only test_dcache uses the
+# .o -- the bench builds each engine from source (address default).
 dcache_txn.o: dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -c $< -o $@
+
+dcache_seqlock.o: dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(HCPP) -c $< -o $@
 
 check: test_dcache
@@ -189,9 +192,17 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 # plot_dcache.py charts them.
 bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode
 
+# The seqlock baseline builds the DEFAULT layout too: the fair 1-CL split hot
+# line (d_parent tags + d_seq on CL0, d_id cold) returning the dentry ADDRESS as
+# identity.  A/B partner: _nosplit = the legacy 3-CL struct.  Equal layout quality
+# is what makes the txn-vs-seqlock footprint A/B mechanism-vs-mechanism.
 bench_dcache_seqlock: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_seqlock.c \
 	  $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_seqlock_nosplit: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
 
 # The txn arms build the DEFAULT layout: the 1-CL split (straddle + d_iparent
 # tags + d_seq on CL0) returning the host ADDRESS as identity (census-gated
@@ -263,7 +274,8 @@ bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 
 clean:
 	rm -f *.o test_dcache test_dcache_asan repro_dcache repro_dcache_asan \
-	  bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_nosplit \
+	  bench_dcache_seqlock bench_dcache_seqlock_nosplit \
+	  bench_dcache_txn bench_dcache_txn_nosplit \
 	  bench_dcache_txn_pernode bench_dcache_txn_pernode_nosplit \
 	  bench_dcache_txn_pernode_keepid bench_dcache_txn_hot1cl \
 	  test_dcache_hot1cl test_dcache_hot1cl_asan \
