@@ -451,21 +451,23 @@ it is that the reader path stops sharing a whole-tree cacheline. §7.1–7.2 fol
 the S3 sweeps that measure it (full data + method in `rename-shell-transition.md`
 §S3 / readdir; 2×96-core EPYC 9654, threads pinned one-per-physical-core via an
 `hwloc-calc core:all.pu:0 → --cpulist`, best-of-5, every run gated on namespace
-conservation — 0 failures). The `.png` renders are not committed; these tables
-are the record.
+conservation — **0 failures across 141 rows**). Figures `figures/dcache_s3.png`
+and `figures/dcache_readdir.png` (regenerate with `scripts/run_dcache.sh` →
+`scripts/plot_dcache*.py`); the tables below are the committed anchors.
 
-These sweeps predate the true-1-CL default (§5 "Landed", `0f4f626`/`706e459`):
-they were taken with **all three arms on the then-current 3-CL layout**, which
-isolates the *counter* axis (global vs per-node vs seqlock) with the layout axis
-held equal — still a fair counter comparison, just not at the 1-CL operating
-point now shipped. One earlier note here was imprecise and is corrected: the old
-`-DDC_HOT1CL_SPLIT` would **not** have lifted the *per-node* curve, because it
-left `d_seq` on CL2 (the per-node reader stayed 2-CL); only the later name-trim
-(`DC_NAME_MAX` 40→32) seated `d_seq` on CL0. A resweep on the current default —
-where every arm is genuinely 1-CL — is the correct instrument for the compounded
-layout+counter effect and is deferred pending a quiet machine (a co-tenant qemu
-VM currently makes DRAM-bound at-scale numbers bistable); its direction is not
-claimed here.
+**Measured on the current default** — the true-1-CL split (§5 "Landed",
+`0f4f626`/`706e459`) with `--precomp` on, both applied identically to all three
+arms, so the layout axis is held fixed at 1-CL and the sweep isolates the
+*counter* axis (global vs per-node vs seqlock). Two notes for anyone diffing
+against the earlier 3-CL / no-precomp tables (this is a resweep of them): (1)
+absolute lookup throughput is **~4× higher** here, almost entirely because
+`--precomp` is now the default — it strips the per-lookup `snprintf` (~74% of
+instructions, §5); readdir, whose cost is child enumeration not path
+construction, barely moves. (2) With that ALU work gone the descent is
+latency/bandwidth-bound, so the reader-path differences the `snprintf` used to
+mask now appear at full size — the per-node lead **widens** vs the old tables
+rather than being an artifact of the change. Machine was quiet at sweep time
+(load ~0.3, the co-tenant qemu VM idle); best-of-5 absorbs residual jitter.
 
 ### 7.1 Path-lookup reader scaling
 
@@ -475,28 +477,32 @@ masked (per-node only ~25% ahead at the high-frac end). The **role-split** mode
 (dedicated readers + writers) isolates the reader path, and the localization
 appears. Two axes, all figures Mops/s:
 
-*8 writers, sweep readers toward the full machine (reported anchors):*
+*8 writers, sweep readers toward the full machine (reported anchors, Mops/s):*
 
 | readers | seqlock | txn-global | txn-per-node |
 |---|--:|--:|--:|
-| 2 (low end) | — | — | ~8 |
-| 160 (per-node peak) | noisy 40–93 | ~110–120 (saturated) | **451** |
-| 184 (all 192 cores) | ~73 | ~114 | **422** |
-| ratio @184 | 5.8× | 3.7× | **1×** |
+| 2 (low end) | 21 | 25 | 58 |
+| 32 | 100 | 156 | 637 |
+| 160 (per-node peak) | 69 | 198 | **2011** |
+| 184 (all 192 cores) | 61 | 262 | 1965 |
+| ratio @184 | 32× | 7.5× | **1×** |
 
-*32 readers, sweep writers (per-node lead over global):*
+*32 readers, sweep writers (per-node lead over global, Mops/s):*
 
 | writers | txn-global | txn-per-node | lead |
 |---|--:|--:|--:|
-| 1 | 141 | 205 | 1.45× |
-| 4 | 50 | 101 | 2.0× |
-| 1→24 (range) | | | **1.3–2.1×** |
+| 1 | 357 | 764 | 2.1× |
+| 4 | 119 | 693 | 5.8× |
+| 1→24 (range) | | | **2.1–6.0×** |
 
 **Reading.** The per-node host counter — read only by walks that pass through the
 *moved* entry (§6) — has no shared ceiling, so reader throughput keeps climbing to
-**451 Mops/s** as cores are added. The global `rename_gen`, read by every walk and
-written by every rename, is one contended cacheline and **saturates ~110–120**;
-seqlock never scales cleanly (reader-retry storms under the fixed rename load).
+**~2011 Mops/s** @160 readers (easing to 1965 @184 as the 8 writers share the last
+socket). The global `rename_gen`, read by every walk and written by every rename,
+is one contended cacheline and **plateaus around ~200–260** (noisy, no clean
+saturation but a firm ceiling ~8× below per-node); seqlock never scales cleanly
+(reader-retry storms under the fixed rename load — non-monotonic 60–100 past
+~32 readers). At the full machine (184) per-node = **7.5× global, 32× seqlock**.
 This is the split the port's headline hides: `d_seq` **dissolves outright** and is
 independent of the counter choice, but the whole-walk-causality role of
 `rename_lock` **dissolves only under the per-node arm** — the global counter
@@ -513,35 +519,40 @@ serialize on paper. Readers enumerate a random dir (~32 children) while writers
 rename; namespace owned by writers, so dir size is fixed as readers scale.
 Figures listings/s:
 
-*Reader scaling, 8 writers, sweep readers:*
+*Reader scaling, 8 writers, sweep readers (listings/s):*
 
-| readers | per-dir rwsem | txn walk |
-|---|--:|--:|
-| 160 | ~15–29 (saturated) | **355** |
-| 184 | ~15–29 | 310 |
-| ratio @160 | 1× | **~12×** |
-
-*Writer load, 32 readers, sweep writers (namespace fixed):*
-
-| writers | rwsem | txn walk | lead |
+| readers | per-dir rwsem | txn-global | txn-per-node |
 |---|--:|--:|--:|
-| light | ~ | ~ | **6–7×** |
-| 48 (saturating) | ~14 | ~27–35 | **~2×** |
+| 32 | 17 | 92 | 113 |
+| 160 | ~18 (saturated) | 293 | 364 |
+| 184 | 18 | 317 | **400** |
+| ratio @184 vs rwsem | 1× | 18× | **~23×** |
 
-**Reading.** `readdir` is the *easy* case: it reads **no generation counter at
-all**, so `txn-global` and `txn-per-node` run near-identical listing code and the
-global-vs-per-node question that decided the lookup path is **moot** here. It
-dissolves to a bare, `rcu_read_lock`-only child-hlist walk — no `rename_gen`, no
-`d_seq`, no cursor. The rwsem baseline saturates ~15–29 because its read-side is a
-shared cacheline that bounces among readers of the same dir; the lock-free walk
-**leads at every reader count**, even two. Crucially the txn walk pays no
-per-child chain walk: the write-once **`d_host` skip pointer overlaid on `d_id`**
-(§3) resolves each child's content host in O(1), which is what erased the earlier
-low-reader crossover and the churn-sensitivity — under saturating write load the
-walk still leads ~2× and its residual decline is *write-side* MCAS churn, not the
-reader path. So the same union that costs one branch on the lookup fast path (§2)
-is what makes listing O(1) in chain depth.
+*Writer load, 32 readers, sweep writers (namespace fixed, listings/s):*
 
-> TODO(S4-figures): the `.png` renders (`dcache_s3.png`, `dcache_readdir.png`) are
-> not committed — the tables above are the standalone record. Rendering them from
-> a fresh sweep + `plot_dcache.py` is optional polish, not a data gap.
+| writers | rwsem | txn-global | txn-per-node | per-node lead |
+|---|--:|--:|--:|--:|
+| 1 (light) | 4.0 | 72 | 78 | **~19×** |
+| 48 (saturating) | 13.5 | 56 | 62 | **~4.6×** |
+
+**Reading.** `readdir`'s reader path reads **no generation counter at all** — the
+dir resolve is a bare `txn_child_lookup_rcu` walk (no `rename_gen`, no `d_seq`, no
+cursor) and the listing is an `rcu_read_lock`-only child-hlist walk — so the two
+txn arms run **identical reader code**. Yet they no longer perfectly overlap:
+per-node leads global by ~15–25% at scale. That gap is **not** the reader path; it
+is a second-order *writer-side* effect. In the global build the 8 concurrent
+writers all bump the single `rename_gen` cacheline, which throttles the writers
+themselves (per-node sustains a higher rename rate — 0.24 vs 0.21 Mrn/s @160rd)
+and, via coherence-bus pressure, indirectly the gen-free readers sharing the
+machine. So even where the reader path is identical, the global counter's writer
+contention leaves a visible mark — a smaller echo of the lookup-path story; the
+old 3-CL/no-precomp sweep, at ~4× lower throughput, had it below the noise floor.
+Both txn arms crush the rwsem (saturates ~18 — its read-side is a shared cacheline
+bouncing among readers of one dir); the lock-free walk **leads at every reader
+count**, even two. Crucially the txn walk pays no per-child chain walk: the
+write-once **`d_host` skip pointer overlaid on `d_id`** (§3) resolves each child's
+content host in O(1), which erased the earlier low-reader crossover and the
+churn-sensitivity — under saturating write load it still leads ~4.6× and its
+residual decline is *write-side* MCAS churn, not the reader walk. So the same
+union that costs one branch on the lookup fast path (§2) makes listing O(1) in
+chain depth.

@@ -143,8 +143,10 @@ fi
 # Readers enumerate a random dir (dc_readdir) instead of a leaf lookup.  Only the
 # writers own the namespace, so dir size is fixed as readers scale.  Compares the
 # txn lock-free RCU child-walk against the seqlock per-directory rwsem (the honest
-# kernel-inode-rwsem analogue, not one global lock).  txn-global == txn-pernode
-# here by construction: readdir reads no generation counter at all.
+# kernel-inode-rwsem analogue, not one global lock).  Both txn arms run identical
+# readdir READER code (it reads no generation counter at all); per-node's small
+# edge here is a second-order writer-side effect (the global rename_gen cacheline
+# the concurrent writers contend), not the reader path.
 if want readdir_scale; then
 RDLEAVES=64                         # 64 leaves/writer * 8 writers / 16 dirs = 32 kids/dir
 RUN_EXTRA="--readdir --leaves $RDLEAVES"
