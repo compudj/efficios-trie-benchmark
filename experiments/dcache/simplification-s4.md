@@ -18,7 +18,7 @@ serialization mechanisms on the rename/lookup path:
 | baseline mechanism | role | in the txn port |
 |---|---|---|
 | per-dentry `d_seq` (seqcount) | per-**component** coherence: a reader re-reads a dentry's name/parent under an even/odd seqcount so it never observes a half-applied rename | **dissolved outright.** Shell-stacking makes identity *write-once* — a rename stacks a fresh named shell, it never mutates a name in place — and the one in-place name write (the fold's TRANSFER into the host) lands inside a `call_rcu` grace-period window no reader can see. With nothing torn to guard, the per-component counter has no job. |
-| `rename_lock` (global seqcount) | whole-**walk** causality: a path walk brackets its whole descent on a tree-global seqcount so it can't stitch together a path that existed at no instant | **demoted to one transacted counter.** Default build: a single `rename_gen` void\* folded into each rename's MCAS commit (still whole-tree, but a lock-free counter, not a lock). Per-node build (`-DDC_PER_NODE_GEN`): dissolves into per-host generations, bumped only by the moved entry — the whole-tree contention is gone, which is the scaling result in `rename-shell-transition.md` §S3. |
+| `rename_lock` (global seqcount) | whole-**walk** causality: a path walk brackets its whole descent on a tree-global seqcount so it can't stitch together a path that existed at no instant | **demoted to one transacted counter.** Default build: a single `rename_gen` void\* folded into each rename's MCAS commit (still whole-tree, but a lock-free counter, not a lock). Per-node build (`-DDC_PER_NODE_GEN`): dissolves into per-host generations, bumped only by the moved entry — the whole-tree contention is gone, which is the scaling result in `rename-shell-transition.md` §S3. Sampling a counter on the *host* (not the parent that names it) is sound only because of two invariants — §6. |
 | global mutator serialization (rename path takes the tree lock; the kernel also leans on `s_vfs_rename_mutex` for cross-dir) | writer/writer exclusion | **dissolved.** Renames are lock-free MCAS commits. The cross-dir loop check is folded into the commit's validate set (walk `new_parent→root` over the transacted `d_parent` chain), so cycle prevention is atomic with the move rather than a separate held lock. |
 
 Net counter/lock surface: **2 seqcounts + 1 mutator lock → 1 transacted counter
@@ -321,6 +321,51 @@ dcache-owns-the-cache microbenchmark structurally understates. The cost is the
 address-as-identity (VFS-faithful; harnesses that assert logical ids build with
 `-DDC_SPLIT_KEEPID`). Kept behind `-DDC_HOT1CL_SPLIT`; promoting it to default
 awaits migrating the harness id-checks to address identity.
+
+## 6. Two invariants the per-node counter rests on
+
+The per-node reader (`-DDC_PER_NODE_GEN`) does something that, stated baldly,
+sounds unsound: to validate the edge to a child it **samples a seqcount that
+lives on the child, not on the parent that names it** (`host->d_seq`, sampled per
+hop in `dc_lookup`). Per-node seqcounts on a tree are exactly where edge-identity
+bugs live — the counter on a node tells you about *that node's* mutations, not
+about whether its parent still points at it. What makes it sound is that the path
+from a parent to the seqcount-bearing node is **two edges**, each pinned by a
+distinct invariant, so the reader validates the edge *above* the counter without
+ever re-reading the parent's pointer as a separate step:
+
+```
+P (parent) ──[index: P's bucket]──▶ top ──[resolution: d_host skip]──▶ host  (d_seq)
+              edge ①  (dynamic)              edge ②  (static)
+```
+
+**Invariant A — `(d_iparent, d_iname)` is immutable per node.** A rename never
+re-keys a live node; it *mints a fresh shell* carrying the new (parent, name) and
+demotes the old top. So a node never migrates hash buckets: its bucket is fixed
+at birth to `hash(d_iparent, d_iname)`. This is what makes `top_unhashed_rcu(top)`
+a *faithful* test of edge ① — "top is still hashed" is equivalent to "P still
+indexes `name → top`," not the weaker "top is hashed somewhere." A demote/unlink/
+fold-transfer marks `top->d_hash.next` in the **same MCAS commit** that bumps
+`host->d_seq` (`stack_one_prepare` + `txn_bump_gen`), so the reader's `rmb`
+between sample and confirm ties the index-membership check to the counter.
+
+**Invariant B — `d_host` is write-once.** The resolution edge ② (`top → host`)
+is set once when the shell is minted and never rewritten. A fold *splice* mutates
+intermediate `d_fwd`/`d_back` and a *transfer* demotes the top, but neither ever
+touches any node's `d_host`, and both preserve the tail. So `host_of_rcu(top)`
+returns the same address for the life of `top`; an immutable edge needs no
+runtime re-validation, which is why there is no explicit "top still points at
+host" check. (In the settled case `top == host`, edge ② collapses to identity and
+edge ①'s `top_unhashed` reads the host's own mark.)
+
+With edge ① validated dynamically and edge ② validated by construction, the
+`host->d_seq` window is left to catch only the third thing — `host` being renamed
+to a *new* namespace position, its own counter bump. **Both invariants are
+load-bearing:** were `(d_iparent, d_iname)` mutable, `top_unhashed` could report a
+node hashed under a *different* key; were `d_host` mutable, a reader could resolve
+`host = X`, sample X's stable `d_seq`, and miss `top` being re-pointed to forward
+to a different host. Sampling the child's counter is sound *because* these two
+edges above it cannot silently change identity.
 
 > TODO(S4-figures): fold the S3 + readdir scaling figures in here with a
 > one-paragraph reading each, so this file is the standalone S4 writeup.
