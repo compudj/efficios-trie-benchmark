@@ -74,12 +74,15 @@ void (*dc_test_fold_hook)(void);
 #endif
 
 /*
- * The 1-CL split hot-path layout (simplification-s4.md §5) is the DEFAULT.
- * Opt out with -DDC_NO_HOT1CL_SPLIT (legacy 3-CL layout) or -DDC_HOT1CL (the
- * fair-weather pack that leaves d_hash cold).  Under split the reader returns
- * the host ADDRESS only with -DDC_SPLIT_ELIDE_ID (the pure 1-CL, footprint
- * minimum); the default keeps the (cold) d_id read so every harness's logical-id
- * and torn-read/wrong-host checks keep working on the split layout.
+ * The 1-CL split hot-path layout (simplification-s4.md §5) is the DEFAULT: the
+ * reader-hot set -- inline identity, the per-node walk gen (d_seq), and the
+ * still-indexed mark (d_hash.next) -- all fit in CL0, so BOTH the global and the
+ * per-node reader touch one cacheline.  Identity is the host ADDRESS (a real
+ * dentry has no logical id); the cold d_id is a benchmark artifact read only by
+ * the census and by -DDC_SPLIT_KEEPID (which returns d_id so a harness's
+ * id==gid / torn-read checks keep working -- same layout, one extra cold read).
+ * Opt out of the layout with -DDC_NO_HOT1CL_SPLIT (legacy 3-CL) or -DDC_HOT1CL
+ * (the fair-weather pack that leaves d_hash cold).
  */
 #if !defined(DC_NO_HOT1CL_SPLIT) && !defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
 #define DC_HOT1CL_SPLIT 1
@@ -99,12 +102,20 @@ struct dentry {
 						 * pos/neg tags (see iparent_of()) */
 	struct qstr    d_iname;			/* inline identity: name bytes (match) */
 #if defined(DC_HOT1CL_SPLIT)
-	/* SPLIT: d_hash straddles here -- next@offset56 lands in CL0 so collision
-	 * walks stay on the hot line; pprev@offset64 spills cold.  The union is
-	 * exiled cold and d_id is elided from the reader (returns the host addr). */
-	struct urcu_txn_hlist_node d_hash;
+	/*
+	 * SPLIT 1-CL hot line: d_iparent(8) + d_iname(40) + d_seq(8) + d_hash.next(8)
+	 * = 64 B, all in CL0.  The per-node walk-causality gen sits ON the hot line
+	 * (sampled every hop); d_hash straddles so next@56 stays in CL0 (collision
+	 * walks hot) while pprev@64 spills cold.  The d_id/d_host union stays COLD:
+	 * the reader returns the host ADDRESS as identity -- d_id is a benchmark
+	 * artifact (a real dentry's identity is its address), read cold only by the
+	 * census and by -DDC_SPLIT_KEEPID validation builds.  In the global build
+	 * d_seq is unused but kept here for a uniform offset.
+	 */
+	void *d_seq;				/* @48: per-node gen, on CL0 */
+	struct urcu_txn_hlist_node d_hash;	/* straddle: next@56 CL0, pprev@64 cold */
 #elif defined(DC_HOT1CL)
-	/* payload joins the hot line: d_iparent(8)+d_iname(48)+union(8) = 64 B */
+	/* payload joins the hot line: d_iparent(8)+d_iname(40)+union(8) = 56 B */
 	union {
 		uint64_t       d_id;
 		struct dentry *d_host;
@@ -173,8 +184,13 @@ struct dentry {
 	 * actually pass through this entry -- the localization the single global
 	 * rename_gen cannot give.  Kept EVEN (stepped by 2) so bit 0 (the proxy tag)
 	 * stays clear.  Unused (stays 0) in the default global-rename_gen build.
+	 *
+	 * SPLIT hoists this onto CL0 (above) so the per-node reader stays 1-CL; the
+	 * cold copy here is for every other layout.
 	 */
+#if !defined(DC_HOT1CL_SPLIT)
 	void *d_seq;
+#endif
 
 #if defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
 	/* cold under DC_HOT1CL: reader touches d_hash.next only on collision
@@ -215,18 +231,20 @@ static inline int node_is_positive(const struct dentry *d)
 #define DC_IPARENT(d)     iparent_of(d)
 #define DC_IS_POSITIVE(d) node_is_positive(d)
 #ifdef DC_HOT1CL_SPLIT
-#ifdef DC_SPLIT_ELIDE_ID
-/* pure 1-CL: elide d_id from the fast path -- the host ADDRESS is a stable,
- * write-once identity here, so return it directly (no cold-line d_id read).  See
- * the seqcount note -- d_id is payload, not an ordering edge.  Harnesses that
- * assert logical ids detect this via the dc_lookup_id_is_address capability
- * (weak symbol) and skip their value checks; the census (dc_walk, real d_id) is
- * the conservation gate. */
-#define DC_FAST_ID(node)  ((uint64_t) (uintptr_t) (node))
-#else
-/* default under split: keep the (cold) d_id read so the straddle+tags layout is
- * measured while every harness's logical-id and torn-read checks keep working. */
+#ifdef DC_SPLIT_KEEPID
+/* validation build: read the (cold) d_id and return it as the logical id, so a
+ * harness's id==gid / torn-read checks keep working.  Same 1-CL hot LAYOUT as the
+ * default -- it just pays one extra cold read for the return value -- so it
+ * validates the layout while the default (address) build measures it. */
 #define DC_FAST_ID(node)  ((node)->d_id)
+#else
+/* DEFAULT 1-CL identity = the host ADDRESS: a real dentry's identity IS its
+ * address (there is no logical id in a kernel dcache -- d_id is a benchmark
+ * artifact).  The reader returns it directly, never touching the cold d_id line.
+ * Harnesses detect this via the dc_lookup_id_is_address capability and check the
+ * seed-time host-address table instead; the census (dc_walk) reads the real
+ * cold d_id. */
+#define DC_FAST_ID(node)  ((uint64_t) (uintptr_t) (node))
 #endif
 #else
 #define DC_FAST_ID(node)  ((node)->d_id)
@@ -316,12 +334,13 @@ const char *dc_engine_name(void)
 
 /*
  * Capability flag for harnesses: 1 when dc_lookup returns the host ADDRESS as the
- * id (the -DDC_SPLIT_ELIDE_ID pure-1-CL build), 0 when it returns the logical
- * d_id.  A harness reads it via a weak reference (absent => 0 => logical id) and,
- * when set, skips its id-VALUE checks and relies on the dc_walk census (which
- * reads the real stored d_id) for conservation.  See bench_dcache.c.
+ * id (the DEFAULT 1-CL split build), 0 when it returns the logical d_id (legacy
+ * layouts, or split -DDC_SPLIT_KEEPID).  A harness reads it via a weak reference
+ * (absent => 0 => logical id) and, when set, checks the seed-time host-address
+ * table instead of id==value; the dc_walk census (which reads the real cold
+ * d_id) remains the conservation gate.  See bench_dcache.c.
  */
-#if defined(DC_HOT1CL_SPLIT) && defined(DC_SPLIT_ELIDE_ID)
+#if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
 const int dc_lookup_id_is_address = 1;
 #else
 const int dc_lookup_id_is_address = 0;

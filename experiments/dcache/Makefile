@@ -20,6 +20,13 @@ CPPFLAGS := -I$(URCU_TXN_INC) -I.
 LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB)
 LDLIBS   := -lurcu-qsbr -lurcu-common -lpthread
 
+# The default 1-CL split layout returns the host ADDRESS as identity.  The
+# correctness harnesses assert logical ids (id==gid torn-read checks), so they
+# build -DDC_SPLIT_KEEPID: same 1-CL layout, but dc_lookup reads the cold d_id and
+# returns it.  The bench (census-gated) uses the address default.
+KEEPID   := -DDC_SPLIT_KEEPID
+HCPP     := $(KEEPID) $(CPPFLAGS)
+
 ENGINE   ?= seqlock
 HDRS     := dcache.h seqcount.h
 
@@ -45,13 +52,19 @@ test_dcache: test_dcache.o dcache_$(ENGINE).o | check-lib
 %.o: %.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+# test_dcache (ENGINE=txn) links this object; build it -DDC_SPLIT_KEEPID so the
+# suite's logical-id assertions hold on the split layout.  Only test_dcache uses
+# the .o -- the bench builds dcache_txn.c from source (address default).
+dcache_txn.o: dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -c $< -o $@
+
 check: test_dcache
 	./test_dcache
 
 # Single-thread harness under ASan (from source, so -fsanitize can't collide with
 # the plain object files).  Use ENGINE=txn / seqlock.
 check-asan: test_dcache.c dcache_$(ENGINE).c $(HDRS) | check-lib
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o test_dcache_asan \
+	$(CC) $(ASANFLAGS) $(HCPP) -o test_dcache_asan \
 	  test_dcache.c dcache_$(ENGINE).c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_asan
 
@@ -59,18 +72,18 @@ check-asan: test_dcache.c dcache_$(ENGINE).c $(HDRS) | check-lib
 # DC_TEST_HOOKS rendezvous hook).  Built straight from source so the -D can't
 # collide with the plain object files.
 repro: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DDC_TEST_HOOKS -o repro_dcache \
+	$(CC) $(CFLAGS) $(HCPP) -DDC_TEST_HOOKS -o repro_dcache \
 	  repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache
 
 repro-fold: repro_fold.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DDC_TEST_HOOKS -o repro_fold \
+	$(CC) $(CFLAGS) $(HCPP) -DDC_TEST_HOOKS -o repro_fold \
 	  repro_fold.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_fold
 
 repro-asan: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(ASANFLAGS) \
-	  $(CPPFLAGS) -DDC_TEST_HOOKS -o repro_dcache_asan \
+	  $(HCPP) -DDC_TEST_HOOKS -o repro_dcache_asan \
 	  repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_asan
 
@@ -84,7 +97,7 @@ repro-foldahead: repro_foldahead.c dcache_txn.c $(HDRS) | check-lib
 	  -o repro_foldahead_off repro_foldahead.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_foldahead_off
 	@echo "--- fold-ahead ON (default HI): chain should stay bounded ---"
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -DDC_STRESS_DEBUG \
+	$(CC) $(ASANFLAGS) $(HCPP) -DDC_STRESS_DEBUG \
 	  -o repro_foldahead_on repro_foldahead.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_foldahead_on
 
@@ -92,12 +105,12 @@ repro-foldahead: repro_foldahead.c dcache_txn.c $(HDRS) | check-lib
 # async fold (the deterministic repro is latent once the fold is deferred).
 # Built from source, txn engine only.
 stress: stress_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o stress_dcache \
+	$(CC) $(CFLAGS) $(HCPP) -o stress_dcache \
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache
 
 stress-asan: stress_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o stress_dcache_asan \
+	$(CC) $(ASANFLAGS) $(HCPP) -o stress_dcache_asan \
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_asan
 
@@ -118,7 +131,7 @@ stress-tsan: stress_dcache.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see the recipe"; \
 	  echo "       in the stress-tsan comment in this Makefile."; exit 1; }
-	$(CC) $(TSANFLAGS) -I$(URCU_TSAN_INC) -I. -o stress_dcache_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_tsan \
 	  stress_dcache.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_tsan 4 2 8 8 15000
@@ -127,12 +140,12 @@ stress-tsan: stress_dcache.c dcache_txn.c $(HDRS)
 # loop check (subtree relocation conservation + the mutual-cycle-abort race).
 # Defaults stay below the liveness cliff (see the file header); txn engine only.
 stress-dirs: stress_dcache_dirs.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o stress_dcache_dirs \
+	$(CC) $(CFLAGS) $(HCPP) -o stress_dcache_dirs \
 	  stress_dcache_dirs.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_dirs
 
 stress-dirs-asan: stress_dcache_dirs.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o stress_dcache_dirs_asan \
+	$(CC) $(ASANFLAGS) $(HCPP) -o stress_dcache_dirs_asan \
 	  stress_dcache_dirs.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_dirs_asan 4 8 4 2 15000
 
@@ -140,7 +153,7 @@ stress-dirs-tsan: stress_dcache_dirs.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) -I$(URCU_TSAN_INC) -I. -o stress_dcache_dirs_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_dirs_tsan \
 	  stress_dcache_dirs.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	# TSAN's ~10x slowdown pushes the heavier dir-move config past the GP-bound
@@ -150,12 +163,12 @@ stress-dirs-tsan: stress_dcache_dirs.c dcache_txn.c $(HDRS)
 # Concurrent ATOMIC-EXCHANGE stress: two shell stacks in one commit, permutation
 # conservation + the "a slot is never empty" atomicity assertion; txn engine only.
 xchg: stress_dcache_xchg.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o stress_dcache_xchg \
+	$(CC) $(CFLAGS) $(HCPP) -o stress_dcache_xchg \
 	  stress_dcache_xchg.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_xchg
 
 xchg-asan: stress_dcache_xchg.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o stress_dcache_xchg_asan \
+	$(CC) $(ASANFLAGS) $(HCPP) -o stress_dcache_xchg_asan \
 	  stress_dcache_xchg.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_xchg_asan
 
@@ -163,7 +176,7 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) -I$(URCU_TSAN_INC) -I. -o stress_dcache_xchg_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_xchg_tsan \
 	  stress_dcache_xchg.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_tsan 4 4 6 8 15000
@@ -180,41 +193,36 @@ bench_dcache_seqlock: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_seqlock.c \
 	  $(LDFLAGS) $(LDLIBS)
 
-# The txn arms now build the DEFAULT layout, which is the 1-CL SPLIT (straddle +
-# d_iparent tags) returning the logical d_id -- so conservation's value checks and
-# the correctness suites keep working.  The per-node _nosplit / _elide variants
-# below A/B the layout: _nosplit = legacy 3-CL baseline, _elide = pure 1-CL
-# (address-return, footprint minimum, census-gated conservation).
+# The txn arms build the DEFAULT layout: the 1-CL split (straddle + d_iparent
+# tags + d_seq on CL0) returning the host ADDRESS as identity (census-gated
+# conservation).  A/B partners: _nosplit = legacy 3-CL baseline; _pernode_keepid
+# = the same 1-CL layout but reading the cold d_id (logical id, so the reader
+# touches 2 CLs -- the cost of keeping d_id hot).
 bench_dcache_txn: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_txn.c \
 	  $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_txn_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-# Per-node reader on the LEGACY 3-CL layout (the §7 baseline): the split-vs-stock
-# A/B partner for the reader sweep.
+# Per-node A/B partners: legacy 3-CL baseline, and the split layout that keeps
+# the cold d_id read (logical id, 2-CL) to isolate the d_id-elision gain.
 bench_dcache_txn_pernode_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-# Per-node reader on the PURE 1-CL split (d_id elided, host address returned): the
-# footprint minimum.  Conservation is census-gated (see dc_lookup_id_is_address).
-bench_dcache_txn_pernode_elide: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_SPLIT_ELIDE_ID $(CPPFLAGS) -o $@ \
+bench_dcache_txn_pernode_keepid: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(KEEPID) $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-# 1-cacheline hot-path layout (global gen): d_iparent low-bit tags remove the
-# d_fwd/d_inode reads, so a settled lookup touches one CL.  A/B vs bench_dcache_txn.
+# Fair-weather 1-CL pack (global gen, d_hash cold): A/B vs bench_dcache_txn.
 bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-
-# PURE 1-CL (global gen): d_hash straddles so next lands on CL0 + d_id elided
-# (return host addr).  A/B vs bench_dcache_txn (now split+logical) / _hot1cl.
-bench_dcache_txn_hot1cl_split: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_HOT1CL_SPLIT -DDC_SPLIT_ELIDE_ID $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 # Quick smoke: a short contended run on all three arms; nonzero exit on any
@@ -232,13 +240,13 @@ bench-check: bench
 # the deterministic walk-causality repro (no misdirection), and concurrent
 # conservation under ASan.  Built from source with -DDC_PER_NODE_GEN.
 check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o test_dcache_pernode \
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o test_dcache_pernode \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_pernode
-	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_TEST_HOOKS $(CPPFLAGS) \
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_TEST_HOOKS $(HCPP) \
 	  -o repro_dcache_pernode repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_pernode
-	$(CC) $(ASANFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o stress_dcache_pernode_asan \
+	$(CC) $(ASANFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o stress_dcache_pernode_asan \
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_pernode_asan 4 4 8 16 15000
 
@@ -255,9 +263,9 @@ bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 
 clean:
 	rm -f *.o test_dcache test_dcache_asan repro_dcache repro_dcache_asan \
-	  bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
-	  bench_dcache_txn_pernode_nosplit bench_dcache_txn_pernode_elide \
-	  bench_dcache_txn_hot1cl bench_dcache_txn_hot1cl_split \
+	  bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_nosplit \
+	  bench_dcache_txn_pernode bench_dcache_txn_pernode_nosplit \
+	  bench_dcache_txn_pernode_keepid bench_dcache_txn_hot1cl \
 	  test_dcache_hot1cl test_dcache_hot1cl_asan \
 	  bench_dcache_seqlock_asan bench_dcache_txn_asan \
 	  test_dcache_pernode repro_dcache_pernode stress_dcache_pernode_asan \

@@ -113,13 +113,16 @@ static unsigned int pollute = 0;
 static unsigned int pollute_kb = 4096;
 static volatile uint64_t g_pollute_sink;
 /*
- * --precomp: build the path component qstrs once and assemble each lookup's
- * dc_path from them, so the timed loop pays NO per-lookup snprintf + FNV hash.
- * A real VFS walks pre-parsed components; that per-op string building is equal
- * for every engine and dilutes the layout A/B.  (The leaf-qstr table is itself
- * a co-footprint, identical for both binaries.)
+ * Precompute the path component qstrs once and assemble each lookup's dc_path
+ * from them, so the timed loop pays NO per-lookup snprintf + FNV hash.  A real
+ * VFS walks pre-parsed components; that per-op string building is a harness
+ * artifact, equal for every engine, and -- because it runs concurrently with the
+ * descent's memory stalls -- it HIDES the per-lookup cache-footprint difference
+ * the layout A/B is trying to measure (see simplification-s4.md §5).  So it is
+ * the DEFAULT; --no-precomp restores the legacy per-lookup snprintf.  (The
+ * leaf-qstr table is itself a co-footprint, identical for every binary.)
  */
-static int precomp = 0;
+static int precomp = 1;
 static struct qstr *g_prefix_q, *g_dir_q, *g_leaf_q;
 /*
  * Ops between QSBR quiescent-state announcements (dc_quiescent()).  Tunable via
@@ -163,6 +166,14 @@ static struct dcache *g_dc;
  */
 static int      *g_final_dir;		/* [nthreads*leaves] final dir per name */
 static uint64_t *g_final_id;		/* [nthreads*leaves] final id per name */
+/*
+ * Address-identity builds (dc_lookup_id_is_address): each leaf's content-host
+ * ADDRESS, captured once at seed time.  A host is address-stable across renames
+ * (they stack shells; the tail host never moves), so this is the rename-invariant
+ * ground truth the torn-read / conservation checks compare against instead of a
+ * logical id.  NULL on logical-id builds.
+ */
+static uintptr_t *g_leaf_addr;		/* [nthreads*leaves] seed-time host addr */
 static char  g_prefix[DC_PATH_MAX][DC_NAME_MAX];	/* spine component names */
 static int   g_prefix_len;		/* = depth - 2 */
 
@@ -429,10 +440,15 @@ static void *worker(void *arg)
 				me->ndirents += n;
 			}
 		} else {
-			/* LOOKUP a random full leaf path.  The walk cost is paid
-			 * hit or miss; a POSITIVE hit must carry an id from the
-			 * name's owner (exchange keeps every name's id inside its
-			 * owner's leaf range), catching torn / wrong-host reads. */
+			/* LOOKUP a random full leaf path.  A POSITIVE hit for name
+			 * L{g} must carry an id in g's owner range -- a worker only
+			 * renames/exchanges its OWN leaves, so L{g}'s carrier stays
+			 * within [owner_base, owner_base+leaves).  This concurrent
+			 * torn-read check needs the logical id, so it runs on KEEPID
+			 * builds only; the address build cannot cheaply range-check a
+			 * pointer per op (an exchange moves L{g} to another host's
+			 * address), so it relies on the census + the exact post-run
+			 * g_leaf_addr[g_final_id] check below. */
 			int g = (int) (xrand(&s) % (uint64_t) total);
 			int dr = (int) (xrand(&s) % (uint64_t) ndirs);
 			int owner_base = (g / leaves) * leaves;
@@ -444,7 +460,7 @@ static void *worker(void *arg)
 			    !id_is_address() &&
 			    (id < (uint64_t) owner_base ||
 			     id >= (uint64_t) (owner_base + leaves)))
-				me->lk_wrong++;	/* value check: logical-id builds only */
+				me->lk_wrong++;
 			me->nlookups++;
 		}
 		if (pollute) {			/* co-tenant: touch app cachelines */
@@ -576,7 +592,10 @@ static void usage(const char *p)
 	    "                     tax for longer GPs -- a net LOSS for the GP-bound\n"
 	    "                     txn fold (measure it).\n"
 	    "  --depth N       => leaf path depth (>=2): a spine of N-2 static dirs,\n"
-	    "                     then d{k}, then the leaf.  Widens the walk window.\n",
+	    "                     then d{k}, then the leaf.  Widens the walk window.\n"
+	    "  --no-precomp    => pay the per-lookup snprintf+hash in the timed loop\n"
+	    "                     (legacy).  Default precomputes the component qstrs so\n"
+	    "                     the timed loop does not, exposing the layout A/B.\n",
 	    p);
 	exit(2);
 }
@@ -605,6 +624,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--pollute"))     pollute = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--pollute-kb"))  pollute_kb = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--precomp"))     precomp = 1;
+		else if (!strcmp(argv[i], "--no-precomp"))  precomp = 0;
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
 		else if (!strcmp(argv[i], "--quiesce")) {
@@ -661,6 +681,23 @@ int main(int argc, char **argv)
 	if (precomp)
 		build_qstr_tables();
 	warm();
+
+	/* Address-identity: capture each leaf's host address at its seed dir
+	 * (i % ndirs) before any rename runs; it is invariant thereafter. */
+	if (id_is_address()) {
+		g_leaf_addr = calloc(total, sizeof(*g_leaf_addr));
+		for (i = 0; i < total; i++) {
+			struct dc_path p;
+			uint64_t a = 0;
+
+			mk_leaf_path(&p, i % ndirs, i);
+			if (dc_lookup(g_dc, &p, &a) != DC_POSITIVE) {
+				fprintf(stderr, "seed addr capture: leaf %d missing\n", i);
+				exit(2);
+			}
+			g_leaf_addr[i] = (uintptr_t) a;
+		}
+	}
 
 	tid = calloc(nthreads, sizeof(*tid));
 	wa = calloc(nthreads, sizeof(*wa));
@@ -727,10 +764,14 @@ int main(int argc, char **argv)
 		if (c.seen[i] != 1)
 			anomaly++;		/* id i missing or duplicated */
 		mk_leaf_path(&p, g_final_dir[i], i);
-		/* presence always; id-VALUE match only on logical-id builds (an
-		 * address-return build validates conservation via the census above). */
+		/* presence always; then the exact identity: name L{i} is finally
+		 * carried by id g_final_id[i], whose host address is the seed-time
+		 * g_leaf_addr[g_final_id[i]] (a host keeps its id, address-stable).
+		 * The logical build checks the id directly. */
 		if (dc_lookup(g_dc, &p, &id) != DC_POSITIVE ||
-		    (!id_is_address() && id != g_final_id[i]))
+		    (id_is_address()
+			 ? (id != (uint64_t) g_leaf_addr[g_final_id[i]])
+			 : (id != g_final_id[i])))
 			anomaly++;
 	}
 
@@ -768,7 +809,7 @@ int main(int argc, char **argv)
 	free(c.seen);
 	free(tid); free(wa);
 	dc_destroy(g_dc);
-	free(g_final_dir); free(g_final_id);
+	free(g_final_dir); free(g_final_id); free(g_leaf_addr);
 	rcu_unregister_thread();
 	return anomaly ? 1 : 0;
 }

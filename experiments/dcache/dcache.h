@@ -24,13 +24,17 @@
 #include <stdint.h>
 #include <string.h>
 
-#define DC_NAME_MAX 40		/* max component name length (incl. NUL) */
+#define DC_NAME_MAX 32		/* max component name length (incl. NUL); matches
+				 * the kernel's DNAME_INLINE_LEN (32 on 64-bit).
+				 * qstr is then 40 B, so the 1-CL split hot line fits
+				 * d_iparent(8)+d_iname(40)+d_seq(8)+d_hash.next(8). */
 #define DC_PATH_MAX 24		/* max components below the root */
 
 /*
  * A path component name.  Mirrors the kernel's struct qstr {hash, len, name}:
  * the hash is precomputed once so the hot lookup path never rehashes.  The name
- * is stored inline (no external-name refcounting in phase 1).
+ * is stored inline (the kernel likewise inlines DNAME_INLINE_LEN and spills
+ * longer names to an external buffer; we reject them -- no external names here).
  */
 struct qstr {
 	uint32_t hash;
