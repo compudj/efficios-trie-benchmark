@@ -66,16 +66,15 @@ for h in sorted(base["txn-pernode"]):
 
 heights = sorted({int(r["move_height"]) for r in rows})
 ax.set_xticks(heights)
-# height H on top, the fan-in it dominates (2^H leaves) as a compact 2nd line
-ax.xaxis.set_major_formatter(FixedFormatter(
-    [f"{h}\n{2**h}" for h in heights]))
+ax.xaxis.set_major_formatter(FixedFormatter([str(h) for h in heights]))
 # headroom above the tallest curve so the ratio labels (offset upward) clear the
 # top spine; x-margin so the H=0 / H=D-1 labels do not clip the side spines.
 ymax = max((float(r["mlookups_s"]) for r in rows), default=1.0)
 ax.set_ylim(bottom=0, top=ymax * 1.18)
 ax.margins(x=0.06)
 ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
-ax.set_xlabel("move height H  (2nd row: fan-in = leaves the moved node dominates)")
+ax.set_xlabel("move height H above the leaves  "
+              "(fan-in = 2^H leaves dominated: 1 at H=0 → 128 at H=7)")
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
 ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
              "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
