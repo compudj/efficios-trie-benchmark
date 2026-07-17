@@ -132,8 +132,9 @@ struct dcache {
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
 
 /*
- * 1-CL tag encoding in d_parent's low bits.  A dentry is 16-byte aligned
- * (calloc), so bits 0-3 are free; unhashed and negative ride bits 0 and 1.  Both
+ * 1-CL tag encoding in d_parent's low bits.  A dentry is 64-byte aligned
+ * (posix_memalign, for the 1-CL reader line), so bits 0-5 are free; unhashed and
+ * negative ride bits 0 and 1.  Both
  * are read off the already-loaded parent word, keeping the removed-from-hash and
  * positive/negative tests on CL0 instead of the cold d_unhashed / d_inode fields.
  * The legacy (non-split) build falls back to those plain fields.
@@ -295,10 +296,20 @@ const char *dc_engine_name(void)
 static struct dentry *dentry_alloc(const struct qstr *name,
 				   struct dentry *parent, uint64_t id)
 {
-	struct dentry *d = calloc(1, sizeof(*d));
+	struct dentry *d;
 
-	if (!d)
+	/*
+	 * Cacheline-align the dentry.  The reader's hot fields are laid out to
+	 * occupy CL0 (d_iparent/d_name + d_seq + d_hash.next), but calloc only
+	 * guarantees 16-byte alignment -- so at 3 of every 4 base addresses that
+	 * "1-CL" line actually STRADDLES two cachelines, and a lookup pays two
+	 * misses per hop instead of one.  posix_memalign(64) makes the 1-CL
+	 * layout real (and makes it robust to struct size: an 8-byte shrink that
+	 * shifts the allocation pattern otherwise swings reader throughput ~2x).
+	 */
+	if (posix_memalign((void **) &d, 64, sizeof(*d)) != 0)
 		return NULL;
+	memset(d, 0, sizeof(*d));
 	d->d_name = *name;
 	d->d_parent = parent;		/* clean low bits => hashed + positive */
 	d->d_id = id;

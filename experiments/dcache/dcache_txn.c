@@ -204,8 +204,9 @@ struct dentry {
 
 #ifdef DC_HOT1CL
 /*
- * DC_HOT1CL tag encoding in d_iparent's low bits.  The dentry is 16-byte aligned
- * (calloc), so bits 0-3 are free; bit 0 stays reserved for the txn proxy tag, so
+ * DC_HOT1CL tag encoding in d_iparent's low bits.  The dentry is 64-byte aligned
+ * (posix_memalign, for the 1-CL reader line), so bits 0-5 are free; bit 0 stays
+ * reserved for the txn proxy tag, so
  * host/shell and pos/neg ride bits 1 and 2.  Both are stable-or-identity
  * properties (a node never changes kind; pos/neg travels with the identity a fold
  * transfers), so the reader reads them off the already-loaded d_iparent instead
@@ -341,10 +342,20 @@ const int dc_lookup_id_is_address = 0;
 static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 				   const struct qstr *name, uint64_t id)
 {
-	struct dentry *d = calloc(1, sizeof(*d));
+	struct dentry *d;
 
-	if (!d)
+	/*
+	 * Cacheline-align the dentry.  The reader's hot fields are laid out to
+	 * occupy CL0 (d_iparent/d_name + d_seq + d_hash.next), but calloc only
+	 * guarantees 16-byte alignment -- so at 3 of every 4 base addresses that
+	 * "1-CL" line actually STRADDLES two cachelines, and a lookup pays two
+	 * misses per hop instead of one.  posix_memalign(64) makes the 1-CL
+	 * layout real (and makes it robust to struct size: an 8-byte shrink that
+	 * shifts the allocation pattern otherwise swings reader throughput ~2x).
+	 */
+	if (posix_memalign((void **) &d, 64, sizeof(*d)) != 0)
 		return NULL;
+	memset(d, 0, sizeof(*d));
 	d->d_iparent = parent;
 	d->d_iname = *name;
 	d->d_fwd = NULL;
