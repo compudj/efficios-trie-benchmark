@@ -33,15 +33,19 @@ measured contention) rather than taken on every write.
 ### LOC accounting
 
 The port is **not fewer lines** — the opposite. Raw `wc -l`: `dcache_seqlock.c`
-**747** → `dcache_txn.c` **1498** (+751, ~2.0×); comment share 18% → 29%. Where
-the +751 goes, bucketed by operation (spans are approximate — a definition's
+**875** → `dcache_txn.c` **1423** (+548, ~1.6×); comment share ~18% → ~30%. (Both
+files grew since the first accounting — the 1-CL layout + alignment landed in
+both, and the txn side then *shrank* ~190 lines when `fold_ahead`/`d_spliced` were
+retired in `08c069b`; the per-bucket split below predates that retirement, so its
+`rename` figure is now ~190 lines lighter, but the shape holds.) Where the bulk
+goes, bucketed by operation (spans are approximate — a definition's
 leading doc-comment is counted with the *preceding* definition — but the shape is
 robust):
 
 | bucket | seqlock | txn | Δ |
 |---|--:|--:|--:|
 | **lookup** (walk + helpers) | ~141 | ~248 | +107 |
-| **rename** (shell-stack + fold + fold-ahead) | ~79 | ~461 | **+382** |
+| **rename** (shell-stack + async fold; fold-ahead since retired) | ~79 | ~461→~270 | **+382→~190** |
 | **unlink** | ~39 | ~91 | +52 |
 | **exchange** | ~69 | ~119 | +50 |
 | **readdir** | ~33 | ~28 | **−5** |
@@ -51,13 +55,13 @@ robust):
 | shared plumbing (structs, alloc, `dc_add`, walk, …) | ~268 | ~424 | +156 |
 | file header / includes / macros | ~59 | ~80 | +21 |
 
-Three things to read off it. **(1) The growth is almost entirely `rename`**
-(+382 of +751): the seqlock rename is a ~79-line critical section (`dc_rename` +
-`__d_move` + `is_subdir`) held under `mutator_lock → rename_lock → dir-rwsems`;
-the txn rename is a ~461-line *lock-free state machine* — `stack_shell` +
-composable `stack_one_prepare` + async `fold`/`fold_cb` + the `fold_ahead` relief
-valve + chain resolution. That is the whole trade: a held lock is cheap in lines
-and dear in invariants; a lock-free protocol is the reverse. **(2) The scaffolding
+Three things to read off it. **(1) The growth is almost entirely `rename`**: the
+seqlock rename is a ~79-line critical section (`dc_rename` + `__d_move` +
+`is_subdir`) held under `mutator_lock → rename_lock → dir-rwsems`; the txn rename
+is a *lock-free state machine* — `stack_shell` + composable `stack_one_prepare` +
+async `fold`/`fold_cb` + O(1) chain resolution (`host_of_rcu`). That is the whole
+trade: a held lock is cheap in lines and dear in invariants; a lock-free protocol
+is the reverse. **(2) The scaffolding
 genuinely disappears** — the per-directory rwlock (~26) and the hand-rolled
 RCU-hlist (~33) vanish from the `.c` (the hlist relocates to the reusable
 `rcu-txn-hlist` library), and the seqcount read-retry loop inside the seqlock
@@ -102,7 +106,6 @@ Which fields are live for which kind:
 | `d_iparent`,`d_iname` | ● | | ● | | inline identity; matched by the reader |
 | `d_fwd` | =NULL | =NULL | ● | ● | successor **and** host/shell discriminator |
 | `d_back` | =NULL | ● | =NULL | ● | immediate predecessor; **fold workers only** |
-| `d_spliced` | | | | ● | fold-ahead self-marker |
 | `d_parent` | ● | ● | (birth) | | logical parent; transacted; load-bearing on hosts |
 | `d_dc` | ● | ● | ● | ● | owner domain (a `call_rcu` fold must reach it) |
 | `d_child_head` | dir only | dir only | | | children hang off the **host**, never a shell |
@@ -399,6 +402,30 @@ can invalidate), not a lone-core one — consistent with the txn split's own
 that §7's counter-axis comparison can be re-run with the *layout axis held fixed
 and 1-CL on every arm*.
 
+### The 1-CL line was a lie in allocation until the object was aligned (2026-07-17)
+
+Everything above reasons about the struct *layout* — offsets 0..63 hold the
+reader-hot set, so "CL0" is one cacheline. That is true only if the object's base
+sits on a cacheline boundary. It did not: dentries were `calloc`'d, and `calloc`
+guarantees only 16-byte alignment, so the base landed at offset 0/16/32/48 within
+a line and the 64-byte "1-CL" set actually **straddled two cachelines for three of
+every four dentries** — a lookup paid two misses per hop, not one. The whole 1-CL
+result rested on an alignment the allocator never delivered; `pahole` shows the
+layout, not where `malloc` puts the object.
+
+It surfaced by accident. Retiring `fold_ahead` (§ writer path, `08c069b`) dropped
+the transacted `d_spliced` field, shrinking `struct dentry` 168→160 B — and 160 B
+landed on a pathological packing point that **halved** per-node reader throughput
+(a size sweep: 160 B a sharp outlier, ≥168 B fine, the reader code byte-identical
+throughout). The size was never the cause; it was the latent straddle the shuffle
+exposed. The fix is `posix_memalign(64)` in **both** engines (`fdfe9db`), which
+pins the base to a line so CL0 is genuinely one cacheline and reader throughput is
+robust to struct size. Measured @184 (per-node lookup): the 160 B/`calloc` build
+regressed to ~900 Mops/s; aligned recovers to **~2050**, *above* the pre-regression
+1965 — the straddle had been quietly taxing the "1-CL" result all along. Lesson:
+a cacheline-resident hot line is a claim about the *object*, and must be enforced
+at allocation, not inferred from field offsets.
+
 ## 6. Two invariants the per-node counter rests on
 
 The per-node reader (`-DDC_PER_NODE_GEN`) does something that, stated baldly,
@@ -461,9 +488,11 @@ inline in the readings, because it is the evidence for *why* the counter must be
 per-node (§7.1), but is not tabled, to keep the headline uncluttered.
 
 **Measured on the current default** — the true-1-CL split (§5 "Landed",
-`0f4f626`/`706e459`) with `--precomp` on, both applied identically to all three
-arms, so the layout axis is held fixed at 1-CL and the sweep isolates the
-*counter* axis (global vs per-node vs seqlock). Two notes for anyone diffing
+`0f4f626`/`706e459`) with `--precomp` on and the dentry cacheline-**aligned**
+(§5 "the 1-CL line was a lie", `fdfe9db`), both applied identically to all three
+arms, so the layout axis is held fixed at a genuinely-1-CL line and the sweep
+isolates the *counter* axis (global vs per-node vs seqlock). Two notes for anyone
+diffing
 against the earlier 3-CL / no-precomp tables (this is a resweep of them): (1)
 absolute lookup throughput is **~4× higher** here, almost entirely because
 `--precomp` is now the default — it strips the per-lookup `snprintf` (~74% of
@@ -486,29 +515,28 @@ appears. Two axes, all figures Mops/s:
 
 | readers | seqlock | txn-per-node |
 |---|--:|--:|
-| 2 (low end) | 21 | 58 |
-| 32 | 100 | 637 |
-| 160 (per-node peak) | 69 | **2011** |
-| 184 (all 192 cores) | 61 | 1965 |
-| ratio @184 | 1× | **32×** |
+| 2 (low end) | 22 | 59 |
+| 32 | 81 | 740 |
+| 160 | 85 | 1946 |
+| 184 (all 192 cores) | 89 | **2201** |
+| ratio @184 | 1× | **~25×** |
 
 *32 readers, sweep writers (per-node lead over the seqlock baseline, Mops/s):*
 
 | writers | seqlock | txn-per-node | lead |
 |---|--:|--:|--:|
-| 1 | 45 | 764 | 16.9× |
-| 4 | 107 | 693 | 6.5× |
-| 1→48 (range) | | | **5–17×** |
+| 1 | 61 | 843 | 13.7× |
+| 4 | 77 | 701 | 9.1× |
+| 1→48 (range) | | | **5–14×** |
 
 **Reading.** The per-node host counter — read only by walks that pass through the
 *moved* entry (§6) — has no shared ceiling, so reader throughput keeps climbing to
-**~2011 Mops/s** @160 readers (easing to 1965 @184 as the 8 writers share the last
-socket), while seqlock never scales cleanly (reader-retry storms under the fixed
-rename load — non-monotonic 60–100 past ~32 readers). At the full machine (184)
-per-node = **32× seqlock**. The decisive control is the intermediate **txn-global**
-arm (in the CSV, not tabled): deleting `d_seq` but keeping *one* global `rename_gen`
-— read by every walk, written by every rename — **plateaus ~200–260 Mops/s**, a
-firm ceiling ~8× below per-node. That is the split the port's headline hides:
+**~2200 Mops/s** at the full machine (184 readers), while seqlock never scales
+cleanly (reader-retry storms under the fixed rename load — non-monotonic 80–170).
+At 184 per-node = **~25× seqlock**. The decisive control is the intermediate
+**txn-global** arm (in the CSV, not tabled): deleting `d_seq` but keeping *one*
+global `rename_gen` — read by every walk, written by every rename — **plateaus
+~220–245 Mops/s**, a firm ceiling ~9× below per-node. That is the split the port's headline hides:
 `d_seq` **dissolves outright** and is independent of the counter choice, but the
 whole-walk-causality role of `rename_lock` **dissolves only under the per-node
 arm** — a global counter reimports exactly the contention it was meant to remove.
@@ -529,17 +557,17 @@ Figures listings/s:
 
 | readers | per-dir rwsem | txn-per-node |
 |---|--:|--:|
-| 32 | 17 | 113 |
-| 160 | ~18 (saturated) | 364 |
-| 184 | 18 | **400** |
-| ratio @184 | 1× | **~23×** |
+| 32 | 16 | 102 |
+| 160 | ~22 (saturated) | 330 |
+| 184 | 24 | **386** |
+| ratio @184 | 1× | **~16×** |
 
 *Writer load, 32 readers, sweep writers (namespace fixed, listings/s):*
 
 | writers | rwsem | txn-per-node | per-node lead |
 |---|--:|--:|--:|
-| 1 (light) | 4.0 | 78 | **~19×** |
-| 48 (saturating) | 13.5 | 62 | **~4.6×** |
+| 1 (light) | 1.7 | 74 | **~43×** |
+| 48 (saturating) | 11.8 | 59 | **~5×** |
 
 **Reading.** `readdir`'s reader path reads **no generation counter at all** — the
 dir resolve is a bare `txn_child_lookup_rcu` walk (no `rename_gen`, no `d_seq`, no
@@ -549,7 +577,7 @@ among readers of one dir) and **leads at every reader count**, even two, scaling
 **~23×** at the full machine. Crucially it pays no per-child chain walk: the
 write-once **`d_host` skip pointer overlaid on `d_id`** (§3) resolves each child's
 content host in O(1), which erased the earlier low-reader crossover and the
-churn-sensitivity — under saturating write load it still leads ~4.6× and its
+churn-sensitivity — under saturating write load it still leads ~5× and its
 residual decline is *write-side* MCAS churn, not the reader walk. So the same union
 that costs one branch on the lookup fast path (§2) makes listing O(1) in chain
 depth. (One footnote from the CSV's untabled txn-global arm: since the readdir
