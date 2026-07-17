@@ -96,7 +96,7 @@ repro-asan: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
 # (the deferred frees must still drain cleanly at teardown).
 repro-foldahead: repro_foldahead.c dcache_txn.c $(HDRS) | check-lib
 	@echo "--- fold-ahead OFF (HI huge): chain should track the rename count ---"
-	$(CC) $(ASANFLAGS) $(CPPFLAGS) -DDC_STRESS_DEBUG -DDC_FOLD_AHEAD_HI=100000000 \
+	$(CC) $(ASANFLAGS) $(HCPP) -DDC_STRESS_DEBUG -DDC_FOLD_AHEAD_HI=100000000 \
 	  -o repro_foldahead_off repro_foldahead.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_foldahead_off
 	@echo "--- fold-ahead ON (default HI): chain should stay bounded ---"
