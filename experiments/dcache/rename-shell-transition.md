@@ -72,11 +72,15 @@ encounters one and needs no tombstone check.
 ## Reader rule (one line over the base RCU walk)
 
 Scan `hash(&cur, comp)` for the named top matching `(d_iparent==&cur,
-d_iname==comp)`; then **follow `d_fwd` to the content host** before using the
-result as the next `cur` or as the terminal (id/inode come from the content
-host). Downward walks never read `d_parent` or `d_back`. Forward depth is the
-current chain length for that entry — transient, and only for an entry being
-renamed right now.
+d_iname==comp)`; then **resolve the content host** before using the result as the
+next `cur` or as the terminal (id/inode come from the content host).
+Conceptually this is "follow `d_fwd` to the tail," but it is realized in **O(1)**
+by a write-once `d_host` skip pointer (`host_of_rcu`, § *readdir*): a reader never
+walks the chain, so chain depth is never a reader-side time cost. Downward walks
+never read `d_parent` or `d_back`. Forward chain depth is transient (an entry
+being renamed right now) and, since nothing traverses it, costs only *memory*,
+not time — the property that (once it was actually enforced) closed the
+liveness collapse in § *Implementation status*.
 
 ## Rename = stack a shell (one MCAS, lock-free)
 
@@ -457,14 +461,16 @@ reads, ASan-clean, across contention regimes up to 8 writers.
 drain only as fast as GPs advance. Anything that keeps a *registered* thread from
 reporting a quiescent state under write load stalls **all** reclamation: the
 harness's `main()` sitting in `pthread_join` (online, never quiescing) held every
-GP open, so `folds=0` for the whole active run, chains grew without bound
-(`max_chain` into the thousands), time went O(n²) and RSS into the hundreds of MB.
-Fixing the workload (`main` goes `rcu_thread_offline()` while joining) restored
-concurrent drain: chains reach a **bounded** steady-state depth ≈ rename-rate ×
-GP-latency (~300–570 at 1–8 writers, flat in iteration count) and time is linear.
-The engine is correct either way — this is a reclamation-throughput property of
-`call_rcu`, and a reason the per-node arm (no global lane holding writers online)
-is friendlier to fold drain than the global arm under sustained churn.
+GP open, so `folds=0` for the whole active run and chains grew without bound
+(`max_chain` into the thousands, RSS into the hundreds of MB). In steady state,
+fixing the workload (`main` goes `rcu_thread_offline()` while joining) restores
+concurrent drain: chains reach a **bounded** depth ≈ rename-rate × GP-latency.
+Crucially, since every access to the chain is now **O(1)** (the `d_host` skip
+pointer — reader, readdir, walk, fold, *and* the writers all resolve the host in
+one hop), a stalled GP costs only **memory**, not time: a deep chain is never
+traversed. That was not always true — an earlier writer path *walked* the chain
+to measure its depth, which turned a GP stall into an O(n²) time collapse; see
+the liveness note below.
 
 TSAN-clean too: on a liburcu built `--enable-compiler-atomic-builtins` +
 `-fsanitize=thread` (`urcu-txn-tsan-build/`, `make stress-tsan`), the leaf stress
@@ -485,42 +491,39 @@ re-walks and rejects).  It passes conservation, a live checker that never sees
 either node detach from the root, and thousands of genuine `-EINVAL`
 rejections — **ASan-clean and TSAN-clean**.  No cycle ever forms.
 
-**Synchronous fold-ahead — landed (relief valve for the GP-bound chain).** When a
-registered thread stops quiescing under write load — `main` blocked in
-`pthread_join` while RCU-online is the clean, single-threaded case — grace periods
-stall, the async fold worker cannot drain, and every rename stacks a shell that
-never folds: the chain grows ~O(renames), so `chain_host_depth_rcu()` (walked by
-EVERY reader and writer) goes O(chain) and the whole thing collapses to O(n²).
-`fold_ahead()` caps it: when a rename's host-walk finds the chain past
-`DC_FOLD_AHEAD_HI` (reusing the depth that walk already measured — no second
-walk), it splices the chain's MIDDLE relays out **in-line**.  Splices touch only
-the transacted `d_fwd`/`d_back` chain — no index, no `d_sib` — so they need no
-grace period and cannot make readdir jump directories; the top's TRANSFER (which
-re-links `d_sib`) still needs a GP and stays async.  Fold-ahead never frees: each
-spliced node is still freed exactly once by its own pending `fold_cb`, which reads
-a **self-marker** `d_spliced == n` (set atomically inside fold_ahead's splice
-MCAS) and skips straight to the free — crucially WITHOUT dereferencing the
-spliced node's now-stale `d_back`, whose target may already be freed (the bug TSAN
-caught on the first cut).  Fold-ahead is also contention-averse: it bails after a
-few consecutive aborts, so on a genuinely MCAS-contended domain it adds no load
-and leaves the chain to the async folds.  `repro_foldahead` (`make repro-foldahead`)
-demonstrates it deterministically: 20000 renames under a stalled GP peak at chain
-depth **19999 without** the valve vs **1024 with** it; both conserve, ASan-clean.
+**The bistable liveness collapse — root-caused and fixed (`08c069b`).** This
+supersedes two earlier notes here (a synchronous "fold-ahead" relief valve, and a
+claim that the lane-parking collapse was a `-DDC_STRESS_DEBUG` artifact); both
+were treating symptoms of one bug.
 
-**On the earlier "lane-parking collapse."** A prior note recorded a *second*
-liveness trigger — workers parking in the engine's fair-mutex escalation lane
-while RCU-online under saturating `stress_dcache_dirs` contention.  Re-investigated
-here: that collapse is **substantially an instrumentation artifact of
-`-DDC_STRESS_DEBUG`**.  The debug build stores a global `dc_dbg_max_chain` on
-*every* `chain_host_depth_rcu()` (i.e. every reader and writer), and that one hot
-cache line, bounced across all threads, is itself enough to drive the bistable
-collapse.  The **clean** engine does NOT collapse: at every tested saturating
-config up to 32 writer threads over 2 anchors, fold-ahead ON, OFF, and at HI 128
-all complete with zero stalls.  So the reproducible cliff in this codebase is the
-GP-stall one above (fixed by fold-ahead); a genuine clean-build lane-parking
-collapse, if it exists, needs conditions beyond anything reproduced here, and its
-real fix would be engine-level (the escalation lane going RCU-offline while
-parked), not in this dcache layer.
+The bug: to decide whether a chain needed relief, the writer *walked* it —
+`chain_host_depth_rcu()`, inside its own `rcu_read_lock()`, on every rename, just
+to measure depth. That walk is O(chain) exactly when the chain is pathological
+(the GP-bound fold having fallen behind). A writer stuck in it never reports a
+quiescent state, so grace periods stall, so the fold drains even less, so the
+chain grows and the next walk is longer still — the relief valve's own trigger
+drove the starvation it existed to relieve. The result is a **bistable ~60×
+collapse**: `bench_dcache_height --move-height 6` (8 writers exchanging sibling
+subtrees onto ~16 hot nodes) runs in 1.06 s normally and >60 s about one run in
+15, with every writer caught in `chain_host_depth_rcu` while every `call_rcu`
+worker sits in `synchronize_rcu`. It reproduces on a **clean** build (correcting
+the earlier "DEBUG artifact" note — `dc_dbg_max_chain` amplifies but is not
+necessary) and it is **not** lane-parking (proven by a `-DDC_NO_LANE` control:
+same collapse, zero threads parked).
+
+The fix: the host was already reachable in one hop via the write-once `d_host`
+skip pointer (`host_of_rcu`), so the walk existed *only* to count hops. Point the
+writers at `host_of_rcu`, delete both chain walkers, and delete the depth, its
+trigger, and the whole `fold_ahead()` machinery (with it the transacted
+`d_spliced` self-marker it needed). Nothing traverses a chain now: reader,
+readdir, walk, fold, and writers are all O(1) in depth. `fold_ahead` was retired
+rather than re-homed because it had **no regime where it helped** — redundant when
+GPs advance (`call_rcu` already batches the fold drain per GP) and unable to run
+at all when they stall (no `fold_cb` runs). A GP stall now degrades to
+bounded-rate **memory** growth (§ *grace-period-bound* above), the honest
+consequence: it halts *all* reclamation process-wide and is a quiescing bug to fix
+at its source (`rcu_thread_offline()` while blocking), not something a per-rename
+chain walk should paper over. Measured on the repro: 10/45 stalls → 0/45.
 
 **Mid-transition unlink — landed + validated.** `dc_unlink` removes the current
 named top from **both** indexes and bumps `rename_gen` in one commit, retrying if
