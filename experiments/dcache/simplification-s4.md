@@ -155,7 +155,7 @@ RCU-core scope:
 
 - **shell vs. host** cannot be cleanly split: the chain is walked
   polymorphically and the kind is discriminated at runtime by `d_fwd==NULL`, so
-  `d_fwd`/`d_back`/`d_spliced` must share offsets across both. The shell's only
+  `d_fwd`/`d_back` must share offsets across both. The shell's only
   unique field (`d_host`) is already free via the union. A split saves zero
   bytes and removes the no-downcast property that lets `find_top_rcu` /
   `host_of_rcu` / `fold` treat settled hosts and mid-transition shells
@@ -200,13 +200,13 @@ are CL1 (discriminator) and CL2 (payload).
 
 **Proposed fix — a pure field reorder (no semantic change):** cluster the
 reader-hot set `{d_hash, d_iparent, d_iname, d_fwd, d_id/d_host, d_inode,
-d_seq}` and exile `{d_back, d_spliced, d_parent, d_dc, d_child_head, d_sib,
-d_rcu}` to the tail. A settled hop then touches **2 lines** (CL0 match + a
+d_seq}` and exile `{d_back, d_parent, d_dc, d_child_head, d_sib, d_rcu}` to the
+tail. A settled hop then touches **2 lines** (CL0 match + a
 single payload-plus-discriminator line). The 48-byte inline `d_iname` makes the
 match alone 72 bytes, so 2 lines is the floor without an out-of-line name
 (rejected earlier for match-compare cost). Safety: `d_fwd`/`d_id`/`d_inode` are
 write-once (no new false sharing); `d_seq` already co-resides with `d_id` today.
-The only trade is that `d_fwd` leaves the `d_fwd`/`d_back`/`d_spliced` cluster,
+The only trade is that `d_fwd` leaves the `d_fwd`/`d_back` cluster,
 so a fold touches 2 lines for the chain instead of 1 — the GP-bound slow path
 paying so the read-mostly path wins. Also: the **global build's `d_seq` is dead
 weight** (only the per-node reader samples it) and can be `#ifdef`-ed out,
