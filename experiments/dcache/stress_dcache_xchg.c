@@ -306,10 +306,10 @@ int main(int argc, char **argv)
 
 #ifdef DC_STRESS_DEBUG
 	{
-		extern unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_max_chain;
+		extern unsigned long dc_dbg_renames, dc_dbg_folds;
 
-		printf("DEBUG renames=%lu folds=%lu max_chain=%lu\n",
-		       dc_dbg_renames, dc_dbg_folds, dc_dbg_max_chain);
+		printf("DEBUG renames=%lu folds=%lu\n",
+		       dc_dbg_renames, dc_dbg_folds);
 	}
 #endif
 	printf("writer exchange errors : %ld (expect 0)\n", werrs);

@@ -25,12 +25,20 @@
  * demoting it, which the pending fold reads as an unlink and RECLAIMs the whole
  * orphaned chain (see fold()/dc_unlink); and the atomic exchange composes TWO
  * shell stacks -- both index del/insert pairs, both loop checks + reparents -- in
- * ONE commit (dc_rename_exchange).  Because the async fold drains only as fast as
- * grace periods advance, a synchronous fold_ahead() relief valve caps chain
- * growth when GPs stall (a registered thread stops quiescing): a rename whose
- * host-walk finds the chain past DC_FOLD_AHEAD_HI splices the middle relays out
- * in-line, so the chain -- and thus every reader/writer's chain walk -- stays
- * bounded regardless of GP progress (see fold_ahead()/repro_foldahead.c).
+ * ONE commit (dc_rename_exchange).  Chain DEPTH is nobody's fast-path concern:
+ * every access resolves the content host in ONE hop through the write-once
+ * d_host skip pointer (host_of_rcu), so readers, readdir, walk_rec, the folds and
+ * the writers are all O(1) in chain depth and NOTHING traverses a chain.  Depth
+ * therefore costs memory, not time, and the async fold -- which call_rcu already
+ * batches per grace period -- drains it at the rate renames create it (steady
+ * state ~ churn x GP latency).  A synchronous fold-ahead relief valve used to cap
+ * depth for the GP-stalled case; it is RETIRED (see the git history): reaching
+ * its trigger cost the writer an O(chain) walk INSIDE its read-side section,
+ * which stopped it quiescing, which stalled the very grace periods the fold needs
+ * -- the valve's own trigger drove the starvation it existed to relieve, a
+ * bistable ~60x collapse.  A GP stall now degrades to bounded-rate memory growth,
+ * which is the honest consequence: it stops ALL reclaim process-wide, and is a
+ * quiescing bug to fix at its source (rcu_thread_offline() while blocking).
  * The reader (incl. its rename-generation bracket), the hash + child-hlist
  * indexes, the shell-vehicle move, and the MCAS stack/fold commits are real,
  * final code.  Validation of the concurrent fold is by stress test under ASan /
@@ -131,14 +139,6 @@ struct dentry {
 	 */
 	struct dentry *d_fwd;			/* down toward content host; NULL at host */
 	struct dentry *d_back;			/* up toward named top;     NULL at top  */
-
-	/*
-	 * Fold-ahead splice marker, TRANSACTED (DC_FWD_TAG).  Set to SELF, atomically
-	 * inside fold_ahead()'s splice MCAS, when a synchronous fold-ahead splices
-	 * this node out; the node's own async fold reads it (never dereferencing the
-	 * possibly-freed d_back) and skips straight to the self-free.  NULL otherwise.
-	 */
-	struct dentry *d_spliced;
 
 	/* writer-side bookkeeping */
 	struct dentry *d_parent;		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
@@ -258,14 +258,6 @@ static inline int node_is_positive(const struct dentry *d)
 #ifdef DC_STRESS_DEBUG
 /* Coarse counters for diagnosing fold drain / chain growth (not thread-exact). */
 unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries;
-unsigned long dc_dbg_max_chain;
-static inline void dc_dbg_chain(unsigned long depth)
-{
-	if (depth > dc_dbg_max_chain)
-		dc_dbg_max_chain = depth;
-}
-#else
-static inline void dc_dbg_chain(unsigned long depth) { (void) depth; }
 #endif
 
 struct dcache {
@@ -357,7 +349,6 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	d->d_iname = *name;
 	d->d_fwd = NULL;
 	d->d_back = NULL;
-	d->d_spliced = NULL;
 	d->d_parent = parent;
 	d->d_dc = dc;
 	urcu_txn_hlist_init(&d->d_child_head);
@@ -432,34 +423,6 @@ void dc_quiescent(void)         { rcu_quiescent_state(); }
 
 /* ---- lock-free lookup (inline name, no d_seq, no rename_lock) ----------- */
 
-/*
- * Follow the transition chain from a named top @d down to its content host (the
- * address-stable node children key on).  A settled entry is its own host
- * (d_fwd == NULL).  d_fwd is transacted, so resolve it with urcu_mcas_read();
- * call within an RCU read-side section.  @depthp (if non-NULL) receives the chain
- * length walked -- a free byproduct the rename path reuses to trip fold-ahead
- * without a second walk.
- */
-static inline struct dentry *chain_host_depth_rcu(struct dentry *d,
-						  unsigned long *depthp)
-{
-	struct dentry *fwd;
-	unsigned long depth = 0;
-
-	while ((fwd = urcu_mcas_read((void **) &d->d_fwd, DC_FWD_TAG)) != NULL) {
-		d = fwd;
-		depth++;
-	}
-	dc_dbg_chain(depth);
-	if (depthp)
-		*depthp = depth;
-	return d;
-}
-
-static inline struct dentry *chain_host_rcu(struct dentry *d)
-{
-	return chain_host_depth_rcu(d, NULL);
-}
 
 /*
  * Resolve @top's content host in O(1) (readers).  A settled top (d_fwd == NULL)
@@ -481,86 +444,6 @@ static inline struct dentry *host_of_rcu(struct dentry *top)
 
 	return fwd ? rcu_dereference(top->d_host) : top;
 #endif
-}
-
-/*
- * SYNCHRONOUS FOLD-AHEAD (liveness relief valve).  The async fold worker drains
- * only as fast as grace periods advance; if a registered thread stops quiescing
- * under write load -- e.g. blocked in pthread_join while still RCU-online -- GPs
- * stall, folds stop draining, and the transition chain grows unbounded.  Then
- * every chain_host_depth_rcu() walk (EVERY reader and writer) goes O(chain) and
- * throughput collapses in a feedback loop.  When a rename finds a chain deeper
- * than DC_FOLD_AHEAD_HI (the depth its host-walk already measured -- no extra
- * walk), it splices the chain's MIDDLE relays out in-line here, capping the depth
- * regardless of GP progress and breaking the feedback.
- *
- * A splice touches ONLY the transacted d_fwd/d_back chain -- no index, no d_sib
- * (a demoted node left the child-hlist at the stack that demoted it) -- so it
- * needs no grace period and cannot make a concurrent readdir jump directories.
- * The top's TRANSFER (which re-links d_sib) still needs a GP and stays async.  We
- * never FREE here: each spliced node is still freed exactly once by its own
- * pending async fold_cb, which sees the already-spliced chain (back->d_fwd != n)
- * and skips straight to the self-free -- so the self-free invariant holds.
- *
- * Contention-averse: on a domain that is ALSO MCAS-contended (many writers), the
- * splices would abort and add load, so we bail after DC_FOLD_AHEAD_ABORTS
- * consecutive aborts -- the async folds handle a contended chain, and the relief
- * valve stays out of the way.  On the quiet-domain GP-stall case it never aborts
- * and splices as deep as needed.  Call within an RCU read-side section.
- */
-#ifndef DC_FOLD_AHEAD_HI		/* overridable: a repro disables it with a huge HI */
-#define DC_FOLD_AHEAD_HI  1024	/* chain depth that trips the relief valve */
-#endif
-#define DC_FOLD_AHEAD_MAX    65536	/* per-call work cap (runaway backstop) */
-#define DC_FOLD_AHEAD_ABORTS 8		/* consecutive aborts => back off (contention) */
-
-static void fold_ahead(struct dcache *dc, struct dentry *top)
-{
-	struct urcu_mcas_txn txn;
-	struct dentry *n;
-	unsigned long work = 0, aborts = 0;
-
-	urcu_txn_init(&txn, &dc->domain);
-	/* Start below the top (its transfer needs a GP); splice each relay. */
-	n = urcu_mcas_read((void **) &top->d_fwd, DC_FWD_TAG);
-	while (n && work++ < DC_FOLD_AHEAD_MAX) {
-		struct dentry *fwd = urcu_mcas_read((void **) &n->d_fwd, DC_FWD_TAG);
-		struct dentry *back = urcu_mcas_read((void **) &n->d_back, DC_FWD_TAG);
-		enum urcu_txn_status st;
-
-		if (!fwd)
-			break;			/* @n is the content host: stop */
-		if (!back) {			/* @n became a top: leave to async */
-			n = fwd;
-			continue;
-		}
-		if (urcu_mcas_read((void **) &n->d_spliced, DC_FWD_TAG) == n) {
-			n = fwd;		/* another fold_ahead already spliced @n */
-			continue;
-		}
-		urcu_txn_begin(&txn);
-		urcu_txn_expect_conflict(&txn);
-		(void) urcu_txn_store(&txn, (void **) &back->d_fwd, n, fwd,
-				      DC_FWD_TAG);
-		(void) urcu_txn_store(&txn, (void **) &fwd->d_back, n, back,
-				      DC_FWD_TAG);
-		/*
-		 * Mark @n spliced ATOMICALLY with the bypass, so @n's own fold
-		 * reads a self-marker instead of dereferencing its now-stale
-		 * d_back (which may be freed by the time that fold runs).
-		 */
-		(void) urcu_txn_store(&txn, (void **) &n->d_spliced, NULL, n,
-				      DC_FWD_TAG);
-		st = urcu_txn_commit(&txn);
-		urcu_txn_end(&txn);
-		if (st == URCU_TXN_STATUS_ABORT) {
-			if (++aborts >= DC_FOLD_AHEAD_ABORTS)
-				break;		/* domain is contended: back off */
-			continue;		/* a neighbour moved: re-read @n */
-		}
-		aborts = 0;			/* progress: reset the contention gauge */
-		n = fwd;			/* @n spliced; advance toward the host */
-	}
 }
 
 /*
@@ -908,13 +791,14 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			ret = -ENOENT;
 			goto out;
 		}
-		host = chain_host_rcu(top);
+		host = host_of_rcu(top);	/* O(1) */
 		if (!children_empty(host)) {	/* children live on the host */
 			ret = -ENOTEMPTY;
 			goto out;
 		}
-		/* top == host iff top is settled (no forwarding chain below it) */
-		settled = urcu_mcas_read((void **) &top->d_fwd, DC_FWD_TAG) == NULL;
+		/* top == host iff top is settled (no forwarding chain below it) --
+		 * host_of_rcu() already answered this; no d_fwd read needed. */
+		settled = (top == host);
 
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
@@ -1045,7 +929,6 @@ static int stack_shell(struct dcache *dc,
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0);
 	struct dentry *top = NULL, *host = NULL;
-	unsigned long depth = 0;
 	struct urcu_mcas_txn txn;
 	int ret;
 
@@ -1067,7 +950,7 @@ static int stack_shell(struct dcache *dc,
 			ret = -ENOENT;
 			goto out_free;
 		}
-		host = chain_host_depth_rcu(top, &depth);
+		host = host_of_rcu(top);	/* O(1): write-once d_host skip pointer */
 		shell->d_host = host;		/* union slot = skip pointer to the tail host */
 		shell->d_fwd = top;		/* new top forwards to the old top */
 
@@ -1102,8 +985,6 @@ static int stack_shell(struct dcache *dc,
 	 * shell makes it depth + 1, so trip at depth >= HI.  Still under the RCU
 	 * read lock; reuses the walk we already paid for.
 	 */
-	if (depth >= DC_FOLD_AHEAD_HI)
-		fold_ahead(dc, shell);
 	rcu_read_unlock();
 	*out_shell = shell;
 	if (out_host)
@@ -1135,9 +1016,8 @@ out_free:
  *   index (the stack that demoted it removed it); rewire the doubly linked chain
  *   past @n (back->d_fwd = fwd, fwd->d_back = back) in one MCAS, touching no
  *   index.  A reader positioned at @n still follows @n->d_fwd (untouched) to the
- *   host until @n is reclaimed.  (If a synchronous fold_ahead already spliced @n,
- *   its self-marker d_spliced == @n is seen first and we skip straight to the
- *   free -- never dereferencing @n's now-stale d_back, which may be freed.)
+ *   host until @n is reclaimed.  @n is always still linked here: nothing splices a
+ *   chain out-of-band, so @n's own fold is the only thing that removes it.
  *
  *   @n is the top but GONE from the index (the TRANSFER's replace returns -ENOENT
  *   while d_back is STILL NULL): an unlink removed the named top without demoting
@@ -1163,14 +1043,6 @@ static void fold(struct dcache *dc, struct dentry *n)
 		struct dentry *back, *fwd;
 		enum urcu_txn_status st;
 		int p;
-
-		/*
-		 * A synchronous fold_ahead may have already spliced @n out (and
-		 * marked it atomically); detect that from @n's OWN self-marker,
-		 * before touching @n->d_back, whose target may since be freed.
-		 */
-		if (urcu_mcas_read((void **) &n->d_spliced, DC_FWD_TAG) == n)
-			break;			/* already spliced: fall through to free */
 
 		back = urcu_mcas_read((void **) &n->d_back, DC_FWD_TAG);
 		fwd = urcu_mcas_read((void **) &n->d_fwd, DC_FWD_TAG);
@@ -1224,10 +1096,10 @@ transfer_retry:
 			urcu_txn_end(&txn);
 			continue;		/* re-read d_back: may now be a relay */
 		} else {
-			/* SPLICE: @n is a middle relay, in no index.  A prior
-			 * fold_ahead splice was already ruled out by the d_spliced
-			 * check at the loop top, so @n is still linked and @back is a
-			 * live chain node -- safe to dereference. */
+			/* SPLICE: @n is a middle relay, in no index.  Nothing
+			 * splices a chain out-of-band any more (the synchronous
+			 * fold-ahead is retired), so @n is necessarily still linked
+			 * and @back is a live chain node -- safe to dereference. */
 			urcu_txn_begin(&txn);
 			urcu_txn_expect_conflict(&txn);
 			(void) urcu_txn_store(&txn, (void **) &back->d_fwd, n,
@@ -1356,7 +1228,6 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 {
 	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
 	struct urcu_txn_hlist_head *bucket_a, *bucket_b;
-	unsigned long depa = 0, depb = 0;
 	const struct qstr *na, *nb;
 	struct urcu_mcas_txn txn;
 	int cross, ret;
@@ -1410,8 +1281,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			ret = -ENOENT;
 			goto out_free;
 		}
-		hosta = chain_host_depth_rcu(topa, &depa);
-		hostb = chain_host_depth_rcu(topb, &depb);
+		hosta = host_of_rcu(topa);	/* O(1) */
+		hostb = host_of_rcu(topb);	/* O(1) */
 		sa->d_host = hosta;		/* union slot: A's new top -> A's tail host */
 		sa->d_fwd = topa;
 		sb->d_host = hostb;		/* union slot: B's new top -> B's tail host */
@@ -1447,10 +1318,6 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		}
 		break;
 	}
-	if (depa >= DC_FOLD_AHEAD_HI)	/* relief valve, reusing the host-walk depths */
-		fold_ahead(dc, sa);
-	if (depb >= DC_FOLD_AHEAD_HI)
-		fold_ahead(dc, sb);
 	rcu_read_unlock();
 #ifdef DC_STRESS_DEBUG
 	uatomic_add(&dc_dbg_renames, 2);

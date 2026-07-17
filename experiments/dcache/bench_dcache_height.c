@@ -84,6 +84,17 @@ static int   *cpulist    = NULL;
 static int    cpulist_len = 0;
 static unsigned int nbuckets = 4096;
 static unsigned int quiesce_mask = 15;
+/*
+ * Microseconds a writer idles between exchanges (--writer-delay).  The engine's
+ * write path cost is itself a throttle: while the writer walked the shell chain
+ * to measure its depth, each rename paid in proportion to the backlog it had
+ * created, which capped churn.  Remove that walk and the writers speed up ~3x,
+ * outrun the GP-bound fold, and the chains they leave behind cost the READERS
+ * memory bandwidth -- so a reader-throughput comparison across engine variants is
+ * only honest at a MATCHED rename rate.  This knob pins churn independently of
+ * how fast the write path happens to be.  0 = flat out (the legacy behaviour).
+ */
+static unsigned long writer_delay_us = 0;
 
 static long   g_bandleaves = 0;		/* B^D: leaves per band */
 static long   g_total      = 0;		/* writers * B^D: total leaves */
@@ -232,6 +243,17 @@ static void *worker(void *arg)
 				me->nrenames++;
 			else
 				me->errs++;
+			if (writer_delay_us) {
+				/* Idle between writes at a PINNED rate.  Quiesce
+				 * first: a registered QSBR thread that sleeps
+				 * without reporting a quiescent state would hold
+				 * every grace period open for the whole delay --
+				 * throttling churn while ALSO stalling the fold
+				 * that drains it, which is the opposite of the
+				 * intent. */
+				dc_quiescent();
+				usleep(writer_delay_us);
+			}
 		} else {
 			/* Full-depth walk to a random leaf in a random band. */
 			int w = (int) (xrand(&s) % (uint64_t) nwriters);
@@ -357,7 +379,10 @@ static void usage(const char *p)
 	    "         [--cpulist c0,..] [--cpustride N] [--nbuckets N] [--quiesce N]\n"
 	    "  Balanced B-ary band per writer (B^D leaves each); writers RENAME_EXCHANGE\n"
 	    "  two sibling subtrees at height H; readers walk random full leaf paths.\n"
-	    "  H=0 moves leaves (the S3 best case); H=D-1 moves near the band root.\n", p);
+	    "  H=0 moves leaves (the S3 best case); H=D-1 moves near the band root.\n"
+	    "  --writer-delay U => writer idles U us between exchanges, pinning churn\n"
+	    "                     so reader throughput is comparable across engines\n"
+	    "                     whose write paths differ in speed (0 = flat out).\n", p);
 	exit(2);
 }
 
@@ -382,6 +407,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cpustride"))   cpustride = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--writer-delay"))
+			writer_delay_us = strtoul(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "--quiesce")) {
 			int q = atoi(argv[++i]);
 			if (q < 1 || (q & (q - 1)) != 0)

@@ -30,8 +30,7 @@ HCPP     := $(KEEPID) $(CPPFLAGS)
 ENGINE   ?= seqlock
 HDRS     := dcache.h seqcount.h
 
-.PHONY: all check check-asan repro repro-asan repro-fold repro-foldahead \
-	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
+.PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode clean check-lib
 
@@ -89,20 +88,6 @@ repro-asan: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
 	  $(HCPP) -DDC_TEST_HOOKS -o repro_dcache_asan \
 	  repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_asan
-
-# Liveness-cliff demo: hammer renames on one entry while grace periods are stalled
-# (main never quiesces), and compare the peak chain depth WITH the synchronous
-# fold-ahead relief valve vs WITHOUT it (a huge HI disables it).  Both under ASan
-# (the deferred frees must still drain cleanly at teardown).
-repro-foldahead: repro_foldahead.c dcache_txn.c $(HDRS) | check-lib
-	@echo "--- fold-ahead OFF (HI huge): chain should track the rename count ---"
-	$(CC) $(ASANFLAGS) $(HCPP) -DDC_STRESS_DEBUG -DDC_FOLD_AHEAD_HI=100000000 \
-	  -o repro_foldahead_off repro_foldahead.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-	./repro_foldahead_off
-	@echo "--- fold-ahead ON (default HI): chain should stay bounded ---"
-	$(CC) $(ASANFLAGS) $(HCPP) -DDC_STRESS_DEBUG \
-	  -o repro_foldahead_on repro_foldahead.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-	./repro_foldahead_on
 
 # Concurrent stress + conservation harness -- the primary validator for the
 # async fold (the deterministic repro is latent once the fold is deferred).
@@ -314,7 +299,7 @@ clean:
 	  bench_dcache_height_txn_pernode \
 	  bench_dcache_height_seqlock_asan bench_dcache_height_txn_asan \
 	  test_dcache_pernode repro_dcache_pernode stress_dcache_pernode_asan \
-	  repro_fold repro_fold_asan repro_foldahead_on repro_foldahead_off \
+	  repro_fold repro_fold_asan \
 	  stress_dcache stress_dcache_asan \
 	  stress_dcache_tsan stress_dcache_dirs stress_dcache_dirs_asan \
 	  stress_dcache_dirs_tsan stress_dcache_xchg stress_dcache_xchg_asan \
