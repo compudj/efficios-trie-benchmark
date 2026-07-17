@@ -236,6 +236,36 @@ bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
+# Adversarial MOVE-HEIGHT sweep: writers exchange sibling subtrees at height H in
+# a balanced B-ary band; readers walk full leaf paths.  Bounds the per-node arm
+# (leaf case H=0 is its best case; near-root moves degenerate to the global
+# counter).  Same three arms as `bench`; scripts/run_dcache_height.sh drives them.
+height: bench_dcache_height_seqlock bench_dcache_height_txn \
+	bench_dcache_height_txn_pernode
+
+bench_dcache_height_seqlock: bench_dcache_height.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_seqlock.c \
+	  $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_txn: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_txn.c \
+	  $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_txn_pernode: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
+	  bench_dcache_height.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# ASan smoke of the height harness (small tree, short) on both engines.
+height-asan: bench_dcache_height.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o bench_dcache_height_seqlock_asan \
+	  bench_dcache_height.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
+	./bench_dcache_height_seqlock_asan --writers 4 --nthreads 12 --move-height 2 \
+	  --branch 2 --tree-depth 6 --duration 300
+	$(CC) $(ASANFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o bench_dcache_height_txn_asan \
+	  bench_dcache_height.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./bench_dcache_height_txn_asan --writers 4 --nthreads 12 --move-height 2 \
+	  --branch 2 --tree-depth 6 --duration 300
+
 # Quick smoke: a short contended run on all three arms; nonzero exit on any
 # conservation failure (each binary returns 1 on CONSERVATION FAILED).
 bench-check: bench
@@ -280,6 +310,9 @@ clean:
 	  bench_dcache_txn_pernode_keepid bench_dcache_txn_hot1cl \
 	  test_dcache_hot1cl test_dcache_hot1cl_asan \
 	  bench_dcache_seqlock_asan bench_dcache_txn_asan \
+	  bench_dcache_height_seqlock bench_dcache_height_txn \
+	  bench_dcache_height_txn_pernode \
+	  bench_dcache_height_seqlock_asan bench_dcache_height_txn_asan \
 	  test_dcache_pernode repro_dcache_pernode stress_dcache_pernode_asan \
 	  repro_fold repro_fold_asan repro_foldahead_on repro_foldahead_off \
 	  stress_dcache stress_dcache_asan \
