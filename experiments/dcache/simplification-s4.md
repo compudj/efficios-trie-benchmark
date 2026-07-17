@@ -4,8 +4,8 @@ What the urcu-txn port *removes* versus the faithful `rename_lock` + `d_seq`
 baseline, and — just as important — what it deliberately *keeps* and why. The
 qualitative analysis (§1–4), the cache-line locality work (§5), the correctness
 invariants the per-node counter rests on (§6), and the S3 scaling curves that
-measure the payoff (§7). The mechanical LOC accounting closes §1: the port is ~2×
-the lines and fewer concurrency invariants.
+measure the payoff (§7). The mechanical LOC accounting closes §1: the port is
+~1.6× the lines and fewer concurrency invariants.
 
 The thesis this file defends: the port replaces **two kernel seqcount mechanisms
 plus a global mutator serialization** with **one uniform node type discriminated
@@ -33,49 +33,50 @@ measured contention) rather than taken on every write.
 ### LOC accounting
 
 The port is **not fewer lines** — the opposite. Raw `wc -l`: `dcache_seqlock.c`
-**875** → `dcache_txn.c` **1423** (+548, ~1.6×); comment share ~18% → ~30%. (Both
-files grew since the first accounting — the 1-CL layout + alignment landed in
-both, and the txn side then *shrank* ~190 lines when `fold_ahead`/`d_spliced` were
-retired in `08c069b`; the per-bucket split below predates that retirement, so its
-`rename` figure is now ~190 lines lighter, but the shape holds.) Where the bulk
-goes, bucketed by operation (spans are approximate — a definition's
-leading doc-comment is counted with the *preceding* definition — but the shape is
-robust):
+**875** → `dcache_txn.c` **1423** (+548, **~1.6×**); comment share 21% → 31%.
+Bucketed by operation (every line assigned to exactly one bucket by a scripted
+breakpoint pass over the current sources — the per-bucket columns sum to the file
+totals, so this is an accounting, not an estimate; a definition's leading
+doc-comment counts with that definition):
 
 | bucket | seqlock | txn | Δ |
 |---|--:|--:|--:|
-| **lookup** (walk + helpers) | ~141 | ~248 | +107 |
-| **rename** (shell-stack + async fold; fold-ahead since retired) | ~79 | ~461→~270 | **+382→~190** |
-| **unlink** | ~39 | ~91 | +52 |
-| **exchange** | ~69 | ~119 | +50 |
-| **readdir** | ~33 | ~28 | **−5** |
-| per-dir rwlock scaffolding (`dir_wlock`, `dirs_wlock2`, …) | ~26 | 0 | −26 |
-| hand-rolled RCU-hlist (`dc_hnode`/`dc_bucket`/add/del) | ~33 | 0 → library | −33 |
-| tag / cache-line layout machinery (§5) | 0 | ~47 | +47 |
-| shared plumbing (structs, alloc, `dc_add`, walk, …) | ~268 | ~424 | +156 |
-| file header / includes / macros | ~59 | ~80 | +21 |
+| **rename** (shell-stack + async fold) | 64 | 392 | **+328** |
+| **lookup** (reader walk + resolve helpers) | 208 | 269 | +61 |
+| **exchange** | 69 | 109 | +40 |
+| **unlink** | 47 | 66 | +19 |
+| **readdir** | 31 | 29 | **−2** |
+| tag / 1-CL layout machinery (§5) | 66 | 59 | −7 |
+| per-dir rwlock scaffolding (`dir_wlock`, `dirs_wlock2`, …) | 24 | 0 | −24 |
+| hand-rolled RCU-hlist (`dc_hnode`/`dc_bucket`/add/del) | 33 | 0 → library | −33 |
+| shared plumbing (structs, alloc, `dc_add`, hashing, children, walk) | 265 | 397 | +132 |
+| file header / includes | 68 | 102 | +34 |
+| **total** | **875** | **1423** | **+548** |
 
-Three things to read off it. **(1) The growth is almost entirely `rename`**: the
-seqlock rename is a ~79-line critical section (`dc_rename` + `__d_move` +
-`is_subdir`) held under `mutator_lock → rename_lock → dir-rwsems`; the txn rename
-is a *lock-free state machine* — `stack_shell` + composable `stack_one_prepare` +
-async `fold`/`fold_cb` + O(1) chain resolution (`host_of_rcu`). That is the whole
-trade: a held lock is cheap in lines and dear in invariants; a lock-free protocol
-is the reverse. **(2) The scaffolding
-genuinely disappears** — the per-directory rwlock (~26) and the hand-rolled
-RCU-hlist (~33) vanish from the `.c` (the hlist relocates to the reusable
-`rcu-txn-hlist` library), and the seqcount read-retry loop inside the seqlock
-lookup is *not* carried forward. **(3) `readdir` is the one bucket that shrinks**
-(−5): the "easy case" of §7.2 is literally fewer lines — a bare `rcu_read_lock`
-child-hlist walk beats the rwsem version.
+Four things to read off it. **(1) The growth is overwhelmingly `rename`** (+328 of
++548, 60%): the seqlock rename is a **64-line critical section** (`dc_rename` +
+`__d_move`) held under `mutator_lock → rename_lock → dir-rwsems`; the txn rename is
+a **392-line lock-free state machine** — `stack_shell` + composable
+`stack_one_prepare` + async `fold`/`fold_cb` + O(1) chain resolution
+(`host_of_rcu`). That is the whole trade: a held lock is cheap in lines and dear in
+invariants; a lock-free protocol is the reverse. **(2) The scaffolding genuinely
+disappears** — the per-directory rwlock (−24) and the hand-rolled RCU-hlist (−33)
+vanish from the `.c` (the hlist relocates to the reusable `rcu-txn-hlist`
+library), and the seqcount read-retry loop inside the seqlock lookup is not
+carried forward. **(3) `readdir` is the one operation that shrinks** (−2): the
+"easy case" of §7.2 is literally fewer lines — a bare `rcu_read_lock` child-hlist
+walk beats the rwsem version. **(4) The 1-CL/tag machinery is now a wash** (66 vs
+59, Δ −7), *not* a txn-only tax: the seqlock reference was brought up to the same
+cacheline-clustered layout (§5), so both engines pay ~60 lines for it — an earlier
+accounting charged it entirely to the port, which is no longer true.
 
-So the file-size claim is honest and unflattering: **2× the lines.** The claim
+So the file-size claim is honest and unflattering: **~1.6× the lines.** The claim
 that *does* hold is the one this document is organized around — **fewer
-concurrency invariants.** The seqlock's 79-line rename leans on invariants that
+concurrency invariants.** The seqlock's 64-line rename leans on invariants that
 live *outside* the function and outside the file: a global lock order that must
 never invert, a `rename_lock` bracket every reader must take, and an even/odd
 `d_seq` phase every reader must re-validate on *every component*. The txn port's
-461 lines are self-contained: their correctness is the write-once / immutable-key
+392 lines are self-contained: their correctness is the write-once / immutable-key
 edge invariants of §6 plus MCAS commit atomicity — no lock order to preserve, no
 per-reader seqcount phase to reason about, and (per-node) no whole-tree bracket.
 The lines moved *up*; the things a reader or a reviewer must simultaneously hold
