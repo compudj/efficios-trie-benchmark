@@ -52,32 +52,39 @@ for e in ENGINES:
     if xs:
         ax.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.1, ms=7,
                 label=LABEL[e], alpha=0.94)
-# per-node lead over the seqlock baseline at each height -- the erosion
+# per-node lead over the seqlock baseline at each height -- the erosion.
+# Label above the per-node point where it leads, below where it dips under
+# seqlock (so the text never lands on the other curve at the crossover).
 for h in sorted(base["txn-pernode"]):
     if h in base["seqlock"] and base["seqlock"][h] > 0:
-        r = base["txn-pernode"][h] / base["seqlock"][h]
-        ax.annotate(f"{r:.2f}×", (h, base["txn-pernode"][h]),
-                    textcoords="offset points", xytext=(0, 9),
+        pn, sq = base["txn-pernode"][h], base["seqlock"][h]
+        dy = 10 if pn >= sq else -18
+        ax.annotate(f"{pn / sq:.2f}×", (h, pn),
+                    textcoords="offset points", xytext=(0, dy),
                     ha="center", fontsize=8.5, color=COLOR["txn-pernode"],
                     fontweight="bold")
 
 heights = sorted({int(r["move_height"]) for r in rows})
 ax.set_xticks(heights)
-# label each height with its fan-in (2^H leaves the moved node dominates)
+# height H on top, the fan-in it dominates (2^H leaves) as a compact 2nd line
 ax.xaxis.set_major_formatter(FixedFormatter(
-    [f"{h}\n(2^{h}={2**h})" for h in heights]))
-ax.set_ylim(bottom=0)
+    [f"{h}\n{2**h}" for h in heights]))
+# headroom above the tallest curve so the ratio labels (offset upward) clear the
+# top spine; x-margin so the H=0 / H=D-1 labels do not clip the side spines.
+ymax = max((float(r["mlookups_s"]) for r in rows), default=1.0)
+ax.set_ylim(bottom=0, top=ymax * 1.18)
+ax.margins(x=0.06)
 ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
-ax.set_xlabel("move height H   (fan-in = leaves the moved node dominates)")
+ax.set_xlabel("move height H  (2nd row: fan-in = leaves the moved node dominates)")
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
-ax.set_title("Adversarial move-height sweep — 32 readers + 8 writers, balanced\n"
-             "binary bands (256 leaves each), writers exchange sibling subtrees at\n"
-             "height H (× = per-node ÷ seqlock: the localization eroding as moves\n"
-             "climb from leaves toward the band root)", fontsize=9.5)
+ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
+             "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
+             "× = per-node ÷ seqlock\nthe localization erodes as moves climb from "
+             "leaves toward the band root", fontsize=9)
 ax.grid(alpha=0.3, ls=":")
 ax.legend(fontsize=8, loc="best")
 fig.suptitle("Userspace dcache — how high can a rename climb before the per-node "
-             "counter stops helping?   ·   2×96-core EPYC", fontsize=11)
-fig.tight_layout(rect=[0, 0, 1, 0.95])
+             "counter stops helping?", fontsize=10.5)
+fig.tight_layout(rect=[0, 0, 1, 0.96])
 fig.savefig(OUT, dpi=140)
 print("wrote", os.path.abspath(OUT))
