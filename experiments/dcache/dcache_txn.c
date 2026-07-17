@@ -571,16 +571,23 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		res = DC_POSITIVE;
 		id = DC_FAST_ID(cur);
 		for (i = 0; i < p->ndepth; i++) {
-			struct dentry *d = txn_child_lookup_rcu(dc, cur,
-							        &p->comp[i]);
+			struct dentry *top = find_top_rcu(dc, cur, &p->comp[i]);
+			struct dentry *d;
 
-			if (!d) {
+			if (!top) {
 				res = DC_ABSENT;
 				break;
 			}
+			d = host_of_rcu(top);		/* O(1) skip to host */
 			cur = d;
 			id = DC_FAST_ID(d);
-			res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
+			/* pos/neg is read off the WRITE-ONCE top, not the host: a
+			 * fold's TRANSFER mutates the host's d_iparent in place, so
+			 * reading it there would race that write (the host is
+			 * reachable via the d_host skip pointer, not just the
+			 * index).  The top is never mutated and carries the same
+			 * pos/neg (rename preserves inode-ness). */
+			res = DC_IS_POSITIVE(top) ? DC_POSITIVE : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -636,7 +643,10 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			nlatched++;
 			cur = host;
 			id = DC_FAST_ID(host);
-			res = DC_IS_POSITIVE(host) ? DC_POSITIVE : DC_NEGATIVE;
+			/* pos/neg off the WRITE-ONCE top (not the host, whose
+			 * d_iparent a fold's TRANSFER mutates in place) -- see the
+			 * global arm above. */
+			res = DC_IS_POSITIVE(top) ? DC_POSITIVE : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -1059,7 +1069,13 @@ static void fold(struct dcache *dc, struct dentry *n)
 		fwd = urcu_mcas_read((void **) &n->d_fwd, DC_FWD_TAG);
 
 		if (back == NULL) {
-			/* TRANSFER: @n is the top; pull identity down into m. */
+			/* TRANSFER: @n is the top; pull identity down into m.
+			 * These are plain in-place stores to a node (m) that
+			 * concurrent readers CAN reach (as the content host, via
+			 * the d_host skip pointer) -- but no reader reads a host's
+			 * d_iparent/d_iname: matching and pos/neg are taken off the
+			 * write-once TOP (dc_lookup), and readdir reads the top's
+			 * d_iname + host's d_id.  So this write races no reader. */
 			struct dentry *m = fwd;
 
 #ifdef DC_HOT1CL
