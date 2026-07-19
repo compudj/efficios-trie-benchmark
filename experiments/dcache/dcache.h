@@ -24,10 +24,41 @@
 #include <stdint.h>
 #include <string.h>
 
-#define DC_NAME_MAX 32		/* max component name length (incl. NUL); matches
-				 * the kernel's DNAME_INLINE_LEN (32 on 64-bit).
-				 * qstr is then 40 B, so the 1-CL split hot line fits
-				 * d_iparent(8)+d_iname(40)+d_seq(8)+d_hash.next(8). */
+/*
+ * Max component name length (incl. NUL).  Sized to fill the 1-CL hot line
+ * exactly, so it depends on what else that line has to carry:
+ *
+ *   default / seqlock: d_iparent(8) + d_iname(40) + d_seq(8) + d_hash.next(8)
+ *                      => 32, which also matches the kernel's DNAME_INLINE_LEN.
+ *   DC_IPARENT_SKIP:   walk causality rides the host's d_iparent skip, so d_seq
+ *                      is gone and its 8 bytes go to the name:
+ *                      d_iparent(8) + d_iname(48) + d_hash.next(8) => 40.
+ *
+ * The larger budget is a straight density win rather than a fidelity break: the
+ * kernel's 32 is a SPILL threshold (longer names go to an external buffer),
+ * while ours is a hard limit (we reject them), so 40 inline represents strictly
+ * more real names -- and the line spends those bytes on the compare the reader
+ * actually does instead of on a version word.
+ *
+ * It also closes a real asymmetry.  Needing no PER-NODE version word was a cited
+ * advantage of the GLOBAL arm -- it brackets on dc->rename_gen and carries d_seq
+ * only "for a uniform offset" (see dcache_txn.c) -- so the wider name was
+ * structurally available to global and not to per-node.  Localized walk
+ * causality therefore cost 8 name bytes.  With the skip it does not: the skip
+ * arm gets per-node localization AND the density, and that advantage of the
+ * global arm is gone.
+ *
+ * Keep it conditional: the seqlock reference genuinely needs its d_seq (it IS
+ * the seqlock), and moving its layout would break the mechanism-vs-mechanism
+ * A/B.  Note the name budget is a CONSEQUENCE of the mechanism, not an
+ * independent knob -- a mechanism that needs a per-node version word costs you
+ * those bytes, and that cost is properly attributed to it.
+ */
+#ifdef DC_IPARENT_SKIP
+#define DC_NAME_MAX 40
+#else
+#define DC_NAME_MAX 32
+#endif
 #define DC_PATH_MAX 24		/* max components below the root */
 
 /*
