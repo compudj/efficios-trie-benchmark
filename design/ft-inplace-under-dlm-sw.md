@@ -40,24 +40,35 @@ flip atomically for the reader, without COW's alloc + copy + reclaim?**
 ## 2. What does NOT work: a plain-store seqlock
 
 The tempting shortcut — mutate in place with plain stores, and bracket readers
-with a seqcount — **fails**, and the failure is instructive.
+with a seqcount — **fails for FT**, and the failure is instructive.
 
 - If the seqcount is a *monotonic counter not tied to the write*, a reader can
   read torn data mid-shift, and if both its samples land after the last
   *completed* update it sees no change and accepts the tear.
 - Fixing that needs a **busy/odd state** (writer goes even→odd→stores→even;
-  reader retries on odd) — i.e. a classic seqlock. But a seqlock's retry trigger
-  is "is a write *in flight right now?*", and under a write stream there is
-  always *some* in-flight window. A reader can hit busy windows back-to-back with
-  **no bound** — the reads are starvable, *theoretically endless*, not `2^N`.
+  reader retries on odd) — i.e. a classic seqlock. That is correct, but it makes
+  the reader **wait on the writer**: it cannot proceed until the writer finishes
+  its non-atomic multi-word store, so a writer preempted mid-shift holds off
+  every reader of that node until it is rescheduled. FT's reads are wait-free by
+  contract, and a dependency on writer progress forfeits exactly that.
 
-The `2^N`-bounded / `≤1`-wait-free results of
+Note what does *not* defeat the seqlock here, because the tempting argument is
+the wrong one: GP-gating **does** bound the number of *distinct* updates a reader
+can straddle, so "a sustained write stream keeps hitting the reader with busy
+windows, without bound" does not survive gating. The disqualifier is the narrower
+and harder one above — the wait-on-writer — and the distinction matters, because
+it is precisely why a consumer that does **not** demand wait-free reads can use
+the plain-store seqcount (that document's ungated case (b)) while FT cannot. The
+choice follows the progress target; FT's is the strict one.
+
+The `K`-bounded / `≤1`-wait-free results of
 [rcu-gp-bounded-version](rcu-gp-bounded-version.md) are properties of the
 **atomic-flip** construction, where the only retry source is "a *completed*
 commit straddled my two samples" (which the GP + recompaction valve bounds). They
-do **not** rescue a busy-window seqlock. **Conclusion: in-place must be an atomic
-commit, not a seqlock.** Everything the update touches — occupancy word, every
-shifted slot, and the version — must flip at *one* linearization point.
+do **not** rescue a busy-window seqlock. **Conclusion, for FT specifically:
+in-place must be an atomic commit, not a seqlock.** Everything the update touches
+— occupancy word, every shifted slot, and the version — must flip at *one*
+linearization point.
 
 ## 3. What works: the DLM + SW two-level engine
 

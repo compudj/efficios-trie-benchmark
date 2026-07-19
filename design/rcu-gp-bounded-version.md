@@ -7,10 +7,11 @@ aliased into a word the reader already loads, with its *exposure* bounded by the
 grace period and **COW recompaction as the overflow valve**. Bounding the version
 that way turns out to buy more than wraparound safety: it upgrades the read from
 "obstruction-free and starvable" to **bounded-retry**, and at the one-bit extreme
-to genuinely **wait-free**. (The wait-free *torn-free reader property* is not itself
-new — Left-Right, DISC 2015, already has it; what is ours is the single-instance
-footprint and the drain outsourced to the grace period. See *Prior art and novelty
-boundary* below before claiming anything.)
+to genuinely **wait-free** — the last of these requiring that content and latch be
+published atomically (case (a) under *Preconditions*). (The wait-free *torn-free
+reader property* is not itself new — Left-Right, DISC 2015, already has it; what is
+ours is the single-instance footprint and the drain outsourced to the grace period.
+See *Prior art and novelty boundary* below before claiming anything.)
 
 Extracted from [rcu-txn-blob](rcu-txn-blob.md), where it grew as an optional
 control layer, because it is not blob-specific: it applies to any RCU structure
@@ -161,11 +162,12 @@ window.
 - **Reader (hot path): compares only the version bits.** Sample, read the data,
   re-sample; accept iff the bits are equal and not in-progress. The bits ride in
   padding the reader already loads, so placement stays ~free.
-- **Writer (cold path): overflow detection.** Snapshot the version at each GP
+- **Writer (cold path): threshold detection.** Snapshot the version at each GP
   transition (a per-node value on the cold metadata line, plus the global GP epoch
-  polled per update). Before an in-place update, check whether the version could
-  advance a full period within the live-reader window; if so, **fall back to
-  recompaction (COW)** for that update instead of incrementing in place.
+  polled per update). Before an in-place update, check whether the version has
+  advanced by the fallback threshold `K` since that snapshot; if so, **fall back to
+  recompaction (COW)** for that update instead of incrementing in place. `K` is a
+  policy number, constrained only by the field's period — see *Two knobs* below.
 - **Recompaction both fixes and resets.** COW is version-independent (the whole
   node reached through one pointer, unconditionally safe) and starts a fresh node
   with a zeroed counter, while the old node freezes and its readers drain on the
@@ -182,56 +184,144 @@ The GP + recompaction machinery is introduced for wraparound safety, but its
 important consequence is elsewhere.
 
 **A plain seqcount reader is starvable indefinitely by a write stream. Here it is
-not.** The forced COW freezes the very node a reader is on within `2^N` updates;
+not.** The forced COW freezes the very node a reader is on within `K` updates;
 once frozen, that reader's version stops moving and it completes on its next
-attempt. So retries are **bounded by the overflow threshold**, upgrading the read
+attempt. So retries are **bounded by the fallback threshold**, upgrading the read
 from "obstruction-free, starvable" to **bounded-retry**. Strictly better than any
 plain seqcount, and the reason to prefer this construction even where wraparound
 was never a practical worry.
 
+Note what does the work here: the bound is `K`, the threshold the *writer* checks
+against — **not** the version's field width. Wraparound safety is a separate
+constraint, and conflating the two costs you the ability to tune the retry bound
+independently of layout. The next section separates them.
+
 The other property worth stating: the **fallback is rare and benign**. With
-updates-per-node-per-GP well under `2^N` it never fires; only a node hammered
-`2^N` times within a single grace period recompacts, and that node was write-hot
-anyway.
+updates-per-node-per-GP well under `K` it never fires; only a node hammered `K`
+times within a single grace period recompacts, and that node was write-hot anyway.
 
-## Width is the knob: write throughput ↔ read latency
+### When the bound isn't wanted: the ungated configuration
 
-Version width `N` sets the retry bound at `≤ 2^N` and the overflow threshold at
-`2^N` updates per GP per node. The two move in opposite directions, and that is
-the whole tuning axis:
+The bound is the point of this construction, but it is not free, and not every
+consumer wants it. Everything above — the GP-epoch poll, the per-node transition
+snapshot, the threshold `K`, the recompaction valve — exists to *bound* reader
+retries. **A consumer whose readers already retry unboundedly for some other
+reason has nothing to buy here** and should take a plain seqcount: no gate, no
+`K`, no valve.
 
-| `N` | retry bound | in-place updates per GP per node | character |
+That is not a degenerate case, and it is not rare. Any structure whose reader
+validates a multi-hop traversal by re-reading generations and re-walking on
+mismatch has already spent its progress guarantee at the traversal level. Putting
+a *bounded* per-node version underneath an *unbounded* walk-level retry buys
+nothing — the walk is still starvable, so the node read may as well be too. The
+apparatus would be pure cost.
+
+Such a consumer pays only the two costs in *The baseline seqcount*, of which the
+footprint one is already answered by aliasing. It needs a generation the writer
+bumps and an in-progress bit, and it may write the content with **plain stores** —
+the torn window is covered by the in-progress bit, and the unbounded retry that
+implies was already the contract.
+
+**So the realization follows the consumer's progress target, not a universal
+ranking.** Target wait-free reads and you need the atomic flip *and* the gate
+(case (a) under *Preconditions*). Accept retry and a plain-store seqcount is both
+sufficient and substantially cheaper: no transacted content, hence no encoding
+cost on the read path, no valve, and no fallback path to maintain.
+
+## Two knobs, not one: width bounds wraparound, the threshold bounds retries
+
+The version has **two** numbers, and they are independent. Earlier drafts of this
+document collapsed them into a single `N`; that is wrong in general, and the
+collapse hides the more useful of the two knobs.
+
+- **Field width `W`** — how many bits the version occupies. It bounds
+  **wraparound**: the reader compares `W` bits, so it is fooled only by an advance
+  that is a nonzero multiple of `2^W` inside its read window. `W` is a **layout**
+  property — how much padding the aliased word has to spare.
+- **Fallback threshold `K`** — how many in-place updates a node accepts within the
+  live-reader window before the writer recompacts instead. It bounds **retries**: a
+  reader retries at most once per update it straddles, and after `K` the node
+  freezes, so retries are `≤ K`. `K` is a **policy** number the writer compares
+  against, chosen by measurement.
+
+The only thing linking them is the safety constraint
+
+> **`K ≤ 2^W − 1`** — the fallback must fire before the version could alias.
+
+Within that bound `K` is free. (The bound is strict: an advance of *exactly* `2^W`
+aliases, so a `W`-bit field admits `K = 2^W − 1`, not `2^W`. Earlier text saying
+"7 bits ⇒ 128" was off by one; it is 127.)
+
+The two were easy to conflate because the natural default is the maximum,
+`K = 2^W − 1` — let the field's own period be the trigger, and one number does
+both jobs. At the one-bit extreme they are *forced* to coincide (`W = 1 ⇒ K = 1`),
+which is why the latch section below still reads as a single knob. But the
+collapse is a default, not a law, and two cases break it:
+
+- **Lowering `K` below the period** tightens the retry bound *without touching
+  layout*. Read latency and write throughput then trade against each other along
+  `K` alone, at fixed `W` — which is the knob you actually want at tuning time,
+  since `W` is usually dictated by whatever padding happened to be available.
+- **A version riding an existing wide counter** makes wraparound vacuous. `2^W` is
+  then astronomically large, the constraint never binds, and `K` is the *only*
+  knob — there is no width decision left to make.
+
+| `K` | retry bound | in-place updates per GP per node | character |
 |---|---|---|---|
-| **1 bit** | **≤ 1 — wait-free** | ≤ 1, everything else recompacts | tightest reads, most recompaction |
-| **7 bits** | ≤ 128 | ≤ 128 | the practical middle (see layout) |
-| wider | ≤ `2^N` | ≤ `2^N` | fewer recompactions under bursts, looser read bound |
+| **1** | **≤ 1 — wait-free** (case (a) only) | ≤ 1, everything else recompacts | tightest reads, most recompaction |
+| **8–16** | ≤ 8–16 | ≤ 8–16 | tight reads, recompaction already rare |
+| **127** (`W = 7`) | ≤ 127 | ≤ 127 | the maximum a 7-bit field admits |
+| any, wide `W` | ≤ `K` | ≤ `K` | `K` chosen purely by measurement |
 
-Narrower → smaller reader footprint, tighter retry bound, *more* frequent
-recompaction. Wider → the reverse. Pick per structure, or per node size class.
+Smaller `K` → tighter retry bound, *more* frequent recompaction. Larger `K` → the
+reverse. Pick per structure, or per node size class; then pick `W` as whatever the
+layout can spare, subject only to `2^W > K`.
 
-### Concrete layout: 7 bits, sharing the low byte with the txn tag
+### Concrete layout: `W = 7`, sharing the low byte with the txn tag
 
-The practical point on that curve, for a version sharing an MCAS-transacted word:
+The practical point for a version sharing an MCAS-transacted word — the case where
+`W` really is scarce, and `K = 2^W − 1 = 127` is the natural default:
 
 ```
 bit 0      : txn proxy tag   — reserved by the engine, not available
-bits 1..7  : VERSION         — 7 bits ⇒ retry bound ≤ 128
+bits 1..7  : VERSION         — W = 7  ⇒  admits K ≤ 127
 bytes 1..7 : other state     — occupancy bits, lock/liveness, payload lanes
 ```
 
 **The engine's tag bit takes bit 0, so a version sharing that word gets 7 bits,
-not 8 — a retry bound of 128, not 256.** Sizing it as "a byte" is the mistake to
-avoid here; the byte is shared. Seven bits is ample: it bounds reader retries at
-128 while allowing 128 in-place updates per node per grace period before the
-recompaction valve opens, which no realistic per-node write rate approaches. And
-it keeps the version inside the low byte, leaving the word's **other seven bytes
-entirely free for other state** — which is exactly the 7+1 bytewise lane encoding
+not 8 — an admissible `K` of 127, not 255.** Sizing it as "a byte" is the mistake
+to avoid here; the byte is shared. Seven bits is ample: at the default
+`K = 2^W − 1` it bounds reader retries at 127 while allowing 127 in-place updates
+per node per grace period before the recompaction valve opens, which no realistic
+per-node write rate approaches — and if a tighter read bound is wanted, `K` can be
+dropped to 8 or 16 with no layout change at all. It also keeps the version inside
+the low byte, leaving the word's **other seven bytes entirely free for other
+state** — which is exactly the 7+1 bytewise lane encoding
 [rcu-txn-blob](rcu-txn-blob.md) already uses, so the version costs no lane.
+
+### When `W` disappears: riding a counter the reader already samples
+
+The opposite regime is worth naming, because it is the case where separating the
+two knobs stops being pedantry. If the version can alias into a word that is
+*already* a wide generation counter — one the reader loads and samples for some
+other reason — then the version costs **zero new bits and zero new loads**, `2^W`
+is far beyond any reachable advance, and the wraparound constraint is vacuous.
+`K` is then the only design parameter, and it is pure policy: *after `K` in-place
+updates to this node within one GP, take the fallback.*
+
+A structure whose readers already run a per-node generation bracket for some
+*other* invariant (walk causality, freshness, ABA rejection) gets the multi-word
+snapshot essentially free by reusing that counter, provided the writer already
+bumps it on the updates in question. Whether a given consumer qualifies is a
+per-structure question — the point here is only that in this regime "how wide
+should the version be?" is not a question, and the entire tuning surface is `K`.
 
 ### The extreme: a single-bit latch, wait-free for real
 
-Push `N` to its floor — **one bit** — and the retry bound collapses to its
-minimum. Gate the flips so a reader's window holds **at most one**: after flipping
+Push both knobs to the floor — `W = 1`, and therefore `K = 1` — and the retry
+bound collapses to its minimum. This is the one point on the curve where the two
+numbers are *forced* to coincide, which is why it reads as a single knob. Gate the
+flips so a reader's window holds **at most one**: after flipping
 the latch, the next in-place flip is allowed only once the grace period
 *following* the previous flip has completed (every reader live during that flip
 has drained); otherwise recompact. Then no reader spans two flips:
@@ -267,25 +357,53 @@ single-instance footprint*. The full prior-art boundary is below.
   no COW escape, so the valve is unavailable and the wait-free loss **stands**
   there. Every result above is for the recompactable case.
 - **The version catches a *completed* update; the in-progress window needs its own
-  cover** — either the content update is atomic at the flip (a flip-selector
-  engine, where the latch simply *is* the selector, resolved through proxies), or a
-  companion in-progress bit for a plain-load data path. So it is one-to-two bits,
-  still aliased into padding. **In the DLM realization this is the flip-selector
-  case (a): the seqcount is a transacted slot of the SW txn, flipped atomically with
-  the content in the same selector store (the latch *is* the selector).** That
-  atomicity is load-bearing, not a placement nicety: a plain-load seqlock bracket
-  (case b) leaves a *torn window* the width of the multi-word write, and a sustained
-  write stream keeps a reader overlapping some write's torn window — the unbounded
-  retry that makes a plain seqlock not wait-free. Publishing content and seqcount in
-  one flip removes the torn window (a reader sees all-old or all-new), so a reader
-  fails only on a *flip* between its two samples; GP-gating then bounds that to ≤ 1.
-  Atomicity kills the torn window; GP-gating bounds the flip count — both are needed.
+  cover.** There are two realizations, and **which is right follows the consumer's
+  progress target, not a universal ranking**:
+  - **case (a), atomic flip** — the content update is atomic at the flip (a
+    flip-selector engine, where the latch simply *is* the selector, resolved
+    through proxies). **In the DLM realization this is the case: the seqcount is a
+    transacted slot of the SW txn, flipped atomically with the content in the same
+    selector store.** Required if reads must be wait-free.
+  - **case (b), plain stores + in-progress bit** — content written with plain
+    stores, a companion bit covering the torn window. Sufficient, and considerably
+    cheaper, for any consumer that already tolerates unbounded reader retry (see
+    *When the bound isn't wanted*): the content need not be transacted, so the
+    read path pays no encoding or resolve cost.
+
+  Either way it is one-to-two bits, still aliased into padding.
+
+  Case (a)'s atomicity is load-bearing **for the wait-free claim specifically**,
+  and it is worth being precise about why, because the obvious reason is not the
+  operative one. It is **not** that a sustained write stream starves the case-(b)
+  reader: GP-gating bounds the number of *distinct* updates any reader can straddle
+  to `K` whatever the realization, so gated case (b) is already strictly better
+  than a plain seqlock — bounded interference, not unbounded. The operative reason
+  is **who the reader waits on**. In case (b) the in-progress bit makes a reader
+  wait for the writer to *finish* a non-atomic multi-word write, so a writer
+  preempted mid-write holds off every reader of that node until it is rescheduled.
+  That is a dependency on writer progress, and it disqualifies wait-freedom however
+  small `K` is — even at `K = 1`, where gating provably admits no *second* update,
+  the reader is still stuck inside the *first* one's torn window. Case (a) has no
+  in-flight state to observe: the reader sees all-old or all-new, a stalled writer
+  is invisible to it, and it fails only on a *flip* between its two samples, which
+  gating bounds to ≤ 1.
+
+  **Atomicity removes the wait-on-writer; GP-gating bounds the interference
+  count** — different hazards, neither substituting for the other. A consumer that
+  wants wait-free reads needs both. A consumer that does not want the bound needs
+  neither and should take **ungated case (b)**, where the wait-on-writer reduces to
+  a single content write: acceptable when that write is O(1) and short (a
+  fixed-size copy), and worth an explicit note at the site so the window is not
+  grown into something unbounded later.
 - **Writer-side cost:** GP-epoch polling and a per-node GP-transition snapshot on
   the cold line, plus a dependency on the RCU flavor exposing a readable GP epoch
   (urcu QSBR/memb do).
 - **Correctness hinges on a conservative window bound** — recompact before the
   version *could* alias for any live reader, accounting exactly for the ≤ 2-GP
-  span and the in-progress bit.
+  span and the in-progress bit. Concretely: the writer's threshold `K` must be
+  enforced against the *whole* live-reader window, not per-GP-epoch, and must
+  satisfy `K ≤ 2^W − 1`. Both halves matter — a correct `K` counted over too short
+  a window is as unsafe as a `K` too large for the field.
 - **Version flavor follows the writer model:** **parity** where writers are
   serialized (single-writer, or lock-serialized), **enter/exit** in-flight count
   where they are concurrent. Parity is the single-writer collapse of enter/exit,
@@ -349,7 +467,7 @@ Note that aliasing (occupancy padding) largely collapses the footprint axis of
 this crossover, and GP-gating removes the progress-class asymmetry that would
 otherwise make it a wait-free/obstruction-free split across size classes. What
 remains is the genuine one: alloc+copy per rank change versus in-place updates
-capped at `2^N` per GP.
+capped at `K` per GP.
 
 ## Summary: what each option gives the reader
 
@@ -358,9 +476,11 @@ capped at `2^N` per GP.
 | single-word resolve (no version) | n/a — single word | **wait-free** | none |
 | COW recompaction | yes (single publish) | **wait-free** | alloc + copy per rank change |
 | plain seqcount | yes | obstruction-free, **starvable** | a word, hot |
+| ungated aliased seqcount, case (b) | yes | starvable — but *free* if the consumer already retries | 1–2 padding bits |
 | occupancy-as-version | yes, if entries ≤ 1 word | obstruction-free, starvable | ~1 padding bit |
-| **GP-bounded `N`-bit** | yes | **bounded-retry (≤ 2^N)** | `N` padding bits |
-| **GP-gated 1-bit latch** | yes | **wait-free (≤ 1 retry)** | 1–2 padding bits |
+| **GP-bounded, threshold `K`** | yes | **bounded-retry (≤ `K`)** | `W` padding bits, `2^W > K` |
+| **GP-gated 1-bit latch, atomic flip (a)** | yes | **wait-free (≤ 1 retry)** | 1 padding bit |
+| **GP-gated 1-bit latch, plain stores (b)** | yes | blocks on writer, interference ≤ `K` | 2 padding bits |
 | validating read-only txn | yes, and **composes** across structures | not wait-free; contends | proxy per validated word |
 
 The validating transaction is the only row that composes a snapshot across *other*
