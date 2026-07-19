@@ -267,10 +267,13 @@ bench-check: bench
 # conservation under ASan.  Built from source with -DDC_PER_NODE_GEN.
 # DC_IPARENT_SKIP arm (experimental): walk causality on the host's d_iparent skip
 # instead of d_seq.  Same suite as check-pernode so the A/B is like-for-like.
-check-iparent: test_dcache.c dcache_txn.c $(HDRS) | check-lib
+check-iparent: test_dcache.c test_skip_invariant.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o test_dcache_iparent \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_iparent
+	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o test_skip_invariant \
+	  test_skip_invariant.c $(LDFLAGS) $(LDLIBS)
+	./test_skip_invariant
 	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP -DDC_TEST_HOOKS $(HCPP) \
 	  -o repro_dcache_iparent repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_iparent

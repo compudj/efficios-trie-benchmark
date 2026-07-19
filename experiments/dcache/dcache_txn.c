@@ -51,6 +51,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <string.h>
 
 #include <urcu/compiler.h>
@@ -227,7 +228,20 @@ struct dentry {
  */
 #define DC_TAG_SHELL	((uintptr_t) 0x2)	/* bit 1: node is a rename shell */
 #define DC_TAG_NEG	((uintptr_t) 0x4)	/* bit 2: negative dentry */
+#ifdef DC_IPARENT_SKIP
+/*
+ * bit 3: this d_iparent is a SKIP to the entry's current named top, not a
+ * lineage pointer.  Set only on a content host while a fold is outstanding
+ * (host != top); a settled host is its own top and carries plain lineage.  The
+ * skip is DIRECT (one load to the top, never a chain walk) and HOST-ONLY (a
+ * rename retargets exactly one slot, whatever the chain depth) -- see
+ * rename-shell-transition.md.
+ */
+#define DC_TAG_SKIP	((uintptr_t) 0x8)
+#define DC_TAG_MASK	((uintptr_t) 0xf)
+#else
 #define DC_TAG_MASK	((uintptr_t) 0x7)
+#endif
 
 #ifdef DC_IPARENT_SKIP
 /*
@@ -997,6 +1011,19 @@ static int stack_one_prepare(struct urcu_mcas_txn *txn, struct dcache *dc,
 	/* Demote the old top atomically with its removal (d_back: NULL -> shell). */
 	(void) urcu_txn_store(txn, (void **) &top->d_back, NULL, shell,
 			      DC_FWD_TAG);
+#ifdef DC_IPARENT_SKIP
+	/*
+	 * Retarget the host's skip to the new top, in the same commit -- ONE
+	 * store regardless of chain depth, which is why the skip is host-only.
+	 * When @host == @top (settled entry) this overwrites the host's lineage,
+	 * which is correct: the entry's identity now lives on @shell, and the
+	 * fold's TRANSFER pulls it back down from the top, never from here.
+	 */
+	(void) urcu_txn_store(txn, (void **) &host->d_iparent,
+			      (void *) iparent_raw(host),
+			      (void *) ((uintptr_t) shell | DC_TAG_SKIP),
+			      DC_IPARENT_TAG);
+#endif
 	if (cross_parent) {
 		struct dentry *cur = new_parent;
 		void *oldp;
@@ -1179,9 +1206,14 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * write to a host reachable via the d_host skip -- does
 			 * not arise).  Expected-value validated like d_back below:
 			 * a concurrent fold that moved the slot aborts us. */
+			/* @m becomes the top, so it takes n's lineage and drops
+			 * any SKIP it carried as the host. */
+			struct dentry *fh = host_of_rcu(n);	/* O(1) */
 			uintptr_t m_old = iparent_raw(m);
-			uintptr_t m_new = (iparent_raw(n) & ~DC_TAG_SHELL)
+			uintptr_t m_new = (iparent_raw(n)
+					   & ~DC_TAG_SHELL & ~DC_TAG_SKIP)
 					  | (m_old & DC_TAG_SHELL);
+			uintptr_t fh_old = (m != fh) ? iparent_raw(fh) : 0;
 #elif defined(DC_HOT1CL)
 			/* adopt n's parent + pos/neg, keep m's OWN host/shell bit
 			 * (m may still be a middle relay of the remaining chain) */
@@ -1219,6 +1251,17 @@ static void fold(struct dcache *dc, struct dentry *n)
 			(void) urcu_txn_store(&txn, (void **) &m->d_iparent,
 					      (void *) m_old, (void *) m_new,
 					      DC_IPARENT_TAG);
+			/* If @m is NOT the tail host, the host's skip still names
+			 * @n: retarget it to the new top in the same commit.  When
+			 * @m IS the host the promote store above already replaced
+			 * the skip with lineage, so nothing more to do. */
+			if (m != fh)
+				(void) urcu_txn_store(&txn,
+						      (void **) &fh->d_iparent,
+						      (void *) fh_old,
+						      (void *) ((uintptr_t) m
+								| DC_TAG_SKIP),
+						      DC_IPARENT_TAG);
 #endif
 			(void) urcu_txn_store(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);
@@ -1486,6 +1529,22 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 		struct dentry *top = sib_dentry(n);
 		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
+#ifdef DC_IPARENT_SKIP
+		/*
+		 * Quiescent invariant for the skip arm (this walk is contractually
+		 * quiescent): a content host names its current top iff it is not
+		 * that top itself.  Checked here, before the reader is switched
+		 * over to depend on it.
+		 */
+		{
+			uintptr_t hraw = iparent_raw(host);
+
+			if (host != top)
+				assert(hraw == ((uintptr_t) top | DC_TAG_SKIP));
+			else
+				assert((hraw & DC_TAG_SKIP) == 0);
+		}
+#endif
 		if (path->ndepth >= DC_PATH_MAX)
 			continue;
 		path->comp[path->ndepth++] = top->d_iname;	/* current name */
