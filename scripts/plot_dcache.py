@@ -117,22 +117,29 @@ for e in ENGINES:
         continue
     ax2.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.1, ms=6.5,
              label=LABEL[e], alpha=0.94)
-# annotate the per-node lead over the seqlock baseline where both exist
-for w in sorted(base["txn-pernode"]):
+# Annotate the lead of the SURVIVING design over the seqlock baseline.  ANNOT
+# tracks whichever arm is the one being argued for -- txn-mark since the
+# per-node counter arm was superseded -- so the ratios label the line a reader
+# is meant to take away.
+ANNOT = os.environ.get("ANNOT", "txn-mark")
+for w in sorted(base.get(ANNOT, {})):
     if w in base["seqlock"] and base["seqlock"][w] > 0:
-        r = base["txn-pernode"][w] / base["seqlock"][w]
+        r = base[ANNOT][w] / base["seqlock"][w]
         if r >= 1.15:
-            ax2.annotate(f"{r:.1f}×", (w, base["txn-pernode"][w]),
+            ax2.annotate(f"{r:.1f}×", (w, base[ANNOT][w]),
                          textcoords="offset points", xytext=(0, 8),
-                         ha="center", fontsize=8, color=COLOR["txn-pernode"],
+                         ha="center", fontsize=8, color=COLOR[ANNOT],
                          fontweight="bold")
 if ax2.has_data():
     plain_thread_x(ax2, [1, 2, 4, 8, 16, 24, 32, 48])
     plain_y(ax2)
+    # headroom so the leftmost ratio label is not clipped by the axes top
+    lo, hi = ax2.get_ylim()
+    ax2.set_ylim(lo, hi * 1.35)
 ax2.set_title("Role-split: 32 dedicated readers + W writers — reader Mops/s vs W\n"
               "ISOLATES the reader path: seqlock retries the whole walk on any\n"
               "rename; the per-node counter is touched only by walks through the\n"
-              "moved entry (× = per-node ÷ seqlock)",
+              "moved entry (× = mark ÷ seqlock)",
               fontsize=9.5)
 ax2.set_xlabel("concurrent writer threads (renaming)")
 ax2.set_ylabel("reader lookup Mops/s   (higher is better)")

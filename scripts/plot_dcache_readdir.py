@@ -90,14 +90,15 @@ for e in ENGINES:
         continue
     ax1.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.0, ms=6.5,
              label=LABEL[e], alpha=0.94)
-# per-node lead over the seqlock rwsem baseline where both exist
-for rd in sorted(base.get("txn-pernode", {})):
+# Lead of the SURVIVING design over the seqlock rwsem baseline (see plot_dcache).
+ANNOT = os.environ.get("ANNOT", "txn-mark")
+for rd in sorted(base.get(ANNOT, {})):
     if rd in base.get("seqlock", {}) and base["seqlock"][rd] > 0:
-        r = base["txn-pernode"][rd] / base["seqlock"][rd]
+        r = base[ANNOT][rd] / base["seqlock"][rd]
         if r >= 1.5:
-            ax1.annotate(f"{r:.1f}×", (rd, base["txn-pernode"][rd]),
+            ax1.annotate(f"{r:.1f}×", (rd, base[ANNOT][rd]),
                          textcoords="offset points", xytext=(0, 8),
-                         ha="center", fontsize=8, color=COLOR["txn-pernode"],
+                         ha="center", fontsize=8, color=COLOR[ANNOT],
                          fontweight="bold")
 if ax1.has_data():
     plain_thread_x(ax1, [2, 8, 16, 32, 64, 96, 128, 184])

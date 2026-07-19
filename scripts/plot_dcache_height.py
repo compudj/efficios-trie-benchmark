@@ -60,13 +60,14 @@ for e in ENGINES:
 # per-node lead over the seqlock baseline at each height -- the erosion.
 # Label above the per-node point where it leads, below where it dips under
 # seqlock (so the text never lands on the other curve at the crossover).
-for h in sorted(base["txn-pernode"]):
+ANNOT = os.environ.get("ANNOT", "txn-mark")
+for h in sorted(base.get(ANNOT, {})):
     if h in base["seqlock"] and base["seqlock"][h] > 0:
-        pn, sq = base["txn-pernode"][h], base["seqlock"][h]
-        dy = 10 if pn >= sq else -18
-        ax.annotate(f"{pn / sq:.2f}×", (h, pn),
+        v, sq = base[ANNOT][h], base["seqlock"][h]
+        dy = 10 if v >= sq else -18
+        ax.annotate(f"{v / sq:.2f}×", (h, v),
                     textcoords="offset points", xytext=(0, dy),
-                    ha="center", fontsize=8.5, color=COLOR["txn-pernode"],
+                    ha="center", fontsize=8.5, color=COLOR[ANNOT],
                     fontweight="bold")
 
 heights = sorted({int(r["move_height"]) for r in rows})
@@ -83,13 +84,14 @@ ax.set_xlabel("move height H above the leaves  "
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
 ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
              "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
-             "× = per-node ÷ seqlock\nthe COUNTER's localization erodes as moves "
-             "climb toward the band root; the MARK's does not", fontsize=9)
+             "× = mark ÷ seqlock\nthe COUNTER's localization erodes as moves climb "
+             "toward the band root,\ncrossing BELOW the baseline at H=7; the MARK's does not",
+             fontsize=9)
 ax.grid(alpha=0.3, ls=":")
 ax.legend(fontsize=8, loc="best")
-fig.suptitle("Userspace dcache — how high can a rename climb before the localized "
-             "version stops helping?   (the per-node COUNTER inverts at H=7; the "
-             "deletion MARK does not)", fontsize=10.5)
-fig.tight_layout(rect=[0, 0, 1, 0.96])
+fig.suptitle("Userspace dcache — how high can a rename climb before the localized\n"
+             "version stops helping?  The per-node COUNTER inverts at H=7; the MARK does not.",
+             fontsize=10.5)
+fig.tight_layout(rect=[0, 0, 1, 0.93])
 fig.savefig(OUT, dpi=140)
 print("wrote", os.path.abspath(OUT))
