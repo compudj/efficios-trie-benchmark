@@ -197,16 +197,33 @@ and FINE pays a lock it did not need. That is the one regime where fine
 granularity could claw back, and it keeps the result from being "FINE wins
 everywhere" by construction.
 
-## 8. Status and next step
+## 8. Roadmap and status
 
-- The transacted 63-bit bitmap engine is **built** (MW + SW, 12/12 TAP,
-  `include/urcu/rcu-txn-bitmap.h`), flowing to `ft-txn-integ`.
-- The FT-wide-lock drop is landed and **default-on for FINE** (2026-07-19), so a
-  FINE trie already runs DLM-only (per-node locks, no FT-wide mutex).
-- **Next:** the pigeon composed commit — replace `ft_node_recompact` for the
-  pigeon tier with `{pointer store/clear} + {bitmap set/clear}` (authoritative
-  transacted bitmap), and measure insert/delete churn + writer scaling vs the COW
-  baseline. It is the cleanest case (2 edges), the built code is right there, and
-  it is the first real in-place-vs-COW datapoint — the honest input to the A/B/C
-  sweep. Then decide whether to push in-place onto the rank-compressed tiers under
-  SW (§4's open crossover).
+Built / landed:
+
+- The transacted 63-bit bitmap engine exists in **both MW and SW** forms (12/12
+  TAP, `include/urcu/rcu-txn-bitmap.h`), flowing to `ft-txn-integ`.
+- The FT-wide-lock drop is landed and **default-on for FINE** (2026-07-19) — the
+  first step of the DLM move (per-node COPYING locks, FT-wide mutex gone).
+
+The engine move is **two bisectable steps**, in this order — *not* an op-first
+integration (a composed-commit op is a consumer of step 2, so building it before
+the content engine flips would exercise the MW/MCAS bitmap, the wrong engine):
+
+**Step 1 — move FT to the DLM scheme, still on MW (MCAS) content.** Adopt the
+composable multi-lock (deadlock-free lock-set *acquire*) as FT's sole exclusion,
+replacing the ad-hoc COPYING-mark + guard-fallback; the FINE-lock-drop is its
+precursor. Content stays MCAS, so rank changes **still COW** (§4/§6: MCAS in-place
+loses) — this step buys the *exclusion* change, not in-place. It is separately
+measurable: **DLM+MCAS FINE vs OPTIMISTIC** isolates whether the lock manager's
+bounded-CAS-then-arbitrate beats OPTIMISTIC's per-slot MCAS on exclusion alone
+(the "too fine-grained" question), before in-place enters the picture.
+
+**Step 2 — flip content MW → SW.** Replace MCAS content with the SW txn
+(plain-store data + one old/new **selector** commit) under the DLM locks, and
+integrate the two missing pieces: the **seqcount** and the **sw-txn 63-bit
+bitmap**. This is where reads become selector resolves and **in-place becomes
+viable**. The in-place ops fall out as consumers — pigeon composed commit first
+(2 edges, the built code), then the rank-compressed crossover (§4). The A/B/C
+sweep is meaningful only *here*: it is the first point at which
+FINE(sw)-in-place exists to compare against COW-bound OPTIMISTIC.
