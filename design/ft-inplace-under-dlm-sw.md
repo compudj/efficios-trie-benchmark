@@ -221,9 +221,13 @@ bounded-CAS-then-arbitrate beats OPTIMISTIC's per-slot MCAS on exclusion alone
 
 **Step 2 — flip content MW → SW.** Replace MCAS content with the SW txn
 (plain-store data + one old/new **selector** commit) under the DLM locks, and
-integrate the two missing pieces: the **seqcount** and the **sw-txn 63-bit
-bitmap**. This is where reads become selector resolves and **in-place becomes
-viable**. The in-place ops fall out as consumers — pigeon composed commit first
-(2 edges, the built code), then the rank-compressed crossover (§4). The A/B/C
-sweep is meaningful only *here*: it is the first point at which
-FINE(sw)-in-place exists to compare against COW-bound OPTIMISTIC.
+integrate the two missing pieces: the **seqcount** and the transacted 63-bit
+bitmap — specifically the bitmap's **SW variant, not the MW one**. Under the DLM
+lock the writer is single-per-node, so the SW bitmap's plain-store + selector
+commit is the right fit; the MW bitmap would pay per-word MCAS *on top of* a lock
+that already provides exclusion — redundant CAS. This is where reads become
+selector resolves and **in-place becomes viable**. The in-place ops fall out as
+consumers — pigeon composed commit first (2 edges, the built code), then the
+rank-compressed crossover (§4). The A/B/C sweep is meaningful only *here*: it is
+the first point at which FINE(sw)-in-place exists to compare against COW-bound
+OPTIMISTIC.
