@@ -92,6 +92,18 @@ void (*dc_test_fold_hook)(void);
  * Opt out of the layout with -DDC_NO_HOT1CL_SPLIT (legacy 3-CL) or -DDC_HOT1CL
  * (the fair-weather pack that leaves d_hash cold).
  */
+/*
+ * DC_IPARENT_SKIP (experimental, rename-shell-transition.md): carry walk
+ * causality on the host's d_iparent -- a direct skip to the current named top --
+ * instead of the d_seq counter.  It needs the d_iparent tag encoding, so it
+ * implies the SPLIT layout.  Step 1 of the arm only makes d_iparent TRANSACTED
+ * (the fold's promote must publish inside the commit); d_seq still carries the
+ * version until the reader is switched over.
+ */
+#ifdef DC_IPARENT_SKIP
+#define DC_HOT1CL_SPLIT 1
+#endif
+
 #if !defined(DC_NO_HOT1CL_SPLIT) && !defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
 #define DC_HOT1CL_SPLIT 1
 #endif
@@ -217,17 +229,44 @@ struct dentry {
 #define DC_TAG_NEG	((uintptr_t) 0x4)	/* bit 2: negative dentry */
 #define DC_TAG_MASK	((uintptr_t) 0x7)
 
+#ifdef DC_IPARENT_SKIP
+/*
+ * Engine proxy tag for the TRANSACTED d_iparent slot.  Under DC_IPARENT_SKIP the
+ * fold's promote publishes d_iparent inside its commit, so the slot can briefly
+ * hold a descriptor and every read must resolve it.  Dentries are 64-byte
+ * aligned (posix_memalign), so bit 0 is clear on every live value.
+ *
+ * Cost of the resolve on the match path: with no txn installed -- the
+ * overwhelming common case -- urcu_mcas_read() is a tag test and a
+ * well-predicted branch on a word already loaded for the compare, the same shape
+ * top_unhashed_rcu() already pays on this path.
+ */
+#define DC_IPARENT_TAG	URCU_MCAS_TAG
+#endif
+
+static inline uintptr_t iparent_raw(const struct dentry *d)
+{
+#ifdef DC_IPARENT_SKIP
+	struct dentry *nc = (struct dentry *) (uintptr_t) d;
+
+	return (uintptr_t) urcu_mcas_read((void **) &nc->d_iparent,
+					  DC_IPARENT_TAG);
+#else
+	return (uintptr_t) d->d_iparent;
+#endif
+}
+
 static inline struct dentry *iparent_of(const struct dentry *d)
 {
-	return (struct dentry *) ((uintptr_t) d->d_iparent & ~DC_TAG_MASK);
+	return (struct dentry *) (iparent_raw(d) & ~DC_TAG_MASK);
 }
 static inline int node_is_shell(const struct dentry *d)
 {
-	return ((uintptr_t) d->d_iparent & DC_TAG_SHELL) != 0;
+	return (iparent_raw(d) & DC_TAG_SHELL) != 0;
 }
 static inline int node_is_positive(const struct dentry *d)
 {
-	return ((uintptr_t) d->d_iparent & DC_TAG_NEG) == 0;
+	return (iparent_raw(d) & DC_TAG_NEG) == 0;
 }
 #define DC_IPARENT(d)     iparent_of(d)
 #define DC_IS_POSITIVE(d) node_is_positive(d)
@@ -479,6 +518,56 @@ static struct dentry *find_top_rcu(struct dcache *dc, struct dentry *parent,
 }
 
 /*
+ * Same scan, but hand the matched node's RAW d_iparent back to the caller so the
+ * host/shell and pos/neg tests reuse that ONE load instead of re-reading the
+ * field twice more.  This matters under DC_IPARENT_SKIP, where the slot is
+ * transacted and every read is a uatomic_load(CMM_ACQUIRE) the compiler may not
+ * CSE -- three accessor calls became three real loads, costing ~4-5% of lookup.
+ * The plain build folds it back to the same code the accessors emitted.
+ */
+#ifdef DC_HOT1CL
+static struct dentry *find_top_raw_rcu(struct dcache *dc, struct dentry *parent,
+				       const struct qstr *name, uintptr_t *raw_out)
+{
+	struct urcu_txn_hlist_head *b = bucket_of(dc, parent, name->hash);
+	struct urcu_txn_hlist_node *n;
+
+	for (n = urcu_txn_hlist_first_rcu(b); n; n = urcu_txn_hlist_next_rcu(n)) {
+		struct dentry *d = hnode_dentry(n);
+		uintptr_t raw = iparent_raw(d);
+
+		if ((struct dentry *) (raw & ~DC_TAG_MASK) == parent &&
+		    dc_qstr_eq(&d->d_iname, name)) {
+			*raw_out = raw;
+			return d;
+		}
+	}
+	return NULL;
+}
+
+static inline struct dentry *host_of_raw(struct dentry *top, uintptr_t raw)
+{
+	return (raw & DC_TAG_SHELL) ? rcu_dereference(top->d_host) : top;
+}
+#define DC_IS_POSITIVE_RAW(top, raw)	(((raw) & DC_TAG_NEG) == 0)
+#else
+static inline struct dentry *find_top_raw_rcu(struct dcache *dc,
+					      struct dentry *parent,
+					      const struct qstr *name,
+					      uintptr_t *raw_out)
+{
+	*raw_out = 0;
+	return find_top_rcu(dc, parent, name);
+}
+static inline struct dentry *host_of_raw(struct dentry *top, uintptr_t raw)
+{
+	(void) raw;
+	return host_of_rcu(top);
+}
+#define DC_IS_POSITIVE_RAW(top, raw)	DC_IS_POSITIVE(top)
+#endif
+
+/*
  * Find parent's child named `name`: the named top, resolved to its content
  * host. Call within an RCU read-side section.
  */
@@ -571,14 +660,16 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		res = DC_POSITIVE;
 		id = DC_FAST_ID(cur);
 		for (i = 0; i < p->ndepth; i++) {
-			struct dentry *top = find_top_rcu(dc, cur, &p->comp[i]);
+			uintptr_t raw;
+			struct dentry *top = find_top_raw_rcu(dc, cur,
+							      &p->comp[i], &raw);
 			struct dentry *d;
 
 			if (!top) {
 				res = DC_ABSENT;
 				break;
 			}
-			d = host_of_rcu(top);		/* O(1) skip to host */
+			d = host_of_raw(top, raw);	/* O(1) skip to host */
 			cur = d;
 			id = DC_FAST_ID(d);
 			/* pos/neg is read off the WRITE-ONCE top, not the host: a
@@ -587,7 +678,8 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			 * reachable via the d_host skip pointer, not just the
 			 * index).  The top is never mutated and carries the same
 			 * pos/neg (rename preserves inode-ness). */
-			res = DC_IS_POSITIVE(top) ? DC_POSITIVE : DC_NEGATIVE;
+			res = DC_IS_POSITIVE_RAW(top, raw) ? DC_POSITIVE
+							   : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -623,7 +715,9 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		id = DC_FAST_ID(cur);
 		nlatched = 0;
 		for (i = 0; i < p->ndepth; i++) {
-			struct dentry *top = find_top_rcu(dc, cur, &p->comp[i]);
+			uintptr_t raw;
+			struct dentry *top = find_top_raw_rcu(dc, cur,
+							      &p->comp[i], &raw);
 			struct dentry *host;
 			void *s;
 
@@ -631,7 +725,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 				res = DC_ABSENT;
 				break;
 			}
-			host = host_of_rcu(top);	/* O(1) skip to host */
+			host = host_of_raw(top, raw);	/* O(1) skip to host */
 			s = urcu_mcas_read(&host->d_seq, DC_GEN_TAG);	/* sample */
 			cmm_smp_rmb();		/* sample gen before the confirm */
 			if (top_unhashed_rcu(top)) {	/* top left the index */
@@ -646,7 +740,8 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			/* pos/neg off the WRITE-ONCE top (not the host, whose
 			 * d_iparent a fold's TRANSFER mutates in place) -- see the
 			 * global arm above. */
-			res = DC_IS_POSITIVE(top) ? DC_POSITIVE : DC_NEGATIVE;
+			res = DC_IS_POSITIVE_RAW(top, raw) ? DC_POSITIVE
+							   : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -1077,8 +1172,17 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * write-once TOP (dc_lookup), and readdir reads the top's
 			 * d_iname + host's d_id.  So this write races no reader. */
 			struct dentry *m = fwd;
-
-#ifdef DC_HOT1CL
+#ifdef DC_IPARENT_SKIP
+			/* d_iparent is transacted here: the identity handover is
+			 * PUBLISHED BY THE COMMIT rather than stored in place, so
+			 * it races no reader (and the d0e7955 hazard -- a plain
+			 * write to a host reachable via the d_host skip -- does
+			 * not arise).  Expected-value validated like d_back below:
+			 * a concurrent fold that moved the slot aborts us. */
+			uintptr_t m_old = iparent_raw(m);
+			uintptr_t m_new = (iparent_raw(n) & ~DC_TAG_SHELL)
+					  | (m_old & DC_TAG_SHELL);
+#elif defined(DC_HOT1CL)
 			/* adopt n's parent + pos/neg, keep m's OWN host/shell bit
 			 * (m may still be a middle relay of the remaining chain) */
 			m->d_iparent = (struct dentry *) (
@@ -1111,6 +1215,11 @@ static void fold(struct dcache *dc, struct dentry *n)
 			if (p)
 				goto transfer_retry;
 			/* promote m atomically with the index swap */
+#ifdef DC_IPARENT_SKIP
+			(void) urcu_txn_store(&txn, (void **) &m->d_iparent,
+					      (void *) m_old, (void *) m_new,
+					      DC_IPARENT_TAG);
+#endif
 			(void) urcu_txn_store(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
