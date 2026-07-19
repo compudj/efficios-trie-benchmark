@@ -37,10 +37,11 @@ else
   echo ">> hwloc-calc unavailable; --cpustride 1" >&2
 fi
 
-declare -A BINOF=( [seqlock]=bench_dcache_height_seqlock \
+declare -A BINOF=( [txn-mark]=bench_dcache_height_txn_mark \
+                   [seqlock]=bench_dcache_height_seqlock \
                    [txn-global]=bench_dcache_height_txn \
                    [txn-pernode]=bench_dcache_height_txn_pernode )
-ENGINES="seqlock txn-global txn-pernode"
+ENGINES="seqlock txn-global txn-pernode txn-mark"
 for e in $ENGINES; do
   test -x "$BIN/${BINOF[$e]}" || { echo "MISSING $BIN/${BINOF[$e]} -- run 'make -C experiments/dcache height'" >&2; exit 1; }
 done

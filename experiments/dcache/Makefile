@@ -236,7 +236,7 @@ bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 # (leaf case H=0 is its best case; near-root moves degenerate to the global
 # counter).  Same three arms as `bench`; scripts/run_dcache_height.sh drives them.
 height: bench_dcache_height_seqlock bench_dcache_height_txn \
-	bench_dcache_height_txn_pernode
+	bench_dcache_height_txn_pernode bench_dcache_height_txn_mark
 
 bench_dcache_height_seqlock: bench_dcache_height.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_seqlock.c \
@@ -249,6 +249,10 @@ bench_dcache_height_txn: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
 bench_dcache_height_txn_pernode: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache_height.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_txn_mark: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ bench_dcache_height.c \
+	  dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 # ASan smoke of the height harness (small tree, short) on both engines.
 height-asan: bench_dcache_height.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib

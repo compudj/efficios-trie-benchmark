@@ -29,13 +29,18 @@ CSV = os.path.join(HERE, "dcache_height.csv")
 OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures", "dcache_height.png"))
 
-COLOR = {"seqlock": "#D55E00", "txn-pernode": "#009E73"}
-MARKER = {"seqlock": "s", "txn-pernode": "^"}
+COLOR = {"seqlock": "#D55E00", "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
+MARKER = {"seqlock": "s", "txn-pernode": "^", "txn-mark": "D"}
 LABEL = {
     "seqlock": "seqlock — rename_lock + d_seq\n(faithful kernel baseline)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(localized: moved subtree only)",
+    "txn-mark": "urcu-txn — deletion MARK as gen\n(localized, no counter)",
 }
-ENGINES = ("seqlock", "txn-pernode")
+# The height panel is where the localized arms are WEAKEST (the per-node lead
+# erodes toward the root), so it is the panel where they could plausibly diverge
+# rather than coincide -- worth plotting the mark arm here explicitly.
+ENGINES = tuple(os.environ.get(
+    "ENGINES", "seqlock txn-pernode txn-mark").split())
 rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
 
 
@@ -78,12 +83,13 @@ ax.set_xlabel("move height H above the leaves  "
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
 ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
              "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
-             "× = per-node ÷ seqlock\nthe localization erodes as moves climb from "
-             "leaves toward the band root", fontsize=9)
+             "× = per-node ÷ seqlock\nthe COUNTER's localization erodes as moves "
+             "climb toward the band root; the MARK's does not", fontsize=9)
 ax.grid(alpha=0.3, ls=":")
 ax.legend(fontsize=8, loc="best")
-fig.suptitle("Userspace dcache — how high can a rename climb before the per-node "
-             "counter stops helping?", fontsize=10.5)
+fig.suptitle("Userspace dcache — how high can a rename climb before the localized "
+             "version stops helping?   (the per-node COUNTER inverts at H=7; the "
+             "deletion MARK does not)", fontsize=10.5)
 fig.tight_layout(rect=[0, 0, 1, 0.96])
 fig.savefig(OUT, dpi=140)
 print("wrote", os.path.abspath(OUT))
