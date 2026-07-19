@@ -94,14 +94,13 @@ void (*dc_test_fold_hook)(void);
  * (the fair-weather pack that leaves d_hash cold).
  */
 /*
- * DC_IPARENT_SKIP (experimental, rename-shell-transition.md): carry walk
- * causality on the host's d_iparent -- a direct skip to the current named top --
- * instead of the d_seq counter.  It needs the d_iparent tag encoding, so it
- * implies the SPLIT layout.  Step 1 of the arm only makes d_iparent TRANSACTED
- * (the fold's promote must publish inside the commit); d_seq still carries the
- * version until the reader is switched over.
+ * DC_MARK_GEN (rename-shell-transition.md): carry walk causality on the hlist
+ * DELETION MARK -- d_hash.next bit 1, which every operation that changes the
+ * named top already sets -- instead of the d_seq counter.  Needs the d_iparent
+ * tag encoding, so it implies the SPLIT layout.  Retiring d_seq hands its 8
+ * bytes to the name (DC_NAME_MAX 40).
  */
-#if defined(DC_IPARENT_SKIP) || defined(DC_MARK_GEN)
+#ifdef DC_MARK_GEN
 #define DC_HOT1CL_SPLIT 1
 /*
  * Both no-counter arms transact d_iparent: the fold's identity handover is then
@@ -137,12 +136,12 @@ struct dentry {
 	 * read cold only by the census and by -DDC_SPLIT_KEEPID validation builds.
 	 *
 	 *   default:         d_iparent(8) + d_iname(40) + d_seq(8) + d_hash.next(8)
-	 *   DC_IPARENT_SKIP: d_iparent(8) + d_iname(48) +           d_hash.next(8)
+	 *   DC_MARK_GEN:     d_iparent(8) + d_iname(48) +           d_hash.next(8)
 	 *
 	 * The per-node walk-causality gen sits ON the hot line (sampled every hop).
 	 * In the global build d_seq is unused but kept for a uniform offset.  Under
-	 * DC_IPARENT_SKIP there is no per-node gen at all -- causality rides the
-	 * host's d_iparent skip -- so the 8 bytes go to the name instead
+	 * DC_MARK_GEN there is no per-node gen at all -- causality rides the
+	 * d_hash.next deletion mark -- so the 8 bytes go to the name instead
 	 * (DC_NAME_MAX 32 -> 40; see dcache.h).
 	 */
 #ifndef DC_IPARENT_TXN
@@ -166,20 +165,6 @@ struct dentry {
 	 */
 	struct dentry *d_fwd;			/* down toward content host; NULL at host */
 	struct dentry *d_back;			/* up toward named top;     NULL at top  */
-#ifdef DC_IPARENT_SKIP
-	/*
-	 * On a SHELL: the content host's d_iparent as it was BEFORE this shell was
-	 * stacked -- the full word, so the SHELL/NEG tags come back intact.  It is
-	 * what keeps the host's identity SEMANTICALLY invariant while its own
-	 * d_iparent carries a skip: a bucket walker that lands on the host resolves
-	 * through the top shell to this value and still matches the name the host
-	 * was answering for, which is the stale-but-valid answer the baseline gives
-	 * from the write-once field directly.  Cold on purpose: the whole point of
-	 * the arm is to spend HOT bytes on the name, and only a walker that is
-	 * already mid-transition ever reads this.  Unused on a host.
-	 */
-	struct dentry *d_origiparent;
-#endif
 
 	/* writer-side bookkeeping */
 	struct dentry *d_parent;		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
@@ -256,29 +241,7 @@ struct dentry {
  */
 #define DC_TAG_SHELL	((uintptr_t) 0x2)	/* bit 1: node is a rename shell */
 #define DC_TAG_NEG	((uintptr_t) 0x4)	/* bit 2: negative dentry */
-#ifdef DC_IPARENT_SKIP
-/*
- * bit 3: this d_iparent is a SKIP to the entry's current named top, not a
- * lineage pointer.  Set only on a content host while a fold is outstanding
- * (host != top); a settled host is its own top and carries plain lineage.  The
- * skip is DIRECT (one load to the top, never a chain walk) and HOST-ONLY (a
- * rename retargets exactly one slot, whatever the chain depth) -- see
- * rename-shell-transition.md.
- */
-#define DC_TAG_SKIP	((uintptr_t) 0x8)
-/*
- * bit 4: the entry was UNLINKED.  Unlink stacks no shell, so it retargets
- * nothing -- without an explicit mark the host's d_iparent would be unchanged
- * and a reader's up-pass could not tell the entry had gone.  The whole value is
- * the bare tag (NULL pointer), which no lineage or skip can alias: real dentries
- * are non-NULL and 64-byte aligned.
- */
-#define DC_TAG_TOMB	((uintptr_t) 0x10)
-#define DC_IPARENT_TOMBSTONE	DC_TAG_TOMB
-#define DC_TAG_MASK	((uintptr_t) 0x1f)
-#else
 #define DC_TAG_MASK	((uintptr_t) 0x7)
-#endif
 
 /*
  * Both localized arms run the SAME reader shape -- a versioned double-collect
@@ -287,27 +250,26 @@ struct dentry {
  * They differ only in WHICH word is the stamp:
  *
  *   DC_PER_NODE_GEN  host->d_seq, a dedicated counter stepped by 2.
- *   DC_IPARENT_SKIP  host->d_iparent, which names the current top and therefore
- *                    already changes on every operation that changes it.  Free
- *                    to sample in the settled case: host == top, so the stamp IS
- *                    the word the bucket match already loaded.
+ *   DC_MARK_GEN      the d_hash.next deletion mark, which every operation that
+ *                    changes the top already sets.  Free: @56 is on CL0 and the
+ *                    bucket walk already loaded it, and the descent's
+ *                    top_unhashed_rcu() is already the first collect.
  */
-#if defined(DC_PER_NODE_GEN) || defined(DC_IPARENT_SKIP) || defined(DC_MARK_GEN)
+#if defined(DC_PER_NODE_GEN) || defined(DC_MARK_GEN)
 #define DC_LOCALIZED_GEN 1
 #endif
 
 /*
  * One stamp type for all three localized arms; what it HOLDS differs:
  *   DC_PER_NODE_GEN  the host's generation counter value
- *   DC_IPARENT_SKIP  the host's identity word
  *   DC_MARK_GEN      the latched top itself (re-tested, not re-read)
  */
 typedef uintptr_t dc_stamp_t;
 
 #ifdef DC_IPARENT_TXN
 /*
- * Engine proxy tag for the TRANSACTED d_iparent slot.  Under DC_IPARENT_SKIP the
- * fold's promote publishes d_iparent inside its commit, so the slot can briefly
+ * Engine proxy tag for the TRANSACTED d_iparent slot.  The fold's promote
+ * publishes d_iparent inside its commit, so the slot can briefly
  * hold a descriptor and every read must resolve it.  Dentries are 64-byte
  * aligned (posix_memalign), so bit 0 is clear on every live value.
  *
@@ -331,30 +293,6 @@ static inline uintptr_t iparent_raw(const struct dentry *d)
 #endif
 }
 
-#ifdef DC_IPARENT_SKIP
-/*
- * Resolve @d's identity word to a MATCHABLE value.  A settled node answers with
- * its own d_iparent.  A host with a shell stacked has a skip there instead, so
- * follow it to the top shell and take the original the shell preserved -- which
- * is exactly the word this node had while it was the one answering in its
- * bucket.  That is what makes d_iparent semantically invariant even though it is
- * bitwise mutable, and it is why a stale bucket walker still matches.
- */
-static inline uintptr_t iparent_match_raw(const struct dentry *d)
-{
-	uintptr_t raw = iparent_raw(d);
-	struct dentry *top;
-
-	if (caa_likely(!(raw & (DC_TAG_SKIP | DC_TAG_TOMB))))
-		return raw;
-	if (raw & DC_TAG_TOMB)
-		return 0;		/* unlinked: matches nothing */
-	top = (struct dentry *) (raw & ~DC_TAG_MASK);
-	return (uintptr_t) rcu_dereference(top->d_origiparent);
-}
-#else
-#define iparent_match_raw(d)	iparent_raw(d)
-#endif
 
 static inline struct dentry *iparent_of(const struct dentry *d)
 {
@@ -459,8 +397,6 @@ const char *dc_engine_name(void)
 {
 #if defined(DC_MARK_GEN)
 	return "txn-mark";
-#elif defined(DC_IPARENT_SKIP)
-	return "txn-skip";
 #elif defined(DC_PER_NODE_GEN)
 	return "txn-pernode";
 #else
@@ -626,7 +562,7 @@ static struct dentry *find_top_rcu(struct dcache *dc, struct dentry *parent,
 /*
  * Same scan, but hand the matched node's RAW d_iparent back to the caller so the
  * host/shell and pos/neg tests reuse that ONE load instead of re-reading the
- * field twice more.  This matters under DC_IPARENT_SKIP, where the slot is
+ * field twice more.  This matters under DC_IPARENT_TXN, where the slot is
  * transacted and every read is a uatomic_load(CMM_ACQUIRE) the compiler may not
  * CSE -- three accessor calls became three real loads, costing ~4-5% of lookup.
  * The plain build folds it back to the same code the accessors emitted.
@@ -640,7 +576,7 @@ static struct dentry *find_top_raw_rcu(struct dcache *dc, struct dentry *parent,
 
 	for (n = urcu_txn_hlist_first_rcu(b); n; n = urcu_txn_hlist_next_rcu(n)) {
 		struct dentry *d = hnode_dentry(n);
-		uintptr_t raw = iparent_match_raw(d);
+		uintptr_t raw = iparent_raw(d);
 
 		if ((struct dentry *) (raw & ~DC_TAG_MASK) == parent &&
 		    dc_qstr_eq(&d->d_iname, name)) {
@@ -763,8 +699,6 @@ static inline dc_stamp_t dc_stamp_of(struct dentry *host, struct dentry *top,
 	 */
 	(void) host; (void) raw;
 	return (uintptr_t) top;
-#elif defined(DC_IPARENT_SKIP)
-	return (host == top) ? raw : iparent_raw(host);
 #else
 	(void) top; (void) raw;
 	return (uintptr_t) urcu_mcas_read(&host->d_seq, DC_GEN_TAG);
@@ -790,8 +724,6 @@ static inline dc_stamp_t dc_stamp_reread(struct dentry *node)
 #if defined(DC_MARK_GEN)
 	/* re-TEST, not re-read: still unmarked means still the indexed top */
 	return top_unhashed_rcu(node) ? 0 : (uintptr_t) node;
-#elif defined(DC_IPARENT_SKIP)
-	return iparent_raw(node);
 #else
 	return (uintptr_t) urcu_mcas_read(&node->d_seq, DC_GEN_TAG);
 #endif
@@ -1088,18 +1020,6 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
 		txn_bump_gen(&txn, dc, host);	/* moved/removed entry: host gen */
-#ifdef DC_IPARENT_SKIP
-		/*
-		 * Unlink stacks no shell, so nothing retargets the skip: mark the
-		 * host explicitly, in the same commit as the index removal, or a
-		 * reader's up-pass would see an unchanged d_iparent and accept a
-		 * walk through an entry that has gone.
-		 */
-		(void) urcu_txn_store(&txn, (void **) &host->d_iparent,
-				      (void *) iparent_raw(host),
-				      (void *) DC_IPARENT_TOMBSTONE,
-				      DC_IPARENT_TAG);
-#endif
 		p = urcu_txn_hlist_del_prepare(&txn, &top->d_hash);
 		if (!p)
 			p = urcu_txn_hlist_del_prepare(&txn, &top->d_sib);
@@ -1178,19 +1098,6 @@ static int stack_one_prepare(struct urcu_mcas_txn *txn, struct dcache *dc,
 	/* Demote the old top atomically with its removal (d_back: NULL -> shell). */
 	(void) urcu_txn_store(txn, (void **) &top->d_back, NULL, shell,
 			      DC_FWD_TAG);
-#ifdef DC_IPARENT_SKIP
-	/*
-	 * Retarget the host's skip to the new top, in the same commit -- ONE
-	 * store regardless of chain depth, which is why the skip is host-only.
-	 * When @host == @top (settled entry) this overwrites the host's lineage,
-	 * which is correct: the entry's identity now lives on @shell, and the
-	 * fold's TRANSFER pulls it back down from the top, never from here.
-	 */
-	(void) urcu_txn_store(txn, (void **) &host->d_iparent,
-			      (void *) iparent_raw(host),
-			      (void *) ((uintptr_t) shell | DC_TAG_SKIP),
-			      DC_IPARENT_TAG);
-#endif
 	if (cross_parent) {
 		struct dentry *cur = new_parent;
 		void *oldp;
@@ -1263,16 +1170,6 @@ static int stack_shell(struct dcache *dc,
 		host = host_of_rcu(top);	/* O(1): write-once d_host skip pointer */
 		shell->d_host = host;		/* union slot = skip pointer to the tail host */
 		shell->d_fwd = top;		/* new top forwards to the old top */
-#ifdef DC_IPARENT_SKIP
-		/*
-		 * Preserve the host's identity word for readers that are still
-		 * matching against it.  RESOLVED, not raw: if the host already
-		 * carries a skip from an earlier rename, this propagates the
-		 * ORIGINAL forward rather than storing a pointer to the shell we
-		 * are about to demote.  Pre-publish -- @shell is not yet reachable.
-		 */
-		shell->d_origiparent = (struct dentry *) iparent_match_raw(host);
-#endif
 
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
@@ -1376,22 +1273,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * write-once TOP (dc_lookup), and readdir reads the top's
 			 * d_iname + host's d_id.  So this write races no reader. */
 			struct dentry *m = fwd;
-#ifdef DC_IPARENT_SKIP
-			/* d_iparent is transacted here: the identity handover is
-			 * PUBLISHED BY THE COMMIT rather than stored in place, so
-			 * it races no reader (and the d0e7955 hazard -- a plain
-			 * write to a host reachable via the d_host skip -- does
-			 * not arise).  Expected-value validated like d_back below:
-			 * a concurrent fold that moved the slot aborts us. */
-			/* @m becomes the top, so it takes n's lineage and drops
-			 * any SKIP it carried as the host. */
-			struct dentry *fh = host_of_rcu(n);	/* O(1) */
-			uintptr_t m_old = iparent_raw(m);
-			uintptr_t m_new = (iparent_raw(n)
-					   & ~DC_TAG_SHELL & ~DC_TAG_SKIP)
-					  | (m_old & DC_TAG_SHELL);
-			uintptr_t fh_old = (m != fh) ? iparent_raw(fh) : 0;
-#elif defined(DC_HOT1CL)
+#if   defined(DC_HOT1CL)
 			/* adopt n's parent + pos/neg, keep m's OWN host/shell bit
 			 * (m may still be a middle relay of the remaining chain) */
 			m->d_iparent = (struct dentry *) (
@@ -1424,22 +1306,6 @@ static void fold(struct dcache *dc, struct dentry *n)
 			if (p)
 				goto transfer_retry;
 			/* promote m atomically with the index swap */
-#ifdef DC_IPARENT_SKIP
-			(void) urcu_txn_store(&txn, (void **) &m->d_iparent,
-					      (void *) m_old, (void *) m_new,
-					      DC_IPARENT_TAG);
-			/* If @m is NOT the tail host, the host's skip still names
-			 * @n: retarget it to the new top in the same commit.  When
-			 * @m IS the host the promote store above already replaced
-			 * the skip with lineage, so nothing more to do. */
-			if (m != fh)
-				(void) urcu_txn_store(&txn,
-						      (void **) &fh->d_iparent,
-						      (void *) fh_old,
-						      (void *) ((uintptr_t) m
-								| DC_TAG_SKIP),
-						      DC_IPARENT_TAG);
-#endif
 			(void) urcu_txn_store(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
@@ -1643,11 +1509,6 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		sa->d_fwd = topa;
 		sb->d_host = hostb;		/* union slot: B's new top -> B's tail host */
 		sb->d_fwd = topb;
-#ifdef DC_IPARENT_SKIP
-		/* same identity preservation as stack_shell, for BOTH shells */
-		sa->d_origiparent = (struct dentry *) iparent_match_raw(hosta);
-		sb->d_origiparent = (struct dentry *) iparent_match_raw(hostb);
-#endif
 
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
@@ -1711,22 +1572,6 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 		struct dentry *top = sib_dentry(n);
 		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
-#ifdef DC_IPARENT_SKIP
-		/*
-		 * Quiescent invariant for the skip arm (this walk is contractually
-		 * quiescent): a content host names its current top iff it is not
-		 * that top itself.  Checked here, before the reader is switched
-		 * over to depend on it.
-		 */
-		{
-			uintptr_t hraw = iparent_raw(host);
-
-			if (host != top)
-				assert(hraw == ((uintptr_t) top | DC_TAG_SKIP));
-			else
-				assert((hraw & DC_TAG_SKIP) == 0);
-		}
-#endif
 		if (path->ndepth >= DC_PATH_MAX)
 			continue;
 		path->comp[path->ndepth++] = top->d_iname;	/* current name */

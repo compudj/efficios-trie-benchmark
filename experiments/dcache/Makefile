@@ -32,7 +32,7 @@ HDRS     := dcache.h seqcount.h
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
-	check-pernode check-iparent check-mark repro-samedir clean check-lib
+	check-pernode check-mark repro-samedir clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -265,8 +265,6 @@ bench-check: bench
 # must clear the SAME correctness bar as the global-gen reader: the full suite,
 # the deterministic walk-causality repro (no misdirection), and concurrent
 # conservation under ASan.  Built from source with -DDC_PER_NODE_GEN.
-# DC_IPARENT_SKIP arm (experimental): walk causality on the host's d_iparent skip
-# instead of d_seq.  Same suite as check-pernode so the A/B is like-for-like.
 # Same-directory twin of `repro`: catches a walk-causality regression that every
 # other harness structurally cannot see (they only ever rename cross-parent, or
 # only move leaves).  See the file header.
@@ -275,8 +273,8 @@ repro-samedir: repro_dcache_samedir.c dcache_txn.c $(HDRS) | check-lib
 	  repro_dcache_samedir.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_samedir
 
-# DC_MARK_GEN arm: walk causality on the d_hash.next deletion mark; d_iparent
-# stays write-once, so no skip, no tombstone, no d_origiparent.
+# DC_MARK_GEN arm: walk causality on the d_hash.next deletion mark, so d_iparent
+# stays write-once and d_seq is gone (DC_NAME_MAX 40).
 check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_mark \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
@@ -290,24 +288,6 @@ check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_mark_asan \
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_mark_asan 4 4 8 16 15000
-
-check-iparent: test_dcache.c test_skip_invariant.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o test_dcache_iparent \
-	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-	./test_dcache_iparent
-	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o test_skip_invariant \
-	  test_skip_invariant.c $(LDFLAGS) $(LDLIBS)
-	./test_skip_invariant
-	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_dcache_iparent repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-	./repro_dcache_iparent
-	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_samedir_iparent repro_dcache_samedir.c dcache_txn.c \
-	  $(LDFLAGS) $(LDLIBS)
-	./repro_samedir_iparent
-	$(CC) $(ASANFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o stress_dcache_iparent_asan \
-	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_iparent_asan 4 4 8 16 15000
 
 check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o test_dcache_pernode \
