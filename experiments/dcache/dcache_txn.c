@@ -101,8 +101,14 @@ void (*dc_test_fold_hook)(void);
  * (the fold's promote must publish inside the commit); d_seq still carries the
  * version until the reader is switched over.
  */
-#ifdef DC_IPARENT_SKIP
+#if defined(DC_IPARENT_SKIP) || defined(DC_MARK_GEN)
 #define DC_HOT1CL_SPLIT 1
+/*
+ * Both no-counter arms transact d_iparent: the fold's identity handover is then
+ * PUBLISHED by its commit instead of stored in place, which is what removes the
+ * d0e7955 hazard for that field.
+ */
+#define DC_IPARENT_TXN 1
 #endif
 
 #if !defined(DC_NO_HOT1CL_SPLIT) && !defined(DC_HOT1CL) && !defined(DC_HOT1CL_SPLIT)
@@ -139,7 +145,7 @@ struct dentry {
 	 * host's d_iparent skip -- so the 8 bytes go to the name instead
 	 * (DC_NAME_MAX 32 -> 40; see dcache.h).
 	 */
-#ifndef DC_IPARENT_SKIP
+#ifndef DC_IPARENT_TXN
 	void *d_seq;				/* @48: per-node gen, on CL0 */
 #endif
 	struct urcu_txn_hlist_node d_hash;	/* straddle: next@56 CL0, pprev@64 cold */
@@ -286,17 +292,19 @@ struct dentry {
  *                    to sample in the settled case: host == top, so the stamp IS
  *                    the word the bucket match already loaded.
  */
-#if defined(DC_PER_NODE_GEN) || defined(DC_IPARENT_SKIP)
+#if defined(DC_PER_NODE_GEN) || defined(DC_IPARENT_SKIP) || defined(DC_MARK_GEN)
 #define DC_LOCALIZED_GEN 1
 #endif
 
-#ifdef DC_IPARENT_SKIP
+/*
+ * One stamp type for all three localized arms; what it HOLDS differs:
+ *   DC_PER_NODE_GEN  the host's generation counter value
+ *   DC_IPARENT_SKIP  the host's identity word
+ *   DC_MARK_GEN      the latched top itself (re-tested, not re-read)
+ */
 typedef uintptr_t dc_stamp_t;
-#else
-typedef void *dc_stamp_t;
-#endif
 
-#ifdef DC_IPARENT_SKIP
+#ifdef DC_IPARENT_TXN
 /*
  * Engine proxy tag for the TRANSACTED d_iparent slot.  Under DC_IPARENT_SKIP the
  * fold's promote publishes d_iparent inside its commit, so the slot can briefly
@@ -313,7 +321,7 @@ typedef void *dc_stamp_t;
 
 static inline uintptr_t iparent_raw(const struct dentry *d)
 {
-#ifdef DC_IPARENT_SKIP
+#ifdef DC_IPARENT_TXN
 	struct dentry *nc = (struct dentry *) (uintptr_t) d;
 
 	return (uintptr_t) urcu_mcas_read((void **) &nc->d_iparent,
@@ -449,7 +457,9 @@ static inline struct urcu_txn_hlist_head *bucket_of(struct dcache *dc,
 
 const char *dc_engine_name(void)
 {
-#if defined(DC_IPARENT_SKIP)
+#if defined(DC_MARK_GEN)
+	return "txn-mark";
+#elif defined(DC_IPARENT_SKIP)
 	return "txn-skip";
 #elif defined(DC_PER_NODE_GEN)
 	return "txn-pernode";
@@ -498,7 +508,7 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	urcu_txn_hlist_init(&d->d_child_head);
 	d->d_id = id;
 	d->d_inode = 1;
-#ifndef DC_IPARENT_SKIP
+#ifndef DC_IPARENT_TXN
 	d->d_seq = NULL;		/* per-node gen (DC_PER_NODE_GEN); even */
 #endif
 	return d;
@@ -687,7 +697,7 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
 static inline void txn_bump_gen(struct urcu_mcas_txn *txn, struct dcache *dc,
 				struct dentry *host)
 {
-#ifdef DC_IPARENT_SKIP
+#ifdef DC_IPARENT_TXN
 	/*
 	 * No counter at all: causality rides the host's d_iparent skip, which
 	 * stack_one_prepare() already retargets inside this same commit.  Unlink
@@ -744,20 +754,46 @@ static inline int top_unhashed_rcu(struct dentry *top)
 static inline dc_stamp_t dc_stamp_of(struct dentry *host, struct dentry *top,
 				     uintptr_t raw)
 {
-#ifdef DC_IPARENT_SKIP
+#if defined(DC_MARK_GEN)
+	/*
+	 * The stamp IS the latched top: the up-pass re-tests whether it is still
+	 * the indexed top for its name.  Nothing to sample -- the descent's
+	 * top_unhashed_rcu(top) already established that it was, which is the
+	 * first half of the double-collect.  Costs no load at all.
+	 */
+	(void) host; (void) raw;
+	return (uintptr_t) top;
+#elif defined(DC_IPARENT_SKIP)
 	return (host == top) ? raw : iparent_raw(host);
 #else
 	(void) top; (void) raw;
-	return urcu_mcas_read(&host->d_seq, DC_GEN_TAG);
+	return (uintptr_t) urcu_mcas_read(&host->d_seq, DC_GEN_TAG);
 #endif
 }
 
-static inline dc_stamp_t dc_stamp_reread(struct dentry *host)
+/* Which node the up-pass re-examines: the content host for the counter arms,
+ * the named top for the mark arm. */
+static inline struct dentry *dc_latch_node(struct dentry *host,
+					   struct dentry *top)
 {
-#ifdef DC_IPARENT_SKIP
-	return iparent_raw(host);
+#ifdef DC_MARK_GEN
+	(void) host;
+	return top;
 #else
-	return urcu_mcas_read(&host->d_seq, DC_GEN_TAG);
+	(void) top;
+	return host;
+#endif
+}
+
+static inline dc_stamp_t dc_stamp_reread(struct dentry *node)
+{
+#if defined(DC_MARK_GEN)
+	/* re-TEST, not re-read: still unmarked means still the indexed top */
+	return top_unhashed_rcu(node) ? 0 : (uintptr_t) node;
+#elif defined(DC_IPARENT_SKIP)
+	return iparent_raw(node);
+#else
+	return (uintptr_t) urcu_mcas_read(&node->d_seq, DC_GEN_TAG);
 #endif
 }
 #endif
@@ -768,7 +804,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 	enum dc_result res;
 	uint64_t id;
 #ifdef DC_LOCALIZED_GEN
-	struct dentry *hosts[DC_PATH_MAX];	/* latched host per hop */
+	struct dentry *hosts[DC_PATH_MAX];	/* latched node per hop */
 	dc_stamp_t     seqs[DC_PATH_MAX];	/* its version, sampled on descent */
 	uint32_t nlatched;
 #endif
@@ -866,7 +902,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 				stale = 1;
 				break;
 			}
-			hosts[nlatched] = host;
+			hosts[nlatched] = dc_latch_node(host, top);
 			seqs[nlatched] = s;
 			nlatched++;
 			cur = host;

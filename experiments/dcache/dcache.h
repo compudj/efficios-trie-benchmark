@@ -30,8 +30,9 @@
  *
  *   default / seqlock: d_iparent(8) + d_iname(40) + d_seq(8) + d_hash.next(8)
  *                      => 32, which also matches the kernel's DNAME_INLINE_LEN.
- *   DC_IPARENT_SKIP:   walk causality rides the host's d_iparent skip, so d_seq
- *                      is gone and its 8 bytes go to the name:
+ *   DC_IPARENT_SKIP /  walk causality rides the host's d_iparent skip, or the
+ *   DC_MARK_GEN:       d_hash.next deletion mark; either way d_seq is gone and
+ *                      its 8 bytes go to the name:
  *                      d_iparent(8) + d_iname(48) + d_hash.next(8) => 40.
  *
  * The larger budget is a straight density win rather than a fidelity break: the
@@ -54,7 +55,7 @@
  * independent knob -- a mechanism that needs a per-node version word costs you
  * those bytes, and that cost is properly attributed to it.
  */
-#ifdef DC_IPARENT_SKIP
+#if defined(DC_IPARENT_SKIP) || defined(DC_MARK_GEN)
 #define DC_NAME_MAX 40
 #else
 #define DC_NAME_MAX 32

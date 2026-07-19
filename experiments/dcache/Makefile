@@ -32,7 +32,7 @@ HDRS     := dcache.h seqcount.h
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
-	check-pernode check-iparent repro-samedir clean check-lib
+	check-pernode check-iparent check-mark repro-samedir clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -274,6 +274,22 @@ repro-samedir: repro_dcache_samedir.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_TEST_HOOKS $(HCPP) -o repro_dcache_samedir \
 	  repro_dcache_samedir.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_dcache_samedir
+
+# DC_MARK_GEN arm: walk causality on the d_hash.next deletion mark; d_iparent
+# stays write-once, so no skip, no tombstone, no d_origiparent.
+check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_mark \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_mark
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) \
+	  -o repro_dcache_mark repro_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_mark
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) \
+	  -o repro_samedir_mark repro_dcache_samedir.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_mark
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_mark_asan \
+	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_mark_asan 4 4 8 16 15000
 
 check-iparent: test_dcache.c test_skip_invariant.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_IPARENT_SKIP $(HCPP) -o test_dcache_iparent \
