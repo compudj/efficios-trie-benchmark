@@ -7,7 +7,10 @@ aliased into a word the reader already loads, with its *exposure* bounded by the
 grace period and **COW recompaction as the overflow valve**. Bounding the version
 that way turns out to buy more than wraparound safety: it upgrades the read from
 "obstruction-free and starvable" to **bounded-retry**, and at the one-bit extreme
-to genuinely **wait-free**.
+to genuinely **wait-free**. (The wait-free *torn-free reader property* is not itself
+new — Left-Right, DISC 2015, already has it; what is ours is the single-instance
+footprint and the drain outsourced to the grace period. See *Prior art and novelty
+boundary* below before claiming anything.)
 
 Extracted from [rcu-txn-blob](rcu-txn-blob.md), where it grew as an optional
 control layer, because it is not blob-specific: it applies to any RCU structure
@@ -242,13 +245,19 @@ has drained); otherwise recompact. Then no reader spans two flips:
 ≤ 1 retry is a constant independent of writers, so the read is **wait-free — for
 real**, not merely bounded by a large constant.
 
-**This dissolves the wait-free-vs-torn-free tension.** The classical statement is
-that a snapshot mechanism categorically costs wait-freedom, leaving COW as the
-only way to keep reads wait-free. The GP-gated single-bit latch gets **both** —
-torn-free (the latch catches the flip) and wait-free (≤ 1 retry) — with the cost
-moved entirely to the write side. So **recompaction stops being the price of
-wait-free reads and becomes the price of write throughput above one in-place
-update per GP per node.** Same knob, with the read side pinned at wait-free.
+**What this buys, stated without overclaiming.** Wait-free torn-free reads of a
+mutable structure are not new — Left-Right (Ramalhete & Correia, DISC 2015) already
+gets both, via a single-bit toggle gated on reader drain, and its reads are in fact
+*retry-free* (0 retries), a hair stronger than our ≤ 1. So the reader *property* is
+not the contribution. What is ours is the *footprint and drain*: the latch gets
+torn-free + wait-free on a **single in-place instance** — no permanent second copy —
+with the reader-drain **outsourced to the RCU grace period the system already pays**
+(zero reader-side synchronization writes, unlike Left-Right's per-reader
+arrive/depart indicator), and recompaction as a **rare overflow valve** rather than
+a standing replica or a per-update copy. Framed that way, recompaction is not the
+price of wait-free reads (it never was, for anyone holding a replica); it is the
+price of write throughput above one in-place update per GP per node — *at
+single-instance footprint*. The full prior-art boundary is below.
 
 ## Preconditions and caveats
 
@@ -261,7 +270,16 @@ update per GP per node.** Same knob, with the read side pinned at wait-free.
   cover** — either the content update is atomic at the flip (a flip-selector
   engine, where the latch simply *is* the selector, resolved through proxies), or a
   companion in-progress bit for a plain-load data path. So it is one-to-two bits,
-  still aliased into padding.
+  still aliased into padding. **In the DLM realization this is the flip-selector
+  case (a): the seqcount is a transacted slot of the SW txn, flipped atomically with
+  the content in the same selector store (the latch *is* the selector).** That
+  atomicity is load-bearing, not a placement nicety: a plain-load seqlock bracket
+  (case b) leaves a *torn window* the width of the multi-word write, and a sustained
+  write stream keeps a reader overlapping some write's torn window — the unbounded
+  retry that makes a plain seqlock not wait-free. Publishing content and seqcount in
+  one flip removes the torn window (a reader sees all-old or all-new), so a reader
+  fails only on a *flip* between its two samples; GP-gating then bounds that to ≤ 1.
+  Atomicity kills the torn window; GP-gating bounds the flip count — both are needed.
 - **Writer-side cost:** GP-epoch polling and a per-node GP-transition snapshot on
   the cold line, plus a dependency on the RCU flavor exposing a readable GP epoch
   (urcu QSBR/memb do).
@@ -348,3 +366,61 @@ capped at `2^N` per GP.
 The validating transaction is the only row that composes a snapshot across *other*
 structures; every version-based row snapshots one structure alone. That, not
 progress class, is the reason to reach for it.
+
+## Prior art and novelty boundary
+
+Two adversarial prior-art reviews (2026-07-19) place this scheme precisely. The
+verdict: it is a **novel combination, not a new primitive** — claim the combination,
+cite-and-distinguish the neighbours, and never claim the version-as-validity *idea*.
+
+The landscape is organised by two anti-correlated axes — reader **progress class**
+and **footprint**:
+
+| scheme | reader progress | footprint |
+|---|---|---|
+| **Left-Right** (Ramalhete–Correia, DISC 2015) | wait-free, **retry-free** (0 retries) | **two permanent full copies** + per-reader arrive/depart writes |
+| **ARC** (Ianni–Pellegrini–Quaglia, IEEE TPDS 2019) | wait-free reads & writes | **N+2 permanent buffers** (worse) + reader writes |
+| **plain RCU** | wait-free | **per-update whole-object copy** (always-COW) |
+| **seqlock / StampedLock / TL2** | starvable / abortable (not wait-free) | single in-place instance |
+| **LSA** | obstruction-free, abortable | multi-version store |
+| **RLU** (SOSP 2015) | torn-free snapshot, *not certified wait-free* | single steady-state instance, but **copies every modified object per write** |
+| **MV-RLU** (ASPLOS 2019) | non-blocking chain read | **master + version chain** (multi-version) |
+| **this scheme** | **wait-free, ≤ 1 retry** | **single in-place instance, COW only on overflow** |
+
+Every scheme with wait-free reads of a mutable multi-word value pays a permanent
+replica or a per-update whole-object copy; every single-instance scheme has
+starvable or obstruction-free reads. **No surveyed scheme occupies the corner this
+one does** (single-instance-steady-state + wait-free/bounded-retry + copy-only-on-
+overflow). RLU is the closest on footprint but copies per write and leans on a
+TL2/LSA global clock; MV-RLU abandons single-instance for a version chain — neither
+defeats the claim.
+
+**Safe to claim:** the *combination* — single-instance-steady-state footprint,
+wait-free/bounded-retry torn-free reads, zero reader-side synchronization writes via
+the GP-outsourced drain, and COW-only-on-overflow. **Must cite-and-distinguish:**
+Left-Right (owns the reader property, and is stronger on it — 0 retry — but pays a
+standing 2× and per-reader writes), ARC, seqlock, plain RCU, and RLU. **Must not
+claim:** the version-as-validity latch *idea* itself, which is anticipated by
+seqlock / StampedLock / TL2 / LSA / RLU.
+
+**The RCU-native question, settled.** A natural challenge is whether RCU's own
+grace-period counter flip (Classic/Tree RCU's `->completed`/`->gpnum`, SRCU's
+per-CPU flip, the `rcu_seq` cookies) already *is* a GP-gated flip serving as a
+reader-facing data version. It is not: that counter is **global / per-gp-domain, not
+per-node**, and is built of **per-CPU split counters** whose sum is expensive to
+read — the opposite of a single bit aliased into a word a node's reader already
+loads. Perfbook confirms the separation: a seqlock reader's data-version is the
+seqlock's **own** sequence number ("snapshot the value before and after each
+access"), while RCU is reached for as a **separate** mechanism ("some other
+synchronization mechanism *in addition to* sequence locks"). RCU's flip detects
+grace periods; it is not a per-node reader data-version.
+
+**Footprint, stated precisely.** "Single in-place instance" means *no permanent
+whole-structure replica* — the axis on which we beat Left-Right/ARC/RCU. The version
+itself costs ~0 (1–2 bits aliased into a word already loaded). The *per-update* data
+cost depends on the realization: the flip-selector case (a) parks transient proxies
+for the *changed slots* (∝ commit width), settled at once — a small per-update
+transient, not a standing replica and not a whole-object copy; the plain-store case
+(b) copies nothing per update. A whole-node COW happens only on the **rare version
+overflow**. So "copies only on overflow" is exact for case (b); case (a) adds the
+flip-latch's transient per-slot proxies — in neither case a permanent replica.
