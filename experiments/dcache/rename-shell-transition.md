@@ -69,12 +69,12 @@ struct dentry {
 any bucket (it left when it was demoted), so a reader scanning a bucket never
 encounters one and needs no tombstone check.
 
-That is the DEFAULT layout. Under `-DDC_IPARENT_SKIP` the hot line carries no
-`d_seq` (walk causality rides `d_iparent` instead, and `DC_NAME_MAX` rises to
-40), `d_iparent` becomes transacted and dual-meaning, and shells gain a cold
-`d_origiparent`. See § *Retiring `d_seq`* — and note that `d_iparent` being
-write-once is load-bearing for the MATCH, which is what that section has to work
-around.
+That is the DEFAULT layout. Under either no-counter arm (`-DDC_MARK_GEN`,
+`-DDC_IPARENT_SKIP`) the hot line carries no `d_seq`, `DC_NAME_MAX` rises to 40,
+and `d_iparent` becomes transacted; the skip arm additionally makes `d_iparent`
+dual-meaning and gives shells a cold `d_origiparent`. See § *Retiring `d_seq`* —
+and note `d_iparent` being write-once is load-bearing for the MATCH, which is
+what the skip arm has to work around and the mark arm avoids entirely.
 
 ## Reader rule (one line over the base RCU walk)
 
@@ -318,10 +318,11 @@ not on re-deriving the path.
 
 Note the scope of that rejection: it kills **re-deriving the path** from a slot
 whose value can revert underneath a live reader. It does *not* kill every
-counter-free form — see *Retiring `d_seq`* below, where the slot's reversion is
-GP-ordered against the reader's own read-side section, so the ABA argument does
-not apply. Note that scheme has to work to keep the *match* invariant too, which
-is a separate and easily-missed requirement; it is written up there.
+counter-free form — see *Retiring `d_seq`* below, which implements two. One
+(`DC_MARK_GEN`) versions on a MONOTONE bit, so the ABA above cannot arise at all;
+the other (`DC_IPARENT_SKIP`) versions on a mutable word and needs a GP-ordering
+argument, plus separate care to keep the *match* invariant — an easily-missed
+requirement written up there.
 
 `dcache_txn` carries the global counter as the **default** and the per-node host
 counter behind `-DDC_PER_NODE_GEN`, so the S3 sweep prices **one bracket per walk
@@ -372,12 +373,13 @@ Correctness parity for the per-node reader: **103/103** suite, the deterministic
 walk-causality repro (no misdirection), and concurrent conservation under **ASan
 and TSAN** (`make check-pernode`; TSAN on the compiler-atomic-builtins liburcu).
 
-## Retiring `d_seq`: walk causality on the host's `d_iparent` skip
+## Retiring `d_seq`: two localized arms without a counter
 
-**Implemented** behind `-DDC_IPARENT_SKIP` (2026-07-19, commits b24bc7d /
-f7706a1 / 7bd3d52); `make check-iparent`. Not the default. This revisits the
-version-less rejection above and finds a form that escapes it — its soundness
-comes from the grace period and from a preserved identity word, not a counter.
+**Both implemented** (2026-07-19): `-DDC_MARK_GEN` (`make check-mark`) and
+`-DDC_IPARENT_SKIP` (`make check-iparent`). Neither is the default. They revisit
+the version-less rejection above and escape it in different ways — one by finding
+a word that already changes, one by repurposing a word and then repairing what
+that breaks.
 
 ### The seqcount's real price is eight name characters
 
@@ -391,90 +393,121 @@ That is a real asymmetry, not just wasted bytes. **Needing no per-node version
 word was a cited advantage of the GLOBAL arm**: it brackets on `dc->rename_gen`,
 so a wider name was structurally available to it and not to per-node, and
 localized walk causality therefore cost 8 name characters. Retiring `d_seq`
-removes that trade — the localized arm now gets both. Note the name budget is a
-**consequence** of the mechanism rather than a free knob: a mechanism that needs
-a per-node version word owes those bytes, and the cost belongs to it.
+removes that trade. The name budget is a **consequence** of the mechanism rather
+than a free knob: a mechanism that needs a per-node version word owes those
+bytes, and the cost belongs to it.
 
-Under the arm CL0 is `d_iparent(8) + d_iname(48) + d_hash.next(8)` = 64, with
-`DC_NAME_MAX` 40 and `sizeof(struct dentry)` unchanged at 160.
+### Where a version can live: the hot-line audit
 
-### The mechanism: a direct skip, plus the identity it displaces
+CL0 is exactly 64 bytes with nothing spare, and that constrains the answer
+almost completely:
 
-`d_iparent` is dead on any node that is not the named top, because readers match
-the top. So the **host's** copy is free to carry a direct pointer to the current
-top instead:
+| offset | field | role | usable as a version? |
+|---|---|---|---|
+| @0 | `d_iparent` (8) | **match key**, parent half | only by breaking write-once |
+| @8 | `d_iname` (48) | **match key**, name half | no, and it is what we are growing |
+| @56 | `d_hash.next` (8) | bucket chain link | **value** no; **low bits** yes |
 
-| node | `d_iparent` holds | used for |
-|---|---|---|
-| **topmost shell** (in the index) | the real lineage: parent host address | bucket match |
-| **content host** (shells outstanding) | direct skip to the **current top** | O(1) host→top, and the version |
-| **demoted middle shells** | don't-care | — |
+The match compares `(d_iparent, d_iname)`, so both are read by every bucket
+walker and both must be invariant — see *The write-once trap* below for what
+happens when that is violated. `d_hash.next` is not a match key, but its *value*
+stays load-bearing after removal: a deleted node keeps pointing at its successor,
+which is how an in-flight walker continues down the chain. Redirect it and the
+walker leaves the bucket entirely.
 
-In the settled state the host **is** the top and the field means what it always
-meant; the skip exists only while a fold is outstanding. `d_back` stays, cold,
-carrying the adjacency the fold needs. The skip is **direct** (host→top is one
-load, not a walk) and **host-only** (a rename retargets exactly one hot slot at
-any chain depth — were every node below the top to carry it, each rename would
-re-point all of them and reintroduce the feedback loop 08c069b removed).
+What is free is its **low bits**. It holds 8-byte-aligned hlist-node pointers, so
+bits 0–2 are available; bit 0 is `URCU_TXN_HLIST_TAG` and bit 1 is
+`URCU_TXN_HLIST_MARK` — which already changes on exactly the events a version
+cares about. Hence arm A.
 
-Because the skip always names the *current* top, it changes on every operation
-that changes the top, which is exactly the walk-causality signal: settled rename
-(`P | LINEAGE` → `S | SKIP`), rename of an already-shelled entry (`s_old | SKIP`
-→ `s_new | SKIP`), and unlink (→ `TOMBSTONE`, since unlink stacks no shell and
-would otherwise retarget nothing). The reader latches `host_i->d_iparent`
-descending and re-reads it on the way up. In the settled case that costs no load
-at all: `host == top`, so the stamp IS the word the bucket match just used.
+### Arm A — `DC_MARK_GEN`: the deletion mark is the version
+
+Every operation that changes which node is the top goes through the same hlist
+del/replace path and therefore marks: rename (`stack_one_prepare` does `del
+top`), unlink (`del`), and the fold (`replace_prepare` stores `set_mark(next)` on
+the node it replaces). **The structural edit is the signal**, so nothing is added
+to the rename commit.
+
+The double-collect becomes a predicate rather than a comparison:
+
+- **descent**, per hop: match `top`, then `top_unhashed_rcu(top)` — collect #1,
+  which the reader already performed — then latch `top`;
+- **up-pass**: re-test `top_unhashed_rcu()` on every latched top.
+
+All unmarked at both ends ⇒ every hop was simultaneously the live indexed top at
+the leaf-turnaround instant: the same argument the counter arm makes.
+
+**No ABA, structurally.** The mark is **monotone** — once set it is never
+cleared, because a marked node is never re-inserted, only reclaimed after a grace
+period. So "unmarked at both samples" cannot mean "changed and changed back".
+This is the property that makes the arm cheap to reason about: the counter arms
+and arm B all need an argument for why a value cannot return; here the failure
+mode does not exist.
+
+Cost: `d_hash.next` is at @56 on CL0, already loaded by the bucket walk; collect
+#1 pre-existed; the up-pass adds one L1 re-read and a bit test per hop. The fold
+also marks, so a fold landing in a reader's window costs a **spurious re-walk** —
+conservative, self-limiting, at the rename rate.
+
+### Arm B — `DC_IPARENT_SKIP`: the host's `d_iparent` names its top
+
+`d_iparent` is dead on any node that is not the named top, so the **host's** copy
+can carry a direct pointer to the current top:
+
+| node | `d_iparent` holds |
+|---|---|
+| **topmost shell** (in the index) | the real lineage: parent host address |
+| **content host** (shells outstanding) | direct skip to the **current top** |
+| **demoted middle shells** | don't-care |
+
+Because the skip always names the current top it changes on every operation that
+changes the top, which is the version: settled rename (`P | LINEAGE` → `S |
+SKIP`), rename of an already-shelled entry (`s_old | SKIP` → `s_new | SKIP`), and
+unlink (→ `TOMBSTONE`, since unlink stacks no shell). In the settled state the
+sample costs no load at all — `host == top`, so the stamp IS the word the bucket
+match just used. The skip is **direct** (host→top is one load) and **host-only**
+(one retarget per rename at any chain depth); `d_back` stays cold for the fold.
 
 ### The write-once trap, and `d_origiparent`
 
 **This is the part that is easy to get wrong, and it cost a working build.**
 
-Overwriting the host's `d_iparent` with the skip breaks the *match*. The hlist
-inserts at the **head**; a reader that already passed the head cannot see the new
-node, walks down the chain to the previous occupant, and — because the skip
-overwrote that node's identity — finds it no longer claims the name either. It
-sees neither, and reports ABSENT. `stress_dcache_xchg` catches this as an
-atomicity violation, 3–4 runs in 5, **with a single writer**. Instrumenting the
-failure showed the wanted binding present in the bucket as the freshly stacked
-shell at position 0 — the head — with the reader having missed it.
+Overwriting the host's `d_iparent` breaks the **match**, not just the version.
+The hlist inserts at the **head**; a reader that already passed the head cannot
+see the new node, walks down to the previous occupant, and finds it no longer
+claims the name either. It sees neither, and reports ABSENT. `stress_dcache_xchg`
+catches this as an atomicity violation, 3–4 runs in 5, **with a single writer**.
+Instrumenting the failure showed the wanted binding sitting in the bucket as the
+freshly stacked shell at position 0 — the head — with the reader having missed it.
 
-The baseline survives this exact race because identity there is **write-once**:
-the old occupant still matches, and the reader gets a stale-but-valid answer
-linearized before the rename. So the match depends on `d_iparent` being
-invariant, and a mutable skip cannot simply take that word.
+The baseline survives that exact race because identity there is **write-once**:
+the old occupant still matches and the reader gets a stale-but-valid answer,
+linearized before the rename.
 
-The repair is to make it **semantically** invariant rather than bitwise. The top
-shell carries `d_origiparent`: the host's identity word from before that shell
-was stacked — the *full* word, so `DC_TAG_SHELL` / `DC_TAG_NEG` come back intact.
-A candidate whose raw carries `SKIP` resolves through the top shell to that
-value (`iparent_match_raw()`), so the host answers for the name it was answering
-for, exactly as the baseline does.
-
-Two properties make it work:
-
-- **Stored resolved.** If the host already carries a skip from an earlier
-  rename, `stack_shell` stores the *resolved* original, so a chain of renames
-  propagates the ORIGINAL forward rather than a pointer to the shell about to be
-  demoted.
-- **Cold.** The arm exists to spend hot bytes on the name; `d_origiparent` lives
-  in the cold tail, and only a walker already mid-transition ever reads it.
-  Settled nodes never take the branch, so the common path is untouched.
+The repair is to make `d_iparent` **semantically** invariant rather than bitwise.
+Only half the match tuple is displaced — `d_iname` on the host is untouched — so
+the top shell carries `d_origiparent`, the host's identity word from before that
+shell was stacked (the *full* word, so `SHELL`/`NEG` come back intact), and
+`iparent_match_raw()` resolves a `SKIP` candidate through the top shell to that
+value. The host then answers for the name it was answering for. Stored
+**resolved**, so a chain of renames propagates the original forward rather than a
+pointer to the shell about to be demoted, and kept **cold**, so the settled path
+pays nothing.
 
 **Rejected repair: restart the bucket walk.** Meeting a skipped node also proves
-the bucket changed after the reader passed the head, so restarting from the head
-picks up the new node. That works and passes, but it costs **1–3.5% across every
-panel**, and it treats the symptom: it defends a broken match key instead of
-repairing it. `d_origiparent` costs nothing on the settled path.
+the bucket changed after the reader passed the head, so restarting picks up the
+new node. It works, but cost **1–3.5% across every panel** and treats the
+symptom: it defends a broken match key instead of repairing it.
 
-### Why the grace period makes it sound
+### Why the grace period makes arm B sound
 
 The remaining objection is the one that killed the version-less double-collect
-above: stack-then-fold inside a reader's window walks the field from `P` → `S` →
-`P`, and after a **same-directory** rename the final value is byte-identical to
-the first. Both collects agree; the rename is missed. Textbook ABA.
+above: stack-then-fold inside a reader's window walks the field `P` → `S` → `P`,
+and after a **same-directory** rename the final value is byte-identical to the
+first. Textbook ABA. (Arm A is immune by monotonicity; only arm B needs this
+argument.)
 
-It cannot happen, for a structural reason. Order the events of a rename the
-reader *straddles*:
+It cannot happen. Order the events of a rename the reader *straddles*:
 
 ```
 T_enter   reader rcu_read_lock()
@@ -490,8 +523,7 @@ Straddling means `T_latch < T_ren`, and `T_enter < T_latch`, and `T_ren ≤ T_cr
 So **the reader was inside its read-side section when the fold was queued**, the
 gating GP cannot complete until it exits, and therefore `T_fold > T_up`. This
 also relies on the retry loop staying inside a *single* read-side section — it
-does (`rcu_read_lock` at `dcache_txn.c:553`, `rcu_read_unlock` at `:669`, the
-`for (;;)` between them).
+does (`rcu_read_lock` at `dcache_txn.c:553`, `rcu_read_unlock` at `:669`).
 
 **A reader entering *after* the rename committed is sound for a different
 reason**, and the two should not be conflated: it does not block that GP, so the
@@ -499,103 +531,103 @@ fold *can* run during its walk — but TRANSFER is **identity-preserving**, so t
 path stays valid and accepting is correct. That imposes a constraint the fold
 honours: never rewrite the *removed* node's `d_iparent`, only the survivor's.
 
-So the guarantee is not "the fold never runs during a walk" but the narrower and
-sufficient **"no fold can revert a value a live reader latched before the
-corresponding rename."**
+So the guarantee is the narrower and sufficient **"no fold can revert a value a
+live reader latched before the corresponding rename."**
 
-### What the fold does
+### Shared: `d_iparent` must be transacted — and that is close to free
 
-TRANSFER promotes `m` by writing `n`'s lineage into it, which clears any `SKIP`
-implicitly rather than by masking; when `m` is not the tail host it also
-retargets the host's skip. Both stores are inside the commit, so the identity
-handover is published rather than stored in place. Branch selection is the
-LINEAGE tag test rather than `back == NULL`, and the skip retarget is one store
-on a host reached in O(1), so 08c069b's property (depth costs memory, not time)
-survives on the rename and fold paths alike. Concurrent-rename validation needs
-nothing new: a rename demotes `n` out of the index, so `replace_prepare` still
-returns `-ENOENT` and the existing *re-read → SPLICE* path catches it.
-
-A fold does retarget the skip, so it costs a straddling reader a **spurious
-retry** — conservative, self-limiting, and at the same order of rate as the
-rename-induced retries already accepted (one fold per rename).
-
-### `d_iparent` must be transacted — and that is close to free
-
-It is the promote, the skip and the version, so it can no longer be a plain
-field. The layout already anticipated this: bit 0 is the MCAS proxy tag,
-`DC_TAG_SHELL` bit 1, `DC_TAG_NEG` bit 2, `DC_TAG_SKIP` bit 3, `DC_TAG_TOMB` bit
-4, all free under the `posix_memalign(64)` alignment.
+Both no-counter arms transact `d_iparent` (`DC_IPARENT_TXN`), so the fold's
+identity handover is published by its commit instead of stored in place. Bit 0 is
+the MCAS proxy tag, `DC_TAG_SHELL` bit 1, `DC_TAG_NEG` bit 2, and arm B adds
+`DC_TAG_SKIP` bit 3 / `DC_TAG_TOMB` bit 4 — all free under the
+`posix_memalign(64)` alignment.
 
 This re-opens a decision d0e7955 recorded as *"transacting `d_iparent` rejected:
 would tax every match"*. **Measured, the tax is ~1% and within noise** — with no
 txn installed, `urcu_mcas_read()` is a tag test and a predicted branch on a word
-already loaded for the compare, the same shape `top_unhashed_rcu()` already pays
-on this path.
+already loaded for the compare.
 
 What *did* cost was calling it three times per matched node (`iparent_of`,
-`node_is_shell`, `node_is_positive`): `uatomic_load(CMM_ACQUIRE)` is an atomic
-the compiler can neither CSE nor keep in a register, so three accessor calls
-became three real loads and cost 4.3% of single-thread lookup.
-`find_top_raw_rcu()` hands the matched node's raw word to `host_of_raw()` and
-`DC_IS_POSITIVE_RAW()` so one load serves all three. **That refactor helps the
-DEFAULT build too** and is worth keeping regardless of this arm.
+`node_is_shell`, `node_is_positive`): `uatomic_load(CMM_ACQUIRE)` is an atomic the
+compiler can neither CSE nor keep in a register, so three accessor calls became
+three real loads and cost 4.3% of single-thread lookup. `find_top_raw_rcu()`
+hands the matched node's raw word to `host_of_raw()` and `DC_IS_POSITIVE_RAW()`
+so one load serves all three. **That refactor helps the DEFAULT build too.**
 
-### The d0e7955 race: one instance goes, the class does not
+### Shared: the d0e7955 race — one instance goes, the class does not
 
 Transacting `d_iparent` removes **that** race — it was specifically the plain
-`d_iparent` write versus a lookup's pos/neg read, and there is no plain write
-left. But `d_iname` **remains a 40-byte plain copy** in TRANSFER. It cannot be
-transacted (blob-encoding 48 B of `qstr` at 7 payload bytes per word costs 56 B
-and bursts CL0), so it stays protected only by the comment-enforced invariant
-that *no reader reads a non-top node's `d_iname`*. One instance of the class is
-eliminated; the class survives on the harder field, and this is the second time
-that invariant has been the only thing between the fold and a data race. A
-standing hazard, not a solved problem.
+`d_iparent` write versus a lookup's pos/neg read. But `d_iname` **remains a
+40-byte plain copy** in TRANSFER. It cannot be transacted (blob-encoding 48 B of
+`qstr` at 7 payload bytes per word costs 56 B and bursts CL0), so it stays
+protected only by the comment-enforced invariant that *no reader reads a non-top
+node's `d_iname`*. One instance of the class is eliminated; the class survives on
+the harder field, and this is the second time that invariant has been the only
+thing between the fold and a data race. A standing hazard, not a solved problem.
 
 ### Results
 
-Correctness: 103/103, the white-box skip-invariant test, the walk-causality
-repro, and ASan `stress`/`xchg`/`dirs` all pass. TSAN `stress`/`xchg`/`dirs`
-report **zero races** against the compiler-atomic-builtins liburcu — the ordinary
-build reports phantom engine races and must not be used to judge this.
+Correctness, both arms: 103/103, **both** walk-causality repros (cross-directory
+and same-directory — see `repro_dcache_samedir.c`), ASan `stress`/`xchg`/`dirs`,
+and TSAN `stress`/`xchg`/`dirs` with **zero races** against the
+compiler-atomic-builtins liburcu (the ordinary build reports phantom engine races
+and must not be used to judge this). Both are mutation-checked: neutering the
+up-pass reproduces the repros, so the mechanisms are load-bearing rather than
+incidentally passing.
 
-Throughput vs the per-node arm, pinned (hwloc, one hw thread per core;
-`--ndirs 16 --depth 4 --leaves 32`), best-of-5 lookup, best-of-9 role-split:
+**Layout — the unambiguous result:**
 
-| panel | t=1 | t=32 | t=128 | t=184 |
-|---|---|---|---|---|
-| pure lookup | −1.2% | −0.4% | −2.5% | +4.2% |
-| 8 writers renaming | | | **−3.4%** | −0.2% |
+| arm | `DC_NAME_MAX` | `sizeof(dentry)` | CL0 |
+|---|---|---|---|
+| default / per-node | 32 | 160 | 64 |
+| `DC_IPARENT_SKIP` | 40 | **168** | 64 |
+| `DC_MARK_GEN` | 40 | **160** | 64 |
 
-**So this buys density, not throughput.** The honest summary is neutral-to-
-slightly-negative, and the arm's case rests on `DC_NAME_MAX` 40 and on removing
-the global-arm asymmetry, not on lookup rate.
+Arm A reaches the wider name at no struct growth; arm B pays 8 bytes for
+`d_origiparent`.
+
+**Throughput**, pinned (hwloc, one hw thread per core; `--ndirs 16 --depth 4
+--leaves 32`), best-of-5 lookup and best-of-9 role-split, Mlookups/s:
+
+| panel | per-node | skip | mark |
+|---|---|---|---|
+| lookup t=1 | 32.8 | 32.8 | 33.5 |
+| lookup t=32 | 798.7 | 815.4 | 848.0 |
+| lookup t=128 | 2050.6 | 2028.5 | 2021.6 |
+| lookup t=184 | 2443.8 | 2364.5 | 2419.3 |
+| 8 writers t=128 | 1700.9 | 1624.5 | 1693.7 |
+| 8 writers t=184 | 2126.1 | 2088.5 | 2055.9 |
+
+**These buy density, not throughput.** Every arm sits within a couple of percent
+of the others. At t=128 under rename load the mark closes the skip's deficit
+(−0.4% vs −4.5%), which is consistent with that deficit being the skip's
+`d_iparent` store in the rename commit — but t=184 reverses, so it is **not
+established**. Attribution would need many more samples or `perf` on the commit
+path. Recorded as an observation.
+
+### Which arm
+
+On present evidence **arm A dominates arm B**: same name budget at 8 fewer bytes
+per dentry, no ABA to argue about, and none of the write-once repair machinery
+(`d_origiparent`, `iparent_match_raw`, the tombstone). Arm B's only unique asset
+is O(1) host→top navigation, which nothing in the reader uses — it treats the
+stamp as opaque and follows the skip only inside `iparent_match_raw()`.
+
+Arm B is retained for now as a documented negative result: putting the version in
+the match key is the obvious move, and *how* it fails is worth keeping.
 
 ### Open
 
-- **The −3.4% at t=128 under rename load is unexplained.** It is consistent over
-  nine runs rather than noise, and it does not appear at 184. Understand it
-  before treating the arm as free.
-- **`d_iname` stays plain** — the standing hazard above. Any new reader that
-  touches a non-top node's name reintroduces the race class.
-- **Not covered by any test:** the fold's `m != host` skip retarget. Deleting it
-  fails nothing, because `fold()` is `call_rcu`-queued in creation order, so a
-  lower relay splices itself out before the upper shell transfers and `m == host`
-  in FIFO order. It is still required for correctness under concurrency.
-
-### Rejected alternative: the deletion mark as the version
-
-The mark on `d_hash.next` (@56, the top's own line) is also a complete version:
-demote, unlink and fold all go through the same hlist del/replace path, and
-`top_unhashed_rcu()` already reads it. It never touches the match key, so it
-needs neither `d_origiparent` nor a tombstone — a genuinely smaller mechanism.
-
-It is not adopted because the skip is wanted anyway for O(1) host→top, and one
-field carrying both keeps the up-pass to a single predicate. **Reconsider it if
-the −3.4% turns out to be the skip's doing**, since the mark would remove the
-`d_iparent` write from the rename commit entirely. Note the skip's navigation
-benefit is currently unrealized: the reader treats the stamp as opaque and
-follows it only in `iparent_match_raw()`.
+- **Perf attribution is unresolved** (t=128 vs t=184 above). Not worth chasing
+  unless an arm ships: the layout difference is the durable result.
+- **`d_iname` stays plain** — the standing hazard above.
+- **Not covered by any test:** the fold's `m != host` skip retarget (arm B).
+  Deleting it fails nothing, because `fold()` is `call_rcu`-queued in creation
+  order, so a lower relay splices itself out before the upper shell transfers and
+  `m == host` in FIFO order. Still required for correctness under concurrency.
+- **`DC_NAME_MAX` now differs by arm**, so the published S3/S4 figures — measured
+  at 32 throughout — are no longer apples-to-apples against these. Any writeup
+  that mixes arms needs a resweep.
 
 ## Directory listing (readdir) and the child index
 
