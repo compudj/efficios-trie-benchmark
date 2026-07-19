@@ -309,6 +309,12 @@ renames (parent unchanged, only the name moves). So `d_parent` stays strictly th
 writer-side loop-check field; the reader's soundness rests on the `d_seq` versions,
 not on re-deriving the path.
 
+Note the scope of that rejection: it kills **re-deriving the path** from a slot
+whose value can revert underneath a live reader. It does *not* kill every
+counter-free form — see *Proposal: retire `d_seq`, version on the host's
+`d_iparent` skip* below, where the slot's reversion is GP-ordered against the
+reader's own read-side section and the ABA argument therefore does not apply.
+
 `dcache_txn` carries the global counter as the **default** and the per-node host
 counter behind `-DDC_PER_NODE_GEN`, so the S3 sweep prices **one bracket per walk
 (global, retries on any rename anywhere)** against **one versioned double-collect
@@ -357,6 +363,243 @@ role of `rename_lock` dissolves *only* under the per-node arm.
 Correctness parity for the per-node reader: **103/103** suite, the deterministic
 walk-causality repro (no misdirection), and concurrent conservation under **ASan
 and TSAN** (`make check-pernode`; TSAN on the compiler-atomic-builtins liburcu).
+
+## Proposal: retire `d_seq`, version on the host's `d_iparent` skip (DESIGN ONLY)
+
+**Not implemented, not measured** (2026-07-19). This revisits the version-less
+rejection above and finds a form that escapes it — one whose soundness comes from
+the grace period rather than from a counter.
+
+### The seqcount's real price is eight name characters
+
+`d_seq` is 8 bytes at @48 of CL0, and those bytes came straight out of the name:
+`DC_NAME_MAX` went 40→32 in 53cda51 specifically to seat it on the hot line. In
+the **default** (global) build the field is not even read — the comment at
+`dcache_txn.c:120` says so outright, *"In the global build d_seq is unused but
+kept here for a uniform offset"* — yet the name still pays for it. So the question
+is whether walk causality can ride a field the reader **already has**.
+
+### The mechanism: `d_iparent` as a direct skip to the top
+
+`d_iparent` is dead on any node that is not the named top, because readers match
+the top. So the **host's** copy is free to carry a direct pointer to the current
+top instead:
+
+| node | `d_iparent` holds | used for |
+|---|---|---|
+| **topmost shell** (in the index) | the real lineage: parent host address | bucket match, unchanged |
+| **content host** (shells outstanding) | direct skip to the **current top** | O(1) host→top, and the version |
+| **demoted middle shells** | don't-care | — |
+
+In the settled state the host **is** the top and the field simply means what it
+always meant; the skip exists only while a fold is outstanding. `d_back` stays,
+moved to the **cold** line, carrying the adjacency the fold needs to splice a
+middle relay. That is the deliberate trade: CL0 bytes cost name characters, cold
+fields cost almost nothing.
+
+**The skip is direct, and only the host carries it.** That combination is what
+keeps both directions O(1):
+
+- *Direct* — host→top is one load, not a walk. An adjacency chain
+  (host → s1 → s2 → top) would make it O(depth).
+- *Host-only* — a rename retargets exactly **one** hot slot, regardless of chain
+  depth. Were every node below the top to carry the skip, each rename would have
+  to re-point all of them, inflating commit width with depth and reintroducing the
+  feedback loop 08c069b removed (fold behind → chain long → commit wide → more
+  aborts → fold further behind). `stack_shell` already holds the host from
+  `host_of_rcu(top)` (`dcache_txn.c:974`), so the store costs nothing to reach.
+
+### Why that same field is already the version
+
+Because the skip always names the *current* top, **it changes on every operation
+that changes the top** — which is exactly the walk-causality signal:
+
+- settled entry renamed: `P | LINEAGE` → `S | SKIP`;
+- already-shelled entry renamed: `s_old | SKIP` → `s_new | SKIP`;
+- unlink: → `TOMBSTONE` (one extra store in a commit unlink already makes; it
+  stacks no shell, so without this it would be the one uncovered case).
+
+So the reader latches `host_i->d_iparent` on the way down and re-reads it on the
+way up, retrying on any change. No counter, and no second mechanism.
+
+Cost, stated honestly: in the **settled** case host == top, so the field is
+already loaded for the match and the latch is free. While a fold is outstanding
+host ≠ top, and reading `host->d_iparent` touches the host's CL0, which the reader
+would not otherwise read — `host_of_rcu()` yields only the address. That is a
+transient state by construction.
+
+### Why the grace period makes it sound
+
+The objection is the one that killed the version-less double-collect above:
+stack-then-fold inside a reader's window walks the field from `P` → `S` → `P`, and
+after a **same-directory** rename the final value is byte-identical to the first.
+Both collects agree; the rename is missed. Textbook ABA.
+
+It cannot happen, for a structural reason. Order the events of a rename the reader
+*straddles*:
+
+```
+T_enter   reader rcu_read_lock()
+T_latch   latches (host_i, V0 = host_i->d_iparent)   ─┐
+T_ren     rename commits, retargets the skip          │  reader live
+T_crcu    fold queued via call_rcu                    │  <- R live HERE
+T_gp      gating grace period completes               │  <- blocked by R
+T_fold    TRANSFER would revert the skip              │
+T_up      reader re-reads and compares               ─┘
+```
+
+Straddling means `T_latch < T_ren`, and `T_enter < T_latch`, and `T_ren ≤ T_crcu`.
+So **the reader was inside its read-side section when the fold was queued**, the
+gating GP cannot complete until it exits, and therefore `T_fold > T_up`. The
+revert cannot land before the up-pass. This also relies on the retry loop staying
+inside a *single* read-side section — it does (`rcu_read_lock` at
+`dcache_txn.c:553`, `rcu_read_unlock` at `:669`, the `for (;;)` between them), so a
+retrying reader keeps blocking the GP across attempts.
+
+**The complementary case — a reader entering *after* the rename committed — is
+sound for a different reason, and the two should not be conflated.** Such a reader
+does not block that GP, so the fold *can* run during its walk. It is nonetheless
+correct, because TRANSFER is **identity-preserving**: it collapses representation
+without moving the entry, so the reader's path stays valid and accepting is right.
+This is the same transparency that lets today's fold skip the generation bump.
+
+So the guarantee is not "the fold never runs during a walk" — it is the narrower
+and sufficient **"no fold can revert a value a live reader latched before the
+corresponding rename."** The skip is one-way for the lifetime of any reader that
+cares, which is what a version supplies, obtained from the grace period the system
+already pays for.
+
+This is why it escapes the version-less rejection above without contradicting it.
+That rejection is about **re-deriving the path** from `d_parent`, whose value can
+revert underneath a live reader because nothing ties its mutation to a grace
+period. Here the reader re-reads one slot whose reversion is GP-ordered against
+its own read-side section. Different mechanism, so the ABA argument does not
+carry over.
+
+### What the fold becomes (sketch)
+
+```
+n = topmost, in the index      d_iparent = P | LINEAGE   (+ SHELL/NEG tags)
+  | d_fwd            ^ d_back (cold)
+m = next down                  d_iparent = don't-care
+  | d_fwd  ...       ^ d_back (cold)
+host                           d_iparent = n | SKIP,  d_fwd = NULL
+```
+
+TRANSFER (`n` is the top, `m = n->d_fwd`):
+
+```c
+/* pre-publish: m is not the top, so no reader matches on it */
+m->d_iname = n->d_iname;                      /* still a plain 40-byte copy */
+
+urcu_txn_begin(&txn);
+  urcu_txn_hlist_replace_prepare(&txn, &n->d_hash, &m->d_hash);
+  urcu_txn_hlist_replace_prepare(&txn, &n->d_sib,  &m->d_sib);
+  /* promote m: give it the lineage n was holding */
+  urcu_txn_store(&txn, &m->d_iparent, /* expected */ m_old,
+                 (n->d_iparent & ~DC_TAG_SHELL & ~SKIP)
+                 | (m->d_iparent & DC_TAG_SHELL) | LINEAGE);
+  urcu_txn_store(&txn, &m->d_back, n, NULL);           /* cold adjacency */
+  if (m != host)                                       /* retarget the skip */
+    urcu_txn_store(&txn, &host->d_iparent, n | SKIP, m | SKIP);
+urcu_txn_commit(&txn);
+```
+
+When `m == host` the chain collapses to the settled state and the promote store
+*is* the skip removal — the field goes straight from `SKIP` back to `LINEAGE`, no
+separate fix-up.
+
+Three things fall out:
+
+- **The promote and the identity copy merge into one store.** Today they are
+  separate — a plain `m->d_iparent = ...` copy plus a transacted
+  `m->d_back := NULL`. Here, writing the lineage value *is* the promotion, because
+  the tag flips.
+- **Everything stays O(1) in depth.** Branch selection is the LINEAGE tag test
+  rather than `back == NULL`; the skip retarget is one store on a host reached in
+  O(1). So 08c069b's property (depth costs memory, not time) survives on both the
+  rename and fold paths. SPLICE keeps its cold `d_back` rewiring unchanged.
+- **Concurrent-rename validation needs nothing new.** A rename demotes `n` by
+  removing it from the index, so `replace_prepare` still returns `-ENOENT` and the
+  existing *re-read → SPLICE* path (`dcache_txn.c:1099`) catches it.
+
+A fold does retarget the skip, so it costs a straddling reader a **spurious
+retry**. That is conservative and self-limiting — the re-walk finds the settled
+host — and occurs at the same order of rate as the rename-induced retries already
+accepted (one fold per rename). Measure before engineering it away.
+
+### `d_iparent` must be transacted — and that is close to free
+
+It is now the promote, the skip and the version, so it can no longer be a plain
+field. The layout already anticipates this: bit 0 is reserved for the MCAS proxy
+tag, `DC_TAG_SHELL` is bit 1, `DC_TAG_NEG` bit 2, and bits 3–5 are free under the
+`posix_memalign(64)` alignment for `SKIP` / `TOMBSTONE`.
+
+This re-opens a decision d0e7955 recorded as *"transacting `d_iparent` rejected:
+would tax every match"*, since every bucket candidate would go through
+`urcu_mcas_read()` rather than a plain load. **That tax is ~0 in the typical
+state.** With no txn installed on the slot — the overwhelming common case — the
+resolve is a **tag check and a perfectly-predicted branch** on a value already in
+a register, loaded for the match anyway. `DC_IPARENT()` already masks tag bits, so
+the delta is one test plus one branch, no new load and no new memory traffic.
+
+The strongest evidence is that the read path *already does exactly this*:
+`top_unhashed_rcu()` resolves `d_hash.next` the same way, on the same hot path,
+and is inside the measured 2201 Mops/s. The shape is priced, not speculative.
+Second-order, not blockers: when a txn *is* installed the resolve chases a
+descriptor to another line, a rare-path cost proportional to rename rate; and the
+cost is per bucket *candidate*, so it scales with collision-chain length, which
+with the table sized to the workload is typically one.
+
+So d0e7955's rejection should not be inherited. It was the right minimal fix for a
+bug, but its stated cost argument does not survive contact with what the resolve
+compiles to.
+
+### The d0e7955 race: one instance goes, the class does not
+
+Transacting `d_iparent` removes **that** race — it was specifically the plain
+`d_iparent` write versus a lookup's pos/neg read, and there is no plain write left.
+
+But `d_iname` **remains a 40-byte plain copy**. It cannot be transacted (that is
+the blob-encoding problem: 40 B at 7 payload bytes per word costs 48 B and bursts
+CL0), so it stays protected only by the comment-enforced invariant that *no reader
+reads a non-top node's `d_iname`*. One instance of the race class is eliminated and
+the class survives, on the field that is harder to protect — and this is now the
+second time that invariant has been the only thing between the fold and a data
+race. Treat it as a standing hazard, not a solved problem.
+
+### Rejected alternative: the deletion mark as the version
+
+The mark on `d_hash.next` (@56, the top's own line) is also a complete version:
+demote, unlink and fold all go through the same hlist del/replace path, so all
+three mark, and `top_unhashed_rcu()` already reads it. It is marginally *cheaper*
+than the skip in the shelled state, being on a line the bucket walk already
+touched.
+
+It is not adopted because it would be a **second** mechanism alongside the skip,
+which the design needs anyway for O(1) host→top. One field carrying both, with
+unlink writing a tombstone, keeps the up-pass to a single predicate. Reconsider
+only if the shelled-state line touch measures worse than expected.
+
+### What it buys
+
+- **`d_seq` goes** — 8 bytes off CL0, so `DC_NAME_MAX` returns to 40, above the
+  kernel's `DNAME_INLINE_LEN` again. This is the whole prize; everything else is
+  bookkeeping around it.
+- **`d_iparent` gains an O(1) host→top skip**, in a field the reader already has.
+- **`d_back` does *not* go** — it moves cold and keeps the fold's adjacency.
+- **Against that:** `d_iparent` becomes a resolved read on every bucket match —
+  expected to be a tag check and a predicted branch. Worth confirming in passing,
+  not a gate.
+
+### Open questions (settle these before coding)
+
+1. **Tag layout.** `SKIP` and `TOMBSTONE` want bits 3–5, and `DC_TAG_SHELL` /
+   `DC_TAG_NEG` need re-deriving per position — what do they mean on a host whose
+   `d_iparent` is a skip rather than a lineage?
+2. **`d_iname` stays plain.** Standing hazard, not a solved problem — see above.
+   Any new reader touching a non-top node's name reintroduces the race class.
+3. **Confirm the match tax** alongside the first benchmark rather than gating on it.
 
 ## Directory listing (readdir) and the child index
 
