@@ -51,14 +51,20 @@ CSV = os.path.join(HERE, "dcache_sweep.csv")
 OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures", "dcache_readdir.png"))
 
-COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2", "txn-pernode": "#009E73"}
-MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^"}
+COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
+MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
 LABEL = {
     "seqlock": "seqlock — per-directory rwsem\n(kernel inode-rwsem analogue)",
     "txn-global": "urcu-txn — GLOBAL rename_gen\n(lock-free RCU child-walk)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(lock-free RCU child-walk)",
+    "txn-mark": "urcu-txn — deletion MARK as gen\n(lock-free RCU child-walk)",
 }
-ENGINES = ("seqlock", "txn-pernode")
+# The readdir reader path reads NO generation in any txn arm, so the localized
+# arms are expected to coincide here; the mark arm is plotted to show that, and
+# to make its small trailing visible rather than hidden in the CSV.
+ENGINES = tuple(os.environ.get(
+    "ENGINES", "seqlock txn-pernode txn-mark").split())
 rows = list(csv.DictReader(open(CSV)))
 
 

@@ -601,6 +601,23 @@ The mark reaches the wider name at no struct growth; the skip needed 8 bytes for
 | 8 writers t=128 | 1700.9 | 1624.5 | 1693.7 |
 | 8 writers t=184 | 2126.1 | 2088.5 | 2055.9 |
 
+**How much to trust these numbers.** The sweep reports **best-of-5**, which is a
+biased-high estimator with no variance information -- right for "how fast can
+this go", wrong for "are these two the same". Measured directly by repeating the
+two reader panels as three INDEPENDENT sweeps:
+
+| | sweep 1 | sweep 2 | sweep 3 |
+|---|---|---|---|
+| `split_w` (n=8) | 0.996x | 1.025x | 1.028x |
+| `split_scale` (n=11) | 1.012x | 0.985x | 0.989x |
+| **combined (n=19)** | **1.005x** | **1.002x** | **1.005x** |
+
+A *single* config re-measured across those sweeps moves by a median of **4.1%**
+and up to **9.5%**. Per-panel aggregates still wander **±3%**. Only the combined
+aggregate is stable, at **1.004 ± 0.002**. So: quote the combined figure, treat
+any single point as noise, and do not read a per-panel aggregate as a result --
+including the `frac` outlier above.
+
 **These buy density, not throughput.** Every arm sits within a couple of percent
 of the others. At t=128 under rename load the mark closes the skip's deficit
 (−0.4% vs −4.5%), which is consistent with that deficit being the skip's
