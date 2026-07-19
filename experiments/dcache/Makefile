@@ -175,7 +175,8 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 # PER-NODE host generation (-DDC_PER_NODE_GEN -- a rename only invalidates walks
 # that pass through the moved entry).  scripts/run_dcache.sh drives all three;
 # plot_dcache.py charts them.
-bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode
+bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
+       bench_dcache_txn_mark
 
 # The seqlock baseline builds the DEFAULT layout too: the fair 1-CL split hot
 # line (d_parent tags + d_seq on CL0, d_id cold) returning the dentry ADDRESS as
@@ -204,6 +205,15 @@ bench_dcache_txn_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 
 bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# Localized walk causality with NO counter: the hlist deletion mark is the
+# version, so d_seq is gone and DC_NAME_MAX rises 32 -> 40.  Layout is otherwise
+# identical (d_hash still at @56, sizeof(dentry) still 160), and dc_qstr_eq
+# short-circuits on hash/len, so the wider name array is a capability win rather
+# than a confound for this benchmark's short names.
+bench_dcache_txn_mark: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 # Per-node A/B partners: legacy 3-CL baseline, and the split layout that keeps

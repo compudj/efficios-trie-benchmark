@@ -5,6 +5,9 @@
 #   seqlock       -- faithful kernel-style rename_lock + per-dentry d_seq
 #   txn-global    -- urcu-txn port, GLOBAL rename_gen walk bracket
 #   txn-pernode   -- urcu-txn port, PER-NODE host generation (localized)
+#   txn-mark      -- urcu-txn port, localized with NO counter: the hlist deletion
+#                    mark is the version, so d_seq is retired and DC_NAME_MAX
+#                    rises 32 -> 40 at unchanged sizeof(dentry)
 #
 # Two headline views + a scaling view, every run gated on namespace conservation
 # (a CONSERVATION FAILED run is flagged and its numbers dropped):
@@ -53,8 +56,9 @@ COMMON="--ndirs $NDIRS --depth $DEPTH --leaves $LEAVES --duration $DUR $PIN"
 
 declare -A BINOF=( [seqlock]=bench_dcache_seqlock \
                    [txn-global]=bench_dcache_txn \
-                   [txn-pernode]=bench_dcache_txn_pernode )
-ENGINES="seqlock txn-global txn-pernode"
+                   [txn-pernode]=bench_dcache_txn_pernode \
+                   [txn-mark]=bench_dcache_txn_mark )
+ENGINES="seqlock txn-global txn-pernode txn-mark"
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
 
