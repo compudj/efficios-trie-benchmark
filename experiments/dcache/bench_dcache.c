@@ -542,10 +542,17 @@ static void build_tree(void)
 			exit(2);
 		}
 	}
-	/* Seed every leaf into its owner's starting dir. */
+	/* Seed every leaf.  -DDC_BENCH_FILE_LEAVES makes the leaves FILES, so a
+	 * leaf rename/move is a FILE operation and the txn engine skips its
+	 * walk-causality bump (the global-arm rescue); the default (directories)
+	 * makes it a directory operation that bumps. */
 	for (i = 0; i < g_nnames; i++) {
 		mk_leaf_path(&p, i % ndirs, i);
+#ifdef DC_BENCH_FILE_LEAVES
+		if (dc_add_file(g_dc, &p, (uint64_t) i)) {
+#else
 		if (dc_add(g_dc, &p, (uint64_t) i)) {
+#endif
 			fprintf(stderr, "seed leaf %d failed\n", i);
 			exit(2);
 		}
