@@ -7,8 +7,10 @@ one churns it with dc_add / dc_unlink.
 
 Four arms:
   seqlock      faithful kernel-style rename_lock + per-dentry d_seq
-  txn-global   urcu-txn, GLOBAL rename_gen -- bumped by every unlink, and
-               bracketed by every reader, so it is the arm expected to collapse
+  txn-global   urcu-txn, GLOBAL rename_gen.  Churn is bump-free on the
+               corrected engine (unlink owes no bump), so global does NOT
+               collapse here -- it tracks the localized arms; its collapse
+               is a DIRECTORY-operation effect (see dcache_optype.png)
   txn-pernode  urcu-txn, PER-NODE host generation
   txn-mark     urcu-txn, no counter at all: the hlist deletion mark IS the
                version, so unlink bumps nothing
@@ -58,14 +60,14 @@ COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
 MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
 LABEL = {
     "seqlock": "seqlock — rename_lock + d_seq\n(faithful kernel baseline)",
-    "txn-global": "urcu-txn — GLOBAL rename_gen\n(every unlink bumps it)",
-    "txn-pernode": "urcu-txn — PER-NODE host gen\n(bump is the removed entry's own)",
-    "txn-mark": "urcu-txn — deletion MARK as gen\n(unlink bumps nothing)",
+    "txn-global": "urcu-txn — GLOBAL rename_gen\n(whole-tree bump per dir rename)",
+    "txn-pernode": "urcu-txn — PER-NODE host gen\n(localized bump per dir rename)",
+    "txn-mark": "urcu-txn — deletion MARK as gen\n(no counter; the del is the signal)",
 }
 # The global arm is KEPT here, unlike dcache_s3.png where it is dropped for
 # readability: on this workload it is the whole point.  Every unlink bumps one
-# whole-tree counter that every reader brackets on, and the collapse that
-# produces is the figure's main result.
+# whole-tree counter -- but on churn (bump-free) it never moves, so global
+# does not collapse here.  Kept plotted for the arm comparison.
 ENGINES = tuple(os.environ.get(
     "ENGINES", "seqlock txn-global txn-pernode txn-mark").split())
 ANNOT = os.environ.get("ANNOT", "txn-mark")
@@ -108,9 +110,10 @@ if ax1.has_data():
     plain_y(ax1)
     lo, hi = ax1.get_ylim(); ax1.set_ylim(lo, hi * 1.35)
 ax1.set_title("Writers only — insert/remove Mops/s vs writer count\n"
-              "the pure MUTATOR path (each writer toggles its own disjoint\n"
-              "slots, so any contention here is shared state, not the workload)\n"
-              "(× = mark ÷ seqlock)", fontsize=9.5)
+              "the pure MUTATOR path.  Bump-free churn, decontended ndirs +\n"
+              "jemalloc: the three txn arms converge and scale; seqlock is\n"
+              "serialized by its mutator lock (× = mark ÷ seqlock)",
+              fontsize=9.5)
 ax1.set_xlabel("churn writer threads")
 ax1.set_ylabel("insert+remove Mops/s   (higher is better)")
 ax1.grid(alpha=0.3, ls=":")
@@ -138,10 +141,10 @@ if ax2.has_data():
     plain_y(ax2)
     lo, hi = ax2.get_ylim(); ax2.set_ylim(lo, hi * 1.35)
 ax2.set_title("32 dedicated readers + W churn writers — reader Mops/s vs W\n"
-              "ISOLATES the read path under create/delete load: a SHARED\n"
-              "version counter is bumped by every unlink and bracketed by\n"
-              "every reader -- the GLOBAL line collapses (× = mark ÷ seqlock,\n"
-              "the baseline throughout)", fontsize=9.5)
+              "the read path under create/delete load.  Churn is BUMP-FREE\n"
+              "(add never bumped; unlink no longer does), so no reader retries\n"
+              "on churn: the three txn arms track together, seqlock trails\n"
+              "(× = mark ÷ seqlock)", fontsize=9.5)
 ax2.set_xlabel("churn writer threads")
 ax2.set_ylabel("reader lookup Mops/s   (higher is better)")
 ax2.grid(alpha=0.3, ls=":")
@@ -159,8 +162,9 @@ if ax3.has_data():
     plain_thread_x(ax3, [2, 4, 8, 16, 32, 64, 128, 184])
     plain_y(ax3)
 ax3.set_title("Reader scaling under constant churn — 8 writers fixed\n"
-              "reader Mops/s vs reader count, one hw thread per core\n"
-              "(the localized arms scale; the global counter does not)",
+              "reader Mops/s vs reader count, one hw thread per core.  Churn\n"
+              "bump-free, so all three txn arms scale together (global edges\n"
+              "them: no per-hop second pass); only seqlock lags",
               fontsize=9.5)
 ax3.set_xlabel("dedicated reader threads")
 ax3.set_ylabel("reader lookup Mops/s   (higher is better)")

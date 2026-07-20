@@ -35,8 +35,8 @@ REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
 CSV=$REPO/scripts/dcache_churn.csv
 
-NDIRS=16
 SLOTS=32
+JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 DUR=${DUR:-1000}
 RUNS=${RUNS:-5}
 
@@ -51,7 +51,11 @@ else
   echo ">> hwloc-calc unavailable; unpinned" >&2
 fi
 
-COMMON="--ndirs $NDIRS --slots $SLOTS --duration $DUR $PIN"
+# ndirs is decontended per-run (16 x writers); jemalloc removes the
+# allocator ceiling.  This is the corrected methodology (see
+# run_dcache_churn_scaling.sh / dcache_optype.png for why).
+COMMON="--slots $SLOTS --nbuckets 1048576 --duration $DUR $PIN"
+[[ -f "$JE" ]] || { echo "jemalloc not at $JE"; exit 1; }
 
 declare -A BINOF=( [seqlock]=bench_dcache_churn_seqlock \
                    [txn-global]=bench_dcache_churn_txn \
@@ -87,8 +91,9 @@ run() {
   local bin=$BIN/${BINOF[$eng]} r out cons=OK
   local best_ch=0 best_lk=0
   for r in $(seq 1 $RUNS); do
-    out=$(cd "$BIN" && ./"$(basename "$bin")" --readers "$rd" --writers "$w" \
-          $COMMON 2>/dev/null)
+    local nd=$(( 16 * (w < 1 ? 1 : w) ))
+    out=$(cd "$BIN" && env LD_PRELOAD="$JE" ./"$(basename "$bin")" \
+          --readers "$rd" --writers "$w" --ndirs "$nd" $COMMON 2>/dev/null)
     if ! grep -q "conservation: OK" <<< "$out"; then
       cons=FAIL
       echo "!! $panel/$eng rd=$rd w=$w CHURN INVARIANT FAILED" >&2
