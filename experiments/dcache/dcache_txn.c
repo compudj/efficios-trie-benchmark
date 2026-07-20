@@ -635,10 +635,12 @@ static inline void txn_bump_gen(struct urcu_mcas_txn *txn, struct dcache *dc,
 {
 #ifdef DC_IPARENT_TXN
 	/*
-	 * No counter at all: causality rides the host's d_iparent skip, which
-	 * stack_one_prepare() already retargets inside this same commit.  Unlink
-	 * stacks no shell and so has no retarget to piggyback on -- it stores the
-	 * tombstone explicitly (see dc_unlink).
+	 * No counter at all: causality rides the hlist deletion MARK, which a
+	 * rename's demote sets on the outgoing top in this same commit and the
+	 * localized reader observes via top_unhashed_rcu.  So a rename needs no
+	 * separate bump here -- the structural edit is the signal -- and this is
+	 * a no-op.  (Unlink already does not call this; its del sets the same
+	 * mark, which is why unlink needs nothing either.)
 	 */
 	(void) txn; (void) dc; (void) host;
 #else
@@ -1019,7 +1021,23 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
-		txn_bump_gen(&txn, dc, host);	/* moved/removed entry: host gen */
+		/*
+		 * NO walk-causality bump on unlink -- and this is exact, not an
+		 * optimization that trades a corner.  The bump exists so a reader
+		 * that straddled a relocation cannot report a path that never
+		 * existed; the axis is REMOVE vs RELOCATE, not leaf vs directory.
+		 * A rename RELOCATES a live, address-stable host that can gain a
+		 * child at its new name, so a reader holding it mid-walk sees a
+		 * phantom -- rename bumps (stack_shell).  Unlink REMOVES the host,
+		 * and requires it be EMPTY (children_empty above), so the removed
+		 * node is always a TERMINAL, never an interior waypoint: a reader
+		 * can only straddle it at the leaf, where present (stale, before)
+		 * and absent (after) are both valid linearizations, and a re-add
+		 * is a DIFFERENT host the reader never latched.  No phantom is
+		 * constructible, so no bump is owed.  (The del below still MARKS
+		 * the node, which the localized reader's top_unhashed_rcu observes
+		 * -- that detection is independent of the gen and remains.)
+		 */
 		p = urcu_txn_hlist_del_prepare(&txn, &top->d_hash);
 		if (!p)
 			p = urcu_txn_hlist_del_prepare(&txn, &top->d_sib);

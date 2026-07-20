@@ -221,6 +221,44 @@ naming `X_B`, but the reader still holds `X_B`) nor even the insert to be a
 demonstration. This is exactly why the kernel bumps `rename_lock` on **every**
 `d_move`.
 
+### The axis is REMOVE vs RELOCATE — so unlink needs no bump
+
+The bump is owed by an operation that can construct the anomaly above, and the
+line is **not** leaf-vs-directory — it is **remove vs relocate**:
+
+- **All four rename/move operations RELOCATE** a live, address-stable host (the
+  taxonomy: *rename*, *file move*, *directory rename*, *directory move*). The
+  host survives the operation and can gain a child at its new name afterward, so
+  a reader that latched it mid-walk reports a path that never existed. Every one
+  of them bumps — even a same-directory *rename* of a *leaf*, because the leaf can
+  become a parent at its new name (step 3 above works whether `X_B` had children
+  or not). `stack_shell` and the exchange bump unconditionally.
+
+- **Unlink REMOVES the host**, and requires it be **empty** (`children_empty`).
+  So the removed node is always a **terminal**, never an interior waypoint: a
+  reader can only straddle an unlink at the leaf it is looking up, where *present*
+  (stale, linearizes before) and *absent* (linearizes after) are both valid, and
+  a re-add is a **different** host the reader never latched. **No phantom is
+  constructible**, so `dc_unlink` bumps nothing. This is exact, not a corner
+  traded: the empty-node precondition is a hard invariant, so there is no unlink
+  interleaving a repro could even catch — the absence of a phantom is structural.
+
+That was verified two ways: the full suite, both walk-causality repros, ASan
+stress/xchg and conservation all pass on every arm with the unlink bump removed;
+and the change is a measured win, because the bump was pure cost on the
+create/delete path. Under churn (`bench_dcache_churn`, decontended + jemalloc,
+writers to 192) it removes the **global arm's collapse entirely** — global goes
+from declining to ~1.8 Mchurn/s to scaling to ~256, a ~140× swing, matching the
+localized arms — since with `dc_add` already bump-free, dropping the unlink bump
+leaves churn generating *no* walk-causality traffic. It also lifts the per-node
+arm ~20% at high writer counts (one fewer transacted `d_seq` store per unlink),
+which was the gap the mark arm had been beating it by.
+
+The localized reader still detects a straddled unlink through the hlist deletion
+**mark** (`top_unhashed_rcu`), independent of any gen — so nothing is lost there;
+the removed bump was redundant with the mark for per-node/mark, and unnecessary
+outright for global.
+
 ### The mechanism: one global generation, folded into the rename commit
 
 We reintroduce a **single global** `rename_gen` (this is `rename_lock`'s job, not
