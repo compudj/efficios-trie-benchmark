@@ -50,6 +50,8 @@ field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< 
 echo "height,engine,move_height,fanin,readers,writers,mlookups_s,mexch_s,conserved" > "$CSV"
 
 NTHREADS=$((READERS + WRITERS))
+JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
+[[ -f "$JE" ]] || { echo "jemalloc not at $JE"; exit 1; }
 COMMON="--writers $WRITERS --nthreads $NTHREADS --branch $BRANCH --tree-depth $DEPTH --duration $DUR $PIN"
 
 for h in $(seq 0 $((DEPTH - 1))); do
@@ -57,7 +59,7 @@ for h in $(seq 0 $((DEPTH - 1))); do
   for e in $ENGINES; do
     best_lk=0; best_ex=0; cons=OK
     for r in $(seq 1 $RUNS); do
-      out=$(cd "$BIN" && ./"${BINOF[$e]}" --move-height "$h" $COMMON 2>/dev/null)
+      out=$(cd "$BIN" && env LD_PRELOAD="$JE" ./"${BINOF[$e]}" --move-height "$h" $COMMON 2>/dev/null)
       if ! grep -q "conservation: OK" <<< "$out"; then
         cons=FAIL; echo "!! $e H=$h CONSERVATION FAILED" >&2; continue
       fi

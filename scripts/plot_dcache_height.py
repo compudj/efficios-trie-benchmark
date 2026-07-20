@@ -84,13 +84,15 @@ ax.set_xlabel("move height H above the leaves  "
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
 ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
              "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
-             "× = mark ÷ seqlock\nthe COUNTER's localization erodes as moves climb "
-             "toward the band root,\ncrossing BELOW the baseline at H=7; the MARK's does not",
+             "× = mark ÷ seqlock\nboth localized arms erode as moves climb toward the "
+             "band root; under jemalloc\nper-node reaches ~parity at H=7 (glibc had it "
+             "invert), the MARK stays above",
              fontsize=9)
 ax.grid(alpha=0.3, ls=":")
 ax.legend(fontsize=8, loc="best")
-fig.suptitle("Userspace dcache — how high can a rename climb before the localized\n"
-             "version stops helping?  The per-node COUNTER inverts at H=7; the MARK does not.",
+fig.suptitle("Userspace dcache — how high can a DIRECTORY rename climb before the\n"
+             "localized version stops helping?  Per-node erodes to ~parity near the root; "
+             "the MARK stays above (jemalloc)",
              fontsize=10.5)
 fig.tight_layout(rect=[0, 0, 1, 0.93])
 fig.savefig(OUT, dpi=140)
