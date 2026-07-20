@@ -199,6 +199,20 @@ struct dentry {
 	};
 #endif
 	int d_inode;
+	/*
+	 * File vs directory type -- COLD, writer-only.  Set once at creation on the
+	 * content host (immutable; a rename never changes it).  The reader fast path
+	 * never touches it.  Two writer uses: dc_add rejects a child under a file
+	 * (ENOTDIR), which enforces the invariant a FILE HAS NO CHILDREN; and a
+	 * rename skips the walk-causality bump when the moved host is a file (a file
+	 * is never an interior waypoint, so it cannot misdirect -- see the "Files are
+	 * exempt" note in rename-shell-transition.md).  This makes the dentry cache
+	 * TYPE-AWARE, which the kernel is NOT: the kernel's per-dentry d_seq bump is
+	 * cheap enough to do unconditionally, so it needs no such distinction.  The
+	 * cost buys back only the GLOBAL arm (whole-tree bump); per-node localizes it
+	 * and the mark arm's signal is the structural del, so both ignore d_isdir.
+	 */
+	unsigned char d_isdir;
 
 	/*
 	 * Per-entry walk-causality generation (the DC_PER_NODE_GEN reader).  Lives
@@ -419,7 +433,8 @@ const int dc_lookup_id_is_address = 0;
 #endif
 
 static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
-				   const struct qstr *name, uint64_t id)
+				   const struct qstr *name, uint64_t id,
+				   int isdir)
 {
 	struct dentry *d;
 
@@ -444,6 +459,7 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	urcu_txn_hlist_init(&d->d_child_head);
 	d->d_id = id;
 	d->d_inode = 1;
+	d->d_isdir = (unsigned char) (isdir != 0);
 #ifndef DC_IPARENT_TXN
 	d->d_seq = NULL;		/* per-node gen (DC_PER_NODE_GEN); even */
 #endif
@@ -471,7 +487,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	urcu_txn_domain_init(&dc->domain);
 
 	dc_qstr_init(&rootname, "");
-	dc->root = dentry_alloc(dc, NULL, &rootname, 0);
+	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1);	/* root is a directory */
 	dc->root->d_parent = dc->root;		/* root is its own parent */
 	dc->root->d_iparent = dc->root;
 	return dc;
@@ -926,7 +942,8 @@ static void dentry_free_cb(struct rcu_head *rh);
 
 /* ---- add / unlink ------------------------------------------------------ */
 
-int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
+static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
+			uint64_t id, int isdir)
 {
 	struct dentry *parent, *d;
 	const struct qstr *name;
@@ -938,10 +955,17 @@ int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 	parent = resolve(dc, path, path->ndepth - 1);
 	if (!parent)
 		return -ENOENT;
+	/*
+	 * A FILE has no children (enforced here): adding under one is -ENOTDIR.
+	 * This is the invariant the file-rename bump-skip relies on -- without it,
+	 * a "file" that had gained a child could misdirect a straddling reader.
+	 */
+	if (!parent->d_isdir)
+		return -ENOTDIR;
 	name = &path->comp[path->ndepth - 1];
 	if (__child_lookup(dc, parent, name))
 		return -EEXIST;
-	d = dentry_alloc(dc, parent, name, id);
+	d = dentry_alloc(dc, parent, name, id, isdir);
 	if (!d)
 		return -ENOMEM;
 	ret = urcu_txn_hlist_add_rcu(&d->d_hash,
@@ -958,6 +982,22 @@ int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 		return ret;
 	}
 	return 0;
+}
+
+/*
+ * dc_add creates a DIRECTORY (historical: every node could have children).
+ * dc_add_file creates a FILE -- a leaf that can never gain children, so a
+ * rename of it skips the walk-causality bump (only global/per-node bump; the
+ * mark arm is unaffected).  Both reject a child under a file with -ENOTDIR.
+ */
+int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	return dc_add_typed(dc, path, id, 1);
+}
+
+int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	return dc_add_typed(dc, path, id, 0);
 }
 
 static void dentry_free_cb(struct rcu_head *rh)
@@ -1162,7 +1202,7 @@ static int stack_shell(struct dcache *dc,
 {
 	struct urcu_txn_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
-	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0);
+	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0);
 	struct dentry *top = NULL, *host = NULL;
 	struct urcu_mcas_txn txn;
 	int ret;
@@ -1191,7 +1231,18 @@ static int stack_shell(struct dcache *dc,
 
 		urcu_txn_begin(&txn);
 		urcu_txn_expect_conflict(&txn);
-		txn_bump_gen(&txn, dc, host);	/* moved entry: its host gen */
+		/*
+		 * Bump only when the moved entry is a DIRECTORY.  A file is never
+		 * an interior waypoint (no children, enforced), so its rename can
+		 * misdirect no reader -- same exemption as unlink.  Files are the
+		 * common case; skipping their bump is what keeps the global arm
+		 * viable on file rename/move (a whole-tree bump per file rename
+		 * would disrupt every reader).  Per-node's bump is already
+		 * localized and the mark arm's is a no-op, so both are unaffected;
+		 * the gate matters for global.
+		 */
+		if (host->d_isdir)
+			txn_bump_gen(&txn, dc, host);	/* dir move: host gen */
 		p = stack_one_prepare(&txn, dc, top, host, new_parent, new_bucket,
 				      shell, cross_parent);
 		if (p) {
@@ -1496,8 +1547,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	cross = pa != pb;
 	bucket_a = bucket_of(dc, pa, na->hash);
 	bucket_b = bucket_of(dc, pb, nb->hash);
-	sa = dentry_alloc(dc, pb, nb, 0);	/* A's new top, at B's slot */
-	sb = dentry_alloc(dc, pa, na, 0);	/* B's new top, at A's slot */
+	sa = dentry_alloc(dc, pb, nb, 0, 0); /* A's new top */
+	sb = dentry_alloc(dc, pa, na, 0, 0); /* B's new top */
 	if (!sa || !sb) {
 		free(sa);
 		free(sb);
@@ -1532,8 +1583,10 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		urcu_txn_expect_conflict(&txn);
 		/* both entries move: bump BOTH hosts' gens (one global bump when
 		 * DC_PER_NODE_GEN is off -- harmless double-step of rename_gen). */
-		txn_bump_gen(&txn, dc, hosta);
-		txn_bump_gen(&txn, dc, hostb);
+		if (hosta->d_isdir)		/* dir only -- see stack_shell */
+			txn_bump_gen(&txn, dc, hosta);
+		if (hostb->d_isdir)
+			txn_bump_gen(&txn, dc, hostb);
 		p = stack_one_prepare(&txn, dc, topa, hosta, pb, bucket_b, sa,
 				      cross);		/* A -> (pb, nb) */
 		if (!p)

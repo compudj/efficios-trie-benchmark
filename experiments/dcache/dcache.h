@@ -120,8 +120,17 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
  * path->comp[0..ndepth-2] (which must already exist).  id is the caller's stable
  * identity for later verification.  0 on success, -EEXIST, -ENOENT (parent
  * missing), -ENAMETOOLONG.
+ *
+ * dc_add creates a DIRECTORY (a node that may have children); dc_add_file
+ * creates a FILE (a leaf that never can).  A file is never an interior path
+ * waypoint, so the txn engine skips its rename walk-causality bump -- which is
+ * what lets the global arm stay competitive on file rename/move.  Adding a child
+ * under a file returns -ENOTDIR, which enforces the invariant that skip relies
+ * on.  The seqlock (kernel-faithful) engine tracks the type but bumps regardless,
+ * as the kernel does.  Both return -ENOTDIR on a child-under-file.
  */
 int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id);
+int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id);
 
 /*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam

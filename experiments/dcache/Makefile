@@ -32,7 +32,7 @@ HDRS     := dcache.h seqcount.h
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
-	check-pernode check-mark repro-samedir churn check-churn clean check-lib
+	check-pernode check-mark check-filetype repro-samedir churn check-churn clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -311,6 +311,16 @@ repro-samedir: repro_dcache_samedir.c dcache_txn.c $(HDRS) | check-lib
 
 # DC_MARK_GEN arm: walk causality on the d_hash.next deletion mark, so d_iparent
 # stays write-once and d_seq is gone (DC_NAME_MAX 40).
+# File/directory type: ENOTDIR enforcement + file-rename bump-skip soundness.
+# Runs on all three txn arms and the seqlock baseline.
+check-filetype: test_file_type.c dcache_txn.c dcache_seqlock.c $(HDRS) | check-lib
+	@for a in "" "-DDC_PER_NODE_GEN" "-DDC_MARK_GEN"; do \
+	  $(CC) $(CFLAGS) $$a $(HCPP) -o test_file_type_txn test_file_type.c \
+	    dcache_txn.c $(LDFLAGS) $(LDLIBS) && ./test_file_type_txn; done
+	$(CC) $(CFLAGS) $(HCPP) -o test_file_type_seqlock test_file_type.c \
+	  dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
+	./test_file_type_seqlock
+
 check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_mark \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)

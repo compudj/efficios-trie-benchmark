@@ -100,6 +100,10 @@ struct dentry {
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
 	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
+	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
+					 * Kernel-faithful: tracked for -ENOTDIR
+					 * but rename_lock bumps regardless of
+					 * type, as the kernel does. */
 
 	struct rcu_head d_rcu;		/* deferred free */
 #else
@@ -116,6 +120,10 @@ struct dentry {
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
 	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
+	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
+					 * Kernel-faithful: tracked for -ENOTDIR
+					 * but rename_lock bumps regardless of
+					 * type, as the kernel does. */
 
 	struct rcu_head d_rcu;		/* deferred free */
 #endif
@@ -294,7 +302,8 @@ const char *dc_engine_name(void)
 }
 
 static struct dentry *dentry_alloc(const struct qstr *name,
-				   struct dentry *parent, uint64_t id)
+				   struct dentry *parent, uint64_t id,
+				   int isdir)
 {
 	struct dentry *d;
 
@@ -320,6 +329,7 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 	seqcount_init(&d->d_seq);
 	d->d_children = NULL;
 	d->d_sib = NULL;
+	d->d_isdir = (unsigned char) (isdir != 0);
 	pthread_rwlock_init(&d->d_lock, NULL);
 	return d;
 }
@@ -344,7 +354,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	pthread_mutex_init(&dc->mutator_lock, NULL);
 
 	dc_qstr_init(&rootname, "");
-	dc->root = dentry_alloc(&rootname, NULL, 0);
+	dc->root = dentry_alloc(&rootname, NULL, 0, 1);	/* root is a directory */
 	dc->root->d_parent = dc->root;	/* root is its own parent */
 	return dc;
 }
@@ -600,7 +610,8 @@ static int is_subdir(struct dentry *a, struct dentry *b)
 
 /* ---- mutators ----------------------------------------------------------- */
 
-int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
+static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
+			uint64_t id, int isdir)
 {
 	struct dentry *parent, *d;
 	const struct qstr *name;
@@ -615,12 +626,16 @@ int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 		ret = -ENOENT;
 		goto out;
 	}
+	if (!parent->d_isdir) {			/* a file has no children */
+		ret = -ENOTDIR;
+		goto out;
+	}
 	name = &path->comp[path->ndepth - 1];
 	if (__child_lookup(dc, parent, name)) {
 		ret = -EEXIST;
 		goto out;
 	}
-	d = dentry_alloc(name, parent, id);
+	d = dentry_alloc(name, parent, id, isdir);
 	if (!d) {
 		ret = -ENOMEM;
 		goto out;
@@ -634,6 +649,18 @@ int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 out:
 	pthread_mutex_unlock(&dc->mutator_lock);
 	return ret;
+}
+
+/* dc_add => directory; dc_add_file => file.  Kernel-faithful: the type gates
+ * -ENOTDIR only; rename_lock still bumps regardless of type (see dcache.h). */
+int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	return dc_add_typed(dc, path, id, 1);
+}
+
+int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	return dc_add_typed(dc, path, id, 0);
 }
 
 static void dentry_free_cb(struct rcu_head *rh)
