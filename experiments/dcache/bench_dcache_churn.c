@@ -85,6 +85,7 @@ static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
 static long duration_ms = 1000;
 static int prefix_depth = 2;
+static unsigned int nbuckets = 1u << 16;
 static int *cpulist, cpulist_len;
 
 #define DIR_ID_BASE 1000000ULL		/* ids >= this are dirs, not slots */
@@ -334,7 +335,8 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 	    "usage: %s [--readers R] [--writers W] [--ndirs N] [--slots S]\n"
-	    "          [--duration MS] [--prefix-depth D] [--cpulist c0,c1,...]\n"
+	    "          [--duration MS] [--prefix-depth D] [--nbuckets N]\n"
+	    "          [--cpulist c0,c1,...]\n"
 	    "  writers TOGGLE their own slots (present -> unlink, absent -> add);\n"
 	    "  readers look up random slots and must tolerate ABSENT.\n", p);
 	exit(2);
@@ -357,6 +359,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--slots"))         slots = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--prefix-depth"))  prefix_depth = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--nbuckets"))      nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))       parse_cpulist(argv[++i]);
 		else usage(argv[0]);
 	}
@@ -366,7 +369,7 @@ int main(int argc, char **argv)
 	total_slots = nwriters * slots;
 
 	rcu_register_thread();
-	g_dc = dc_create(1u << 16);
+	g_dc = dc_create(nbuckets);
 	if (!g_dc) {
 		fprintf(stderr, "dc_create failed\n");
 		return 2;
