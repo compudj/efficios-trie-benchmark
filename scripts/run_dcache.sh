@@ -29,7 +29,7 @@ REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
 CSV=$REPO/scripts/dcache_sweep.csv
 
-NDIRS=16
+JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 DEPTH=4
 LEAVES=32
 DUR=1000
@@ -52,7 +52,10 @@ else
 fi
 
 # tree geometry knobs held fixed across the sweep
-COMMON="--ndirs $NDIRS --depth $DEPTH --leaves $LEAVES --duration $DUR $PIN"
+# Corrected methodology: jemalloc (allocator) + ndirs decontended to
+# 16 x writers (child-hlist heads), per-run.  See dcache_optype.png.
+COMMON="--depth $DEPTH --leaves $LEAVES --nbuckets 1048576 --duration $DUR $PIN"
+[[ -f "$JE" ]] || { echo "jemalloc not at $JE"; exit 1; }
 
 declare -A BINOF=( [seqlock]=bench_dcache_seqlock \
                    [txn-global]=bench_dcache_txn \
@@ -77,9 +80,12 @@ run() {
   local bin=$BIN/${BINOF[$eng]} split="" readers=$threads r
   local best_lk=0 best_rn=0 cons=OK out
   if [[ "$writers" -ge 0 ]]; then split="--writers $writers"; readers=$((threads-writers)); fi
+  # decontend: writers>=0 -> 16*writers dirs; homogeneous (writers<0) -> 16*threads
+  local nw=$(( writers >= 0 ? writers : threads ))
+  local nd=$(( 16 * (nw < 1 ? 1 : nw) ))
   for r in $(seq 1 $RUNS); do
-    out=$(cd "$BIN" && ./"${BINOF[$eng]}" --nthreads "$threads" $split \
-          --rename-frac "$frac" $COMMON $RUN_EXTRA 2>/dev/null)
+    out=$(cd "$BIN" && env LD_PRELOAD="$JE" ./"${BINOF[$eng]}" --nthreads "$threads" \
+          $split --ndirs "$nd" --rename-frac "$frac" $COMMON $RUN_EXTRA 2>/dev/null)
     if ! grep -q "conservation: OK" <<< "$out"; then
       cons=FAIL; echo "!! $panel/$eng threads=$threads w=$writers frac=$frac CONSERVATION FAILED" >&2
       continue
