@@ -259,6 +259,44 @@ The localized reader still detects a straddled unlink through the hlist deletion
 the removed bump was redundant with the mark for per-node/mark, and unnecessary
 outright for global.
 
+### Files are exempt for the same reason — noted, not built
+
+The exemption generalizes past unlink. The real axis is *"can this node ever be an
+interior waypoint?"*, and that is false for two kinds of node: a **removed** one
+(unlink, empty by precondition) and a **file** (a file has no children, so no path
+walks *through* it and it can never gain one). So a **file rename / file move**
+can no more construct a phantom than an unlink can — only **directory rename /
+directory move** genuinely need the bump. Under the taxonomy: `rename` and `file
+move` are exempt; `directory rename` and `directory move` are not.
+
+Two reasons we *note* this rather than *build* it:
+
+- **The kernel doesn't distinguish either** (verified against Linux v7.0-rc3:
+  `d_move`/`d_exchange` take `write_seqlock(&rename_lock)` and `__d_move` bumps
+  both dentries' `d_seq` unconditionally, no `d_is_dir` test). It is conservative
+  because its per-dentry `d_seq` bump is nearly free — a non-atomic increment
+  under a lock already held — so a file/dir branch to skip it would cost more code
+  than it saves.
+
+- **Only the global arm would benefit, and it is not the end goal.** The cost a
+  file-rename bump imposes is exactly the whole-tree-vs-localized split: the global
+  arm bumps one tree-wide counter every reader brackets on, so *one file rename
+  disrupts every reader* — which is why the `split_scale` file-rename panel shows
+  global at ~349 Mlookups/s against per-node/mark ~1960 at 184 readers. The
+  per-node arm bumps only the renamed file's own `d_seq`, so the cost is confined
+  to readers of *that* file; the mark arm's signal *is* the `del`'s mark, which the
+  rename must set regardless, so there is nothing to skip and the cost is likewise
+  localized. Exploiting the exemption would need the dcache to *model*
+  file-vs-directory (a type bit + `ENOTDIR` on adding under a file), and it would
+  buy back only the global arm — the naive-port reference, not the design we are
+  converging on.
+
+So the standing statement is: **speeding up file rename and file move would require
+the file-vs-directory distinction, and it is a global-arm rescue.** The mark arm
+reaches localized, bump-free walk causality without it — which is itself the
+result. It gets for free (the structural `del`-mark) what the global arm can only
+approach by accumulating exemptions.
+
 ### The mechanism: one global generation, folded into the rename commit
 
 We reintroduce a **single global** `rename_gen` (this is `rename_lock`'s job, not
