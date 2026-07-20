@@ -32,7 +32,7 @@ HDRS     := dcache.h seqcount.h
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
-	check-pernode check-mark repro-samedir clean check-lib
+	check-pernode check-mark repro-samedir churn check-churn clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -176,7 +176,7 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 # that pass through the moved entry).  scripts/run_dcache.sh drives all three;
 # plot_dcache.py charts them.
 bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
-       bench_dcache_txn_mark
+       bench_dcache_txn_mark churn
 
 # The seqlock baseline builds the DEFAULT layout too: the fair 1-CL split hot
 # line (d_parent tags + d_seq on CL0, d_id cold) returning the dentry ADDRESS as
@@ -206,6 +206,28 @@ bench_dcache_txn_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# Insert/remove throughput (bench_dcache_churn).  Built -DDC_SPLIT_KEEPID: a
+# re-added dentry is a NEW allocation, so address identity is not stable across
+# churn and the harness's id checks need logical ids.  The reader path is
+# therefore not directly comparable with the address-default bench_dcache runs.
+CHURN_ENGINES := seqlock txn txn_pernode txn_mark
+churn: $(addprefix bench_dcache_churn_,$(CHURN_ENGINES))
+
+bench_dcache_churn_seqlock: bench_dcache_churn.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -o $@ bench_dcache_churn.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_txn: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_txn_pernode: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_txn_mark: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# Quick correctness gate for the churn invariant (state + census + ids).
+check-churn: churn
+	./bench_dcache_churn_txn_mark --writers 6 --readers 6 --duration 1500
+	./bench_dcache_churn_txn_pernode --writers 6 --readers 6 --duration 1500
+	./bench_dcache_churn_seqlock --writers 6 --readers 6 --duration 1500
 
 # Localized walk causality with NO counter: the hlist deletion mark is the
 # version, so d_seq is gone and DC_NAME_MAX rises 32 -> 40.  Layout is otherwise
