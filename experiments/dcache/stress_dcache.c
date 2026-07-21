@@ -329,10 +329,14 @@ int main(int argc, char **argv)
 
 #ifdef DC_STRESS_DEBUG
 	{
-		extern unsigned long dc_dbg_renames, dc_dbg_folds;
+		extern unsigned long dc_dbg_renames, dc_dbg_folds,
+			dc_dbg_fold_retries, dc_dbg_fold_aborts;
 
-		printf("DEBUG renames=%lu folds=%lu\n",
-		       dc_dbg_renames, dc_dbg_folds);
+		printf("DEBUG renames=%lu folds=%lu attempts=%lu "
+		       "commit_ABORTS=%lu (%.3f%% of folds truly raced)\n",
+		       dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries,
+		       dc_dbg_fold_aborts,
+		       dc_dbg_folds ? 100.0 * dc_dbg_fold_aborts / dc_dbg_folds : 0.0);
 	}
 #endif
 	printf("writer rename errors : %ld (expect 0)\n", werrs);
