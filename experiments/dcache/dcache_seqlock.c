@@ -16,16 +16,27 @@
  * The mechanism the txn port deletes is exactly (rename_lock + d_seq): global +
  * per-object sequence counters read on the fast path.
  *
- * Controlled-experiment scoping (see README): writers are serialized by ONE
- * mutator lock (the s_vfs_rename_mutex analog, here covering all mutators, not
- * just cross-dir rename).  That is deliberately coarser than the kernel's
- * per-directory i_rwsem -- it isolates the ONE variable under study, the READER
- * path, so the only thing that differs between the seqlock and txn engines is
- * how a lookup validates and how a rename publishes.  Per-dentry d_lock collapses
- * into this mutator lock (a single writer at a time), so d_seq is written under
- * the mutator lock directly.  Refcounting is omitted: a walk lives entirely in
+ * Kernel-faithful write-side locking (see README): the write path mirrors the
+ * kernel's granularity so writer THROUGHPUT is a fair comparison too, not only
+ * the reader path.  A structural mutator takes the per-directory rwsem of the
+ * dir(s) it touches (the i_rwsem analog, guarding each dir's child list and
+ * serializing same-dir mutators) and the per-bucket lock of the hash bucket(s)
+ * it edits (an hlist_bl bit lock in bit 0 of the bucket head word, guarding each
+ * hash chain) -- NOT one global lock, so add/unlink in different dirs and buckets
+ * proceed in parallel exactly as they do in the kernel.  Every rename / exchange
+ * takes rename_lock (the seqlock the reader validates on); a CROSS-directory one
+ * additionally takes a single global s_vfs_rename_mutex, as the kernel's
+ * lock_rename does for p1 != p2, making the loop check atomic with the reparent
+ * (a same-dir rename takes neither the mutex nor the loop check).  Lock ordering,
+ * outermost first: vfs_rename_mutex -> rename_lock -> dir rwsems (address-ordered)
+ * -> bucket locks (address-ordered); no mutator takes a dir lock while already
+ * holding a bucket lock, so the two-level hierarchy cannot cycle.  d_seq is written under the bucket lock
+ * of the dentry's own chain.  Refcounting is omitted: a walk lives entirely in
  * one RCU read-side section and retains nothing (the kernel's LOOKUP_RCU fast
- * path), and unlink RCU-defers the free.
+ * path), unlink RCU-defers the free, and every mutator brackets its resolve +
+ * edit in rcu_read_lock so a node it observes cannot be reclaimed under it (the
+ * benchmark's disjoint-slot ownership already means no two writers target the
+ * same leaf, and directory nodes are stable for a run's duration).
  */
 
 #define _GNU_SOURCE
@@ -71,8 +82,18 @@ struct dc_hnode {
 	struct dc_hnode **pprev;
 };
 
+/*
+ * One machine word per bucket -- exactly the kernel's hlist_bl_head.  Bit 0 of
+ * `first` is the bucket's spinlock (the hlist_bl bit lock); the chain head is the
+ * pointer with that bit masked off.  Embedding the lock in the head word keeps a
+ * bucket at 8 bytes (8 per cacheline, as in the kernel) and adds ZERO cache
+ * footprint or second-line traffic to a write -- which a side table of locks
+ * would, distorting the very write throughput this baseline measures.
+ */
+#define DC_BL_LOCK 1UL
+
 struct dc_bucket {
-	struct dc_hnode *first;
+	struct dc_hnode *first;		/* chain head | bit0 lock */
 };
 
 struct dentry {
@@ -130,11 +151,11 @@ struct dentry {
 };
 
 struct dcache {
-	struct dc_bucket *buckets;
+	struct dc_bucket *buckets;	/* each head word carries its own bit lock */
 	unsigned long mask;		/* nbuckets - 1 (power of two) */
 	struct dentry *root;
 	seqlock_t rename_lock;		/* GLOBAL: the walk's consistency anchor */
-	pthread_mutex_t mutator_lock;	/* serializes all structural mutators */
+	pthread_mutex_t vfs_rename_mutex; /* s_vfs_rename_mutex: cross-dir moves only */
 };
 
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
@@ -216,28 +237,85 @@ static inline struct dc_bucket *bucket_of(struct dcache *dc,
 	return &dc->buckets[(h >> 32) & dc->mask];
 }
 
-/* ---- RCU hlist (writer side runs under mutator_lock) -------------------- */
+/* ---- bit-locked bucket head (hlist_bl) --------------------------------- */
+
+/*
+ * Chain head with the lock bit masked off -- what a traversal actually walks.
+ * Every access to the head word is __atomic (matching bl_lock's fetch_or), so
+ * the lock bit and the chain pointer share a word without a data race on it.
+ */
+static inline struct dc_hnode *bl_first(struct dc_bucket *b)
+{
+	uintptr_t v = __atomic_load_n((uintptr_t *) &b->first, __ATOMIC_RELAXED);
+
+	return (struct dc_hnode *) (v & ~DC_BL_LOCK);
+}
+
+static inline struct dc_hnode *bl_first_rcu(struct dc_bucket *b)
+{
+	return (struct dc_hnode *)
+		((uintptr_t) rcu_dereference(b->first) & ~DC_BL_LOCK);
+}
+
+/*
+ * Publish a new head, keeping the lock bit set.  Only the lock holder calls this
+ * (from hlist_add_head_rcu, under bl_lock), so the bit is definitionally 1 -- OR
+ * it in without reading the word, avoiding a race with concurrent lock spinners.
+ */
+static inline void bl_set_first_rcu(struct dc_bucket *b, struct dc_hnode *n)
+{
+	rcu_assign_pointer(b->first,
+			   (struct dc_hnode *) ((uintptr_t) n | DC_BL_LOCK));
+}
+
+/*
+ * Bit spinlock on bit 0 of the head word (the kernel's bit_spin_lock(0, &first)).
+ * The atomic fetch_or/fetch_and touch the whole word but only ever flip bit 0;
+ * the holder's chain stores (bl_set_first_rcu, hlist_del_rcu's *pprev) preserve
+ * that bit by value, so lock and data never clobber each other.
+ */
+static inline void bl_lock(struct dc_bucket *b)
+{
+	uintptr_t *p = (uintptr_t *) &b->first;
+
+	while (__atomic_fetch_or(p, DC_BL_LOCK, __ATOMIC_ACQUIRE) & DC_BL_LOCK)
+		caa_cpu_relax();
+}
+
+static inline void bl_unlock(struct dc_bucket *b)
+{
+	uintptr_t *p = (uintptr_t *) &b->first;
+
+	__atomic_fetch_and(p, ~DC_BL_LOCK, __ATOMIC_RELEASE);
+}
+
+/* ---- RCU hlist (writer side runs under the bucket's bit lock) ----------- */
 
 static inline void hlist_add_head_rcu(struct dc_bucket *b, struct dc_hnode *n)
 {
-	struct dc_hnode *first = b->first;
+	struct dc_hnode *first = bl_first(b);	/* masked: the real head */
 
 	n->next = first;
 	n->pprev = &b->first;
 	if (first)
 		first->pprev = &n->next;
-	rcu_assign_pointer(b->first, n);	/* release: publish n */
+	bl_set_first_rcu(b, n);			/* release: publish n, keep bit */
 }
 
 static inline void hlist_del_rcu(struct dc_hnode *n)
 {
 	struct dc_hnode *next = n->next;
-	struct dc_hnode **pprev = n->pprev;
+	uintptr_t *pprev = (uintptr_t *) n->pprev;
+	/* Set iff pprev is a (locked) bucket head; a node's ->next never carries it.
+	 * Read atomically: if pprev is the head, spinners fetch_or the same word. */
+	uintptr_t bit = __atomic_load_n(pprev, __ATOMIC_RELAXED) & DC_BL_LOCK;
 
-	/* Splice n out; n->next stays valid for readers already past it. */
-	CMM_STORE_SHARED(*pprev, next);
+	/* Splice n out (release-publish the forward link readers dereference); n->next
+	 * stays valid for readers already past it.  Preserve whatever lock bit lives
+	 * in the slot -- the head word carries one, a node's ->next does not. */
+	__atomic_store_n(pprev, (uintptr_t) next | bit, __ATOMIC_RELEASE);
 	if (next)
-		next->pprev = pprev;
+		next->pprev = n->pprev;
 }
 
 /* ---- children list (verify + -ENOTEMPTY; writer/quiescent only) --------- */
@@ -265,10 +343,11 @@ static void children_remove(struct dentry *parent, struct dentry *child)
  * place (name change under the same parent) -- write-locks that dir.  Concurrent
  * readdirs of a dir thus share, and a readdir of one dir never serializes against
  * a rename of another: the honest per-directory-inode-rwsem analogue, not one
- * global lock.  All writers already funnel through mutator_lock (a single writer
- * at a time), so the two-dir case cannot deadlock writer-vs-writer; readdir takes
- * only a read lock, so there is no lock cycle either.  Ordering, where both are
- * held: mutator_lock -> rename_lock -> these dir rwsems.
+ * global lock.  Writer-vs-writer cannot deadlock because the two-dir case is
+ * address-ordered (dirs_wlock2) and multi-dir mutators are serialized by
+ * rename_lock, so at most one holds two dir locks at a time; readdir takes only a
+ * read lock, so there is no cycle either.  Ordering, outermost first:
+ * rename_lock -> these dir rwsems -> bucket bit locks.
  */
 static void dir_wlock(struct dentry *d)   { pthread_rwlock_wrlock(&d->d_lock); }
 static void dir_wunlock(struct dentry *d) { pthread_rwlock_unlock(&d->d_lock); }
@@ -292,6 +371,32 @@ static void dirs_wunlock2(struct dentry *a, struct dentry *b)
 	dir_wunlock(a);
 	if (a != b)
 		dir_wunlock(b);
+}
+
+/*
+ * Lock two buckets' bit locks in address order (once if they coincide).  The
+ * outer rename_lock already serializes multi-bucket mutators, but the address
+ * order keeps the discipline uniform with dirs_wlock2 and safe against a
+ * single-bucket add/unlink contending for one of the two.
+ */
+static void bl_lock2(struct dc_bucket *x, struct dc_bucket *y)
+{
+	if (x == y) {
+		bl_lock(x);
+	} else if ((uintptr_t) x < (uintptr_t) y) {
+		bl_lock(x);
+		bl_lock(y);
+	} else {
+		bl_lock(y);
+		bl_lock(x);
+	}
+}
+
+static void bl_unlock2(struct dc_bucket *x, struct dc_bucket *y)
+{
+	bl_unlock(x);
+	if (x != y)
+		bl_unlock(y);
 }
 
 /* ---- lifecycle ---------------------------------------------------------- */
@@ -351,7 +456,8 @@ struct dcache *dc_create(unsigned int nbuckets)
 	}
 	dc->mask = n - 1;
 	seqlock_init(&dc->rename_lock);
-	pthread_mutex_init(&dc->mutator_lock, NULL);
+	pthread_mutex_init(&dc->vfs_rename_mutex, NULL);
+	/* calloc left every bucket head NULL with bit 0 clear -- all unlocked. */
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(&rootname, NULL, 0, 1);	/* root is a directory */
@@ -379,7 +485,7 @@ void dc_destroy(struct dcache *dc)
 	free_subtree(dc->root);
 	free(dc->buckets);
 	seqlock_destroy(&dc->rename_lock);
-	pthread_mutex_destroy(&dc->mutator_lock);
+	pthread_mutex_destroy(&dc->vfs_rename_mutex);
 	free(dc);
 }
 
@@ -416,7 +522,7 @@ static struct dentry *__d_lookup_rcu(struct dcache *dc, struct dentry *parent,
 	struct dc_bucket *b = bucket_of(dc, parent, name->hash);
 	struct dc_hnode *n;
 
-	for (n = rcu_dereference(b->first); n; n = rcu_dereference(n->next)) {
+	for (n = bl_first_rcu(b); n; n = rcu_dereference(n->next)) {
 		struct dentry *d = hnode_dentry(n);
 		unsigned long seq;
 
@@ -521,13 +627,16 @@ retry_check:
 }
 
 /*
- * Lock-free resolve of `path` to its dentry, for readdir.  The caller holds
- * rcu_read_lock, so the returned dentry cannot be freed under it.  Mirrors
- * dc_lookup's d_seq + rename_lock discipline but returns the dentry rather than
- * an id, and retries internally (bounded) on a racing rename.  NULL if absent.
+ * Lock-free resolve of `path`'s first `depth` components to its dentry.  The
+ * caller holds rcu_read_lock, so the returned dentry cannot be freed under it.
+ * Mirrors dc_lookup's d_seq + rename_lock discipline but returns the dentry
+ * rather than an id, and retries internally (bounded) on a racing rename -- so a
+ * concurrent rename of ANOTHER node in a chain the walk crosses forces a re-walk
+ * instead of a spurious miss.  Used by readdir and by every writer to locate its
+ * target(s); NULL if genuinely absent.
  */
 static struct dentry *resolve_dentry_rcu(struct dcache *dc,
-					 const struct dc_path *p)
+					 const struct dc_path *p, uint32_t depth)
 {
 	unsigned long retries = 0;
 
@@ -537,7 +646,7 @@ static struct dentry *resolve_dentry_rcu(struct dcache *dc,
 		uint32_t i;
 		int ok = 1;
 
-		for (i = 0; i < p->ndepth; i++) {
+		for (i = 0; i < depth; i++) {
 			unsigned long seq;
 			struct dentry *d = __d_lookup_rcu(dc, cur, &p->comp[i],
 							  &seq);
@@ -561,15 +670,25 @@ static struct dentry *resolve_dentry_rcu(struct dcache *dc,
 	}
 }
 
-/* ---- writer-side helpers (under mutator_lock) --------------------------- */
+/* ---- writer-side helpers (under dir rwsem + bucket bit lock) ----------- */
 
+/*
+ * Writer-side exact lookup.  Two of its three callers -- resolve() and the
+ * rename EXISTS check -- run WITHOUT the bucket lock, concurrent with another
+ * writer's hlist_add_head_rcu / hlist_del_rcu on the same chain, so the traversal
+ * must be a correct RCU reader (rcu_dereference), exactly like __d_lookup_rcu; a
+ * plain-load walk can transiently lose a continuously-present node and miss it.
+ * The match fields it reads (d_parent, d_name) belong to a node it is not itself
+ * editing, and a node mid-rename can only fail to match (never falsely match a
+ * different name), so no d_seq bracket is needed here.
+ */
 static struct dentry *__child_lookup(struct dcache *dc, struct dentry *parent,
 				     const struct qstr *name)
 {
 	struct dc_bucket *b = bucket_of(dc, parent, name->hash);
 	struct dc_hnode *n;
 
-	for (n = b->first; n; n = n->next) {
+	for (n = bl_first_rcu(b); n; n = rcu_dereference(n->next)) {
 		struct dentry *d = hnode_dentry(n);
 
 		if (DC_DPARENT(d) == parent && !DC_IS_UNHASHED(d) &&
@@ -580,19 +699,6 @@ static struct dentry *__child_lookup(struct dcache *dc, struct dentry *parent,
 }
 
 /* Resolve the first `depth` components from the root; NULL if any is missing. */
-static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
-			      uint32_t depth)
-{
-	struct dentry *cur = dc->root;
-	uint32_t i;
-
-	for (i = 0; i < depth; i++) {
-		cur = __child_lookup(dc, cur, &p->comp[i]);
-		if (!cur)
-			return NULL;
-	}
-	return cur;
-}
 
 /* Is `a` equal to `b` or a descendant of `b`?  (Directory-loop guard.) */
 static int is_subdir(struct dentry *a, struct dentry *b)
@@ -615,39 +721,49 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 {
 	struct dentry *parent, *d;
 	const struct qstr *name;
+	struct dc_bucket *b;
 	int ret = 0;
 
 	if (path->ndepth == 0)
 		return -EEXIST;			/* the root already exists */
 
-	pthread_mutex_lock(&dc->mutator_lock);
-	parent = resolve(dc, path, path->ndepth - 1);
+	rcu_read_lock();
+	parent = resolve_dentry_rcu(dc, path, path->ndepth - 1);
 	if (!parent) {
-		ret = -ENOENT;
-		goto out;
+		rcu_read_unlock();
+		return -ENOENT;
 	}
 	if (!parent->d_isdir) {			/* a file has no children */
-		ret = -ENOTDIR;
-		goto out;
+		rcu_read_unlock();
+		return -ENOTDIR;
 	}
 	name = &path->comp[path->ndepth - 1];
+	b = bucket_of(dc, parent, name->hash);
+	/*
+	 * dir rwsem (child list + same-dir serialization) then the bucket lock
+	 * (hash chain).  The EXISTS check and the insert are both under the bucket
+	 * lock, so a racing add of the same (parent, name) -- which hashes to this
+	 * same bucket -- sees one or the other atomically.
+	 */
+	dir_wlock(parent);
+	bl_lock(b);
 	if (__child_lookup(dc, parent, name)) {
 		ret = -EEXIST;
-		goto out;
+		goto unlock;
 	}
 	d = dentry_alloc(name, parent, id, isdir);
 	if (!d) {
 		ret = -ENOMEM;
-		goto out;
+		goto unlock;
 	}
 	/* A brand-new node has no readers yet: hlist_add_head_rcu is its one
 	 * publish (release).  No rename_lock bump -- add doesn't move anything. */
-	hlist_add_head_rcu(bucket_of(dc, parent, name->hash), &d->d_hash);
-	dir_wlock(parent);
+	hlist_add_head_rcu(b, &d->d_hash);
 	children_add(parent, d);
+unlock:
+	bl_unlock(b);
 	dir_wunlock(parent);
-out:
-	pthread_mutex_unlock(&dc->mutator_lock);
+	rcu_read_unlock();
 	return ret;
 }
 
@@ -673,21 +789,26 @@ static void dentry_free_cb(struct rcu_head *rh)
 
 int dc_unlink(struct dcache *dc, const struct dc_path *path)
 {
-	struct dentry *victim;
+	struct dentry *victim, *parent;
+	struct dc_bucket *b;
 	int ret = 0;
 
 	if (path->ndepth == 0)
 		return -EINVAL;			/* cannot unlink the root */
 
-	pthread_mutex_lock(&dc->mutator_lock);
-	victim = resolve(dc, path, path->ndepth);
+	rcu_read_lock();
+	victim = resolve_dentry_rcu(dc, path, path->ndepth);
 	if (!victim) {
-		ret = -ENOENT;
-		goto out;
+		rcu_read_unlock();
+		return -ENOENT;
 	}
+	parent = DC_DPARENT(victim);
+	b = bucket_of(dc, parent, victim->d_name.hash);
+	dir_wlock(parent);
+	bl_lock(b);
 	if (victim->d_children) {
 		ret = -ENOTEMPTY;
-		goto out;
+		goto unlock;
 	}
 	/* Publish the removal under d_seq so a reader mid-compare on the victim
 	 * re-scans and misses it; hlist_del_rcu splices it for new readers. */
@@ -695,12 +816,12 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	DC_SET_UNHASHED(victim);
 	hlist_del_rcu(&victim->d_hash);
 	write_seqcount_end(&victim->d_seq);
-	dir_wlock(DC_DPARENT(victim));
-	children_remove(DC_DPARENT(victim), victim);
-	dir_wunlock(DC_DPARENT(victim));
+	children_remove(parent, victim);
 	call_rcu(&victim->d_rcu, dentry_free_cb);	/* honest deferred free */
-out:
-	pthread_mutex_unlock(&dc->mutator_lock);
+unlock:
+	bl_unlock(b);
+	dir_wunlock(parent);
+	rcu_read_unlock();
 	return ret;
 }
 
@@ -714,25 +835,30 @@ static void __d_move(struct dcache *dc, struct dentry *victim,
 		     struct dentry *new_parent, const struct qstr *new_name)
 {
 	struct dentry *old_parent = DC_DPARENT(victim);
+	struct dc_bucket *ob = bucket_of(dc, old_parent, victim->d_name.hash);
+	struct dc_bucket *nb = bucket_of(dc, new_parent, new_name->hash);
 
 	/*
 	 * Write-lock both affected dirs (one if unchanged) for the whole identity
 	 * change: excludes concurrent readdir of the old dir (child leaving), the
 	 * new dir (child arriving), AND the same-dir case where only the child's
 	 * name changes in place -- a readdir of that dir must not see a torn name.
+	 * Then both hash buckets (the old chain it leaves, the new it enters) so
+	 * the del + add is atomic against a concurrent add/unlink on either chain.
 	 */
 	dirs_wlock2(old_parent, new_parent);
+	bl_lock2(ob, nb);
 	write_seqcount_begin(&victim->d_seq);
 	hlist_del_rcu(&victim->d_hash);			/* leave old bucket */
 	if (old_parent != new_parent)
 		children_remove(old_parent, victim);
 	victim->d_name = *new_name;			/* identity change */
 	rcu_assign_pointer(victim->d_parent, new_parent);
-	hlist_add_head_rcu(bucket_of(dc, new_parent, new_name->hash),
-			   &victim->d_hash);		/* enter new bucket */
+	hlist_add_head_rcu(nb, &victim->d_hash);	/* enter new bucket */
 	if (old_parent != new_parent)
 		children_add(new_parent, victim);
 	write_seqcount_end(&victim->d_seq);
+	bl_unlock2(ob, nb);
 	dirs_wunlock2(old_parent, new_parent);
 }
 
@@ -741,36 +867,58 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 {
 	struct dentry *victim, *to_parent;
 	const struct qstr *to_name;
-	int ret = 0;
+	int cross, ret = 0;
 
 	if (from->ndepth == 0 || to->ndepth == 0)
 		return -EINVAL;			/* cannot move the root */
 
-	pthread_mutex_lock(&dc->mutator_lock);
-	victim = resolve(dc, from, from->ndepth);
+	rcu_read_lock();
+	victim = resolve_dentry_rcu(dc, from, from->ndepth);
 	if (!victim) {
 		ret = -ENOENT;
 		goto out;
 	}
-	to_parent = resolve(dc, to, to->ndepth - 1);
+	to_parent = resolve_dentry_rcu(dc, to, to->ndepth - 1);
 	if (!to_parent) {
 		ret = -ENOENT;
 		goto out;
 	}
+	/*
+	 * Cross-directory move: take the global s_vfs_rename_mutex, exactly as the
+	 * kernel's lock_rename does for p1 != p2 (a same-dir rename takes only the
+	 * one dir's rwsem, no global lock).  It makes the loop check + reparent
+	 * atomic against another cross-move -- without it two moves can each pass
+	 * is_subdir and splice a cycle -- and it is the kernel-faithful cost of any
+	 * cross-directory rename (file or directory alike).
+	 */
+	cross = (DC_DPARENT(victim) != to_parent);
+	if (cross)
+		pthread_mutex_lock(&dc->vfs_rename_mutex);
 	to_name = &to->comp[to->ndepth - 1];
 	if (__child_lookup(dc, to_parent, to_name)) {
 		ret = -EEXIST;			/* phase 1: no replace */
-		goto out;
+		goto out_unlock;
 	}
-	if (DC_DPARENT(victim) != to_parent && is_subdir(to_parent, victim)) {
+	if (cross && is_subdir(to_parent, victim)) {
 		ret = -EINVAL;			/* would create a loop */
-		goto out;
+		goto out_unlock;
 	}
+	/*
+	 * __d_move takes the dir rwsems and both bucket locks; rename_lock seals
+	 * the whole move for the reader seqbracket and serializes it against other
+	 * renames.  For a same-dir rename the EXISTS check is not under the target
+	 * bucket lock, so it races a concurrent add of the same (to_parent, to_name)
+	 * -- which the benchmark's disjoint-slot ownership precludes (a writer owns
+	 * its target slot), the same ownership resolve's returned nodes rely on.
+	 */
 	write_seqlock(&dc->rename_lock);
 	__d_move(dc, victim, to_parent, to_name);
 	write_sequnlock(&dc->rename_lock);
+out_unlock:
+	if (cross)
+		pthread_mutex_unlock(&dc->vfs_rename_mutex);
 out:
-	pthread_mutex_unlock(&dc->mutator_lock);
+	rcu_read_unlock();
 	return ret;
 }
 
@@ -778,15 +926,16 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 		       const struct dc_path *b)
 {
 	struct dentry *da, *db, *pa, *pb;
+	struct dc_bucket *ba, *bb;
 	struct qstr na, nb;
-	int ret = 0;
+	int cross = 0, ret = 0;
 
 	if (a->ndepth == 0 || b->ndepth == 0)
 		return -EINVAL;
 
-	pthread_mutex_lock(&dc->mutator_lock);
-	da = resolve(dc, a, a->ndepth);
-	db = resolve(dc, b, b->ndepth);
+	rcu_read_lock();
+	da = resolve_dentry_rcu(dc, a, a->ndepth);
+	db = resolve_dentry_rcu(dc, b, b->ndepth);
 	if (!da || !db) {
 		ret = -ENOENT;
 		goto out;
@@ -795,16 +944,24 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 		goto out;			/* exchanging a node with itself */
 	pa = DC_DPARENT(da);
 	pb = DC_DPARENT(db);
+	/* Cross-directory exchange takes the global s_vfs_rename_mutex too, so the
+	 * two-directional loop check below is atomic with the swap (see dc_rename). */
+	cross = (pa != pb);
+	if (cross)
+		pthread_mutex_lock(&dc->vfs_rename_mutex);
 	/* Neither may end up under the other (no loops in either direction). */
-	if (pa != pb && (is_subdir(pb, da) || is_subdir(pa, db))) {
+	if (cross && (is_subdir(pb, da) || is_subdir(pa, db))) {
 		ret = -EINVAL;
-		goto out;
+		goto out_unlock;
 	}
 	na = da->d_name;
 	nb = db->d_name;
 
+	ba = bucket_of(dc, pa, na.hash);	/* da leaves here, db enters */
+	bb = bucket_of(dc, pb, nb.hash);	/* db leaves here, da enters */
 	write_seqlock(&dc->rename_lock);
 	dirs_wlock2(pa, pb);
+	bl_lock2(ba, bb);
 	/*
 	 * Drop both, then re-add both at swapped positions -- one rename_lock
 	 * section, so a walker sees the exchange atomically.  d_seq on each is
@@ -822,26 +979,31 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 	db->d_name = na;
 	rcu_assign_pointer(da->d_parent, pb);
 	rcu_assign_pointer(db->d_parent, pa);
-	hlist_add_head_rcu(bucket_of(dc, pb, nb.hash), &da->d_hash);
-	hlist_add_head_rcu(bucket_of(dc, pa, na.hash), &db->d_hash);
+	hlist_add_head_rcu(bb, &da->d_hash);		/* da enters pb's bucket */
+	hlist_add_head_rcu(ba, &db->d_hash);		/* db enters pa's bucket */
 	if (pa != pb) {
 		children_add(pb, da);
 		children_add(pa, db);
 	}
 	write_seqcount_end(&db->d_seq);
 	write_seqcount_end(&da->d_seq);
+	bl_unlock2(ba, bb);
 	dirs_wunlock2(pa, pb);
 	write_sequnlock(&dc->rename_lock);
+out_unlock:
+	if (cross)
+		pthread_mutex_unlock(&dc->vfs_rename_mutex);
 out:
-	pthread_mutex_unlock(&dc->mutator_lock);
+	rcu_read_unlock();
 	return ret;
 }
 
 /*
- * List a directory.  Faithful baseline: readdir takes the mutator lock (the
- * kernel holds the directory's i_rwsem), so listing is serialized against every
- * rename -- a consistent snapshot, but readdir contends with all mutation.  This
- * is the cost the txn engine's lock-free child-hlist is meant to beat.
+ * List a directory.  Faithful baseline: readdir read-locks the directory's own
+ * rwsem (the kernel holds that dir's i_rwsem), so listing is serialized only
+ * against mutations of THIS dir's child list -- a consistent snapshot that
+ * contends with add/remove/rename in the same dir.  This is the cost the txn
+ * engine's lock-free child-hlist is meant to beat.
  */
 long dc_readdir(struct dcache *dc, const struct dc_path *path,
 		dc_dirent_fn fn, void *arg)
@@ -851,14 +1013,14 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 
 	/*
 	 * Kernel-faithful readdir: navigate to the directory with the lock-free
-	 * RCU walk (no mutator_lock), then take that directory's rwsem read-side
+	 * RCU walk (no writer lock), then take that directory's rwsem read-side
 	 * for the child enumeration -- the analogue of iterate_dir() under the
 	 * inode rwsem.  Concurrent readdirs of the same dir share; only a mutator
 	 * changing THIS dir's child listing is excluded.  rcu_read_lock keeps the
 	 * resolved dir alive across the lock acquisition (frees are call_rcu'd).
 	 */
 	rcu_read_lock();
-	dir = resolve_dentry_rcu(dc, path);
+	dir = resolve_dentry_rcu(dc, path, path->ndepth);
 	if (!dir) {
 		rcu_read_unlock();
 		return -ENOENT;
