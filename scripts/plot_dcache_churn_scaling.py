@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Plot scripts/dcache_churn_scaling.csv -> figures/dcache_churn_scaling.png.
 
-Insert/remove WRITER scaling to 192, with the two bottlenecks the fixed-ndirs
-glibc run in dcache_churn.png hides both removed: default jemalloc for the
-allocator, and ndirs scaled WITH the writer count for the shared child-hlist
-heads.  Linear axes -- the message is the scaling divergence, which linear shows
-starkly (contended and seqlock lines flat near the axis, the decontended txn
-line climbing).
+Insert/remove WRITER scaling to 192.  The seqlock baseline's write path is now
+kernel-faithful and FINE-GRAINED -- a per-bucket hlist_bl bit lock (bit 0 of the
+bucket head word) plus the per-directory rwsem, exactly the kernel's add/unlink
+locking, NOT one global mutator lock.  So add/unlink in different dirs and buckets
+proceed in parallel, and this figure measures the write path, not a serialization
+artifact.  (Renames still take rename_lock + a cross-dir s_vfs_rename_mutex, as
+the kernel does -- but churn is add/unlink, which take neither.)
 
-Left panel: one engine (txn-mark) across three ndirs -- how much decontention
-buys.  Right panel: the widest ndirs (16*writers), four engines -- who scales.
-Measured on the bump-free engine (unlink owes no walk-causality bump), so churn
-generates NO gen traffic and the three txn arms converge; the crossover the old
-figure showed was the unlink bump, now removed (see dcache_optype.png for the
-crossover that remains, on directory operations).
+Two stacked bottlenecks the naive fixed-ndirs glibc run hides are removed:
+default jemalloc for the allocator, and ndirs scaled WITH the writer count for
+the shared child-hlist HEADS.  Linear axes.
+
+Left panel: one engine (the seqlock baseline) across three ndirs -- how much
+decontention buys (matched ndirs=writers is child-hlist-head bound; 16*writers
+lifts it ~6x at the top).  Right panel: the widest ndirs (16*writers), four
+engines -- who scales.  Churn is BUMP-FREE (add never bumped; unlink no longer
+does), so the three txn arms are indistinguishable.  The result inverts the old
+figure: the faithful bit-lock baseline is the FASTEST here -- ~1.4-2x ahead of
+the transactional engine across the range, because a bit-lock + hlist splice is
+lighter than txn's per-op MCAS (two commits + a descriptor per churn op); the
+txn arms only draw level at the full 192-writer machine.  The txn engine earns
+its keep on the READ path and on renames (see dcache_churn.png / dcache_s3.png),
+not on pure insert/remove.
 
 Env: ENGINES / OUT overrides as usual.
 """
@@ -46,6 +56,7 @@ DCOL = {"writers/16": "#CC79A7", "writers": "#E69F00", "16*writers": "#009E73"}
 DMARK = {"writers/16": "v", "writers": "o", "16*writers": "D"}
 DLAB = {"writers/16": "ndirs = writers ÷ 16", "writers": "ndirs = writers",
         "16*writers": "ndirs = 16×writers"}
+DECON_ENGINE = "seqlock"
 
 
 def linx(ax):
@@ -59,29 +70,37 @@ def linx(ax):
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.2))
 
 for dm in ("writers/16", "writers", "16*writers"):
-    ys = [d[(dm, w)]["txn-mark"] for w in Ws]
+    ys = [d[(dm, w)][DECON_ENGINE] for w in Ws]
     ax1.plot(Ws, ys, color=DCOL[dm], marker=DMARK[dm], lw=2.2, ms=6.5,
              label=DLAB[dm])
 linx(ax1)
-ax1.set_title("Directory decontention unlocks the write path (txn-mark)\n"
+ax1.set_title("Directory decontention unlocks the write path (seqlock)\n"
               "insert+remove Mops/s vs writers, at three directory counts\n"
-              "each writer toggles 32 slots; shared child-hlist HEADS are the\n"
-              "contention removed as ndirs grows past the writer count",
+              "each writer toggles 32 slots; the shared child-hlist HEADS are\n"
+              "the contention removed as ndirs grows past the writer count",
               fontsize=9.5)
 ax1.set_xlabel("writer threads")
 ax1.set_ylabel("insert+remove Mops/s   (higher is better)")
 ax1.grid(alpha=0.3, ls=":")
 ax1.legend(fontsize=9, loc="upper left")
 
-for e in ("txn-mark", "txn-pernode", "txn-global", "seqlock"):
+for e in ("seqlock", "txn-mark", "txn-pernode", "txn-global"):
     ys = [d[("16*writers", w)][e] for w in Ws]
     ax2.plot(Ws, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6.5,
              label=ELAB[e])
+# annotate the seqlock lead over the (indistinguishable) txn arms
+for w in Ws:
+    s = d[("16*writers", w)].get("seqlock")
+    t = d[("16*writers", w)].get("txn-mark")
+    if s and t and w in (1, 8, 32, 96, 160):
+        ax2.annotate(f"{s / t:.1f}×", (w, s), textcoords="offset points",
+                     xytext=(0, 8), ha="center", fontsize=8,
+                     color=COLOR["seqlock"], fontweight="bold")
 linx(ax2)
 ax2.set_title("Decontended (ndirs = 16×writers, jemalloc) — who scales\n"
-              "insert+remove Mops/s vs writers.  Churn is BUMP-FREE (add never\n"
-              "bumped; unlink no longer does), so all three txn arms CONVERGE\n"
-              "and scale; only seqlock (mutator-lock serialized) stays flat",
+              "insert+remove Mops/s vs writers.  Churn is BUMP-FREE, so the\n"
+              "three txn arms coincide; the faithful bit-lock BASELINE LEADS\n"
+              "(× = seqlock ÷ txn) — MCAS is per-op overhead on pure churn",
               fontsize=9.5)
 ax2.set_xlabel("writer threads")
 ax2.set_ylabel("insert+remove Mops/s   (higher is better)")
