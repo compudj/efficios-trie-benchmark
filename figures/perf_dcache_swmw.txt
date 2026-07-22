@@ -1,77 +1,66 @@
-DLM+SW dentry cache -- per-host CHAIN LOCK vs the mixed SW/MW commit
-===================================================================
-2×96 EPYC 9654, one hw thread/core (0..191), jemalloc, best-of-5, conservation-
+DLM+SW dentry cache -- transition-chain serialization strategies
+================================================================
+2x96 EPYC 9654, one hw thread/core (0..191), jemalloc, best-of-5, conservation-
 gated.  dirs decontended to 16/writer (so the ONLY writer contention is the
 transition chain, not the index buckets).  data: scripts/dcache_swmw.csv;
 figure: figures/dcache_swmw.png; sweep: scripts/run_dcache_swmw.sh.
 
-Three arms -- identical reader + mark; only the chain (d_fwd/d_back) differs:
-  dlm           default: index SW (bucket-locked) + per-host CHAIN LOCK.  176 B.
-  dlm-swmw      -DDC_CHAIN_SWMW: chain rides the mixed commit as MW records
-                (CAS-old serializes adjacent folds); chain lock RETIRED.  168 B.
-  dlm-swmw-pad  -DDC_CHAIN_SWMW -DDC_SWMW_PAD: mixed engine + 8 B dead padding
-                -> 176 B, the SAME-SIZE control.
+The transition chain is a single-producer / multi-consumer list: the demote
+(ENQUEUE) has one producer under the bucket lock; the folds (DEQUEUE) are many
+consumers.  Four arms -- identical reader + mark; only the chain differs:
+  dlm-chainlock  -DDC_CHAIN_LOCK: legacy per-host CHAIN LOCK -- demote AND folds
+                 take it.  176 B.  The reference baseline.
+  dlm-swmw       -DDC_CHAIN_SWMW: SW enqueue + MW dequeue -- the chain rides the
+                 mixed commit as MW records (lock-free folds).  168 B.
+  dlm-swmw-pad   dlm-swmw + 8 B dead padding -> 176 B, the SAME-SIZE control.
+  dlm-foldlock   DEFAULT (no chain flag): SW enqueue + per-host FOLD LOCK dequeue,
+                 plain chain stores, no MW descriptor.  The producer does NOT take
+                 the fold lock -- only fold workers do.  176 B.
 
 RENAME THROUGHPUT vs threads (homogeneous, rename-frac 0.5), Mrenames/s:
-  thr     dlm    swmw   pad    swmw/dlm
-    1    2.66    1.61   1.57     0.61   <- chain lock WINS single-thread
-    2    2.73    2.27   2.25     0.83
-    4    2.99    3.23   3.18     1.08   <- crossover
-    8    2.75    5.29   5.16     1.92
-   16    3.86    7.37   7.35     1.91
-   32    4.30   12.91  13.21     3.00
-   48    5.98   17.59  18.27     2.94
-   64    6.89   23.41  22.55     3.40
-   96   11.20   31.44  30.08     2.81
-  128   13.26   32.51  34.86     2.45
-  192   13.90   48.36  45.10     3.48   <- swmw still scaling; dlm plateaued
+  thr   chainlock  swmw   swmw-pad  FOLDLOCK   foldlock/chainlock  foldlock/swmw
+    1     2.67     1.62    1.62      2.39         0.89              1.48
+    2     2.61     2.29    2.28      3.87         1.48              1.69
+    4     3.09     3.33    3.21      5.90         1.91              1.77
+    8     3.43     5.57    5.36      9.36         2.73              1.68
+   16     3.26     7.62    7.57     13.01         3.99              1.71
+   48     5.67    18.24   17.92     31.02         5.47              1.70
+   96     9.79    33.43   33.03     50.27         5.13              1.50
+  192    13.43    49.09   45.61     63.22         4.71              1.29
 
 RENAME THROUGHPUT vs rename fraction (48 threads), Mrenames/s:
-  frac    dlm    swmw   pad
-   1%    4.59    7.90   7.82   (1.7x even at 1% renames)
-   5%    6.00   14.12  14.37
-  10%    5.06   15.40  15.76
-  20%    5.54   17.13  17.13
-  35%    4.86   17.27  17.97   (dlm DEGRADES as frac rises -> more chain-lock contention)
-  50%    5.07   18.15  17.22
+  frac  chainlock  swmw   FOLDLOCK
+   1%    4.36      7.9     8.4     (fold lock leads even at 1% renames)
+   5%    7.5      12      19.4
+  10%    4.7      16      22
+  20%    6.3      19      27
+  35%    5.6      19      29
+  50%    5.2      20      30      (chain lock DEGRADES as frac rises; fold lock climbs)
 
-READER PATH (frac=0 pure lookups, 48 threads), Mlookups/s:
-  dlm 1279.9   swmw 1291.4   pad 1291.0     <- a WASH (identical reader code)
-
-READER under heavy concurrent rename load (32 readers + W writers), Mlookups/s:
-   W    dlm    swmw   pad
-   1   923    943    941    <- wash at low writer load
-   8   877    845    845
-  16   875    848    846
-  24   865    757    756    <- swmw readers ~12-18% lower at heavy write load
-  48   810    668    746       (the MW commit's heavier call_rcu/reclaim traffic
-                               taxes co-running readers -- but swmw writers are
-                               doing ~3x the renames).
+READER PATH (frac=0 pure lookups, 48 threads), Mlookups/s -- a WASH:
+  chainlock 1294   swmw 1289   swmw-pad 1290   FOLDLOCK 1293   (identical reader)
 
 CONCLUSIONS
 -----------
-1. The win is the lock-free CHAIN, not the -8B footprint.  dlm-swmw (168 B) and
-   dlm-swmw-pad (176 B) track each other within noise across every panel, so the
-   speedup is the MECHANISM (retiring the per-host chain lock that serialized
-   every stack demote and every fold of a chain), not cache density.  On this
-   allocator a 64-aligned 168 B and 176 B object both occupy 3 cachelines, so the
-   -8B is a real footprint saving but a throughput no-op here.
+1. FOLD LOCK is the best of the three, and is now the DEFAULT.  It nearly matches
+   the chain lock uncontended (0.89x at 1 thread, vs 0.61x for the MW dequeue) and
+   beats BOTH alternatives at every higher thread count -- 1.3-1.8x over the MW
+   dequeue and 2.7-5.5x over the chain lock from 8 to 192 threads.  Why: the plain
+   chain stores under a rarely-contended per-host lock avoid the MW dequeue's
+   descriptor + call_rcu per fold (recovering the uncontended cost), while
+   decoupling the producer from that lock avoids the chain lock's producer-vs-fold
+   coupling (recovering the scaling).
 
-2. It is a genuine TRADE-OFF with a crossover at ~4 threads.  The mixed commit's
-   descriptor machinery (install/decide/settle + call_rcu the descriptor) makes a
-   rename ~1.6x MORE EXPENSIVE uncontended, so the chain-lock build wins 1-2
-   threads.  Past the crossover the lock-free chain scales where the chain lock
-   serializes: swmw is ~1.9x at 8-16 threads, ~3x at 32-64, and 3.5x (and still
-   climbing) at 192, where dlm has plateaued near 14 Mrenames/s.  Correcting an
-   earlier fixed-dir spot-check that read as a flat "1.8-2x": with dirs
-   decontended (chain isolated) the honest shape is crossover + widening win.
+2. The MW dequeue (dlm-swmw) is a TRADE-OFF: lock-free folds scale, but the
+   descriptor cost makes it ~1.6x slower than the chain lock uncontended (1 thread).
+   Its win over the chain lock is the lock-free chain, NOT the -8B: dlm-swmw (168 B)
+   and dlm-swmw-pad (176 B) track each other within noise across every panel.
 
-3. The fair-mutex escalation lane the mixed front-end reintroduces does NOT cost
-   the shell ops at scale -- swmw keeps scaling cleanly to 192 threads with no
-   collapse.
+3. The chain lock (reference) plateaus with concurrency (its demote couples the
+   producer with the folds on one per-host word) and even DEGRADES as the rename
+   fraction rises.
 
-4. Reads are untouched when uncontended (frac=0: wash).  Under HEAVY concurrent
-   rename load the swmw readers run ~12-18% slower than the chain-lock readers
-   (the MW commit's higher reclaim/descriptor traffic on the shared machine),
-   offset by ~3x the write throughput -- a writer-throughput-for-reader-tax trade
-   worth stating, not a reader-path regression (the reader code is identical).
+4. Reads are a wash when uncontended (all four ~1290 Mlk/s -- identical reader).
+   Under heavy concurrent rename load the mixed arms' readers run somewhat slower
+   than the chain-lock readers (the mixed commit's call_rcu/reclaim traffic on the
+   shared machine) -- but the mixed writers are doing far more renames.
