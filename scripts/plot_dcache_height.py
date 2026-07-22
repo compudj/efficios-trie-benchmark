@@ -29,18 +29,19 @@ CSV = os.path.join(HERE, "dcache_height.csv")
 OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures", "dcache_height.png"))
 
-COLOR = {"seqlock": "#D55E00", "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARKER = {"seqlock": "s", "txn-pernode": "^", "txn-mark": "D"}
+COLOR = {"seqlock": "#D55E00", "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARKER = {"seqlock": "s", "txn-pernode": "^", "txn-mark": "D", "bucketlock": "X"}
 LABEL = {
     "seqlock": "seqlock — rename_lock + d_seq\n(faithful kernel baseline)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(localized: moved subtree only)",
     "txn-mark": "urcu-txn — deletion MARK as gen\n(localized, no counter)",
+    "bucketlock": "bucket lock + SW txn\n(fold-lock writer)",
 }
 # The height panel is where the localized arms are WEAKEST (the per-node lead
 # erodes toward the root), so it is the panel where they could plausibly diverge
 # rather than coincide -- worth plotting the mark arm here explicitly.
 ENGINES = tuple(os.environ.get(
-    "ENGINES", "seqlock txn-pernode txn-mark").split())
+    "ENGINES", "seqlock txn-mark bucketlock").split())
 rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
 
 

@@ -46,12 +46,14 @@ for r in rows:
 Ws = sorted({int(r["writers"]) for r in rows})
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARK = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARK = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
+        "bucketlock": "X"}
 ELAB = {"seqlock": "seqlock (kernel baseline)",
         "txn-global": "txn — GLOBAL rename_gen",
         "txn-pernode": "txn — PER-NODE host gen",
-        "txn-mark": "txn — deletion MARK"}
+        "txn-mark": "txn — deletion MARK",
+        "bucketlock": "bucket lock + SW txn"}
 DCOL = {"writers/16": "#CC79A7", "writers": "#E69F00", "16*writers": "#009E73"}
 DMARK = {"writers/16": "v", "writers": "o", "16*writers": "D"}
 DLAB = {"writers/16": "ndirs = writers ÷ 16", "writers": "ndirs = writers",
@@ -84,7 +86,7 @@ ax1.set_ylabel("insert+remove Mops/s   (higher is better)")
 ax1.grid(alpha=0.3, ls=":")
 ax1.legend(fontsize=9, loc="upper left")
 
-for e in ("seqlock", "txn-mark", "txn-pernode", "txn-global"):
+for e in ("seqlock", "txn-mark", "bucketlock", "txn-pernode", "txn-global"):
     ys = [d[("16*writers", w)][e] for w in Ws]
     ax2.plot(Ws, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6.5,
              label=ELAB[e])

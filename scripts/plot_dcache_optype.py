@@ -32,13 +32,15 @@ for r in rows:
 RDs = sorted({int(r["readers"]) for r in rows})
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARK = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARK = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
+        "bucketlock": "X"}
 ELAB = {"seqlock": "seqlock (kernel baseline)",
         "txn-global": "txn — GLOBAL rename_gen",
         "txn-pernode": "txn — PER-NODE host gen",
-        "txn-mark": "txn — deletion MARK"}
-ORDER = ("txn-mark", "txn-pernode", "txn-global", "seqlock")
+        "txn-mark": "txn — deletion MARK",
+        "bucketlock": "bucket lock + SW txn"}
+ORDER = ("bucketlock", "txn-mark", "txn-pernode", "txn-global", "seqlock")
 
 
 def linx(ax):

@@ -60,8 +60,9 @@ COMMON="--depth $DEPTH --leaves $LEAVES --nbuckets 1048576 --duration $DUR $PIN"
 declare -A BINOF=( [seqlock]=bench_dcache_seqlock \
                    [txn-global]=bench_dcache_txn \
                    [txn-pernode]=bench_dcache_txn_pernode \
-                   [txn-mark]=bench_dcache_txn_mark )
-ENGINES="seqlock txn-global txn-pernode txn-mark"
+                   [txn-mark]=bench_dcache_txn_mark \
+                   [bucketlock]=bench_dcache_bucketlock )
+ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
 

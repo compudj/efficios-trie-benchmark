@@ -53,13 +53,15 @@ CSV = os.path.join(HERE, "dcache_sweep.csv")
 OUT = os.environ.get("OUT", os.path.join(HERE, os.pardir, "figures", "dcache_s3.png"))
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
+          "bucketlock": "X"}
 LABEL = {
     "seqlock": "seqlock — rename_lock + d_seq\n(faithful kernel baseline)",
     "txn-global": "urcu-txn — GLOBAL rename_gen\n(d_seq deleted, one global bracket)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(localized: moved entry only)",
     "txn-mark": "urcu-txn — deletion MARK as gen\n(localized, no counter; name 40)",
+    "bucketlock": "bucket lock + SW txn\n(same mark reader; fold-lock writer)",
 }
 # Headline comparison: the faithful kernel baseline vs the localized designs.
 # The txn-global arm (an intermediate A/B showing a naive port that keeps one
@@ -72,7 +74,7 @@ LABEL = {
 # retired counter and the 8 name bytes, not throughput.  Override with
 # ENGINES=... to plot a different subset.
 ENGINES = tuple(os.environ.get(
-    "ENGINES", "seqlock txn-pernode txn-mark").split())
+    "ENGINES", "seqlock txn-mark bucketlock").split())
 rows = list(csv.DictReader(open(CSV)))
 
 
@@ -167,8 +169,8 @@ for ax in (ax1, ax2, ax3):
         ax.legend(fontsize=7.5, loc="best")
 
 fig.suptitle("Userspace dcache — does urcu-txn dissolve rename_lock + d_seq?   "
-             "seqlock (kernel baseline) vs txn localized "
-             "(per-node gen, and no-counter deletion mark)   ·   2×96-core EPYC",
+             "seqlock (kernel baseline) vs two urcu-txn engines: all-MW deletion-mark "
+             "and the bucket-lock + SW txn (fold-lock writer)   ·   2×96-core EPYC",
              fontsize=12)
 fig.tight_layout(rect=[0, 0, 1, 0.94])
 fig.savefig(OUT, dpi=140)

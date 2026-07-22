@@ -67,16 +67,18 @@ OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures", "dcache_churn.png"))
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
+          "bucketlock": "X"}
 LABEL = {
     "seqlock": "seqlock — hlist_bl + d_seq\n(faithful kernel baseline)",
     "txn-global": "urcu-txn — GLOBAL rename_gen",
     "txn-pernode": "urcu-txn — PER-NODE host gen",
     "txn-mark": "urcu-txn — deletion MARK as gen",
+    "bucketlock": "bucket lock + SW txn\n(bit-lock add/unlink)",
 }
 ENGINES = tuple(os.environ.get(
-    "ENGINES", "seqlock txn-global txn-pernode txn-mark").split())
+    "ENGINES", "seqlock txn-mark bucketlock").split())
 TXN_REF = "txn-mark"        # representative txn arm for ratio labels
 
 rows = list(csv.DictReader(open(CSV)))

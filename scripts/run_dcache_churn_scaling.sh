@@ -37,8 +37,9 @@ CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 declare -A BINOF=( [seqlock]=bench_dcache_churn_seqlock \
                    [txn-global]=bench_dcache_churn_txn \
                    [txn-pernode]=bench_dcache_churn_txn_pernode \
-                   [txn-mark]=bench_dcache_churn_txn_mark )
-ENGINES="seqlock txn-global txn-pernode txn-mark"
+                   [txn-mark]=bench_dcache_churn_txn_mark \
+                   [bucketlock]=bench_dcache_churn_bucketlock )
+ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
 for e in $ENGINES; do
   test -x "$BIN/${BINOF[$e]}" || {
     echo "MISSING $BIN/${BINOF[$e]} -- run 'make -C experiments/dcache churn'" >&2

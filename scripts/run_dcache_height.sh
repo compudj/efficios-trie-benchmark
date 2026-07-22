@@ -40,8 +40,9 @@ fi
 declare -A BINOF=( [txn-mark]=bench_dcache_height_txn_mark \
                    [seqlock]=bench_dcache_height_seqlock \
                    [txn-global]=bench_dcache_height_txn \
-                   [txn-pernode]=bench_dcache_height_txn_pernode )
-ENGINES="seqlock txn-global txn-pernode txn-mark"
+                   [txn-pernode]=bench_dcache_height_txn_pernode \
+                   [bucketlock]=bench_dcache_height_bucketlock )
+ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
 for e in $ENGINES; do
   test -x "$BIN/${BINOF[$e]}" || { echo "MISSING $BIN/${BINOF[$e]} -- run 'make -C experiments/dcache height'" >&2; exit 1; }
 done

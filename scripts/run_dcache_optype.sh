@@ -45,10 +45,11 @@ CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 
 # engine define ; source
 declare -A EDEF=( [seqlock]="" [txn-global]="" [txn-pernode]="-DDC_PER_NODE_GEN" \
-                  [txn-mark]="-DDC_MARK_GEN" )
+                  [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" )
 declare -A ESRC=( [seqlock]="dcache_seqlock.c" [txn-global]="dcache_txn.c" \
-                  [txn-pernode]="dcache_txn.c" [txn-mark]="dcache_txn.c" )
-ENGINES="seqlock txn-global txn-pernode txn-mark"
+                  [txn-pernode]="dcache_txn.c" [txn-mark]="dcache_txn.c" \
+                  [bucketlock]="dcache_bucketlock.c" )
+ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
