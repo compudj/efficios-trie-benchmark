@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Adversarial move-HEIGHT sweep -- how far does the per-node localization survive?
+Adversarial move-HEIGHT sweep -- how far does the localized reader's lead survive?
 
-The S3 sweep moves leaves (fan-in 1): the per-node counter's best case.  Here the
+The S3 sweep moves leaves (fan-in 1): the localized reader's best case.  Here the
 reader workload is fixed (uniform full-depth walks over a balanced binary forest)
 and the writers move nodes at a swept HEIGHT H; a move at height H swaps two
 sibling subtrees of 2^H leaves, invalidating a fraction ~2^(H-D) of reader walks.
-The per-node reader's lead over the seqlock baseline should erode from its
-leaf-case peak toward parity as H climbs, because a near-root move touches almost
-every walk -- exactly what rename_lock does.  That erosion is the honest BOUND on
-the S3 headline: per-node wins big for the common (low-fan-in) rename, and degrades
-gracefully to the baseline for the rare near-root move.
+The localized reader's lead over the seqlock baseline erodes from its leaf-case
+peak as H climbs (a near-root move touches almost every walk), but it does NOT
+reach parity: at H=7 the deletion-MARK reader and the bucket lock are still ~10x
+and ~8x the seqlock baseline, because seqlock retries the WHOLE walk on ANY rename
+regardless of height, while the localized reader only retries walks that actually
+pass through the moved subtree.  So this bounds the S3 headline: the localized
+lead shrinks ~40% for the rare near-root move but never collapses to the baseline.
 
-Two-way (seqlock vs per-node), consistent with dcache_s3.png; the txn-global arm
-(uniformly floored here -- its one counter slot serializes all 8 writers AND its
-deep-walk readers retry on every bump) stays in the CSV.
+Plotted: seqlock vs the localized deletion-MARK reader (txn-mark) and the bucket
+lock + SW (bucketlock, same mark reader, fold-lock writer).  The txn-global and
+txn-pernode arms stay in the CSV but are dropped from the plot (global is
+uniformly floored -- one counter slot serializes all writers; per-node coincides
+with the mark reader, differing only in which CL0 word the stamp reads).
 
 Data: scripts/dcache_height.csv (best-of-5, conservation-gated).  2x96 EPYC.
 """
@@ -37,7 +41,7 @@ LABEL = {
     "txn-mark": "urcu-txn — deletion MARK as gen\n(localized, no counter)",
     "bucketlock": "bucket lock + SW txn\n(fold-lock writer)",
 }
-# The height panel is where the localized arms are WEAKEST (the per-node lead
+# The height panel is where the localized arms are WEAKEST (their lead
 # erodes toward the root), so it is the panel where they could plausibly diverge
 # rather than coincide -- worth plotting the mark arm here explicitly.
 ENGINES = tuple(os.environ.get(
@@ -58,8 +62,8 @@ for e in ENGINES:
     if xs:
         ax.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.1, ms=7,
                 label=LABEL[e], alpha=0.94)
-# per-node lead over the seqlock baseline at each height -- the erosion.
-# Label above the per-node point where it leads, below where it dips under
+# the ANNOT (mark) arm's lead over the seqlock baseline at each height -- the erosion.
+# Label above the point where it leads, below where it dips under
 # seqlock (so the text never lands on the other curve at the crossover).
 ANNOT = os.environ.get("ANNOT", "txn-mark")
 for h in sorted(base.get(ANNOT, {})):
@@ -85,15 +89,16 @@ ax.set_xlabel("move height H above the leaves  "
 ax.set_ylabel("reader Mlookups/s   (higher is better)")
 ax.set_title("Move-height sweep — 32 readers + 8 writers, balanced binary bands "
              "(256 leaves)\nwriters exchange sibling subtrees at height H;  "
-             "× = mark ÷ seqlock\nboth localized arms erode as moves climb toward the "
-             "band root; under jemalloc\nper-node reaches ~parity at H=7 (glibc had it "
-             "invert), the MARK stays above",
+             "× = mark ÷ seqlock\nboth localized arms (deletion MARK reader, bucket "
+             "lock) erode ~40% as moves\nclimb toward the band root, but stay ~8–10× "
+             "the seqlock baseline (jemalloc)",
              fontsize=9)
 ax.grid(alpha=0.3, ls=":")
 ax.legend(fontsize=8, loc="best")
 fig.suptitle("Userspace dcache — how high can a DIRECTORY rename climb before the\n"
-             "localized version stops helping?  Per-node erodes to ~parity near the root; "
-             "the MARK stays above (jemalloc)",
+             "localized reader stops helping?  It erodes toward the root but stays ~8–10× "
+             "the\nseqlock baseline (which retries the whole walk on any rename) — never parity "
+             "(jemalloc)",
              fontsize=10.5)
 fig.tight_layout(rect=[0, 0, 1, 0.93])
 fig.savefig(OUT, dpi=140)
