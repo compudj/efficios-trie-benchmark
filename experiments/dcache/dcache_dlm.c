@@ -62,8 +62,33 @@
 #include <urcu/rcu-txn-hlist.h>		/* URCU_TXN_HLIST_TAG / _MARK / is_marked (reused) */
 #include <urcu/rcu-txn-sw.h>		/* DLM: single-writer flip-proxy commit */
 #include <urcu/rcu-txn-sw-hlist.h>	/* DLM: SW hlist node type + _prepare forms */
-#ifdef DC_CHAIN_SWMW
-#include <urcu/rcu-txn-sw-mw.h>		/* mixed SW/MW: chain MW + index SW, ONE commit */
+/*
+ * Chain-serialization strategy (mutually exclusive):
+ *   default          SW enqueue + per-host FOLD LOCK dequeue (== DC_CHAIN_FOLDLOCK,
+ *                    the DEFAULT): the folds take a per-host lock and rewrite the
+ *                    chain with PLAIN stores; the demote does NOT take it, so the
+ *                    producer never contends -- only fold workers do.  Best of the
+ *                    three: nearly matches the chain lock uncontended and scales
+ *                    past both alternatives (figures/dcache_swmw.png).
+ *   DC_CHAIN_LOCK    original per-host CHAIN LOCK covering demote + folds; SW index
+ *                    commit (the reference build).
+ *   DC_CHAIN_SWMW    SW enqueue + MW dequeue: the chain rides a mixed SW/MW commit,
+ *                    chain lock retired (lock-free folds; scales, but the MW
+ *                    descriptor cost loses uncontended).
+ * The two mixed variants (default/FOLDLOCK and SWMW) share the SW-enqueue front-end
+ * (DC_CHAIN_MIXED) and the mixed reader resolve; they differ only in the fold.
+ */
+#if (defined(DC_CHAIN_LOCK) + defined(DC_CHAIN_SWMW) + defined(DC_CHAIN_FOLDLOCK)) > 1
+# error "DC_CHAIN_LOCK / DC_CHAIN_SWMW / DC_CHAIN_FOLDLOCK are mutually exclusive"
+#endif
+#if !defined(DC_CHAIN_LOCK) && !defined(DC_CHAIN_SWMW)
+# define DC_CHAIN_FOLDLOCK 1	/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
+#endif
+#if defined(DC_CHAIN_SWMW) || defined(DC_CHAIN_FOLDLOCK)
+# define DC_CHAIN_MIXED 1	/* SW enqueue via the mixed engine; reader resolves mixed records */
+#endif
+#ifdef DC_CHAIN_MIXED
+#include <urcu/rcu-txn-sw-mw.h>		/* mixed SW/MW: SW enqueue (+ SWMW: MW dequeue) */
 #endif
 
 #include "dcache.h"
@@ -73,16 +98,15 @@
  *
  * The DEFAULT DLM build drives the pure single-writer engine (rcu-txn-sw.h): the
  * index commits SW under the bucket lock and the transition chain (d_fwd/d_back)
- * is serialized by a SEPARATE per-host chain lock.  -DDC_CHAIN_SWMW instead drives
- * the MIXED engine (rcu-txn-sw-mw.h): the index stays SW (store_sw, bucket-locked)
- * but the chain edits become MW records (store_mw, CAS-old) carried in the SAME
- * commit, so the demote / promote / splice linearize atomically with the index and
- * the per-host chain lock is RETIRED (-8 B/dentry, lock-free splices).  add/unlink
- * stay plain locked stores on BOTH builds.  The SW proxy and the MW record share a
- * resolve header, so ONE reader (dc_proxy_resolve) serves both; only the record
- * helpers, the escalation domain, and the shell ops differ.
+ * is serialized by a SEPARATE per-host chain lock.  A MIXED build (DC_CHAIN_SWMW /
+ * DC_CHAIN_FOLDLOCK) drives the mixed engine (rcu-txn-sw-mw.h): the index and the
+ * demote commit SW (store_sw, bucket-locked) in ONE commit; the two variants
+ * differ only in how the FOLD removes nodes (MW records vs a per-host fold lock).
+ * add/unlink stay plain locked stores on ALL builds.  The SW proxy and the MW
+ * record share a resolve header, so ONE reader (dc_proxy_resolve) serves both;
+ * only the record helpers, the escalation domain, and the shell ops differ.
  */
-#ifdef DC_CHAIN_SWMW
+#ifdef DC_CHAIN_MIXED
 typedef struct urcu_txn_sw_mw_txn	dc_swtxn_t;
 typedef struct urcu_txn_sw_mw_domain	dc_domain_t;
 #define dc_sw_record(txn, slot, o, n, tag) \
@@ -230,21 +254,22 @@ struct dentry {
 	unsigned long d_moving;
 #ifndef DC_CHAIN_SWMW
 	/*
-	 * TRANSITION-CHAIN LOCK (per content host).  DLM: serializes every mutation
-	 * of THIS entry's d_fwd/d_back chain -- the stack's demote and all three
-	 * fold branches -- so those links are plain reader-atomic stores that need
-	 * NO txn.  One lock per chain: all its nodes share this address-stable tail
-	 * host (host_of_rcu), so the single lock makes all its folds mutually
-	 * exclusive, which is what the SW engine's missing shared-slot ABORT no
-	 * longer provides (see the DLM chain-lock note).  Taken under
-	 * rcu_read_lock() so the host cannot be reclaimed while it is held.  Kept
-	 * DISTINCT from d_moving (the cross-dir cycle Dekker flag) so a fold does
-	 * not trip a concurrent move's ancestry check.  Cold, writer-only.
-	 *
-	 * RETIRED under DC_CHAIN_SWMW: the chain (d_fwd/d_back) rides the mixed
-	 * commit as MW records, so no per-host lock is needed -- reclaiming the 8
-	 * bytes (sizeof(dentry) drops back under the seqlock baseline). */
-	unsigned long d_chain_lock;
+	 * Per-host serialization word for the transition chain (d_fwd/d_back).  Its
+	 * ROLE depends on the build:
+	 *   DEFAULT (fold-lock dequeue): the per-host FOLD LOCK -- only the folds
+	 *     (dequeue) take it and rewrite the chain with plain reader-atomic stores;
+	 *     the demote (enqueue) does NOT, so the producer never contends on it --
+	 *     only fold workers do.
+	 *   DC_CHAIN_LOCK (legacy): the classic per-host CHAIN LOCK -- the demote AND
+	 *     all three fold branches take it, so every chain mutation is a plain
+	 *     store, at the cost of coupling the producer with the folds.
+	 *   DC_CHAIN_SWMW retires it (the chain rides the mixed commit as MW records,
+	 *     -8 B) -- absent in that build.
+	 * One lock per chain: all its nodes share this address-stable tail host
+	 * (host_of_rcu).  Taken under rcu_read_lock() so the host cannot be reclaimed
+	 * while it is held.  Kept DISTINCT from d_moving (the cross-dir cycle Dekker
+	 * flag) so a fold does not trip a concurrent move's ancestry check.  Cold. */
+	unsigned long d_fold_lock;
 #elif defined(DC_SWMW_PAD)
 	/*
 	 * PERF A/B CONTROL only (-DDC_SWMW_PAD): restore the 8 bytes the retired
@@ -404,40 +429,40 @@ static inline void bl_unlock2(struct urcu_txn_sw_hlist_head *x,
 
 #ifndef DC_CHAIN_SWMW
 /*
- * ---- transition-chain lock (per content host) --------------------------- *
+ * ---- per-host chain-serialization lock (the FOLD LOCK) ------------------ *
  *
- * A test-and-set spinlock on host->d_chain_lock (0 = free, 1 = held).  ALL
- * chain lock acquisition happens BEFORE any bucket-head lock, and chain locks
- * are taken in address order (an exchange grays two), so the global lock order
- * is {chain locks < bucket-head locks}, each class address-ordered -- no
- * bucket is ever held while waiting on a chain, so the two classes cannot
- * deadlock.  Held only under rcu_read_lock(), so the host stays alive (a
- * spinner is itself in an RCU read section, so the host it spins on cannot
- * pass a grace period and be freed).  RETIRED under DC_CHAIN_SWMW (the chain
- * rides the mixed commit as MW records).
+ * A test-and-set spinlock on host->d_fold_lock (0 = free, 1 = held).  It is
+ * taken BEFORE any bucket-head lock and in address order (an exchange grays
+ * two), so the global lock order is {fold locks < bucket-head locks}, each
+ * class address-ordered -- no bucket is ever held while waiting on a fold lock,
+ * so the two classes cannot deadlock.  Held only under rcu_read_lock(), so the
+ * host stays alive (a spinner is itself in an RCU read section, so the host it
+ * spins on cannot pass a grace period and be freed).  In the DEFAULT build only
+ * the folds take it (the fold lock); DC_CHAIN_LOCK also has the demote take it
+ * (the classic chain lock); DC_CHAIN_SWMW retires it (MW dequeue).
  *
  */
-static inline void chain_lock(struct dentry *host)
+static inline void fold_lock(struct dentry *host)
 {
-	while (uatomic_cmpxchg(&host->d_chain_lock, 0UL, 1UL) != 0UL)
+	while (uatomic_cmpxchg(&host->d_fold_lock, 0UL, 1UL) != 0UL)
 		caa_cpu_relax();
 }
-static inline void chain_unlock(struct dentry *host)
+static inline void fold_unlock(struct dentry *host)
 {
-	uatomic_store(&host->d_chain_lock, 0UL, CMM_RELEASE);
+	uatomic_store(&host->d_fold_lock, 0UL, CMM_RELEASE);
 }
 /* Two chain locks in ADDRESS ORDER (exchange); dedup a degenerate a == b. */
-static inline void chain_lock2(struct dentry *a, struct dentry *b)
+static inline void fold_lock2(struct dentry *a, struct dentry *b)
 {
-	if (a == b)	{ chain_lock(a); return; }
-	if (a < b)	{ chain_lock(a); chain_lock(b); }
-	else		{ chain_lock(b); chain_lock(a); }
+	if (a == b)	{ fold_lock(a); return; }
+	if (a < b)	{ fold_lock(a); fold_lock(b); }
+	else		{ fold_lock(b); fold_lock(a); }
 }
-static inline void chain_unlock2(struct dentry *a, struct dentry *b)
+static inline void fold_unlock2(struct dentry *a, struct dentry *b)
 {
-	chain_unlock(a);
+	fold_unlock(a);
 	if (a != b)
-		chain_unlock(b);
+		fold_unlock(b);
 }
 #endif	/* !DC_CHAIN_SWMW */
 
@@ -933,8 +958,12 @@ static inline struct urcu_txn_sw_hlist_head *bucket_of(struct dcache *dc,
 
 const char *dc_engine_name(void)
 {
-#if defined(DC_CHAIN_SWMW)
+#if defined(DC_CHAIN_LOCK)
+	return "dlm-chainlock";		/* legacy: per-host chain lock (demote + folds) */
+#elif defined(DC_CHAIN_SWMW)
 	return "dlm-swmw";		/* mixed SW/MW: chain MW, index SW, no chain lock */
+#elif defined(DC_CHAIN_FOLDLOCK)
+	return "dlm-foldlock";		/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
 #elif defined(DC_MARK_GEN)
 	return "dlm-mark";
 #elif defined(DC_PER_NODE_GEN)
@@ -1010,7 +1039,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	for (i = 0; i < n; i++)
 		urcu_txn_sw_hlist_init(&dc->buckets[i]);
 	dc->mask = n - 1;
-#ifdef DC_CHAIN_SWMW
+#ifdef DC_CHAIN_MIXED
 	urcu_txn_sw_mw_domain_init(&dc->domain);
 #else
 	urcu_txn_domain_init(&dc->domain);
@@ -1699,7 +1728,7 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 		dlm_sw_del_marked(txn, &top->d_sib);
 		dlm_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
 	}
-#ifdef DC_CHAIN_SWMW
+#ifdef DC_CHAIN_MIXED
 	(void) urcu_txn_sw_mw_store_sw(txn, (void **) &top->d_back, NULL, shell,
 				      DC_FWD_TAG);
 #endif
@@ -1709,7 +1738,7 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 					  DC_PARENT_TAG);
 }
 
-#ifndef DC_CHAIN_SWMW	/* ===== default: per-host chain lock + plain demote ===== */
+#ifndef DC_CHAIN_MIXED	/* ===== default: per-host chain lock + plain demote ===== */
 
 /*
  * STACK.  Move the entry named (@from_parent, @from_name) so it becomes named
@@ -1817,12 +1846,12 @@ static int stack_shell(struct dcache *dc,
 		heads[1] = &from_parent->d_child_head;
 		heads[2] = new_bucket;
 		heads[3] = &new_parent->d_child_head;
-		chain_lock(host);
+		fold_lock(host);
 		bl_lock_n(heads, 4);
 		(void) dlm_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
 		if (marked) {
 			bl_unlock_n(heads, 4);
-			chain_unlock(host);
+			fold_unlock(host);
 			if (cross_parent)
 				uatomic_and(&host->d_moving, ~1UL);
 			continue;		/* re-find the current top */
@@ -1837,7 +1866,7 @@ static int stack_shell(struct dcache *dc,
 			 * top's index removal above, both held under this lock. */
 			uatomic_store(&top->d_back, shell, CMM_RELEASE);
 		bl_unlock_n(heads, 4);
-		chain_unlock(host);
+		fold_unlock(host);
 		if (cross_parent)
 			uatomic_and(&host->d_moving, ~1UL);
 		if (st != URCU_TXN_STATUS_OK) {	/* MEMORY_ERROR: nothing published */
@@ -1903,7 +1932,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 	int reclaim_n = 1;
 
 	rcu_read_lock();
-	chain_lock(host);			/* serialize this chain's mutations */
+	fold_lock(host);			/* serialize this chain's mutations */
 	back = uatomic_load(&n->d_back, CMM_RELAXED);	/* stable under the chain lock */
 	fwd  = uatomic_load(&n->d_fwd, CMM_RELAXED);
 
@@ -1976,7 +2005,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 	}
 
 done:
-	chain_unlock(host);
+	fold_unlock(host);
 	rcu_read_unlock();
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
@@ -1987,7 +2016,7 @@ done:
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
 }
 
-#else	/* ===== DC_CHAIN_SWMW: mixed engine -- chain edits are MW records ===== */
+#else	/* ===== DC_CHAIN_MIXED: SW enqueue (store_sw); fold splits SWMW vs RMLOCK ===== */
 
 /*
  * STACK (mixed SW/MW).  Same shell-vehicle move as the default build, but the
@@ -2137,6 +2166,8 @@ out_free:
 	free(shell);
 	return ret;
 }
+
+#ifdef DC_CHAIN_SWMW	/* ---- dequeue = MW records (lock-free folds) ---- */
 
 /*
  * FOLD (mixed SW/MW).  Same three branches as the default build, but WITHOUT the
@@ -2308,7 +2339,127 @@ done:
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
 }
 
-#endif	/* DC_CHAIN_SWMW */
+#else	/* DC_CHAIN_FOLDLOCK ---- dequeue = per-host FOLD LOCK (plain chain stores) ---- */
+
+/*
+ * FOLD (mixed SW enqueue + FOLD-LOCK dequeue).  The demote (enqueue) is a
+ * store_sw as in DC_CHAIN_SWMW, but the fold (dequeue) takes the per-host REMOVE
+ * LOCK (host->d_fold_lock, reused) and rewrites the chain with PLAIN stores -- no
+ * MW descriptor, no per-fold call_rcu of a descriptor, like the default chain-lock
+ * build.  Two differences from that build make it worth the flag:
+ *   - the demote does NOT take the fold lock (it is SW under the bucket lock), so
+ *     the PRODUCER never contends on it -- only fold workers do;
+ *   - because of that, d_back is NOT stable under the fold lock against a
+ *     concurrent demote of a TOP, so it is read through the mixed reader and the
+ *     demote race is caught by the mark-recheck under the bucket lock, exactly as
+ *     the MW fold does.  Once a node is a RELAY (d_back != NULL) its chain slots
+ *     ARE stable under the fold lock (a relay is never demoted; every removal
+ *     takes the lock), so SPLICE / RECLAIM are single-shot plain stores.
+ *
+ * The TRANSFER's index replace stays a mixed-engine store_sw (so the mixed reader
+ * resolves it) but on a NULL domain: it is an abort-free disjoint commit already
+ * serialized by the remove + bucket locks, so it needs no fair-mutex lane and can
+ * run with those locks held (no begin-park).
+ */
+static void fold(struct dcache *dc, struct dentry *n)
+{
+	struct dentry *host = host_of_rcu(n);	/* chain's tail host (invariant) */
+	struct dentry *host_to_free = NULL;
+	int reclaim_n = 1;
+
+	rcu_read_lock();
+	fold_lock(host);			/* FOLD LOCK: serialize this chain's folds */
+	for (;;) {
+		struct dentry *back, *fwd, *m;
+		int marked = 0;
+
+		DC_DBG_FOLD_ATTEMPT();
+		back = urcu_txn_sw_mw_read((void **) &n->d_back, DC_FWD_TAG);
+		fwd  = urcu_txn_sw_mw_read((void **) &n->d_fwd, DC_FWD_TAG);
+
+		if (back != NULL) {
+			/* SPLICE: n is a relay; back/fwd stable under the fold lock. */
+			uatomic_store(&back->d_fwd, fwd, CMM_RELEASE);	/* reader-visible skip */
+			uatomic_store(&fwd->d_back, back, CMM_RELAXED);	/* fold-only backptr */
+			break;
+		}
+
+		m = fwd;
+		{
+			struct dentry *parent = parent_of_rcu(n);
+			struct urcu_txn_sw_hlist_head *heads[2];
+
+			heads[0] = bucket_of(dc, parent, n->d_iname.hash);
+			heads[1] = &parent->d_child_head;
+			bl_lock_n(heads, 2);		/* fold lock < bucket lock (address-ordered) */
+			(void) dlm_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
+			if (marked) {
+				/* n out of the index; under the bucket lock no demote is in
+				 * progress.  Re-read d_back: NULL => an unlink removed the
+				 * orphan top (RECLAIM); non-NULL => a re-rename demoted it ->
+				 * n is now a relay: drop the bucket lock and re-derive -> SPLICE. */
+				struct dentry *b2 = urcu_txn_sw_mw_read(
+					(void **) &n->d_back, DC_FWD_TAG);
+
+				if (b2 == NULL) {
+					/* Under the fold lock n->d_fwd is stable (no splice
+					 * of m), so a single-shot detach + promote. */
+					host_to_free = urcu_txn_sw_mw_read(
+						(void **) &m->d_fwd, DC_FWD_TAG) ? NULL : m;
+					uatomic_store(&n->d_fwd, NULL, CMM_RELEASE);
+					uatomic_store(&m->d_back, NULL, CMM_RELEASE);
+					bl_unlock_n(heads, 2);
+					break;
+				}
+				bl_unlock_n(heads, 2);
+				continue;		/* demoted: re-read -> SPLICE */
+			}
+
+			/* TRANSFER: pull n's identity into m (plain pre-publish -- m is the
+			 * unindexed content host), replace n by m in both indexes, promote
+			 * m (plain store under the fold lock). */
+#if defined(DC_HOT1CL)
+			m->d_iparent = (struct dentry *) (
+				((uintptr_t) n->d_iparent & ~DC_TAG_SHELL) |
+				((uintptr_t) m->d_iparent & DC_TAG_SHELL));
+#else
+			m->d_iparent = n->d_iparent;
+#endif
+			m->d_iname = n->d_iname;
+			{
+				struct urcu_txn_sw_mw_txn txn;
+				enum urcu_txn_status st;
+
+				urcu_txn_sw_mw_init(&txn, NULL);	/* no lane (see the note) */
+				urcu_txn_sw_mw_declare_disjoint(&txn);
+				urcu_txn_sw_mw_begin(&txn);
+				dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
+				dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
+				st = urcu_txn_sw_mw_commit_sw(&txn);
+				urcu_txn_sw_mw_end(&txn);
+				if (st == URCU_TXN_STATUS_OK)
+					uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
+				else			/* OOM: nothing published, n still indexed */
+					reclaim_n = 0;	/* do NOT free a live top */
+			}
+			bl_unlock_n(heads, 2);
+			break;
+		}
+	}
+	fold_unlock(host);			/* release the FOLD LOCK */
+	rcu_read_unlock();
+#ifdef DC_STRESS_DEBUG
+	uatomic_inc(&dc_dbg_folds);
+#endif
+	if (host_to_free)
+		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
+	if (reclaim_n)
+		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
+}
+
+#endif	/* DC_CHAIN_SWMW fold vs DC_CHAIN_FOLDLOCK fold */
+
+#endif	/* DC_CHAIN_MIXED */
 
 static void fold_cb(struct rcu_head *rh)
 {
@@ -2367,7 +2518,7 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	return 0;
 }
 
-#ifndef DC_CHAIN_SWMW	/* ===== default: per-host chain locks + plain demotes ===== */
+#ifndef DC_CHAIN_MIXED	/* ===== default: per-host chain locks + plain demotes ===== */
 
 /*
  * EXCHANGE.  Atomically swap the entries named (pa, na) and (pb, nb): A becomes
@@ -2513,7 +2664,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		heads[1] = bucket_b;
 		heads[2] = &pa->d_child_head;
 		heads[3] = &pb->d_child_head;
-		chain_lock2(hosta, hostb);
+		fold_lock2(hosta, hostb);
 		bl_lock_n(heads, 4);
 		(void) dlm_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
 		(void) dlm_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
@@ -2552,7 +2703,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			uatomic_store(&topb->d_back, sb, CMM_RELEASE);
 		}
 		bl_unlock_n(heads, 4);
-		chain_unlock2(hosta, hostb);
+		fold_unlock2(hosta, hostb);
 		if (cross) {
 			uatomic_and(&hosta->d_moving, ~1UL);
 			uatomic_and(&hostb->d_moving, ~1UL);
@@ -2565,7 +2716,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 
 retry_unlock:
 		bl_unlock_n(heads, 4);
-		chain_unlock2(hosta, hostb);
+		fold_unlock2(hosta, hostb);
 		if (cross) {
 			uatomic_and(&hosta->d_moving, ~1UL);
 			uatomic_and(&hostb->d_moving, ~1UL);
@@ -2586,7 +2737,7 @@ out_free:
 	return ret;
 }
 
-#else	/* ===== DC_CHAIN_SWMW: mixed engine -- demotes are MW records ===== */
+#else	/* ===== DC_CHAIN_MIXED: SW-enqueue exchange (shared by SWMW and RMLOCK) ===== */
 
 /*
  * EXCHANGE (mixed SW/MW).  Same atomic name swap as the default build, but the
@@ -2799,7 +2950,7 @@ out_free:
 	return ret;
 }
 
-#endif	/* DC_CHAIN_SWMW */
+#endif	/* DC_CHAIN_MIXED */
 
 /* ---- verification walk (quiescent) ------------------------------------- */
 

@@ -33,6 +33,7 @@ HDRS     := dcache.h seqcount.h
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-dlm check-dlm-tsan check-dlm-swmw check-dlm-swmw-tsan \
+	check-dlm-chainlock check-dlm-chainlock-tsan \
 	check-filetype repro-samedir churn check-churn clean check-lib
 
 # ASan flags for the from-source concurrency builds.
@@ -258,9 +259,18 @@ bench_dcache_txn_mark: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 
 # DLM+SW reader bench (address default): the reader path is IDENTICAL to the
 # txn-mark arm (same resolve + mark), so this A/B isolates the writer-engine swap
-# on the read-under-churn panels -- reads should stay on the txn-mark curve.
+# on the read-under-churn panels -- reads should stay on the txn-mark curve.  The
+# DEFAULT chain strategy is now the per-host FOLD LOCK (SW enqueue + fold-lock
+# dequeue); the legacy chain lock is bench_dcache_dlm_chainlock (-DDC_CHAIN_LOCK).
 bench_dcache_dlm: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+
+# Legacy per-host CHAIN LOCK reference (-DDC_CHAIN_LOCK): the demote AND the folds
+# take the lock.  The A/B baseline the fold-lock default (bench_dcache_dlm) and the
+# MW dequeue (bench_dcache_dlm_swmw) are measured against.
+bench_dcache_dlm_chainlock: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
 
 # DLM MIXED SW/MW reader/rename bench (-DDC_CHAIN_SWMW): identical reader; the
@@ -384,11 +394,12 @@ check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_mark_asan 4 4 8 16 15000
 
-# DLM+SW engine validation gate (mark arm): the full single-thread suite, both
-# walk-causality repros + the fold repro, then the concurrent conservation
-# harnesses under ASan -- general, dir-move cycle, atomic exchange, and the mixed
-# rename/exchange mutual-cycle harness (mixed_cycle.c, wired here for the DLM
-# engine).  The shell ops (rename/exchange/fold) run on the per-host chain lock.
+# DLM+SW engine validation gate (mark arm) -- the DEFAULT chain strategy, now the
+# per-host FOLD LOCK (SW enqueue + fold-lock dequeue).  The full single-thread
+# suite, both walk-causality repros + the fold repro, then the concurrent
+# conservation harnesses under ASan -- general, dir-move cycle, atomic exchange, and
+# the mixed rename/exchange mutual-cycle harness (mixed_cycle.c).  The legacy chain
+# lock is check-dlm-chainlock; the MW dequeue is check-dlm-swmw.
 check-dlm: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
 	   stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
 	   dcache_dlm.c $(HDRS) | check-lib
@@ -437,6 +448,50 @@ check-dlm-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache
 	  -o stress_dcache_dirs_dlm_tsan stress_dcache_dirs.c dcache_dlm.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_dlm_tsan 2 4 2 1 4000
+
+# LEGACY per-host CHAIN LOCK gate (-DDC_CHAIN_LOCK): the original strategy (demote +
+# folds both take the lock), kept as the A/B reference and to confirm it still builds
+# under the DC_CHAIN_MIXED refactor.  Same surface as check-dlm.
+check-dlm-chainlock: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
+	   stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
+	   dcache_dlm.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o test_dcache_dlm_chainlock \
+	  test_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_dlm_chainlock
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
+	  -o repro_dcache_dlm_chainlock repro_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_dlm_chainlock
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
+	  -o repro_samedir_dlm_chainlock repro_dcache_samedir.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_dlm_chainlock
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
+	  -o repro_fold_dlm_chainlock repro_fold.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./repro_fold_dlm_chainlock
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_dlm_chainlock_asan \
+	  stress_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dlm_chainlock_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_dirs_dlm_chainlock_asan \
+	  stress_dcache_dirs.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dirs_dlm_chainlock_asan 4 8 4 2 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_xchg_dlm_chainlock_asan \
+	  stress_dcache_xchg.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_xchg_dlm_chainlock_asan
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o mixed_cycle_dlm_chainlock_asan \
+	  mixed_cycle.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	./mixed_cycle_dlm_chainlock_asan
+
+check-dlm-chainlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_dlm.c
+	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
+	  exit 1; }
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	  -o stress_dcache_dlm_chainlock_tsan stress_dcache.c dcache_dlm.c \
+	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dlm_chainlock_tsan 4 2 8 8 15000
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	  -o stress_dcache_xchg_dlm_chainlock_tsan stress_dcache_xchg.c dcache_dlm.c \
+	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_dlm_chainlock_tsan 4 4 6 8 15000
 
 # DLM MIXED SW/MW engine validation gate (-DDC_CHAIN_SWMW): identical to check-dlm
 # but the transition chain (d_fwd/d_back) rides the mixed SW/MW commit instead of a
@@ -537,7 +592,11 @@ clean:
 	  stress_dcache_xchg_tsan \
 	  bench_dcache_churn_dlm bench_dcache_dlm bench_dcache_height_dlm \
 	  bench_dcache_dlm_swmw bench_dcache_dlm_swmw_pad bench_dcache_churn_dlm_swmw \
-	  bench_dcache_height_dlm_swmw \
+	  bench_dcache_height_dlm_swmw bench_dcache_dlm_chainlock \
+	  test_dcache_dlm_chainlock repro_dcache_dlm_chainlock repro_samedir_dlm_chainlock \
+	  repro_fold_dlm_chainlock stress_dcache_dlm_chainlock_asan stress_dcache_dirs_dlm_chainlock_asan \
+	  stress_dcache_xchg_dlm_chainlock_asan mixed_cycle_dlm_chainlock_asan \
+	  stress_dcache_dlm_chainlock_tsan stress_dcache_xchg_dlm_chainlock_tsan \
 	  test_dcache_dlm repro_dcache_dlm repro_samedir_dlm repro_fold_dlm \
 	  stress_dcache_dlm_asan stress_dcache_dirs_dlm_asan stress_dcache_xchg_dlm_asan \
 	  mixed_cycle_dlm_asan stress_dcache_dlm_tsan stress_dcache_xchg_dlm_tsan \
