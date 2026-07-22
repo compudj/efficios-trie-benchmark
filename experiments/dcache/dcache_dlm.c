@@ -58,7 +58,7 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>			/* generic rcu_* names => QSBR flavor */
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn.h>		/* AFTER the RCU flavor: URCU_MCAS_TAG */
+#include <urcu/rcu-txn.h>		/* the canonical (mixed SW/MW) front-end + URCU_TXN_TAG */
 #include <urcu/rcu-txn-hlist.h>		/* URCU_TXN_HLIST_TAG / _MARK / is_marked (reused) */
 #include <urcu/rcu-txn-sw.h>		/* DLM: single-writer flip-proxy commit */
 #include <urcu/rcu-txn-sw-hlist.h>	/* DLM: SW hlist node type + _prepare forms */
@@ -87,9 +87,8 @@
 #if defined(DC_CHAIN_SWMW) || defined(DC_CHAIN_FOLDLOCK)
 # define DC_CHAIN_MIXED 1	/* SW enqueue via the mixed engine; reader resolves mixed records */
 #endif
-#ifdef DC_CHAIN_MIXED
-#include <urcu/rcu-txn-sw-mw.h>		/* mixed SW/MW: SW enqueue (+ SWMW: MW dequeue) */
-#endif
+/* The mixed engine is the canonical urcu_txn_* front-end (<urcu/rcu-txn.h>,
+ * included above); no extra include is needed for a DC_CHAIN_MIXED build. */
 
 #include "dcache.h"
 
@@ -99,7 +98,7 @@
  * The DEFAULT DLM build drives the pure single-writer engine (rcu-txn-sw.h): the
  * index commits SW under the bucket lock and the transition chain (d_fwd/d_back)
  * is serialized by a SEPARATE per-host chain lock.  A MIXED build (DC_CHAIN_SWMW /
- * DC_CHAIN_FOLDLOCK) drives the mixed engine (rcu-txn-sw-mw.h): the index and the
+ * DC_CHAIN_FOLDLOCK) drives the mixed engine (rcu-txn.h): the index and the
  * demote commit SW (store_sw, bucket-locked) in ONE commit; the two variants
  * differ only in how the FOLD removes nodes (MW records vs a per-host fold lock).
  * add/unlink stay plain locked stores on ALL builds.  The SW proxy and the MW
@@ -107,12 +106,12 @@
  * only the record helpers, the escalation domain, and the shell ops differ.
  */
 #ifdef DC_CHAIN_MIXED
-typedef struct urcu_txn_sw_mw_txn	dc_swtxn_t;
-typedef struct urcu_txn_sw_mw_domain	dc_domain_t;
+typedef struct urcu_txn	dc_swtxn_t;
+typedef struct urcu_txn_domain	dc_domain_t;
 #define dc_sw_record(txn, slot, o, n, tag) \
-	urcu_txn_sw_mw_store_sw((txn), (slot), (o), (n), (tag))
+	urcu_txn_store_sw((txn), (slot), (o), (n), (tag))
 #define dc_proxy_resolve(p) \
-	urcu_txn_sw_mw_resolve_record((struct urcu_txn_sw_mw_record *) (p))
+	urcu_txn_resolve_record((struct urcu_txn_record *) (p))
 #else
 typedef struct urcu_txn_sw_txn		dc_swtxn_t;
 typedef struct urcu_txn_domain		dc_domain_t;
@@ -816,7 +815,7 @@ typedef uintptr_t dc_stamp_t;
  * well-predicted branch on a word already loaded for the compare, the same shape
  * top_unhashed_rcu() already pays on this path.
  */
-#define DC_IPARENT_TAG	URCU_MCAS_TAG
+#define DC_IPARENT_TAG	URCU_TXN_TAG
 #endif
 
 static inline uintptr_t iparent_raw(const struct dentry *d)
@@ -942,7 +941,7 @@ struct dcache {
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
-#define DC_GEN_TAG	URCU_MCAS_TAG
+#define DC_GEN_TAG	URCU_TXN_TAG
 
 /*
  * Engine proxy tag for the transacted transition chain (d_fwd/d_back).  The
@@ -951,14 +950,14 @@ struct dcache {
  * dlm_read() (it may briefly hold a commit descriptor).  Node addresses
  * are >= 8-byte aligned, so bit 0 is clear on every live value the slot holds.
  */
-#define DC_FWD_TAG	URCU_MCAS_TAG
+#define DC_FWD_TAG	URCU_TXN_TAG
 
 /*
  * Engine proxy tag for the transacted d_parent slot (bit 0; hosts are aligned).
  * Writer-only: read via the txn in the cross-dir loop check and via
  * dlm_read() in the quiescent walk; never on the downward reader path.
  */
-#define DC_PARENT_TAG	URCU_MCAS_TAG
+#define DC_PARENT_TAG	URCU_TXN_TAG
 
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
 
@@ -1060,11 +1059,9 @@ struct dcache *dc_create(unsigned int nbuckets)
 	for (i = 0; i < n; i++)
 		urcu_txn_sw_hlist_init(&dc->buckets[i]);
 	dc->mask = n - 1;
-#ifdef DC_CHAIN_MIXED
-	urcu_txn_sw_mw_domain_init(&dc->domain);
-#else
+	/* One escalation domain type now (the canonical urcu_txn_domain); LIVE only
+	 * for a DC_CHAIN_MIXED build's shell ops, vestigial otherwise. */
 	urcu_txn_domain_init(&dc->domain);
-#endif
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1);	/* root is a directory */
@@ -1750,7 +1747,7 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 		dlm_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
 	}
 #ifdef DC_CHAIN_MIXED
-	(void) urcu_txn_sw_mw_store_sw(txn, (void **) &top->d_back, NULL, shell,
+	(void) urcu_txn_store_sw(txn, (void **) &top->d_back, NULL, shell,
 				      DC_FWD_TAG);
 #endif
 	if (cross_parent)
@@ -2066,7 +2063,7 @@ static int stack_shell(struct dcache *dc,
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0);
 	struct dentry *top = NULL, *host = NULL;
-	struct urcu_txn_sw_mw_txn txn;
+	struct urcu_txn txn;
 	int ret;
 
 	if (!shell)
@@ -2077,12 +2074,12 @@ static int stack_shell(struct dcache *dc,
 #endif
 
 	rcu_read_lock();			/* keeps top/host alive across the commit */
-	urcu_txn_sw_mw_init(&txn, &dc->domain);
+	urcu_txn_init(&txn, &dc->domain);
 	/* The stack writes only DISTINCT slots (both indexes + the demote + the
 	 * cross-parent reparent are disjoint), and it is a PURE store_sw commit (the
 	 * SPMC enqueue is single-producer under the bucket lock), so declare disjoint
 	 * and commit through the branch-lean commit_sw. */
-	urcu_txn_sw_mw_declare_disjoint(&txn);
+	urcu_txn_declare_disjoint(&txn);
 	for (;;) {
 		struct urcu_txn_sw_hlist_head *heads[4];
 		enum urcu_txn_status st;
@@ -2094,13 +2091,13 @@ static int stack_shell(struct dcache *dc,
 		 * parked writer holds them and stalls the lane -- the discipline the
 		 * pure-SW build could drop because SW has no lane).
 		 */
-		urcu_txn_sw_mw_begin(&txn);
+		urcu_txn_begin(&txn);
 		DC_RENAME_CONFLICT_HINT(&txn);
 
 		top = find_top_rcu(dc, from_parent, from_name);
 		if (!top) {			/* concurrently removed */
-			urcu_txn_sw_mw_abandon(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
 			ret = -ENOENT;
 			goto out_free;
 		}
@@ -2115,8 +2112,8 @@ static int stack_shell(struct dcache *dc,
 		 */
 		if (cross_parent &&
 		    uatomic_cmpxchg(&host->d_moving, 0UL, 1UL) != 0UL) {
-			urcu_txn_sw_mw_abandon(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
 			continue;		/* another writer owns this host's move */
 		}
 
@@ -2131,13 +2128,13 @@ static int stack_shell(struct dcache *dc,
 			if (c) {		/* -EINVAL cycle (terminal) / -EAGAIN (retry) */
 				uatomic_and(&host->d_moving, ~1UL);
 				if (c == -EINVAL) {
-					urcu_txn_sw_mw_abandon(&txn);
-					urcu_txn_sw_mw_end(&txn);
+					urcu_txn_abandon(&txn);
+					urcu_txn_end(&txn);
 					ret = -EINVAL;
 					goto out_free;
 				}
-				urcu_txn_sw_mw_conflict(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				urcu_txn_conflict(&txn);
+				urcu_txn_end(&txn);
 				continue;	/* re-find + retry */
 			}
 		}
@@ -2157,16 +2154,16 @@ static int stack_shell(struct dcache *dc,
 			bl_unlock_n(heads, 4);
 			if (cross_parent)
 				uatomic_and(&host->d_moving, ~1UL);
-			urcu_txn_sw_mw_conflict(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
 			continue;		/* re-find the current top */
 		}
 
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent);
-		st = urcu_txn_sw_mw_commit_sw(&txn);	/* pure-SW: index + demote, one commit */
+		st = urcu_txn_commit_sw(&txn);	/* pure-SW: index + demote, one commit */
 		bl_unlock_n(heads, 4);
-		urcu_txn_sw_mw_end(&txn);
+		urcu_txn_end(&txn);
 		if (cross_parent)
 			uatomic_and(&host->d_moving, ~1UL);
 		if (st == URCU_TXN_STATUS_ABORT)
@@ -2212,11 +2209,11 @@ out_free:
 static void fold(struct dcache *dc, struct dentry *n)
 {
 	struct dentry *host_to_free = NULL;
-	struct urcu_txn_sw_mw_txn txn;
+	struct urcu_txn txn;
 	int reclaim_n = 1;
 
 	rcu_read_lock();
-	urcu_txn_sw_mw_init(&txn, &dc->domain);
+	urcu_txn_init(&txn, &dc->domain);
 	for (;;) {
 		struct dentry *back, *fwd, *m;
 		enum urcu_txn_status st;
@@ -2224,21 +2221,21 @@ static void fold(struct dcache *dc, struct dentry *n)
 
 		DC_DBG_FOLD_ATTEMPT();
 		/* WAITING reads: a writer needs a value stable across the commit. */
-		back = urcu_txn_sw_mw_read((void **) &n->d_back, DC_FWD_TAG);
-		fwd  = urcu_txn_sw_mw_read((void **) &n->d_fwd, DC_FWD_TAG);
+		back = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG);
+		fwd  = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
 
 		if (back != NULL) {
 			/* SPLICE: @n is a middle relay in NO index.  MW-only; the CAS-old
 			 * on back->d_fwd / fwd->d_back serializes adjacent folds (what the
 			 * retired chain lock used to do). */
-			urcu_txn_sw_mw_begin(&txn);
+			urcu_txn_begin(&txn);
 			DC_FOLD_CONFLICT_HINT(&txn);
-			(void) urcu_txn_sw_mw_store_mw(&txn, (void **) &back->d_fwd,
+			(void) urcu_txn_store_mw(&txn, (void **) &back->d_fwd,
 						      n, fwd, DC_FWD_TAG);
-			(void) urcu_txn_sw_mw_store_mw(&txn, (void **) &fwd->d_back,
+			(void) urcu_txn_store_mw(&txn, (void **) &fwd->d_back,
 						      n, back, DC_FWD_TAG);
-			st = urcu_txn_sw_mw_commit(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			st = urcu_txn_commit(&txn);
+			urcu_txn_end(&txn);
 			if (st == URCU_TXN_STATUS_ABORT) {
 				DC_DBG_FOLD_ABORT();
 				continue;
@@ -2261,7 +2258,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			heads[0] = bucket_of(dc, parent, n->d_iname.hash);
 			heads[1] = &parent->d_child_head;
 
-			urcu_txn_sw_mw_begin(&txn);
+			urcu_txn_begin(&txn);
 			DC_FOLD_CONFLICT_HINT(&txn);
 			bl_lock_n(heads, 2);		/* AFTER begin (fair-mutex discipline) */
 			(void) dlm_hlist_resolve(rcu_dereference(n->d_hash.next),
@@ -2271,12 +2268,12 @@ static void fold(struct dcache *dc, struct dentry *n)
 				 * be in progress, so re-read d_back to classify: NULL => an
 				 * unlink removed it (RECLAIM); non-NULL => a committed
 				 * re-rename demoted it (relay -> re-loop -> SPLICE). */
-				struct dentry *b2 = urcu_txn_sw_mw_read(
+				struct dentry *b2 = urcu_txn_read(
 					(void **) &n->d_back, DC_FWD_TAG);
 
 				bl_unlock_n(heads, 2);
-				urcu_txn_sw_mw_conflict(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				urcu_txn_conflict(&txn);
+				urcu_txn_end(&txn);
 				if (b2 == NULL)
 					goto reclaim;
 				continue;		/* demoted: re-read -> SPLICE */
@@ -2298,11 +2295,11 @@ static void fold(struct dcache *dc, struct dentry *n)
 
 			dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
 			dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
-			(void) urcu_txn_sw_mw_store_mw(&txn, (void **) &m->d_back,
+			(void) urcu_txn_store_mw(&txn, (void **) &m->d_back,
 						      n, NULL, DC_FWD_TAG);
-			st = urcu_txn_sw_mw_commit(&txn);
+			st = urcu_txn_commit(&txn);
 			bl_unlock_n(heads, 2);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_end(&txn);
 			if (st == URCU_TXN_STATUS_ABORT) {
 				DC_DBG_FOLD_ABORT();
 				continue;
@@ -2324,20 +2321,20 @@ reclaim:
 	 * queued) and is freed here.
 	 */
 	for (;;) {
-		struct dentry *m = urcu_txn_sw_mw_read((void **) &n->d_fwd, DC_FWD_TAG);
+		struct dentry *m = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
 		enum urcu_txn_status st;
 
 		DC_DBG_FOLD_ATTEMPT();
-		host_to_free = urcu_txn_sw_mw_read((void **) &m->d_fwd,
+		host_to_free = urcu_txn_read((void **) &m->d_fwd,
 						   DC_FWD_TAG) == NULL ? m : NULL;
-		urcu_txn_sw_mw_begin(&txn);
+		urcu_txn_begin(&txn);
 		DC_FOLD_CONFLICT_HINT(&txn);
-		(void) urcu_txn_sw_mw_store_mw(&txn, (void **) &n->d_fwd, m, NULL,
+		(void) urcu_txn_store_mw(&txn, (void **) &n->d_fwd, m, NULL,
 					      DC_FWD_TAG);	/* detach; conflicts w/ a splice of m */
-		(void) urcu_txn_sw_mw_store_mw(&txn, (void **) &m->d_back, n, NULL,
+		(void) urcu_txn_store_mw(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);	/* promote m (harmless if host) */
-		st = urcu_txn_sw_mw_commit(&txn);
-		urcu_txn_sw_mw_end(&txn);
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
 		if (st == URCU_TXN_STATUS_ABORT) {
 			DC_DBG_FOLD_ABORT();
 			continue;		/* n->d_fwd moved (splice) or m->d_back changed */
@@ -2395,8 +2392,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 		int marked = 0;
 
 		DC_DBG_FOLD_ATTEMPT();
-		back = urcu_txn_sw_mw_read((void **) &n->d_back, DC_FWD_TAG);
-		fwd  = urcu_txn_sw_mw_read((void **) &n->d_fwd, DC_FWD_TAG);
+		back = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG);
+		fwd  = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
 
 		if (back != NULL) {
 			/* SPLICE: n is a relay; back/fwd stable under the fold lock. */
@@ -2419,13 +2416,13 @@ static void fold(struct dcache *dc, struct dentry *n)
 				 * progress.  Re-read d_back: NULL => an unlink removed the
 				 * orphan top (RECLAIM); non-NULL => a re-rename demoted it ->
 				 * n is now a relay: drop the bucket lock and re-derive -> SPLICE. */
-				struct dentry *b2 = urcu_txn_sw_mw_read(
+				struct dentry *b2 = urcu_txn_read(
 					(void **) &n->d_back, DC_FWD_TAG);
 
 				if (b2 == NULL) {
 					/* Under the fold lock n->d_fwd is stable (no splice
 					 * of m), so a single-shot detach + promote. */
-					host_to_free = urcu_txn_sw_mw_read(
+					host_to_free = urcu_txn_read(
 						(void **) &m->d_fwd, DC_FWD_TAG) ? NULL : m;
 					uatomic_store(&n->d_fwd, NULL, CMM_RELEASE);
 					uatomic_store(&m->d_back, NULL, CMM_RELEASE);
@@ -2448,16 +2445,16 @@ static void fold(struct dcache *dc, struct dentry *n)
 #endif
 			m->d_iname = n->d_iname;
 			{
-				struct urcu_txn_sw_mw_txn txn;
+				struct urcu_txn txn;
 				enum urcu_txn_status st;
 
-				urcu_txn_sw_mw_init(&txn, NULL);	/* no lane (see the note) */
-				urcu_txn_sw_mw_declare_disjoint(&txn);
-				urcu_txn_sw_mw_begin(&txn);
+				urcu_txn_init(&txn, NULL);	/* no lane (see the note) */
+				urcu_txn_declare_disjoint(&txn);
+				urcu_txn_begin(&txn);
 				dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
 				dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
-				st = urcu_txn_sw_mw_commit_sw(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				st = urcu_txn_commit_sw(&txn);
+				urcu_txn_end(&txn);
 				if (st == URCU_TXN_STATUS_OK)
 					uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
 				else			/* OOM: nothing published, n still indexed */
@@ -2777,7 +2774,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
 	struct urcu_txn_sw_hlist_head *bucket_a, *bucket_b;
 	const struct qstr *na, *nb;
-	struct urcu_txn_sw_mw_txn txn;
+	struct urcu_txn txn;
 	int cross, ret;
 
 	if (ap->ndepth == 0 || bp->ndepth == 0)
@@ -2817,21 +2814,21 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 #endif
 
 	rcu_read_lock();			/* keeps tops/hosts alive across the commit */
-	urcu_txn_sw_mw_init(&txn, &dc->domain);
-	urcu_txn_sw_mw_declare_disjoint(&txn);	/* pure-SW: 4 replaces + 2 demotes + 2 reparents, all distinct */
+	urcu_txn_init(&txn, &dc->domain);
+	urcu_txn_declare_disjoint(&txn);	/* pure-SW: 4 replaces + 2 demotes + 2 reparents, all distinct */
 	for (;;) {
 		struct urcu_txn_sw_hlist_head *heads[4];
 		struct dentry *topa, *topb;
 		enum urcu_txn_status st;
 		int ma = 0, mb = 0, ca, cb;
 
-		urcu_txn_sw_mw_begin(&txn);
+		urcu_txn_begin(&txn);
 
 		topa = find_top_rcu(dc, pa, na);
 		topb = find_top_rcu(dc, pb, nb);
 		if (!topa || !topb) {		/* an entry vanished */
-			urcu_txn_sw_mw_abandon(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
 			ret = -ENOENT;
 			goto out_free;
 		}
@@ -2851,14 +2848,14 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			struct dentry *hi = hosta < hostb ? hostb : hosta;
 
 			if (uatomic_cmpxchg(&lo->d_moving, 0UL, 1UL) != 0UL) {
-				urcu_txn_sw_mw_abandon(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
 				continue;	/* lo owned by another mover: retry */
 			}
 			if (uatomic_cmpxchg(&hi->d_moving, 0UL, 1UL) != 0UL) {
 				uatomic_and(&lo->d_moving, ~1UL);
-				urcu_txn_sw_mw_abandon(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
 				continue;	/* hi owned by another mover: retry */
 			}
 		}
@@ -2876,13 +2873,13 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 				uatomic_and(&hostb->d_moving, ~1UL);
 			}
 			if (ca == -EINVAL || cb == -EINVAL) {
-				urcu_txn_sw_mw_abandon(&txn);
-				urcu_txn_sw_mw_end(&txn);
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
 				ret = -EINVAL;
 				goto out_free;
 			}
-			urcu_txn_sw_mw_conflict(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
 			continue;		/* -EAGAIN: re-find + retry */
 		}
 
@@ -2904,8 +2901,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 				uatomic_and(&hosta->d_moving, ~1UL);
 				uatomic_and(&hostb->d_moving, ~1UL);
 			}
-			urcu_txn_sw_mw_conflict(&txn);
-			urcu_txn_sw_mw_end(&txn);
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
 			continue;		/* re-find + retry (marked top) */
 		}
 
@@ -2930,21 +2927,21 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		/* Two demotes as store_SW records in the SAME commit: each is the SPMC
 		 * ENQUEUE of its chain -- single-producer under topX's bucket heads
 		 * (topX->d_back is NULL and stays so), a plain park, never a CAS. */
-		(void) urcu_txn_sw_mw_store_sw(&txn, (void **) &topa->d_back, NULL, sa,
+		(void) urcu_txn_store_sw(&txn, (void **) &topa->d_back, NULL, sa,
 					      DC_FWD_TAG);
-		(void) urcu_txn_sw_mw_store_sw(&txn, (void **) &topb->d_back, NULL, sb,
+		(void) urcu_txn_store_sw(&txn, (void **) &topb->d_back, NULL, sb,
 					      DC_FWD_TAG);
 		if (cross) {			/* reparent both hosts (store_sw) */
-			(void) urcu_txn_sw_mw_store_sw(&txn, (void **) &hosta->d_parent,
+			(void) urcu_txn_store_sw(&txn, (void **) &hosta->d_parent,
 						      parent_of_rcu(hosta), pb,
 						      DC_PARENT_TAG);
-			(void) urcu_txn_sw_mw_store_sw(&txn, (void **) &hostb->d_parent,
+			(void) urcu_txn_store_sw(&txn, (void **) &hostb->d_parent,
 						      parent_of_rcu(hostb), pa,
 						      DC_PARENT_TAG);
 		}
-		st = urcu_txn_sw_mw_commit_sw(&txn);	/* atomic swap: pure store_sw */
+		st = urcu_txn_commit_sw(&txn);	/* atomic swap: pure store_sw */
 		bl_unlock_n(heads, 4);
-		urcu_txn_sw_mw_end(&txn);
+		urcu_txn_end(&txn);
 		if (cross) {
 			uatomic_and(&hosta->d_moving, ~1UL);
 			uatomic_and(&hostb->d_moving, ~1UL);

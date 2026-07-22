@@ -159,7 +159,7 @@ struct dentry {
 	/*
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
 	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
-	 * readers following a chain -- via urcu_mcas_read(), since it can briefly
+	 * readers following a chain -- via urcu_txn_read(), since it can briefly
 	 * hold a commit descriptor; d_back is read only by fold workers.  Both NULL
 	 * in steady state (settled content host = its own top, no chain).
 	 */
@@ -300,11 +300,11 @@ typedef uintptr_t dc_stamp_t;
  * aligned (posix_memalign), so bit 0 is clear on every live value.
  *
  * Cost of the resolve on the match path: with no txn installed -- the
- * overwhelming common case -- urcu_mcas_read() is a tag test and a
+ * overwhelming common case -- urcu_txn_read() is a tag test and a
  * well-predicted branch on a word already loaded for the compare, the same shape
  * top_unhashed_rcu() already pays on this path.
  */
-#define DC_IPARENT_TAG	URCU_MCAS_TAG
+#define DC_IPARENT_TAG	URCU_TXN_TAG
 #endif
 
 static inline uintptr_t iparent_raw(const struct dentry *d)
@@ -312,7 +312,7 @@ static inline uintptr_t iparent_raw(const struct dentry *d)
 #ifdef DC_IPARENT_TXN
 	struct dentry *nc = (struct dentry *) (uintptr_t) d;
 
-	return (uintptr_t) urcu_mcas_read((void **) &nc->d_iparent,
+	return (uintptr_t) urcu_txn_read((void **) &nc->d_iparent,
 					  DC_IPARENT_TAG);
 #else
 	return (uintptr_t) d->d_iparent;
@@ -416,30 +416,30 @@ struct dcache {
 	 * path walk on it and retries if it moved (a rename touched the tree
 	 * mid-walk).  Stored as a transacted void* slot so the bump composes
 	 * atomically with the structural edge change; the reader resolves it
-	 * with urcu_mcas_read().  Kept EVEN (stepped by 2) so bit 0 -- the
+	 * with urcu_txn_read().  Kept EVEN (stepped by 2) so bit 0 -- the
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
 	void *rename_gen;
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
-#define DC_GEN_TAG	URCU_MCAS_TAG
+#define DC_GEN_TAG	URCU_TXN_TAG
 
 /*
  * Engine proxy tag for the transacted transition chain (d_fwd/d_back).  The
  * splice MCASes both links of a middle relay in one commit, so a concurrent
  * fold sees a consistent chain; readers following d_fwd resolve the slot with
- * urcu_mcas_read() (it may briefly hold a commit descriptor).  Node addresses
+ * urcu_txn_read() (it may briefly hold a commit descriptor).  Node addresses
  * are >= 8-byte aligned, so bit 0 is clear on every live value the slot holds.
  */
-#define DC_FWD_TAG	URCU_MCAS_TAG
+#define DC_FWD_TAG	URCU_TXN_TAG
 
 /*
  * Engine proxy tag for the transacted d_parent slot (bit 0; hosts are aligned).
  * Writer-only: read via the txn in the cross-dir loop check and via
- * urcu_mcas_read() in the quiescent walk; never on the downward reader path.
+ * urcu_txn_read() in the quiescent walk; never on the downward reader path.
  */
-#define DC_PARENT_TAG	URCU_MCAS_TAG
+#define DC_PARENT_TAG	URCU_TXN_TAG
 
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
 
@@ -599,7 +599,7 @@ static inline struct dentry *host_of_rcu(struct dentry *top)
 	 * read, so a settled hop never leaves the hot cacheline. */
 	return node_is_shell(top) ? rcu_dereference(top->d_host) : top;
 #else
-	struct dentry *fwd = urcu_mcas_read((void **) &top->d_fwd, DC_FWD_TAG);
+	struct dentry *fwd = urcu_txn_read((void **) &top->d_fwd, DC_FWD_TAG);
 
 	return fwd ? rcu_dereference(top->d_host) : top;
 #endif
@@ -697,7 +697,7 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
  * proxy tag) clear.  The bump rides the SAME MCAS as the structural edge change
  * (the caller's txn), so a reader sees (gen, index-membership) as one atom.
  */
-static inline void txn_bump_gen(struct urcu_mcas_txn *txn, struct dcache *dc,
+static inline void txn_bump_gen(struct urcu_txn *txn, struct dcache *dc,
 				struct dentry *host)
 {
 #ifdef DC_IPARENT_TXN
@@ -722,7 +722,7 @@ static inline void txn_bump_gen(struct urcu_mcas_txn *txn, struct dcache *dc,
 	(void) host;
 #endif
 	g = urcu_txn_load(txn, slot, DC_GEN_TAG);
-	(void) urcu_txn_store(txn, slot, g, (void *) ((uintptr_t) g + 2),
+	(void) urcu_txn_store_mw(txn, slot, g, (void *) ((uintptr_t) g + 2),
 			      DC_GEN_TAG);
 #endif
 }
@@ -744,7 +744,7 @@ static inline int top_unhashed_rcu(struct dentry *top)
 	if (caa_unlikely((uintptr_t) raw &
 			 (URCU_TXN_HLIST_TAG | URCU_TXN_HLIST_MARK)))
 		return urcu_txn_hlist_is_marked(
-				urcu_mcas_resolve(raw, URCU_TXN_HLIST_TAG));
+				urcu_txn_resolve(raw, URCU_TXN_HLIST_TAG));
 	return 0;			/* clean unmarked next: still hashed */
 }
 #endif
@@ -770,7 +770,7 @@ static inline dc_stamp_t dc_stamp_of(struct dentry *host, struct dentry *top,
 	return (uintptr_t) top;
 #else
 	(void) top; (void) raw;
-	return (uintptr_t) urcu_mcas_read(&host->d_seq, DC_GEN_TAG);
+	return (uintptr_t) urcu_txn_read(&host->d_seq, DC_GEN_TAG);
 #endif
 }
 
@@ -794,7 +794,7 @@ static inline dc_stamp_t dc_stamp_reread(struct dentry *node)
 	/* re-TEST, not re-read: still unmarked means still the indexed top */
 	return top_unhashed_rcu(node) ? 0 : (uintptr_t) node;
 #else
-	return (uintptr_t) urcu_mcas_read(&node->d_seq, DC_GEN_TAG);
+	return (uintptr_t) urcu_txn_read(&node->d_seq, DC_GEN_TAG);
 #endif
 }
 #endif
@@ -827,7 +827,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		void *g0, *g1;
 		uint32_t i;
 
-		g0 = urcu_mcas_read(&dc->rename_gen, DC_GEN_TAG);	/* acquire */
+		g0 = urcu_txn_read(&dc->rename_gen, DC_GEN_TAG);	/* acquire */
 		res = DC_POSITIVE;
 		id = DC_FAST_ID(cur);
 		for (i = 0; i < p->ndepth; i++) {
@@ -857,7 +857,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 #endif
 		}
 		cmm_smp_rmb();			/* walk loads before re-reading gen */
-		g1 = urcu_mcas_read(&dc->rename_gen, DC_GEN_TAG);
+		g1 = urcu_txn_read(&dc->rename_gen, DC_GEN_TAG);
 		if (g0 == g1)
 			break;			/* no rename crossed the walk */
 		/* a rename touched the tree mid-walk: re-walk from the root */
@@ -968,7 +968,7 @@ static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 /* Resolve the transacted d_parent slot (RCU-side; call within a read section). */
 static inline struct dentry *parent_of_rcu(struct dentry *d)
 {
-	return urcu_mcas_read((void **) &d->d_parent, DC_PARENT_TAG);
+	return urcu_txn_read((void **) &d->d_parent, DC_PARENT_TAG);
 }
 
 /* Is @d's child-hlist empty?  Call within an RCU read-side section. */
@@ -987,7 +987,7 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	struct dentry *parent, *d;
 	const struct qstr *name;
 	struct urcu_txn_hlist_head *bucket;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	enum urcu_txn_status st;
 	int ret = 0, p;
 
@@ -1099,7 +1099,7 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 {
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int settled, ret;
 
 	if (path->ndepth == 0)
@@ -1214,7 +1214,7 @@ out:
  * Returns 0, -ENOENT/-EAGAIN (a link moved: caller aborts, re-finds, retries),
  * or -EINVAL (the move would create a directory cycle).
  */
-static int stack_one_prepare(struct urcu_mcas_txn *txn, struct dcache *dc,
+static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 			     struct dentry *top, struct dentry *host,
 			     struct dentry *new_parent,
 			     struct urcu_txn_hlist_head *new_bucket,
@@ -1249,7 +1249,7 @@ static int stack_one_prepare(struct urcu_mcas_txn *txn, struct dcache *dc,
 	if (p)
 		return p;
 	/* Demote the old top atomically with its removal (d_back: NULL -> shell). */
-	(void) urcu_txn_store(txn, (void **) &top->d_back, NULL, shell,
+	(void) urcu_txn_store_mw(txn, (void **) &top->d_back, NULL, shell,
 			      DC_FWD_TAG);
 	if (cross_parent) {
 		void *oldp = urcu_txn_load(txn, (void **) &host->d_parent,
@@ -1282,7 +1282,7 @@ static int stack_one_prepare(struct urcu_mcas_txn *txn, struct dcache *dc,
 				return -EAGAIN;		/* transient cycle: re-walk */
 			cur = parent_of_rcu(cur);	/* plain resolving load, no validate */
 		}
-		(void) urcu_txn_store(txn, (void **) &host->d_parent, oldp,
+		(void) urcu_txn_store_mw(txn, (void **) &host->d_parent, oldp,
 				      new_parent, DC_PARENT_TAG);
 	}
 	return 0;
@@ -1316,7 +1316,7 @@ static int stack_shell(struct dcache *dc,
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0);
 	struct dentry *top = NULL, *host = NULL;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret;
 
 	if (!shell)
@@ -1482,7 +1482,7 @@ out_free:
 static void fold(struct dcache *dc, struct dentry *n)
 {
 	struct dentry *host_to_free = NULL;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 
 	rcu_read_lock();
 	urcu_txn_init(&txn, &dc->domain);
@@ -1492,8 +1492,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 		int p;
 
 		DC_DBG_FOLD_ATTEMPT();
-		back = urcu_mcas_read((void **) &n->d_back, DC_FWD_TAG);
-		fwd = urcu_mcas_read((void **) &n->d_fwd, DC_FWD_TAG);
+		back = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG);
+		fwd = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
 
 		if (back == NULL) {
 			/* TRANSFER: @n is the top; pull identity down into m.
@@ -1525,7 +1525,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 				 * d_back) -> tear the orphaned chain down. */
 				urcu_txn_conflict(&txn);
 				urcu_txn_end(&txn);
-				if (urcu_mcas_read((void **) &n->d_back,
+				if (urcu_txn_read((void **) &n->d_back,
 						   DC_FWD_TAG) == NULL)
 					goto reclaim;
 				continue;	/* re-rename demoted @n: re-read -> SPLICE */
@@ -1537,7 +1537,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			if (p)
 				goto transfer_retry;
 			/* promote m atomically with the index swap */
-			(void) urcu_txn_store(&txn, (void **) &m->d_back, n, NULL,
+			(void) urcu_txn_store_mw(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
 			urcu_txn_end(&txn);
@@ -1557,9 +1557,9 @@ transfer_retry:
 			 * and @back is a live chain node -- safe to dereference. */
 			urcu_txn_begin(&txn);
 			DC_FOLD_CONFLICT_HINT(&txn);
-			(void) urcu_txn_store(&txn, (void **) &back->d_fwd, n,
+			(void) urcu_txn_store_mw(&txn, (void **) &back->d_fwd, n,
 					      fwd, DC_FWD_TAG);
-			(void) urcu_txn_store(&txn, (void **) &fwd->d_back, n,
+			(void) urcu_txn_store_mw(&txn, (void **) &fwd->d_back, n,
 					      back, DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
 			urcu_txn_end(&txn);
@@ -1582,17 +1582,17 @@ reclaim:
 	 * host (m->d_fwd == NULL, no fold queued) and is freed here.
 	 */
 	for (;;) {
-		struct dentry *m = urcu_mcas_read((void **) &n->d_fwd, DC_FWD_TAG);
+		struct dentry *m = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
 		enum urcu_txn_status st;
 
 		DC_DBG_FOLD_ATTEMPT();
-		host_to_free = urcu_mcas_read((void **) &m->d_fwd,
+		host_to_free = urcu_txn_read((void **) &m->d_fwd,
 					      DC_FWD_TAG) == NULL ? m : NULL;
 		urcu_txn_begin(&txn);
 		DC_FOLD_CONFLICT_HINT(&txn);
-		(void) urcu_txn_store(&txn, (void **) &n->d_fwd, m, NULL,
+		(void) urcu_txn_store_mw(&txn, (void **) &n->d_fwd, m, NULL,
 				      DC_FWD_TAG);	/* detach; conflicts w/ a splice of m */
-		(void) urcu_txn_store(&txn, (void **) &m->d_back, n, NULL,
+		(void) urcu_txn_store_mw(&txn, (void **) &m->d_back, n, NULL,
 				      DC_FWD_TAG);	/* promote m (harmless if host) */
 		st = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
@@ -1696,7 +1696,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
 	struct urcu_txn_hlist_head *bucket_a, *bucket_b;
 	const struct qstr *na, *nb;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int cross, ret;
 
 	if (ap->ndepth == 0 || bp->ndepth == 0)
