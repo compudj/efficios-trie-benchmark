@@ -165,7 +165,7 @@ for ax in (ax1, ax2, ax3):
         ax.legend(fontsize=7.5, loc="best")
 
 fig.suptitle("Userspace dcache — does urcu-txn dissolve rename_lock + d_seq?   "
-             "seqlock (kernel baseline) vs two urcu-txn engines: all-MW deletion-mark "
+             "seqlock (kernel baseline) vs two urcu-txn implementations: all-MW deletion-mark "
              "and the bucket-lock + SW txn (fold-lock writer)   ·   2×96-core EPYC",
              fontsize=12)
 fig.tight_layout(rect=[0, 0, 1, 0.94])
