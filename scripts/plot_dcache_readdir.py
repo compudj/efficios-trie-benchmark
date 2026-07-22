@@ -33,14 +33,12 @@ _num = FuncFormatter(lambda v, pos: f"{v:g}")
 
 
 def plain_y(ax):
-    ax.set_yscale("log")
-    ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    ax.set_ylim(bottom=0)
     ax.yaxis.set_major_formatter(_num)
-    ax.yaxis.set_minor_formatter(NullFormatter())
 
 
 def plain_thread_x(ax, ticks):
-    ax.set_xscale("log", base=2)
+    ax.set_xlim(0, max(ticks) * 1.02)
     ax.xaxis.set_major_locator(FixedLocator(ticks))
     ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
     ax.xaxis.set_minor_formatter(NullFormatter())
@@ -52,19 +50,21 @@ OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures", "dcache_readdir.png"))
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7"}
-MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARKER = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
+          "bucketlock": "X"}
 LABEL = {
     "seqlock": "seqlock — per-directory rwsem\n(kernel inode-rwsem analogue)",
     "txn-global": "urcu-txn — GLOBAL rename_gen\n(lock-free RCU child-walk)",
     "txn-pernode": "urcu-txn — PER-NODE host gen\n(lock-free RCU child-walk)",
     "txn-mark": "urcu-txn — deletion MARK as gen\n(lock-free RCU child-walk)",
+    "bucketlock": "bucket lock + SW txn\n(lock-free RCU child-walk)",
 }
 # The readdir reader path reads NO generation in any txn arm, so the localized
 # arms are expected to coincide here; the mark arm is plotted to show that, and
 # to make its small trailing visible rather than hidden in the CSV.
 ENGINES = tuple(os.environ.get(
-    "ENGINES", "seqlock txn-pernode txn-mark").split())
+    "ENGINES", "seqlock txn-mark bucketlock").split())
 rows = list(csv.DictReader(open(CSV)))
 
 
@@ -101,7 +101,7 @@ for rd in sorted(base.get(ANNOT, {})):
                          ha="center", fontsize=8, color=COLOR[ANNOT],
                          fontweight="bold")
 if ax1.has_data():
-    plain_thread_x(ax1, [2, 8, 16, 32, 64, 96, 128, 184])
+    plain_thread_x(ax1, [0, 32, 64, 96, 128, 160, 184])
     plain_y(ax1)
 ax1.set_title("readdir reader scaling — 8 writers fixed, sweep readers to 184\n"
               "listings/s vs reader count, fixed dir size (~32 children), one hw\n"
@@ -118,7 +118,7 @@ for e in ENGINES:
     ax2.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.0, ms=6.5,
              label=LABEL[e], alpha=0.94)
 if ax2.has_data():
-    plain_thread_x(ax2, [1, 2, 4, 8, 16, 24, 32, 48])
+    plain_thread_x(ax2, [0, 8, 16, 24, 32, 40, 48])
     plain_y(ax2)
 ax2.set_title("readdir vs writer load — 32 readers fixed, sweep writers\n"
               "listings/s vs concurrent renamers, namespace held constant\n"
