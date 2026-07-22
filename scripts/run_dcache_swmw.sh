@@ -1,17 +1,17 @@
 #!/bin/bash
-# Chain-lock vs mixed-SW/MW A/B sweep for the DLM+SW dentry cache.
+# Chain-lock vs mixed-SW/MW A/B sweep for the bucket lock+SW dentry cache.
 #
 # Four arms, one binary each (built by `make -C experiments/dcache
-# bench_dcache_dlm bench_dcache_dlm_chainlock bench_dcache_dlm_swmw
-# bench_dcache_dlm_swmw_pad`):
-#   dlm-chainlock -- -DDC_CHAIN_LOCK: the legacy per-host CHAIN LOCK (demote + folds
+# bench_dcache_bucketlock bench_dcache_bucketlock_chainlock bench_dcache_bucketlock_swmw
+# bench_dcache_bucketlock_swmw_pad`):
+#   bucketlock-chainlock -- -DDC_CHAIN_LOCK: the legacy per-host CHAIN LOCK (demote + folds
 #                take it).  sizeof(dentry) 176.  The A/B reference baseline.
-#   dlm-swmw  -- -DDC_CHAIN_SWMW: the chain (d_fwd/d_back) rides the mixed commit as
+#   bucketlock-swmw  -- -DDC_CHAIN_SWMW: the chain (d_fwd/d_back) rides the mixed commit as
 #                MW records; chain lock RETIRED (sizeof 168, lock-free folds)
-#   dlm-swmw-pad -- -DDC_CHAIN_SWMW -DDC_SWMW_PAD: the mixed engine with 8 bytes of
+#   bucketlock-swmw-pad -- -DDC_CHAIN_SWMW -DDC_SWMW_PAD: the mixed engine with 8 bytes of
 #                dead padding (sizeof 176), the SAME-SIZE control.  (swmw-pad vs
 #                chainlock) isolates the mechanism; (swmw vs swmw-pad) the -8B.
-#   dlm-foldlock -- the DEFAULT (bench_dcache_dlm, no chain flag): SW enqueue + a
+#   bucketlock-foldlock -- the DEFAULT (bench_dcache_bucketlock, no chain flag): SW enqueue + a
 #                per-host FOLD LOCK dequeue with plain chain stores (the producer
 #                does not take the lock).  sizeof 176.
 #
@@ -52,11 +52,11 @@ fi
 COMMON="--depth $DEPTH --leaves $LEAVES --nbuckets 1048576 --duration $DUR $PIN"
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE"; exit 1; }
 
-declare -A BINOF=( [dlm-chainlock]=bench_dcache_dlm_chainlock \
-                   [dlm-swmw]=bench_dcache_dlm_swmw \
-                   [dlm-swmw-pad]=bench_dcache_dlm_swmw_pad \
-                   [dlm-foldlock]=bench_dcache_dlm )
-ENGINES="dlm-chainlock dlm-swmw dlm-swmw-pad dlm-foldlock"
+declare -A BINOF=( [bucketlock-chainlock]=bench_dcache_bucketlock_chainlock \
+                   [bucketlock-swmw]=bench_dcache_bucketlock_swmw \
+                   [bucketlock-swmw-pad]=bench_dcache_bucketlock_swmw_pad \
+                   [bucketlock-foldlock]=bench_dcache_bucketlock )
+ENGINES="bucketlock-chainlock bucketlock-swmw bucketlock-swmw-pad bucketlock-foldlock"
 for e in $ENGINES; do
   test -x "$BIN/${BINOF[$e]}" || { echo "MISSING $BIN/${BINOF[$e]} -- run 'make -C experiments/dcache ${BINOF[$e]}'" >&2; exit 1; }
 done

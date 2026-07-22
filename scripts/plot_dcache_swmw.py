@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-DLM+SW dentry cache: chain-serialization strategies for the transition chain.
+bucket lock+SW dentry cache: chain-serialization strategies for the transition chain.
 
 Four arms (identical reader + mark; only the chain d_fwd/d_back handling differs):
-  dlm-chainlock -DDC_CHAIN_LOCK -- legacy per-host chain LOCK: the demote AND every
+  bucketlock-chainlock -DDC_CHAIN_LOCK -- legacy per-host chain LOCK: the demote AND every
                 fold of a chain take it.  176 B.  The A/B reference baseline.
-  dlm-swmw      -DDC_CHAIN_SWMW -- the chain rides the mixed commit as MW records
+  bucketlock-swmw      -DDC_CHAIN_SWMW -- the chain rides the mixed commit as MW records
                 (CAS-old serializes adjacent folds); chain lock RETIRED.  168 B.
-  dlm-swmw-pad  same mixed engine + 8 B dead padding -> 176 B: the SAME-SIZE
+  bucketlock-swmw-pad  same mixed engine + 8 B dead padding -> 176 B: the SAME-SIZE
                 control.  (swmw-pad vs chainlock) isolates the MECHANISM;
                 (swmw vs swmw-pad) isolates the -8B FOOTPRINT.
-  dlm-foldlock  the DEFAULT (no chain flag) -- SW enqueue but the fold dequeue takes
+  bucketlock-foldlock  the DEFAULT (no chain flag) -- SW enqueue but the fold dequeue takes
                 a per-host FOLD lock and rewrites the chain with plain stores (no MW
                 descriptor).  The producer never takes that lock.  176 B.
 
@@ -53,15 +53,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CSV = os.path.join(HERE, "dcache_swmw.csv")
 OUT = os.environ.get("OUT", os.path.join(HERE, os.pardir, "figures", "dcache_swmw.png"))
 
-COLOR = {"dlm-chainlock": "#D55E00", "dlm-swmw": "#0072B2", "dlm-swmw-pad": "#009E73", "dlm-foldlock": "#CC79A7"}
-MARKER = {"dlm-chainlock": "s", "dlm-swmw": "o", "dlm-swmw-pad": "^", "dlm-foldlock": "D"}
+COLOR = {"bucketlock-chainlock": "#D55E00", "bucketlock-swmw": "#0072B2", "bucketlock-swmw-pad": "#009E73", "bucketlock-foldlock": "#CC79A7"}
+MARKER = {"bucketlock-chainlock": "s", "bucketlock-swmw": "o", "bucketlock-swmw-pad": "^", "bucketlock-foldlock": "D"}
 LABEL = {
-    "dlm-chainlock": "chain lock (legacy reference)\ndemote + folds take it — 176 B",
-    "dlm-swmw": "mixed SW/MW (chain lock retired)\nchain = MW records, one commit — 168 B",
-    "dlm-swmw-pad": "mixed SW/MW + 8 B pad\nsame-size control — 176 B",
-    "dlm-foldlock": "fold lock (DEFAULT)\nSW enqueue + fold-lock dequeue — 176 B",
+    "bucketlock-chainlock": "chain lock (legacy reference)\ndemote + folds take it — 176 B",
+    "bucketlock-swmw": "mixed SW/MW (chain lock retired)\nchain = MW records, one commit — 168 B",
+    "bucketlock-swmw-pad": "mixed SW/MW + 8 B pad\nsame-size control — 176 B",
+    "bucketlock-foldlock": "fold lock (DEFAULT)\nSW enqueue + fold-lock dequeue — 176 B",
 }
-ORDER = ["dlm-chainlock", "dlm-swmw", "dlm-foldlock", "dlm-swmw-pad"]
+ORDER = ["bucketlock-chainlock", "bucketlock-swmw", "bucketlock-foldlock", "bucketlock-swmw-pad"]
 
 
 def load():
@@ -145,7 +145,7 @@ def main():
     a2.grid(True, which="both", ls=":", alpha=0.4)
     a2.legend(fontsize=8, loc="lower left", framealpha=0.9)
 
-    fig.suptitle("DLM+SW dentry cache — transition-chain serialization: chain lock vs "
+    fig.suptitle("bucket lock+SW dentry cache — transition-chain serialization: chain lock vs "
                  "mixed SW/MW vs the FOLD LOCK default (2×96 EPYC, 1 hw thread/core, jemalloc)",
                  fontsize=12, y=1.02)
     fig.tight_layout()

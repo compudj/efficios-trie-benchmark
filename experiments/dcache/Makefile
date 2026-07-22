@@ -32,8 +32,8 @@ HDRS     := dcache.h seqcount.h
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
-	check-pernode check-mark check-dlm check-dlm-tsan check-dlm-swmw check-dlm-swmw-tsan \
-	check-dlm-chainlock check-dlm-chainlock-tsan \
+	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
+	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
 	check-filetype repro-samedir churn check-churn clean check-lib
 
 # ASan flags for the from-source concurrency builds.
@@ -62,11 +62,11 @@ dcache_txn.o: dcache_txn.c $(HDRS) | check-lib
 dcache_seqlock.o: dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(HCPP) -c $< -o $@
 
-# DLM+SW engine (dcache_dlm.c): per-bucket bit-lock + single-writer SW commit +
+# bucket lock+SW engine (dcache_bucketlock.c): per-bucket bit-lock + single-writer SW commit +
 # per-host transition-chain lock.  MARK-ONLY (a bare build defaults to the mark
 # arm; a counter arm #errors).  Explicit -DDC_MARK_GEN for clarity.  Use with
-# `make test_dcache ENGINE=dlm`.
-dcache_dlm.o: dcache_dlm.c $(HDRS) | check-lib
+# `make test_dcache ENGINE=bucketlock`.
+dcache_bucketlock.o: dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -c $< -o $@
 
 check: test_dcache
@@ -185,7 +185,7 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 # that pass through the moved entry).  scripts/run_dcache.sh drives all three;
 # plot_dcache.py charts them.
 bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
-       bench_dcache_txn_mark bench_dcache_dlm churn
+       bench_dcache_txn_mark bench_dcache_bucketlock churn
 
 # The seqlock baseline builds the DEFAULT layout too: the fair 1-CL split hot
 # line (d_parent tags + d_seq on CL0, d_id cold) returning the dentry ADDRESS as
@@ -220,7 +220,7 @@ bench_dcache_txn_pernode: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 # re-added dentry is a NEW allocation, so address identity is not stable across
 # churn and the harness's id checks need logical ids.  The reader path is
 # therefore not directly comparable with the address-default bench_dcache runs.
-CHURN_ENGINES := seqlock txn txn_pernode txn_mark dlm
+CHURN_ENGINES := seqlock txn txn_pernode txn_mark bucketlock
 churn: $(addprefix bench_dcache_churn_,$(CHURN_ENGINES))
 
 bench_dcache_churn_seqlock: bench_dcache_churn.c dcache_seqlock.c $(HDRS) | check-lib
@@ -231,16 +231,16 @@ bench_dcache_churn_txn_pernode: bench_dcache_churn.c dcache_txn.c $(HDRS) | chec
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 bench_dcache_churn_txn_mark: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-# DLM+SW churn arm: the add/unlink write path this engine targets (design §0.1).
+# bucket lock+SW churn arm: the add/unlink write path this engine targets (design §0.1).
 # A/B partner to bench_dcache_churn_txn_mark (same reader + mark; MCAS vs bit-lock
 # writer) and bench_dcache_churn_seqlock (the kernel-faithful write-path baseline).
-bench_dcache_churn_dlm: bench_dcache_churn.c dcache_dlm.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_bucketlock: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o $@ bench_dcache_churn.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 # Mixed SW/MW churn arm: add/unlink are UNCHANGED from the chain-lock build (plain
-# locked stores), so this should track bench_dcache_churn_dlm -- a null-result A/B
+# locked stores), so this should track bench_dcache_churn_bucketlock -- a null-result A/B
 # that confirms the mixed engine costs the shell-FREE path nothing.
-bench_dcache_churn_dlm_swmw: bench_dcache_churn.c dcache_dlm.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o $@ bench_dcache_churn.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_bucketlock_swmw: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o $@ bench_dcache_churn.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # Quick correctness gate for the churn invariant (state + census + ids).
 check-churn: churn
@@ -257,36 +257,36 @@ bench_dcache_txn_mark: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-# DLM+SW reader bench (address default): the reader path is IDENTICAL to the
+# bucket lock+SW reader bench (address default): the reader path is IDENTICAL to the
 # txn-mark arm (same resolve + mark), so this A/B isolates the writer-engine swap
 # on the read-under-churn panels -- reads should stay on the txn-mark curve.  The
 # DEFAULT chain strategy is now the per-host FOLD LOCK (SW enqueue + fold-lock
-# dequeue); the legacy chain lock is bench_dcache_dlm_chainlock (-DDC_CHAIN_LOCK).
-bench_dcache_dlm: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
+# dequeue); the legacy chain lock is bench_dcache_bucketlock_chainlock (-DDC_CHAIN_LOCK).
+bench_dcache_bucketlock: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # Legacy per-host CHAIN LOCK reference (-DDC_CHAIN_LOCK): the demote AND the folds
-# take the lock.  The A/B baseline the fold-lock default (bench_dcache_dlm) and the
-# MW dequeue (bench_dcache_dlm_swmw) are measured against.
-bench_dcache_dlm_chainlock: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
+# take the lock.  The A/B baseline the fold-lock default (bench_dcache_bucketlock) and the
+# MW dequeue (bench_dcache_bucketlock_swmw) are measured against.
+bench_dcache_bucketlock_chainlock: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
-# DLM MIXED SW/MW reader/rename bench (-DDC_CHAIN_SWMW): identical reader; the
+# bucket lock MIXED SW/MW reader/rename bench (-DDC_CHAIN_SWMW): identical reader; the
 # transition chain rides the mixed commit instead of the per-host chain lock
-# (sizeof(dentry) 176 -> 168).  A/B partner to bench_dcache_dlm (same reader+mark;
+# (sizeof(dentry) 176 -> 168).  A/B partner to bench_dcache_bucketlock (same reader+mark;
 # chain lock vs lock-free MW chain).
-bench_dcache_dlm_swmw: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
+bench_dcache_bucketlock_swmw: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # Same-SIZE (176 B) A/B control: the mixed engine with the retired chain lock's 8
-# bytes restored as dead padding, so bench_dcache_dlm_swmw_pad vs bench_dcache_dlm
+# bytes restored as dead padding, so bench_dcache_bucketlock_swmw_pad vs bench_dcache_bucketlock
 # isolates the lock-free-chain MECHANISM and _swmw vs _swmw_pad isolates the -8B.
-bench_dcache_dlm_swmw_pad: bench_dcache.c dcache_dlm.c $(HDRS) | check-lib
+bench_dcache_bucketlock_swmw_pad: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_SWMW_PAD $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # Per-node A/B partners: legacy 3-CL baseline, and the split layout that keeps
 # the cold d_id read (logical id, 2-CL) to isolate the d_id-elision gain.
@@ -309,7 +309,7 @@ bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 # counter).  Same three arms as `bench`; scripts/run_dcache_height.sh drives them.
 height: bench_dcache_height_seqlock bench_dcache_height_txn \
 	bench_dcache_height_txn_pernode bench_dcache_height_txn_mark \
-	bench_dcache_height_dlm
+	bench_dcache_height_bucketlock
 
 bench_dcache_height_seqlock: bench_dcache_height.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_seqlock.c \
@@ -327,13 +327,13 @@ bench_dcache_height_txn_mark: bench_dcache_height.c dcache_txn.c $(HDRS) | check
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ bench_dcache_height.c \
 	  dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
-bench_dcache_height_dlm: bench_dcache_height.c dcache_dlm.c $(HDRS) | check-lib
+bench_dcache_height_bucketlock: bench_dcache_height.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ bench_dcache_height.c \
-	  dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
-bench_dcache_height_dlm_swmw: bench_dcache_height.c dcache_dlm.c $(HDRS) | check-lib
+bench_dcache_height_bucketlock_swmw: bench_dcache_height.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(CPPFLAGS) -o $@ bench_dcache_height.c \
-	  dcache_dlm.c $(LDFLAGS) $(LDLIBS)
+	  dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # ASan smoke of the height harness (small tree, short) on both engines.
 height-asan: bench_dcache_height.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
@@ -394,158 +394,158 @@ check-mark: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_mark_asan 4 4 8 16 15000
 
-# DLM+SW engine validation gate (mark arm) -- the DEFAULT chain strategy, now the
+# bucket lock+SW engine validation gate (mark arm) -- the DEFAULT chain strategy, now the
 # per-host FOLD LOCK (SW enqueue + fold-lock dequeue).  The full single-thread
 # suite, both walk-causality repros + the fold repro, then the concurrent
 # conservation harnesses under ASan -- general, dir-move cycle, atomic exchange, and
 # the mixed rename/exchange mutual-cycle harness (mixed_cycle.c).  The legacy chain
-# lock is check-dlm-chainlock; the MW dequeue is check-dlm-swmw.
-check-dlm: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
+# lock is check-bucketlock-chainlock; the MW dequeue is check-bucketlock-swmw.
+check-bucketlock: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
 	   stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
-	   dcache_dlm.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_dlm \
-	  test_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./test_dcache_dlm
+	   dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_bucketlock \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_bucketlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_dcache_dlm repro_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_dcache_dlm
+	  -o repro_dcache_bucketlock repro_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_bucketlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_samedir_dlm repro_dcache_samedir.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_samedir_dlm
+	  -o repro_samedir_bucketlock repro_dcache_samedir.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_bucketlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_fold_dlm repro_fold.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_fold_dlm
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_dlm_asan \
-	  stress_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dlm_asan 4 4 8 16 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_dirs_dlm_asan \
-	  stress_dcache_dirs.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dirs_dlm_asan 4 8 4 2 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_xchg_dlm_asan \
-	  stress_dcache_xchg.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_xchg_dlm_asan
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o mixed_cycle_dlm_asan \
-	  mixed_cycle.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./mixed_cycle_dlm_asan
+	  -o repro_fold_bucketlock repro_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_fold_bucketlock
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_bucketlock_asan \
+	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_bucketlock_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_dirs_bucketlock_asan \
+	  stress_dcache_dirs.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dirs_bucketlock_asan 4 8 4 2 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o stress_dcache_xchg_bucketlock_asan \
+	  stress_dcache_xchg.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_xchg_bucketlock_asan
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN $(HCPP) -o mixed_cycle_bucketlock_asan \
+	  mixed_cycle.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./mixed_cycle_bucketlock_asan
 
-# DLM+SW under TSAN (needs the compiler-builtins liburcu; see stress-tsan): the
+# bucket lock+SW under TSAN (needs the compiler-builtins liburcu; see stress-tsan): the
 # per-host chain lock + demote + fold + the two-node exchange replace must be
 # race-free.  General, exchange, and dir-move, at the light configs TSAN's ~10x
 # slowdown keeps below the fold-drain liveness cliff.
-check-dlm-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_dlm.c
+check-bucketlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_bucketlock.c
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_dlm_tsan stress_dcache.c dcache_dlm.c \
+	  -o stress_dcache_bucketlock_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dlm_tsan 4 2 8 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_tsan 4 2 8 8 15000
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_xchg_dlm_tsan stress_dcache_xchg.c dcache_dlm.c \
+	  -o stress_dcache_xchg_bucketlock_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_dlm_tsan 4 4 6 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_tsan 4 4 6 8 15000
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_dirs_dlm_tsan stress_dcache_dirs.c dcache_dlm.c \
+	  -o stress_dcache_dirs_bucketlock_tsan stress_dcache_dirs.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_dlm_tsan 2 4 2 1 4000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_bucketlock_tsan 2 4 2 1 4000
 
 # LEGACY per-host CHAIN LOCK gate (-DDC_CHAIN_LOCK): the original strategy (demote +
 # folds both take the lock), kept as the A/B reference and to confirm it still builds
-# under the DC_CHAIN_MIXED refactor.  Same surface as check-dlm.
-check-dlm-chainlock: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
+# under the DC_CHAIN_MIXED refactor.  Same surface as check-bucketlock.
+check-bucketlock-chainlock: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
 	   stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
-	   dcache_dlm.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o test_dcache_dlm_chainlock \
-	  test_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./test_dcache_dlm_chainlock
+	   dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o test_dcache_bucketlock_chainlock \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_bucketlock_chainlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_dcache_dlm_chainlock repro_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_dcache_dlm_chainlock
+	  -o repro_dcache_bucketlock_chainlock repro_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_bucketlock_chainlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_samedir_dlm_chainlock repro_dcache_samedir.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_samedir_dlm_chainlock
+	  -o repro_samedir_bucketlock_chainlock repro_dcache_samedir.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_bucketlock_chainlock
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_fold_dlm_chainlock repro_fold.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_fold_dlm_chainlock
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_dlm_chainlock_asan \
-	  stress_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dlm_chainlock_asan 4 4 8 16 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_dirs_dlm_chainlock_asan \
-	  stress_dcache_dirs.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dirs_dlm_chainlock_asan 4 8 4 2 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_xchg_dlm_chainlock_asan \
-	  stress_dcache_xchg.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_xchg_dlm_chainlock_asan
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o mixed_cycle_dlm_chainlock_asan \
-	  mixed_cycle.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./mixed_cycle_dlm_chainlock_asan
+	  -o repro_fold_bucketlock_chainlock repro_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_fold_bucketlock_chainlock
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_bucketlock_chainlock_asan \
+	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_bucketlock_chainlock_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_dirs_bucketlock_chainlock_asan \
+	  stress_dcache_dirs.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dirs_bucketlock_chainlock_asan 4 8 4 2 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o stress_dcache_xchg_bucketlock_chainlock_asan \
+	  stress_dcache_xchg.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_xchg_bucketlock_chainlock_asan
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(HCPP) -o mixed_cycle_bucketlock_chainlock_asan \
+	  mixed_cycle.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./mixed_cycle_bucketlock_chainlock_asan
 
-check-dlm-chainlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_dlm.c
+check-bucketlock-chainlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_bucketlock.c
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_dlm_chainlock_tsan stress_dcache.c dcache_dlm.c \
+	  -o stress_dcache_bucketlock_chainlock_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dlm_chainlock_tsan 4 2 8 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_chainlock_tsan 4 2 8 8 15000
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_xchg_dlm_chainlock_tsan stress_dcache_xchg.c dcache_dlm.c \
+	  -o stress_dcache_xchg_bucketlock_chainlock_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_dlm_chainlock_tsan 4 4 6 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_chainlock_tsan 4 4 6 8 15000
 
-# DLM MIXED SW/MW engine validation gate (-DDC_CHAIN_SWMW): identical to check-dlm
+# bucket lock MIXED SW/MW engine validation gate (-DDC_CHAIN_SWMW): identical to check-bucketlock
 # but the transition chain (d_fwd/d_back) rides the mixed SW/MW commit instead of a
 # per-host chain lock (index stays store_sw + bucket-locked; demote/promote/splice
 # become store_mw records; the chain lock + d_chain_lock are retired).  The shell
 # ops re-inherit the fair-mutex escalation discipline, so mixed_cycle.c (the
 # rename/exchange mutual-cycle harness) is the key added stressor here.
-check-dlm-swmw: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
+check-bucketlock-swmw: test_dcache.c repro_dcache.c repro_dcache_samedir.c repro_fold.c \
 	   stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
-	   dcache_dlm.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o test_dcache_dlm_swmw \
-	  test_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./test_dcache_dlm_swmw
+	   dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o test_dcache_bucketlock_swmw \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_bucketlock_swmw
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_dcache_dlm_swmw repro_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_dcache_dlm_swmw
+	  -o repro_dcache_bucketlock_swmw repro_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_bucketlock_swmw
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_samedir_dlm_swmw repro_dcache_samedir.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_samedir_dlm_swmw
+	  -o repro_samedir_bucketlock_swmw repro_dcache_samedir.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_bucketlock_swmw
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_TEST_HOOKS $(HCPP) \
-	  -o repro_fold_dlm_swmw repro_fold.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./repro_fold_dlm_swmw
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_dlm_swmw_asan \
-	  stress_dcache.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dlm_swmw_asan 4 4 8 16 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_dirs_dlm_swmw_asan \
-	  stress_dcache_dirs.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_dirs_dlm_swmw_asan 4 8 4 2 15000
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_xchg_dlm_swmw_asan \
-	  stress_dcache_xchg.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./stress_dcache_xchg_dlm_swmw_asan
-	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o mixed_cycle_dlm_swmw_asan \
-	  mixed_cycle.c dcache_dlm.c $(LDFLAGS) $(LDLIBS)
-	./mixed_cycle_dlm_swmw_asan
+	  -o repro_fold_bucketlock_swmw repro_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_fold_bucketlock_swmw
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_bucketlock_swmw_asan \
+	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_bucketlock_swmw_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_dirs_bucketlock_swmw_asan \
+	  stress_dcache_dirs.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dirs_bucketlock_swmw_asan 4 8 4 2 15000
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o stress_dcache_xchg_bucketlock_swmw_asan \
+	  stress_dcache_xchg.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_xchg_bucketlock_swmw_asan
+	$(CC) $(ASANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o mixed_cycle_bucketlock_swmw_asan \
+	  mixed_cycle.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./mixed_cycle_bucketlock_swmw_asan
 
-# DLM MIXED SW/MW under TSAN (needs the compiler-builtins liburcu; see stress-tsan):
+# bucket lock MIXED SW/MW under TSAN (needs the compiler-builtins liburcu; see stress-tsan):
 # the store_mw demote/promote/splice, the CAS-old adjacent-fold serialization, and
 # the fair-mutex lane must all be race-free without the chain lock.
-check-dlm-swmw-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_dlm.c
+check-bucketlock-swmw-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c dcache_bucketlock.c
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_dlm_swmw_tsan stress_dcache.c dcache_dlm.c \
+	  -o stress_dcache_bucketlock_swmw_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dlm_swmw_tsan 4 2 8 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_swmw_tsan 4 2 8 8 15000
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_xchg_dlm_swmw_tsan stress_dcache_xchg.c dcache_dlm.c \
+	  -o stress_dcache_xchg_bucketlock_swmw_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_dlm_swmw_tsan 4 4 6 8 15000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_swmw_tsan 4 4 6 8 15000
 	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
-	  -o stress_dcache_dirs_dlm_swmw_tsan stress_dcache_dirs.c dcache_dlm.c \
+	  -o stress_dcache_dirs_bucketlock_swmw_tsan stress_dcache_dirs.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
-	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_dlm_swmw_tsan 2 4 2 1 4000
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_bucketlock_swmw_tsan 2 4 2 1 4000
 
 check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o test_dcache_pernode \
@@ -590,20 +590,20 @@ clean:
 	  stress_dcache_tsan stress_dcache_dirs stress_dcache_dirs_asan \
 	  stress_dcache_dirs_tsan stress_dcache_xchg stress_dcache_xchg_asan \
 	  stress_dcache_xchg_tsan \
-	  bench_dcache_churn_dlm bench_dcache_dlm bench_dcache_height_dlm \
-	  bench_dcache_dlm_swmw bench_dcache_dlm_swmw_pad bench_dcache_churn_dlm_swmw \
-	  bench_dcache_height_dlm_swmw bench_dcache_dlm_chainlock \
-	  test_dcache_dlm_chainlock repro_dcache_dlm_chainlock repro_samedir_dlm_chainlock \
-	  repro_fold_dlm_chainlock stress_dcache_dlm_chainlock_asan stress_dcache_dirs_dlm_chainlock_asan \
-	  stress_dcache_xchg_dlm_chainlock_asan mixed_cycle_dlm_chainlock_asan \
-	  stress_dcache_dlm_chainlock_tsan stress_dcache_xchg_dlm_chainlock_tsan \
-	  test_dcache_dlm repro_dcache_dlm repro_samedir_dlm repro_fold_dlm \
-	  stress_dcache_dlm_asan stress_dcache_dirs_dlm_asan stress_dcache_xchg_dlm_asan \
-	  mixed_cycle_dlm_asan stress_dcache_dlm_tsan stress_dcache_xchg_dlm_tsan \
-	  stress_dcache_dirs_dlm_tsan \
-	  test_dcache_dlm_swmw repro_dcache_dlm_swmw repro_samedir_dlm_swmw repro_fold_dlm_swmw \
-	  stress_dcache_dlm_swmw_asan stress_dcache_dirs_dlm_swmw_asan \
-	  stress_dcache_xchg_dlm_swmw_asan mixed_cycle_dlm_swmw_asan \
-	  stress_dcache_dlm_swmw_tsan stress_dcache_xchg_dlm_swmw_tsan stress_dcache_dirs_dlm_swmw_tsan \
+	  bench_dcache_churn_bucketlock bench_dcache_bucketlock bench_dcache_height_bucketlock \
+	  bench_dcache_bucketlock_swmw bench_dcache_bucketlock_swmw_pad bench_dcache_churn_bucketlock_swmw \
+	  bench_dcache_height_bucketlock_swmw bench_dcache_bucketlock_chainlock \
+	  test_dcache_bucketlock_chainlock repro_dcache_bucketlock_chainlock repro_samedir_bucketlock_chainlock \
+	  repro_fold_bucketlock_chainlock stress_dcache_bucketlock_chainlock_asan stress_dcache_dirs_bucketlock_chainlock_asan \
+	  stress_dcache_xchg_bucketlock_chainlock_asan mixed_cycle_bucketlock_chainlock_asan \
+	  stress_dcache_bucketlock_chainlock_tsan stress_dcache_xchg_bucketlock_chainlock_tsan \
+	  test_dcache_bucketlock repro_dcache_bucketlock repro_samedir_bucketlock repro_fold_bucketlock \
+	  stress_dcache_bucketlock_asan stress_dcache_dirs_bucketlock_asan stress_dcache_xchg_bucketlock_asan \
+	  mixed_cycle_bucketlock_asan stress_dcache_bucketlock_tsan stress_dcache_xchg_bucketlock_tsan \
+	  stress_dcache_dirs_bucketlock_tsan \
+	  test_dcache_bucketlock_swmw repro_dcache_bucketlock_swmw repro_samedir_bucketlock_swmw repro_fold_bucketlock_swmw \
+	  stress_dcache_bucketlock_swmw_asan stress_dcache_dirs_bucketlock_swmw_asan \
+	  stress_dcache_xchg_bucketlock_swmw_asan mixed_cycle_bucketlock_swmw_asan \
+	  stress_dcache_bucketlock_swmw_tsan stress_dcache_xchg_bucketlock_swmw_tsan stress_dcache_dirs_bucketlock_swmw_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
 	  bench_dcache_churn_txn_mark

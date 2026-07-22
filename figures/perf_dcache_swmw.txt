@@ -1,4 +1,4 @@
-DLM+SW dentry cache -- transition-chain serialization strategies
+bucket lock+SW dentry cache -- transition-chain serialization strategies
 ================================================================
 2x96 EPYC 9654, one hw thread/core (0..191), jemalloc, best-of-5, conservation-
 gated.  dirs decontended to 16/writer (so the ONLY writer contention is the
@@ -10,12 +10,12 @@ scripts/run_dcache_swmw.sh.
 The transition chain is a single-producer / multi-consumer list: the demote
 (ENQUEUE) has one producer under the bucket lock; the folds (DEQUEUE) are many
 consumers.  Four arms -- identical reader + mark; only the chain differs:
-  dlm-chainlock  -DDC_CHAIN_LOCK: legacy per-host CHAIN LOCK -- demote AND folds
+  bucketlock-chainlock  -DDC_CHAIN_LOCK: legacy per-host CHAIN LOCK -- demote AND folds
                  take it.  176 B.  The reference baseline.
-  dlm-swmw       -DDC_CHAIN_SWMW: SW enqueue + MW dequeue -- the chain rides the
+  bucketlock-swmw       -DDC_CHAIN_SWMW: SW enqueue + MW dequeue -- the chain rides the
                  mixed commit as MW records (lock-free folds).  168 B.
-  dlm-swmw-pad   dlm-swmw + 8 B dead padding -> 176 B, the SAME-SIZE control.
-  dlm-foldlock   DEFAULT (no chain flag): SW enqueue + per-host FOLD LOCK dequeue,
+  bucketlock-swmw-pad   bucketlock-swmw + 8 B dead padding -> 176 B, the SAME-SIZE control.
+  bucketlock-foldlock   DEFAULT (no chain flag): SW enqueue + per-host FOLD LOCK dequeue,
                  plain chain stores, no MW descriptor.  The producer does NOT take
                  the fold lock -- only fold workers do.  176 B.
 
@@ -56,10 +56,10 @@ CONCLUSIONS
    decoupling the producer from that lock avoids the chain lock's producer-vs-fold
    coupling (recovering the scaling).
 
-2. The MW dequeue (dlm-swmw) is a TRADE-OFF: lock-free folds scale, but the
+2. The MW dequeue (bucketlock-swmw) is a TRADE-OFF: lock-free folds scale, but the
    descriptor cost makes it ~1.7x slower than the chain lock uncontended (1 thread).
-   Its win over the chain lock is the lock-free chain, NOT the -8B: dlm-swmw (168 B)
-   and dlm-swmw-pad (176 B) track each other within noise across every panel.
+   Its win over the chain lock is the lock-free chain, NOT the -8B: bucketlock-swmw (168 B)
+   and bucketlock-swmw-pad (176 B) track each other within noise across every panel.
 
 3. The chain lock (reference) plateaus with concurrency (its demote couples the
    producer with the folds on one per-host word) and even DEGRADES as the rename

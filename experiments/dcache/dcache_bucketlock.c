@@ -60,8 +60,8 @@
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-txn.h>		/* the canonical (mixed SW/MW) front-end + URCU_TXN_TAG */
 #include <urcu/rcu-txn-hlist.h>		/* URCU_TXN_HLIST_TAG / _MARK / is_marked (reused) */
-#include <urcu/rcu-txn-sw.h>		/* DLM: single-writer flip-proxy commit */
-#include <urcu/rcu-txn-sw-hlist.h>	/* DLM: SW hlist node type + _prepare forms */
+#include <urcu/rcu-txn-sw.h>		/* bucket lock: single-writer flip-proxy commit */
+#include <urcu/rcu-txn-sw-hlist.h>	/* bucket lock: SW hlist node type + _prepare forms */
 /*
  * Chain-serialization strategy (mutually exclusive):
  *   default          SW enqueue + per-host FOLD LOCK dequeue (== DC_CHAIN_FOLDLOCK,
@@ -95,7 +95,7 @@
 /*
  * ---- engine selector: pure single-writer SW vs mixed SW/MW -----------------
  *
- * The DEFAULT DLM build drives the pure single-writer engine (rcu-txn-sw.h): the
+ * The DEFAULT bucket lock build drives the pure single-writer engine (rcu-txn-sw.h): the
  * index commits SW under the bucket lock and the transition chain (d_fwd/d_back)
  * is serialized by a SEPARATE per-host chain lock.  A MIXED build (DC_CHAIN_SWMW /
  * DC_CHAIN_FOLDLOCK) drives the mixed engine (rcu-txn.h): the index and the
@@ -152,7 +152,7 @@ void (*dc_test_fold_hook)(void);
  * (the fair-weather pack that leaves d_hash cold).
  */
 /*
- * The DLM engine is MARK-ONLY for now: its shell ops (rename/exchange/fold) owe
+ * The bucket lock engine is MARK-ONLY for now: its shell ops (rename/exchange/fold) owe
  * no walk-causality gen bump -- a rename's demote MARK is the signal -- so they
  * do not implement the GLOBAL / PER-NODE counter arms.  A bare build therefore
  * defaults to the mark arm; any explicit non-mark selection hits the #error in
@@ -245,7 +245,7 @@ struct dentry {
 	 *
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
 	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
-	 * readers following a chain -- via dlm_read(), since it can briefly
+	 * readers following a chain -- via bl_read(), since it can briefly
 	 * hold a commit descriptor; d_back is read only by fold workers.  Both NULL
 	 * in steady state (settled content host = its own top, no chain).
 	 */
@@ -387,9 +387,9 @@ struct dentry {
 #define DC_TAG_NEG	((uintptr_t) 0x4)	/* bit 2: negative dentry */
 #define DC_TAG_MASK	((uintptr_t) 0x7)
 
-/* ==== DLM engine: per-bucket write lock (bit 2) + SW-proxy resolve ========= *
+/* ==== bucket lock engine: per-bucket write lock (bit 2) + SW-proxy resolve ========= *
  *
- * The DLM engine keeps dcache_txn.c's algorithm intact (shell rename, async
+ * The bucket lock engine keeps dcache_txn.c's algorithm intact (shell rename, async
  * fold, host_of_rcu skip, walk-causality gen, the deletion mark) but swaps the
  * writer commit from the multi-writer MCAS to the single-writer SW flip-proxy
  * engine (rcu-txn-sw.h): a writer LOCKS the affected bucket head(s) -- one or
@@ -520,10 +520,10 @@ static inline void bl_unlock_n(struct urcu_txn_sw_hlist_head **h, int n)
  * Resolve a transacted SINGLE-pointer slot (d_fwd, d_parent, d_iparent, d_seq,
  * the gen) to its current value: strip the proxy tag (bit 0) through the SW
  * selector, else pass through.  Any OTHER low bits (iparent SHELL/NEG) are
- * returned intact for the caller.  Drop-in for dlm_read().  NOT for head
+ * returned intact for the caller.  Drop-in for bl_read().  NOT for head
  * words -- those carry the lock; use the hlist accessors below.
  */
-static inline void *dlm_read(void **slot, uintptr_t tag)
+static inline void *bl_read(void **slot, uintptr_t tag)
 {
 	uintptr_t v = (uintptr_t) rcu_dereference(*slot);
 
@@ -540,7 +540,7 @@ static inline void *dlm_read(void **slot, uintptr_t tag)
  * from the returned pointer, reporting it via *marked (NULL to ignore).
  */
 static inline struct urcu_txn_sw_hlist_node *
-dlm_hlist_resolve(struct urcu_txn_sw_hlist_node *ptr, int *marked)
+bl_hlist_resolve(struct urcu_txn_sw_hlist_node *ptr, int *marked)
 {
 	uintptr_t v = (uintptr_t) ptr & ~DC_BL_LOCK;	/* slot-level lock strip */
 
@@ -560,14 +560,14 @@ dlm_hlist_resolve(struct urcu_txn_sw_hlist_node *ptr, int *marked)
 
 /* Resolved first / next step (call under rcu_read_lock()). */
 static inline struct urcu_txn_sw_hlist_node *
-dlm_hlist_first_rcu(struct urcu_txn_sw_hlist_head *head)
+bl_hlist_first_rcu(struct urcu_txn_sw_hlist_head *head)
 {
-	return dlm_hlist_resolve(rcu_dereference(head->first), NULL);
+	return bl_hlist_resolve(rcu_dereference(head->first), NULL);
 }
 static inline struct urcu_txn_sw_hlist_node *
-dlm_hlist_next_rcu(struct urcu_txn_sw_hlist_node *node)
+bl_hlist_next_rcu(struct urcu_txn_sw_hlist_node *node)
 {
-	return dlm_hlist_resolve(rcu_dereference(node->next), NULL);
+	return bl_hlist_resolve(rcu_dereference(node->next), NULL);
 }
 
 /*
@@ -590,7 +590,7 @@ static inline void bl_set_first(struct urcu_txn_sw_hlist_head *h,
 }
 
 /* Add n at the head of a LOCKED bucket. */
-static inline void dlm_hlist_add_head_locked(struct urcu_txn_sw_hlist_head *h,
+static inline void bl_hlist_add_head_locked(struct urcu_txn_sw_hlist_head *h,
 					     struct urcu_txn_sw_hlist_node *n)
 {
 	struct urcu_txn_sw_hlist_node *first = bl_first(h);
@@ -609,7 +609,7 @@ static inline void dlm_hlist_add_head_locked(struct urcu_txn_sw_hlist_head *h,
  * head.  n's own next/pprev are left pointing forward (marked), so a reader on n
  * still escapes into the live chain; the caller reclaims n after a grace period.
  */
-static inline void dlm_hlist_del_locked(struct urcu_txn_sw_hlist_node *n)
+static inline void bl_hlist_del_locked(struct urcu_txn_sw_hlist_node *n)
 {
 	struct urcu_txn_sw_hlist_node **ppv = n->pprev;
 	struct urcu_txn_sw_hlist_node *next =
@@ -635,7 +635,7 @@ static inline void dlm_hlist_del_locked(struct urcu_txn_sw_hlist_node *n)
  *   HEAD slots carry the bucket lock (bit 2).  install parks proxy|tag and
  *   settle stores new -- both would drop the lock -- so a head record uses tag
  *   DC_HLOCKTAG and its old/new carry the lock bit, keeping bit 2 set across the
- *   whole install..settle window (dlm_hlist_resolve strips it, twice).
+ *   whole install..settle window (bl_hlist_resolve strips it, twice).
  *   a DEL must MARK the removed node's next (the reader's unlink signal), which
  *   the raw SW del omits, so we record that edge too.
  * pprev backpointers are writer-only (no reader reads them); recording them
@@ -645,7 +645,7 @@ static inline void dlm_hlist_del_locked(struct urcu_txn_sw_hlist_node *n)
 #define DC_HLOCKTAG	(DC_HTAG | DC_BL_LOCK)		  /* head-slot record tag */
 
 /* Record insert of newp at the head of a LOCKED bucket into txn. */
-static inline void dlm_sw_add_head(dc_swtxn_t *txn,
+static inline void bl_sw_add_head(dc_swtxn_t *txn,
 		struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_head *head)
 {
@@ -662,7 +662,7 @@ static inline void dlm_sw_add_head(dc_swtxn_t *txn,
 }
 
 /* Record marked del of elem from its LOCKED chain into txn. */
-static inline void dlm_sw_del_marked(dc_swtxn_t *txn,
+static inline void bl_sw_del_marked(dc_swtxn_t *txn,
 		struct urcu_txn_sw_hlist_node *elem)
 {
 	struct urcu_txn_sw_hlist_node **ppv = elem->pprev;
@@ -691,7 +691,7 @@ static inline void dlm_sw_del_marked(dc_swtxn_t *txn,
  * pre-publish.  Unlike a del + add-head, only *oldn->pprev is rewritten (to
  * @newn), so it never double-writes a first-slot bucket head (no same-slot
  * record conflict).  The caller holds @oldn's bucket-head lock. */
-static inline void dlm_sw_replace(dc_swtxn_t *txn,
+static inline void bl_sw_replace(dc_swtxn_t *txn,
 		struct urcu_txn_sw_hlist_node *oldn,
 		struct urcu_txn_sw_hlist_node *newn)
 {
@@ -717,11 +717,11 @@ static inline void dlm_sw_replace(dc_swtxn_t *txn,
 /*
  * Record replace of an ADJACENT pair @first -> @second (first->next == second)
  * by @newfirst -> @newsecond in one combined edit, MARKing both olds.  Two plain
- * dlm_sw_replace()s would double-write the shared linking slot (first->next is
+ * bl_sw_replace()s would double-write the shared linking slot (first->next is
  * also second->pprev's target); this writes it once.  The news are UNLINKED;
  * their next/pprev are set here pre-publish.  Caller holds the chain's head lock.
  */
-static inline void dlm_sw_replace_adj(dc_swtxn_t *txn,
+static inline void bl_sw_replace_adj(dc_swtxn_t *txn,
 		struct urcu_txn_sw_hlist_node *first,
 		struct urcu_txn_sw_hlist_node *newfirst,
 		struct urcu_txn_sw_hlist_node *second,
@@ -755,11 +755,11 @@ static inline void dlm_sw_replace_adj(dc_swtxn_t *txn,
 /*
  * Record replace of TWO nodes in the SAME locked chain (olda->newa, oldb->newb),
  * both olds MARKed.  A same-directory exchange puts both tops in one child head
- * (a hash collision, one bucket); two independent dlm_sw_replace()s would then
+ * (a hash collision, one bucket); two independent bl_sw_replace()s would then
  * conflict on a shared linking slot iff the olds are ADJACENT.  Disjoint: two
  * independent replaces; adjacent: the combined edit above (correct order).
  */
-static inline void dlm_sw_replace2(dc_swtxn_t *txn,
+static inline void bl_sw_replace2(dc_swtxn_t *txn,
 		struct urcu_txn_sw_hlist_node *olda,
 		struct urcu_txn_sw_hlist_node *newa,
 		struct urcu_txn_sw_hlist_node *oldb,
@@ -771,12 +771,12 @@ static inline void dlm_sw_replace2(dc_swtxn_t *txn,
 		((uintptr_t) oldb->next & ~(uintptr_t) URCU_TXN_HLIST_MARK);
 
 	if (na == oldb)				/* olda directly precedes oldb */
-		dlm_sw_replace_adj(txn, olda, newa, oldb, newb);
+		bl_sw_replace_adj(txn, olda, newa, oldb, newb);
 	else if (nb == olda)			/* oldb directly precedes olda */
-		dlm_sw_replace_adj(txn, oldb, newb, olda, newa);
+		bl_sw_replace_adj(txn, oldb, newb, olda, newa);
 	else {					/* disjoint slots: two plain replaces */
-		dlm_sw_replace(txn, olda, newa);
-		dlm_sw_replace(txn, oldb, newb);
+		bl_sw_replace(txn, olda, newa);
+		bl_sw_replace(txn, oldb, newb);
 	}
 }
 
@@ -811,7 +811,7 @@ typedef uintptr_t dc_stamp_t;
  * aligned (posix_memalign), so bit 0 is clear on every live value.
  *
  * Cost of the resolve on the match path: with no txn installed -- the
- * overwhelming common case -- dlm_read() is a tag test and a
+ * overwhelming common case -- bl_read() is a tag test and a
  * well-predicted branch on a word already loaded for the compare, the same shape
  * top_unhashed_rcu() already pays on this path.
  */
@@ -823,7 +823,7 @@ static inline uintptr_t iparent_raw(const struct dentry *d)
 #ifdef DC_IPARENT_TXN
 	struct dentry *nc = (struct dentry *) (uintptr_t) d;
 
-	return (uintptr_t) dlm_read((void **) &nc->d_iparent,
+	return (uintptr_t) bl_read((void **) &nc->d_iparent,
 					  DC_IPARENT_TAG);
 #else
 	return (uintptr_t) d->d_iparent;
@@ -934,7 +934,7 @@ struct dcache {
 	 * path walk on it and retries if it moved (a rename touched the tree
 	 * mid-walk).  Stored as a transacted void* slot so the bump composes
 	 * atomically with the structural edge change; the reader resolves it
-	 * with dlm_read().  Kept EVEN (stepped by 2) so bit 0 -- the
+	 * with bl_read().  Kept EVEN (stepped by 2) so bit 0 -- the
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
 	void *rename_gen;
@@ -947,7 +947,7 @@ struct dcache {
  * Engine proxy tag for the transacted transition chain (d_fwd/d_back).  The
  * splice MCASes both links of a middle relay in one commit, so a concurrent
  * fold sees a consistent chain; readers following d_fwd resolve the slot with
- * dlm_read() (it may briefly hold a commit descriptor).  Node addresses
+ * bl_read() (it may briefly hold a commit descriptor).  Node addresses
  * are >= 8-byte aligned, so bit 0 is clear on every live value the slot holds.
  */
 #define DC_FWD_TAG	URCU_TXN_TAG
@@ -955,7 +955,7 @@ struct dcache {
 /*
  * Engine proxy tag for the transacted d_parent slot (bit 0; hosts are aligned).
  * Writer-only: read via the txn in the cross-dir loop check and via
- * dlm_read() in the quiescent walk; never on the downward reader path.
+ * bl_read() in the quiescent walk; never on the downward reader path.
  */
 #define DC_PARENT_TAG	URCU_TXN_TAG
 
@@ -979,17 +979,17 @@ static inline struct urcu_txn_sw_hlist_head *bucket_of(struct dcache *dc,
 const char *dc_engine_name(void)
 {
 #if defined(DC_CHAIN_LOCK)
-	return "dlm-chainlock";		/* legacy: per-host chain lock (demote + folds) */
+	return "bucketlock-chainlock";		/* legacy: per-host chain lock (demote + folds) */
 #elif defined(DC_CHAIN_SWMW)
-	return "dlm-swmw";		/* mixed SW/MW: chain MW, index SW, no chain lock */
+	return "bucketlock-swmw";		/* mixed SW/MW: chain MW, index SW, no chain lock */
 #elif defined(DC_CHAIN_FOLDLOCK)
-	return "dlm-foldlock";		/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
+	return "bucketlock-foldlock";		/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
 #elif defined(DC_MARK_GEN)
-	return "dlm-mark";
+	return "bucketlock-mark";
 #elif defined(DC_PER_NODE_GEN)
-	return "dlm-pernode";
+	return "bucketlock-pernode";
 #else
-	return "dlm";
+	return "bucketlock";
 #endif
 }
 
@@ -1073,10 +1073,10 @@ struct dcache *dc_create(unsigned int nbuckets)
 /* Quiescent teardown: recurse the child-hlist, free every node. */
 static void free_subtree(struct dentry *d)
 {
-	struct urcu_txn_sw_hlist_node *n = dlm_hlist_first_rcu(&d->d_child_head);
+	struct urcu_txn_sw_hlist_node *n = bl_hlist_first_rcu(&d->d_child_head);
 
 	while (n) {
-		struct urcu_txn_sw_hlist_node *next = dlm_hlist_next_rcu(n);
+		struct urcu_txn_sw_hlist_node *next = bl_hlist_next_rcu(n);
 
 		free_subtree(sib_dentry(n));
 		n = next;
@@ -1125,7 +1125,7 @@ static inline struct dentry *host_of_rcu(struct dentry *top)
 	 * read, so a settled hop never leaves the hot cacheline. */
 	return node_is_shell(top) ? rcu_dereference(top->d_host) : top;
 #else
-	struct dentry *fwd = dlm_read((void **) &top->d_fwd, DC_FWD_TAG);
+	struct dentry *fwd = bl_read((void **) &top->d_fwd, DC_FWD_TAG);
 
 	return fwd ? rcu_dereference(top->d_host) : top;
 #endif
@@ -1143,7 +1143,7 @@ static struct dentry *find_top_rcu(struct dcache *dc, struct dentry *parent,
 	struct urcu_txn_sw_hlist_head *b = bucket_of(dc, parent, name->hash);
 	struct urcu_txn_sw_hlist_node *n;
 
-	for (n = dlm_hlist_first_rcu(b); n; n = dlm_hlist_next_rcu(n)) {
+	for (n = bl_hlist_first_rcu(b); n; n = bl_hlist_next_rcu(n)) {
 		struct dentry *d = hnode_dentry(n);
 
 		if (DC_IPARENT(d) == parent && dc_qstr_eq(&d->d_iname, name))
@@ -1167,7 +1167,7 @@ static struct dentry *find_top_raw_rcu(struct dcache *dc, struct dentry *parent,
 	struct urcu_txn_sw_hlist_head *b = bucket_of(dc, parent, name->hash);
 	struct urcu_txn_sw_hlist_node *n;
 
-	for (n = dlm_hlist_first_rcu(b); n; n = dlm_hlist_next_rcu(n)) {
+	for (n = bl_hlist_first_rcu(b); n; n = bl_hlist_next_rcu(n)) {
 		struct dentry *d = hnode_dentry(n);
 		uintptr_t raw = iparent_raw(d);
 
@@ -1216,17 +1216,17 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
 }
 
 /*
- * Walk causality (DLM engine is MARK-ONLY for now): there is no generation
+ * Walk causality (bucket lock engine is MARK-ONLY for now): there is no generation
  * counter and no bump.  A rename's demote sets the hlist deletion MARK on the
  * outgoing top in the same SW commit that removes it from the index, and the
  * localized reader observes it via top_unhashed_rcu -- the structural edit IS
- * the signal.  So the DLM shell path owes no gen bump (the counter arms
+ * the signal.  So the bucket lock shell path owes no gen bump (the counter arms
  * GLOBAL/PER-NODE would SW-record on dc->rename_gen / host->d_seq here; carry
  * them by restoring an SW txn_bump_gen).  Enforce the mark arm for the shell
  * ops, whose reader-side causality this file only implements for the mark.
  */
 #ifndef DC_MARK_GEN
-# error "DLM engine shell ops (rename/exchange/fold) are DC_MARK_GEN-only for now"
+# error "bucket lock engine shell ops (rename/exchange/fold) are DC_MARK_GEN-only for now"
 #endif
 
 #ifdef DC_LOCALIZED_GEN
@@ -1246,7 +1246,7 @@ static inline int top_unhashed_rcu(struct dentry *top)
 	/* Resolve d_hash.next (an SW proxy mid-commit, else a plain pointer) and
 	 * report its deletion MARK: a del sets it, so a marked next means the top
 	 * has left the name index. */
-	(void) dlm_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
+	(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
 	return marked;
 }
 #endif
@@ -1272,7 +1272,7 @@ static inline dc_stamp_t dc_stamp_of(struct dentry *host, struct dentry *top,
 	return (uintptr_t) top;
 #else
 	(void) top; (void) raw;
-	return (uintptr_t) dlm_read(&host->d_seq, DC_GEN_TAG);
+	return (uintptr_t) bl_read(&host->d_seq, DC_GEN_TAG);
 #endif
 }
 
@@ -1296,7 +1296,7 @@ static inline dc_stamp_t dc_stamp_reread(struct dentry *node)
 	/* re-TEST, not re-read: still unmarked means still the indexed top */
 	return top_unhashed_rcu(node) ? 0 : (uintptr_t) node;
 #else
-	return (uintptr_t) dlm_read(&node->d_seq, DC_GEN_TAG);
+	return (uintptr_t) bl_read(&node->d_seq, DC_GEN_TAG);
 #endif
 }
 #endif
@@ -1329,7 +1329,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		void *g0, *g1;
 		uint32_t i;
 
-		g0 = dlm_read(&dc->rename_gen, DC_GEN_TAG);	/* acquire */
+		g0 = bl_read(&dc->rename_gen, DC_GEN_TAG);	/* acquire */
 		res = DC_POSITIVE;
 		id = DC_FAST_ID(cur);
 		for (i = 0; i < p->ndepth; i++) {
@@ -1359,7 +1359,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 #endif
 		}
 		cmm_smp_rmb();			/* walk loads before re-reading gen */
-		g1 = dlm_read(&dc->rename_gen, DC_GEN_TAG);
+		g1 = bl_read(&dc->rename_gen, DC_GEN_TAG);
 		if (g0 == g1)
 			break;			/* no rename crossed the walk */
 		/* a rename touched the tree mid-walk: re-walk from the root */
@@ -1470,13 +1470,13 @@ static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 /* Resolve the transacted d_parent slot (RCU-side; call within a read section). */
 static inline struct dentry *parent_of_rcu(struct dentry *d)
 {
-	return dlm_read((void **) &d->d_parent, DC_PARENT_TAG);
+	return bl_read((void **) &d->d_parent, DC_PARENT_TAG);
 }
 
 /* Is @d's child-hlist empty?  Call within an RCU read-side section. */
 static int children_empty(struct dentry *d)
 {
-	return dlm_hlist_first_rcu(&d->d_child_head) == NULL;
+	return bl_hlist_first_rcu(&d->d_child_head) == NULL;
 }
 
 static void dentry_free_cb(struct rcu_head *rh);
@@ -1522,8 +1522,8 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	 * churn workload; harden with a re-check under the lock if ever needed).
 	 */
 	bl_lock2(bucket, &parent->d_child_head);
-	dlm_hlist_add_head_locked(bucket, &d->d_hash);
-	dlm_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
+	bl_hlist_add_head_locked(bucket, &d->d_hash);
+	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
 	return 0;
 }
@@ -1619,15 +1619,15 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			 * transfer removed it between our find and our acquire. */
 			int marked = 0;
 
-			(void) dlm_hlist_resolve(
+			(void) bl_hlist_resolve(
 				rcu_dereference(top->d_hash.next), &marked);
 			if (marked) {
 				bl_unlock2(bucket, &parent->d_child_head);
 				continue;	/* re-find the current top */
 			}
 		}
-		dlm_hlist_del_locked(&top->d_hash);
-		dlm_hlist_del_locked(&top->d_sib);
+		bl_hlist_del_locked(&top->d_hash);
+		bl_hlist_del_locked(&top->d_sib);
 		bl_unlock2(bucket, &parent->d_child_head);
 		break;				/* removed from both indexes */
 	}
@@ -1715,7 +1715,7 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 	 * a hash collision shares the bucket), a del(top) + add(shell) would record
 	 * TWO edges on that one head->first slot when top is first -- a same-slot
 	 * conflict the SW engine cannot reconcile (no RYW).  So detect the coincidence
-	 * and use an in-place dlm_sw_replace (shell takes top's exact slot), which
+	 * and use an in-place bl_sw_replace (shell takes top's exact slot), which
 	 * rewrites only *top->pprev and still MARKs top; otherwise del + add-head into
 	 * two distinct heads.
 	 *
@@ -1735,16 +1735,16 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 	 *   chain lock.
 	 */
 	if (from_bucket == new_bucket) {		/* same hash bucket */
-		dlm_sw_replace(txn, &top->d_hash, &shell->d_hash);
+		bl_sw_replace(txn, &top->d_hash, &shell->d_hash);
 	} else {
-		dlm_sw_del_marked(txn, &top->d_hash);
-		dlm_sw_add_head(txn, &shell->d_hash, new_bucket);
+		bl_sw_del_marked(txn, &top->d_hash);
+		bl_sw_add_head(txn, &shell->d_hash, new_bucket);
 	}
 	if (!cross_parent) {				/* same parent -> same child head */
-		dlm_sw_replace(txn, &top->d_sib, &shell->d_sib);
+		bl_sw_replace(txn, &top->d_sib, &shell->d_sib);
 	} else {
-		dlm_sw_del_marked(txn, &top->d_sib);
-		dlm_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
+		bl_sw_del_marked(txn, &top->d_sib);
+		bl_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
 	}
 #ifdef DC_CHAIN_MIXED
 	(void) urcu_txn_store_sw(txn, (void **) &top->d_back, NULL, shell,
@@ -1866,7 +1866,7 @@ static int stack_shell(struct dcache *dc,
 		heads[3] = &new_parent->d_child_head;
 		fold_lock(host);
 		bl_lock_n(heads, 4);
-		(void) dlm_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
+		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
 		if (marked) {
 			bl_unlock_n(heads, 4);
 			fold_unlock(host);
@@ -1981,7 +1981,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 		heads[0] = bucket_of(dc, parent, n->d_iname.hash);
 		heads[1] = &parent->d_child_head;
 		bl_lock_n(heads, 2);
-		(void) dlm_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
+		(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
 		if (marked) {
 			/* out of the index + d_back still NULL (stable under the chain
 			 * lock) => an unlink removed it: RECLAIM the orphan chain. */
@@ -2008,8 +2008,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 		m->d_iname = n->d_iname;
 
 		urcu_txn_sw_init(&txn);
-		dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
-		dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
+		bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
+		bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
 		st = urcu_txn_sw_commit(&txn);		/* no ABORT under the lock */
 		if (st == URCU_TXN_STATUS_OK) {
 			uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
@@ -2149,7 +2149,7 @@ static int stack_shell(struct dcache *dc,
 		heads[2] = new_bucket;
 		heads[3] = &new_parent->d_child_head;
 		bl_lock_n(heads, 4);
-		(void) dlm_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
+		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
 		if (marked) {
 			bl_unlock_n(heads, 4);
 			if (cross_parent)
@@ -2261,7 +2261,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			urcu_txn_begin(&txn);
 			DC_FOLD_CONFLICT_HINT(&txn);
 			bl_lock_n(heads, 2);		/* AFTER begin (fair-mutex discipline) */
-			(void) dlm_hlist_resolve(rcu_dereference(n->d_hash.next),
+			(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next),
 						 &marked);
 			if (marked) {
 				/* @n out of the index.  Under the bucket lock no demote can
@@ -2293,8 +2293,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 #endif
 			m->d_iname = n->d_iname;
 
-			dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
-			dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
+			bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
+			bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
 			(void) urcu_txn_store_mw(&txn, (void **) &m->d_back,
 						      n, NULL, DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
@@ -2410,7 +2410,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			heads[0] = bucket_of(dc, parent, n->d_iname.hash);
 			heads[1] = &parent->d_child_head;
 			bl_lock_n(heads, 2);		/* fold lock < bucket lock (address-ordered) */
-			(void) dlm_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
+			(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
 			if (marked) {
 				/* n out of the index; under the bucket lock no demote is in
 				 * progress.  Re-read d_back: NULL => an unlink removed the
@@ -2451,8 +2451,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 				urcu_txn_init(&txn, NULL);	/* no lane (see the note) */
 				urcu_txn_declare_disjoint(&txn);
 				urcu_txn_begin(&txn);
-				dlm_sw_replace(&txn, &n->d_hash, &m->d_hash);
-				dlm_sw_replace(&txn, &n->d_sib, &m->d_sib);
+				bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
+				bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
 				st = urcu_txn_commit_sw(&txn);
 				urcu_txn_end(&txn);
 				if (st == URCU_TXN_STATUS_OK)
@@ -2551,7 +2551,7 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
  * land move A's del and move B's add on the SAME head, aliasing when a top is
  * first).  Each (parent, name) SLOT is simply taken over by the OTHER entry's
  * shell -- an in-place replace.  When both tops share a head (a same-dir
- * exchange, or a hash collision), dlm_sw_replace2 handles their possible
+ * exchange, or a hash collision), bl_sw_replace2 handles their possible
  * adjacency.
  *
  * A cycle-forming exchange (one host an ancestor of the other) is rejected
@@ -2684,8 +2684,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		heads[3] = &pb->d_child_head;
 		fold_lock2(hosta, hostb);
 		bl_lock_n(heads, 4);
-		(void) dlm_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
-		(void) dlm_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
+		(void) bl_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
+		(void) bl_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
 		if (ma || mb)
 			goto retry_unlock;
 
@@ -2695,18 +2695,18 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		 */
 		urcu_txn_sw_init(&txn);
 		if (bucket_a == bucket_b)
-			dlm_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
+			bl_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
 					&topb->d_hash, &sa->d_hash);
 		else {
-			dlm_sw_replace(&txn, &topa->d_hash, &sb->d_hash);
-			dlm_sw_replace(&txn, &topb->d_hash, &sa->d_hash);
+			bl_sw_replace(&txn, &topa->d_hash, &sb->d_hash);
+			bl_sw_replace(&txn, &topb->d_hash, &sa->d_hash);
 		}
 		if (!cross)			/* same parent -> same child head */
-			dlm_sw_replace2(&txn, &topa->d_sib, &sb->d_sib,
+			bl_sw_replace2(&txn, &topa->d_sib, &sb->d_sib,
 					&topb->d_sib, &sa->d_sib);
 		else {
-			dlm_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
-			dlm_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
+			bl_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
+			bl_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
 		}
 		if (cross) {			/* reparent both hosts */
 			(void) dc_sw_record(&txn, (void **) &hosta->d_parent,
@@ -2893,8 +2893,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		heads[2] = &pa->d_child_head;
 		heads[3] = &pb->d_child_head;
 		bl_lock_n(heads, 4);
-		(void) dlm_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
-		(void) dlm_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
+		(void) bl_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
+		(void) bl_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
 		if (ma || mb) {
 			bl_unlock_n(heads, 4);
 			if (cross) {
@@ -2911,18 +2911,18 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		 * topb's), coalescing to a two-node replace when the tops share a head.
 		 */
 		if (bucket_a == bucket_b)
-			dlm_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
+			bl_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
 					&topb->d_hash, &sa->d_hash);
 		else {
-			dlm_sw_replace(&txn, &topa->d_hash, &sb->d_hash);
-			dlm_sw_replace(&txn, &topb->d_hash, &sa->d_hash);
+			bl_sw_replace(&txn, &topa->d_hash, &sb->d_hash);
+			bl_sw_replace(&txn, &topb->d_hash, &sa->d_hash);
 		}
 		if (!cross)			/* same parent -> same child head */
-			dlm_sw_replace2(&txn, &topa->d_sib, &sb->d_sib,
+			bl_sw_replace2(&txn, &topa->d_sib, &sb->d_sib,
 					&topb->d_sib, &sa->d_sib);
 		else {
-			dlm_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
-			dlm_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
+			bl_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
+			bl_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
 		}
 		/* Two demotes as store_SW records in the SAME commit: each is the SPMC
 		 * ENQUEUE of its chain -- single-producer under topX's bucket heads
@@ -2983,8 +2983,8 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 	if (path->ndepth > 0 || parent_of_rcu(d) != d)
 		fn(d->d_id, path, arg);
 
-	for (n = dlm_hlist_first_rcu(&d->d_child_head); n;
-	     n = dlm_hlist_next_rcu(n)) {
+	for (n = bl_hlist_first_rcu(&d->d_child_head); n;
+	     n = bl_hlist_next_rcu(n)) {
 		struct dentry *top = sib_dentry(n);
 		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
@@ -3036,8 +3036,8 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 			return -ENOENT;
 		}
 	}
-	for (n = dlm_hlist_first_rcu(&dir->d_child_head); n;
-	     n = dlm_hlist_next_rcu(n)) {
+	for (n = bl_hlist_first_rcu(&dir->d_child_head); n;
+	     n = bl_hlist_next_rcu(n)) {
 		struct dentry *top = sib_dentry(n);
 		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
