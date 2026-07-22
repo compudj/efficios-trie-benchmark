@@ -229,6 +229,21 @@ struct dentry {
 #endif
 
 	/*
+	 * ---- cold cache-line layout (grouped around the FOLD LOCK) -------------
+	 * CL0 above is the reader-hot line (identity + mark).  The cold fields are
+	 * split so the fold lock's line carries ONLY fold-side and read-only words,
+	 * never a field another core reads concurrently with a fold:
+	 *   CL1 (the fold-lock line): d_fwd, d_back (the chain a fold rewrites under
+	 *     the lock), d_fold_lock, d_dc (read-only), d_inode/d_isdir (set at
+	 *     creation), d_rcu (reclaim).  A fold acquires the lock and mutates the
+	 *     chain within one line; the only other writer of it is the demote
+	 *     (d_back), co-located per-CPU with the fold worker, so the line stays
+	 *     local.
+	 *   CL2 (the structural-reader line): d_parent + d_moving (read cross-core by
+	 *     a peer mover's cycle check), d_child_head + d_sib + the d_id/d_host
+	 *     union (read cross-core by readdir / host_of_rcu).  Kept OFF the fold-lock
+	 *     line so a readdir or a peer's ancestry walk does not bounce it.
+	 *
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
 	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
 	 * readers following a chain -- via dlm_read(), since it can briefly
@@ -237,21 +252,6 @@ struct dentry {
 	 */
 	struct dentry *d_fwd;			/* down toward content host; NULL at host */
 	struct dentry *d_back;			/* up toward named top;     NULL at top  */
-
-	/* writer-side bookkeeping */
-	struct dentry *d_parent;		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
-	/*
-	 * MOVE-IN-PROGRESS flag (cross-dir cycle prevention).  A cross-parent move
-	 * sets this on its host before validating the ancestry, and clears it after
-	 * the reparent commits (or aborts).  The loop check walks new_parent -> root
-	 * with PLAIN loads (not the proxy-installing load_validate that pinned the
-	 * shared spine) and aborts (-EAGAIN) if any ancestor carries this flag: a
-	 * Dekker set-before-check, so two moves that would jointly form a cycle
-	 * cannot both proceed (one sees the other's flag).  Cold word, its own line-
-	 * neighbour of d_parent so a walk hop reads both at once; only written when
-	 * THIS node is itself the host of a move, so spine nodes keep it 0 forever
-	 * (their reads stay S-state -- no cross-CCD ping-pong). */
-	unsigned long d_moving;
 #ifndef DC_CHAIN_SWMW
 	/*
 	 * Per-host serialization word for the transition chain (d_fwd/d_back).  Its
@@ -279,35 +279,6 @@ struct dentry {
 	unsigned long d_swmw_pad;
 #endif
 	struct dcache *d_dc;			/* owner, so a call_rcu fold reaches the domain */
-
-	/*
-	 * Child index (readdir fast path + -ENOTEMPTY): a per-directory
-	 * rcu-txn-hlist, mutated by MCAS and traversed under RCU.  d_child_head
-	 * heads THIS node's children; d_sib links this node into its parent's
-	 * child-hlist.  Distinct from d_hash (the name-bucket link).
-	 */
-	struct urcu_txn_sw_hlist_head d_child_head;
-	struct urcu_txn_sw_hlist_node d_sib;
-
-	/*
-	 * Identity id (HOST) OR skip pointer to the content host (SHELL), overlaid:
-	 * a host reads it as d_id, a shell as d_host.  Which is live is fixed by the
-	 * STABLE per-node property d_fwd==NULL (host) vs !=NULL (shell) -- a node is
-	 * born a host or a shell and never crosses over, so each node only ever
-	 * touches ONE member (no type-punning).  A reader resolves the host in O(1)
-	 * with host_of_rcu().  The shell's d_host is WRITE-ONCE (the tail is fold-
-	 * invariant), so it's a plain rcu_dereference.  This reuses the old
-	 * "cosmetic" shell d_id slot -- shells never needed their own id (readers use
-	 * the host's) and hosts never need a self skip pointer -- so the struct does
-	 * not grow and the identity slot keeps its original offset.  (Under
-	 * DC_HOT1CL the union is hoisted onto the hot line above instead.)
-	 */
-#if !defined(DC_HOT1CL) || defined(DC_HOT1CL_SPLIT)
-	union {
-		uint64_t       d_id;	/* host: stable identity (SPLIT: cold) */
-		struct dentry *d_host;	/* shell: skip pointer to the tail host */
-	};
-#endif
 	int d_inode;
 	/*
 	 * File vs directory type -- COLD, writer-only.  Set once at creation on the
@@ -348,6 +319,56 @@ struct dentry {
 	struct urcu_txn_sw_hlist_node d_hash;
 #endif
 	struct rcu_head d_rcu;
+
+	/*
+	 * ---- CL2: the structural-reader line (see the cold-layout note above) --
+	 * Every field here is read cross-core by an operation OTHER than a fold, so
+	 * it is kept off the fold lock's line.
+	 */
+
+	/* writer-side bookkeeping.  d_parent + d_moving are read cross-core by a peer
+	 * mover's ancestry cycle check; keep them ADJACENT so a walk hop reads both. */
+	struct dentry *d_parent;		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
+	/*
+	 * MOVE-IN-PROGRESS flag (cross-dir cycle prevention).  A cross-parent move
+	 * sets this on its host before validating the ancestry, and clears it after
+	 * the reparent commits (or aborts).  The loop check walks new_parent -> root
+	 * with PLAIN loads (not the proxy-installing load_validate that pinned the
+	 * shared spine) and aborts (-EAGAIN) if any ancestor carries this flag: a
+	 * Dekker set-before-check, so two moves that would jointly form a cycle
+	 * cannot both proceed (one sees the other's flag).  Only written when THIS
+	 * node is itself the host of a move, so spine nodes keep it 0 forever (their
+	 * reads stay S-state -- no cross-CCD ping-pong). */
+	unsigned long d_moving;
+
+	/*
+	 * Child index (readdir fast path + -ENOTEMPTY): a per-directory
+	 * rcu-txn-hlist, mutated by MCAS and traversed under RCU.  d_child_head
+	 * heads THIS node's children; d_sib links this node into its parent's
+	 * child-hlist.  Distinct from d_hash (the name-bucket link).  Read cross-core
+	 * by readdir, so on CL2 -- off the fold lock's line.
+	 */
+	struct urcu_txn_sw_hlist_head d_child_head;
+	struct urcu_txn_sw_hlist_node d_sib;
+
+	/*
+	 * Identity id (HOST) OR skip pointer to the content host (SHELL), overlaid:
+	 * a host reads it as d_id, a shell as d_host.  Which is live is fixed by the
+	 * STABLE per-node property d_fwd==NULL (host) vs !=NULL (shell) -- a node is
+	 * born a host or a shell and never crosses over, so each node only ever
+	 * touches ONE member (no type-punning).  A reader resolves the host in O(1)
+	 * with host_of_rcu().  The shell's d_host is WRITE-ONCE (the tail is fold-
+	 * invariant), so it's a plain rcu_dereference.  This reuses the old
+	 * "cosmetic" shell d_id slot -- shells never needed their own id (readers use
+	 * the host's) and hosts never need a self skip pointer.  (Under DC_HOT1CL the
+	 * union is hoisted onto the hot line above instead.)
+	 */
+#if !defined(DC_HOT1CL) || defined(DC_HOT1CL_SPLIT)
+	union {
+		uint64_t       d_id;	/* host: stable identity (SPLIT: cold) */
+		struct dentry *d_host;	/* shell: skip pointer to the tail host */
+	};
+#endif
 };
 
 #define sib_dentry(n) caa_container_of((n), struct dentry, d_sib)
