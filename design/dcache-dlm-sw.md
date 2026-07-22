@@ -1,4 +1,4 @@
-# The dcache under DLM + SW: bucket-head lock, then commit with the SW txn
+# The dcache under bucket lock + SW — the smallest DLM: bucket-head lock (no txn to acquire), then commit with the SW txn
 
 A **minimal writer-engine swap** for the userspace dentry cache, keeping the
 existing `dcache_txn.c` architecture intact — the shell-stacking rename, the
@@ -36,8 +36,15 @@ provides. The reader-visible result is identical to the MCAS commit — the same
 selector, the same old⊕new atomic flip — so **the reader is untouched, and its
 read-path win is kept for free.**
 
-This is the [ft-inplace §3](ft-inplace-under-dlm-sw.md) DLM + SW engine applied at
-its smallest: **DLM = the bucket-head lock; SW = the commit.** Nothing else moves.
+This is the [ft-inplace §3](ft-inplace-under-dlm-sw.md) **DLM + SW** pattern applied at its
+smallest. The DLM concept is to acquire a data structure's whole write-set of locks
+atomically **via an MW txn** — many locks, deadlock-free, in one transaction. dcache is the
+**degenerate** case: its lock-set is just two heads (the hash bucket + the parent's child
+list), taken by plain address-ordered CAS with **no txn to acquire them at all** — the SW
+txn is *only the commit*. That degenerate acquire is what the engine calls the **bucket
+lock**: **bucket lock = the bucket-head lock(s); SW = the commit.** Nothing else moves. (So
+"bucket lock" is dcache's specific 2-lock case; "DLM" below is the general pattern it is the
+smallest instance of.)
 
 ### 0.1 The payoff is concentrated on the shell-FREE ops
 
@@ -49,14 +56,14 @@ every rename on `rename_lock`, and cross-directory ones additionally on the glob
 
 Where the txn engine actually **loses** is exactly the **shell-free** path —
 add/unlink, the churn workload where the bit-lock baseline wins ~1.4–2×. So the
-DLM + SW swap's whole payoff lands there, and there it is almost free: an add is a
+bucket lock + SW swap's whole payoff lands there, and there it is almost free: an add is a
 *single* hlist head-store and an unlink a *single* splice (the deletion mark),
 each already one atomic pointer flip. Under the held bucket lock the "SW txn" for
 these is therefore barely more than the bit-lock's plain store — **no selector
 needed** (a single-pointer publish is already tier-1 atomic to the reader). Net,
 for add/unlink:
 
-> **DLM + SW add/unlink = the bit-lock's two-CAS write budget, committed into the
+> **bucket lock + SW add/unlink = the bit-lock's two-CAS write budget, committed into the
 > txn engine's transacted hlist, keeping the txn reader unchanged** — i.e. the
 > seqlock's writer *and* the txn's reader, by construction, with essentially no
 > new machinery. The shell/selector cost is confined to rename/move, where it was
@@ -69,6 +76,41 @@ lock(s); it keeps the shell, committed SW under the two-bucket lock. That is for
 exclusion-uniformity and to keep the reader/composability, **not** to out-run the
 seqlock on a path where the seqlock is already slow.
 
+### 0.2 The durable argument: commit cost is flat in transaction size
+
+Beyond today's add/unlink ballpark, the structural case for DLM is how the two
+commits scale with the *number of records* an op touches:
+
+- **MW MCAS = O(records) atomic RMWs.** Each recorded slot gets a descriptor
+  planted and installed (a `cmpxchg` per slot), plus read-**helping** if any of
+  those slots is contended.
+- **DLM + SW = O(distinct locked heads) atomic RMWs + O(records) plain stores +
+  at most one selector release-store.** The *atomic* cost is decoupled from the
+  record count: every extra slot folded into a transaction is `+1 cmpxchg
+  (+ helping risk)` under MCAS but a **plain store** under DLM.
+
+So as the per-op transaction grows, the gap widens. **LRU is the concrete
+driver** (and the next dcache feature): an eviction list re-points ~2–4 list
+slots on every add/unlink/lookup to move the dentry to the LRU head — +2–4
+records/op under MCAS, and the LRU head is a *single hot shared slot*, the MCAS
+worst case (colliding updaters pay the read-helping storm, not just extra CAS).
+Under DLM those are plain stores beneath the LRU-head lock. So LRU widens the gap
+*and* lands it on MCAS's softest spot.
+
+**Honest bound.** The O(1)-vs-O(N) win is largest when the added records
+**cluster under few locks** (an LRU list is one structure → one lock). A
+*scattered* write-set (e.g. RLU touching many unrelated objects → one lock each)
+pushes DLM's lock count toward the record count; there it still trades
+`cmpxchg + helping` for `lock + plain store` (a real win on the helping term)
+but not the asymptotic one. And a hot shared LRU head serializes *either* engine
+(lock contention vs helping) — the real scaling fix there is per-CPU LRU
+regardless of engine. Net: DLM's advantage grows with records, most sharply for
+clustered structures like the LRU.
+
+This reframes the goal from "match the seqlock on today's churn" to **a commit
+whose atomic cost is flat in transaction size** — the durable reason to prefer
+DLM as the dcache gains an LRU and beyond.
+
 ## 1. What changes, and only this
 
 Per structural op, the commit path goes from
@@ -79,7 +121,7 @@ Per structural op, the commit path goes from
 
 to
 
-- **proposed (DLM + SW):** **lock** the affected bucket head(s) — one CAS for a
+- **proposed (bucket lock + SW):** **lock** the affected bucket head(s) — one CAS for a
   single bucket (add / unlink), two for a two-bucket op (rename / exchange, an
   all-or-none acquire) → commit the **same** transaction via the **SW** form
   (plain stores + one selector install) → **unlock**.
@@ -111,7 +153,7 @@ supplies exactly that assumption and no more:
 
 ## 3. CAS accounting — the whole point
 
-| op | MW today | DLM + SW proposed |
+| op | MW today | bucket lock + SW proposed |
 |---|---|---|
 | add | MCAS: ~plant+install per slot (hash edge, child edge) + helping | **1 CAS** lock + plain stores + 1 CAS unlock |
 | unlink | MCAS: del from both indexes | **1 CAS** lock + plain stores + 1 CAS unlock |
@@ -120,7 +162,7 @@ supplies exactly that assumption and no more:
 If the conjecture is right, add/unlink fall from *several* CAS to the bit-lock's
 **two**, and their throughput should climb onto (or near) the seqlock curve —
 while the reader stays on the winning MW-txn curve. That is the single, testable
-claim: **DLM + SW = the bit-lock's writer CAS budget with the MW-txn's reader.**
+claim: **bucket lock + SW = the bit-lock's writer CAS budget with the MW-txn's reader.**
 
 ## 4. What explicitly does NOT change
 
@@ -171,7 +213,7 @@ Both add and unlink touch **two transacted heads**, not one:
   `urcu_txn_hlist_del_prepare(&top->d_sib)` in **one composed** txn — same two
   heads.
 
-So the DLM lock-set for both is **{hash bucket head, parent `d_child_head`}** — a
+So the bucket lock lock-set for both is **{hash bucket head, parent `d_child_head`}** — a
 **two**-lock acquire (the "or two CAS" case), because a concurrent same-parent
 writer races the child head just as a same-bucket writer races the hash head.
 Both heads are head words that can carry a bit-0 lock; both are uncontended under
@@ -219,7 +261,7 @@ separate commit cycles*) rather than a lower `cmpxchg` count. Two consequences:
 
 ## 6. Validation
 
-A **fourth arm** (`txn-dlm-sw`) on the existing, now-fair sweeps: it must land on
+A **fourth arm** (`txn-bucketlock-sw`) on the existing, now-fair sweeps: it must land on
 the **upper envelope** — writes on/near the seqlock (bit-lock) curve, reads on the
 MW-txn curve — on `dcache_churn*` and the read-under-churn panels, with the
 current stress suite (103 + churn / rename / exchange / dir-move conservation) +

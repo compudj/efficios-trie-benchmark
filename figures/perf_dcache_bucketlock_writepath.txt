@@ -1,0 +1,46 @@
+dcache write-path (add/unlink churn) perf delta -- bucket lock+SW vs seqlock vs MCAS-txn
+================================================================================
+Host: AMD EPYC 9654 (Zen4, 2x96c, SMT2, 24 NUMA/CCD domains). perf 7.0.10.
+Build: -DDC_MARK_GEN -DDC_SPLIT_KEEPID -O2 -march=native.  Engines all mark arm.
+Workload: bench_dcache_churn, writers-only (readers 0), each writer toggles its
+own disjoint slots.  DECONTENDED: --ndirs 512 --slots 32 --nbuckets 16384 so
+each writer owns disjoint dirs AND buckets (no shared head).  --duration 3000ms.
+W=1 pinned to core 0; W=16 pinned to cores 0-15 (16 physical cores, CCD0+CCD1).
+perf stat over the whole process; counters normalized by (adds+unlinks).
+
+sizeof(struct dentry): bucket lock 176 B == seqlock 176 B  >  MCAS-txn(mark) 168 B
+  (the per-host d_chain_lock word brings bucket lock to parity with the seqlock baseline;
+   footprint is therefore NOT a bucket lock-vs-seqlock differentiator.)
+
+Throughput (Mchurn/s):
+                 W=1        W=16(decontended)
+  seqlock       4.83         10.25
+  bucketlock           5.12         11.59
+  txn (MCAS)    2.55          4.55
+
+Per-op counters:
+  engine   W    | ins/op | cyc/op |  IPC | L1dmiss/op | cache-miss/op | brmiss/op
+  --------------+--------+--------+------+------------+---------------+----------
+  seqlock  W=1  |  2313  |   891  | 2.59 |    18.0    |     1.03      |   6.71
+  bucketlock      W=1  |  2169  |   847  | 2.56 |    17.1    |     0.98      |   6.38
+  txn      W=1  |  3387  |  1972  | 1.72 |    56.2    |     1.94      |  18.15
+  --------------+--------+--------+------+------------+---------------+----------
+  seqlock  W=16 |  2400  |  2965  | 0.81 |    22.1    |     4.16      |   5.84
+  bucketlock      W=16 |  2266  |  2717  | 0.83 |    22.4    |     4.49      |   5.79
+  txn      W=16 |  3308  |  4546  | 0.73 |    55.1    |     8.32      |  14.34
+
+Reading:
+1. bucket lock MATCHES/BEATS the kernel-faithful seqlock write path (fewer ins/op,
+   cyc/op, L1 misses) and is ~2-2.5x leaner than the MCAS txn engine.  The MCAS
+   gap is the COMMIT MACHINERY: +1200 ins/op, 3x the L1-dcache misses (56 vs 17),
+   3x branch-misses (18 vs 6) -- descriptor plant/install + helping + the retry
+   loop -- exactly the design hypothesis (design/dcache-dlm-sw.md sec 0.2, 5b).
+   bucket lock strips it to the bit-lock's two-CAS budget + plain stores.
+2. The W=16 slowdown is MEMORY-BOUND, not lock contention (decontended) and not
+   instruction count (ins/op is FLAT W=1->W=16).  cyc/op triples and IPC falls
+   2.6 -> 0.8 while cache-miss/op rises 4x (1 -> 4.2): the shared allocator +
+   call_rcu reclaim + cross-CCD coherence, which taxes ALL engines alike.  bucket lock
+   stays ahead by its leaner instruction stream.
+3. No residual bucket lock-vs-seqlock disadvantage in this controlled run (bucket lock >= seqlock
+   at both W).  Absolute W=16 throughput is pinning-sensitive (cross-CCD reclaim
+   placement); the per-op COUNTER deltas above are the config-robust conclusion.
