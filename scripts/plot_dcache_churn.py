@@ -48,14 +48,12 @@ _num = FuncFormatter(lambda v, _: ("%g" % v))
 
 
 def plain_y(ax):
-    ax.set_yscale("log")
-    ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
+    ax.set_ylim(bottom=0)
     ax.yaxis.set_major_formatter(_num)
-    ax.yaxis.set_minor_formatter(NullFormatter())
 
 
 def plain_thread_x(ax, ticks):
-    ax.set_xscale("log", base=2)
+    ax.set_xlim(0, max(ticks) * 1.02)
     ax.xaxis.set_major_locator(FixedLocator(ticks))
     ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
     ax.xaxis.set_minor_formatter(NullFormatter())
@@ -121,7 +119,7 @@ for e in ENGINES:
              label=LABEL[e], alpha=0.94)
 annotate_ratio(ax1, base, "seqlock", TXN_REF, 1.3, COLOR["seqlock"])
 if ax1.has_data():
-    plain_thread_x(ax1, [1, 2, 4, 8, 16, 32, 48])
+    plain_thread_x(ax1, [0, 8, 16, 24, 32, 40, 48])
     plain_y(ax1)
     lo, hi = ax1.get_ylim(); ax1.set_ylim(lo, hi * 1.35)
 ax1.set_title("Writers only — insert/remove Mops/s vs writer count\n"
@@ -146,7 +144,7 @@ for e in ENGINES:
              label=LABEL[e], alpha=0.94)
 annotate_ratio(ax2, base, TXN_REF, "seqlock", 1.3, COLOR[TXN_REF])
 if ax2.has_data():
-    plain_thread_x(ax2, [1, 2, 4, 8, 16, 32, 48])
+    plain_thread_x(ax2, [0, 8, 16, 24, 32, 40, 48])
     plain_y(ax2)
     lo, hi = ax2.get_ylim(); ax2.set_ylim(lo, hi * 1.35)
 ax2.set_title("32 dedicated readers + W churn writers — reader Mops/s vs W\n"
@@ -169,8 +167,7 @@ for e in ENGINES:
     ax3.plot(xs, ys, color=COLOR[e], marker=MARKER[e], lw=2.1, ms=6.5,
              label=LABEL[e], alpha=0.94)
 if ax3.has_data():
-    # thin the ticks: the sampled points crowd at the top end (128/160/184)
-    plain_thread_x(ax3, [2, 4, 8, 16, 32, 64, 128, 184])
+    plain_thread_x(ax3, [0, 32, 64, 96, 128, 160, 184])
     plain_y(ax3)
 ax3.set_title("Reader scaling under constant churn — 8 writers fixed\n"
               "reader Mops/s vs reader count, one hw thread per core.  Same\n"
