@@ -37,15 +37,21 @@ OUT = os.environ.get("OUT",
 rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
 
 COLOR = {"seqlock-rp": "#D55E00", "seqlock-wp": "#E69F00",
-         "txn-mark": "#CC79A7", "bucketlock": "#000000"}
-MARK = {"seqlock-rp": "s", "seqlock-wp": "v", "txn-mark": "D", "bucketlock": "X"}
+         "seqlock-krwsem": "#7B3294", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+MARK = {"seqlock-rp": "s", "seqlock-wp": "v", "seqlock-krwsem": "*",
+        "txn-mark": "D", "bucketlock": "X"}
 LABEL = {
     "seqlock-rp": "seqlock — per-dir rwlock\nreader-pref (glibc default)",
     "seqlock-wp": "seqlock — per-dir rwlock\nwriter-pref (PREFER_WRITER)",
+    "seqlock-krwsem": "seqlock — VENDORED Linux\nkernel rw_semaphore (fair)",
     "txn-mark": "urcu-txn — deletion MARK\n(lock-free RCU readdir)",
     "bucketlock": "bucket lock + SW txn\n(lock-free readdir, bit-lock churn)",
 }
-ORDER = ("bucketlock", "txn-mark", "seqlock-wp", "seqlock-rp")
+# krwsem drawn thicker: it is the faithful fair point that should sit INSIDE the
+# reader-pref<->writer-pref band.  (Its absolute height also carries the userspace
+# port's overhead -- naive wait_lock + futex -- so the same-glibc-lock bracket
+# stays the clean quantitative bound; krwsem confirms the fair POLICY is between.)
+ORDER = ("bucketlock", "txn-mark", "seqlock-krwsem", "seqlock-wp", "seqlock-rp")
 
 
 def series(panel, eng, xcol, ycol):

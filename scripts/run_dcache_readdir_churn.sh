@@ -49,17 +49,22 @@ if [[ -n "$CPULIST" ]]; then
 else PIN=""; NCORE=$(nproc); echo ">> hwloc-calc unavailable; unpinned" >&2; fi
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE (set JE=)"; exit 1; }
 
-# engine ; extra defines ; source
+# engine ; extra defines ; source ; extra link objects
 declare -A EDEF=( [seqlock-rp]="" [seqlock-wp]="-DDC_DIR_LOCK_WRITER_PREF" \
+                  [seqlock-krwsem]="-DDC_DIR_LOCK_KRWSEM" \
                   [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" )
 declare -A ESRC=( [seqlock-rp]="dcache_seqlock.c" [seqlock-wp]="dcache_seqlock.c" \
+                  [seqlock-krwsem]="dcache_seqlock.c" \
                   [txn-mark]="dcache_txn.c" [bucketlock]="dcache_bucketlock.c" )
-ENGINES="seqlock-rp seqlock-wp txn-mark bucketlock"
+# seqlock-krwsem links the vendored Linux kernel rw_semaphore (GPL-2.0).
+declare -A EXTRA=( [seqlock-krwsem]="krwsem/libkrwsem.a" )
+ENGINES="seqlock-rp seqlock-wp seqlock-krwsem txn-mark bucketlock"
 
+make -C "$BIN/krwsem" libkrwsem.a >/dev/null 2>&1 || { echo "krwsem build failed"; exit 1; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 for e in $ENGINES; do
   (cd "$BIN" && $CC $CFLAGS ${EDEF[$e]} $INC -o "$TMP/$e" \
-      bench_dcache_churn.c "${ESRC[$e]}" $LIB) || { echo "build $e failed"; exit 1; }
+      bench_dcache_churn.c "${ESRC[$e]}" ${EXTRA[$e]:-} $LIB) || { echo "build $e failed"; exit 1; }
 done
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
