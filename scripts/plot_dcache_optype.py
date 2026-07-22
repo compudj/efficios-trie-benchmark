@@ -2,17 +2,21 @@
 """Plot scripts/dcache_optype.csv -> figures/dcache_optype.png.
 
 File-operation vs directory-operation reader scaling, same benchmark, only the
-leaf TYPE differs (which flips the writer's walk-causality bump).  Two panels so
-the GLOBAL arm's crossover is the visible story:
+leaf TYPE differs -- which flips whether the writer's walk-causality COUNTER is
+bumped.  The file/dir distinction is a COUNTER-arm phenomenon:
 
-  left  (file ops, bump SKIPPED): global brackets on a stable whole-tree counter
-        and does no per-hop second pass, so it is competitive -- even edging the
-        localized arms, whose reader always pays the up-pass.
-  right (directory ops, bump):    every bump is tree-wide, every reader
-        re-walks, global collapses; per-node/mark localize and scale.
+  left  (file ops): a file is never an interior waypoint, so the counter arms
+        (seqlock d_seq, global rename_gen, per-node host gen) SKIP the bump.  The
+        GLOBAL arm is a global seqcount -- a seqlock-style bracket over one
+        whole-tree counter, no per-hop second pass -- so it is competitive here.
+  right (directory ops): the bump fires.  The GLOBAL seqcount's one whole-tree
+        bump makes every reader re-walk -> it COLLAPSES; PER-NODE localizes it.
 
-seqlock (kernel-faithful) bumps regardless of type, so its two panels match --
-the kernel makes no file/dir distinction.  Linear axes.
+The MARK and bucket-lock arms carry NO counter at all -- the hlist deletion mark
+IS the version (the structural edit is the signal) -- so they neither skip nor
+fire a bump; they are FLAT across file vs dir, high in both.  seqlock bumps d_seq
+regardless of type (kernel-faithful: no file/dir distinction), so its two panels
+match.  Linear axes.
 """
 import csv, collections, os
 import matplotlib
@@ -36,7 +40,7 @@ COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
 MARK = {"seqlock": "s", "txn-global": "o", "txn-pernode": "^", "txn-mark": "D",
         "bucketlock": "X"}
 ELAB = {"seqlock": "seqlock (kernel baseline)",
-        "txn-global": "txn — GLOBAL rename_gen",
+        "txn-global": "txn — GLOBAL rename_gen (a seqcount)",
         "txn-pernode": "txn — PER-NODE host gen",
         "txn-mark": "txn — deletion MARK",
         "bucketlock": "bucket lock + SW txn"}
@@ -55,13 +59,15 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.2), sharey=True)
 
 for lt, ax, title in (
     ("file", ax1,
-     "FILE rename/move — the bump is SKIPPED\nreader Mlookups/s vs readers "
-     "(8 writers, rename-frac 1).  Global\nbrackets on a stable counter and does "
-     "NO second pass, so it\nis competitive -- even edging the localized arms"),
+     "FILE rename/move — a file is never an interior waypoint\nreader Mlk/s vs "
+     "readers (8 writers, rename-frac 1).  The counter\narms SKIP the bump; the "
+     "GLOBAL seqcount (a seqlock-style\nbracket over one counter) is then "
+     "competitive -- even edging the rest"),
     ("dir", ax2,
-     "DIRECTORY rename/move — the bump fires\nsame axes.  Every bump is "
-     "whole-tree, every reader re-walks:\nglobal COLLAPSES; per-node/mark localize "
-     "the retry and\nscale.  seqlock bumps regardless of type (kernel-faithful)")):
+     "DIRECTORY rename/move — the counter bump FIRES\nsame axes.  The GLOBAL "
+     "seqcount's whole-tree bump collapses it;\nPER-NODE localizes.  MARK / bucket "
+     "lock carry NO counter (the\ndeletion mark is the version) — flat file-vs-dir, "
+     "high in both")):
     for e in ORDER:
         ys = [d[(lt, rd)].get(e, 0) for rd in RDs]
         ax.plot(RDs, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6,
