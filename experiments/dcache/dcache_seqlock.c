@@ -349,6 +349,37 @@ static void children_remove(struct dentry *parent, struct dentry *child)
  * read lock, so there is no cycle either.  Ordering, outermost first:
  * rename_lock -> these dir rwsems -> bucket bit locks.
  */
+/*
+ * Per-directory lock BIAS -- a fidelity knob, because it decides who wins the
+ * readdir-vs-churn contention on a directory's child list (readdir takes it
+ * shared, dc_add/dc_unlink take it exclusive).  The glibc DEFAULT (NULL attr,
+ * the -DDC_DIR_LOCK_READER_PREF / unset case) is PTHREAD_RWLOCK_PREFER_READER_NP:
+ * readers barge past a waiting writer, so a stream of readdir readers can STARVE
+ * add/unlink indefinitely.  That is NOT the kernel: a directory op takes
+ * inode->i_rwsem, a FAIR FIFO rw_semaphore where a queued writer blocks later
+ * readers, so writers are not starved.  Two closer analogues:
+ *   -DDC_DIR_LOCK_WRITER_PREF  glibc PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+ *                              (writer-non-starving; a waiting writer holds off
+ *                              new readers -- brackets the fair case from the
+ *                              writer side)
+ * The truly faithful FAIR arm uses the ISC phase-fair rwlock (see the
+ * DC_DIR_LOCK_ISC build); this pthread path covers the two glibc biases.
+ */
+static void dir_lock_init(pthread_rwlock_t *l)
+{
+#ifdef DC_DIR_LOCK_WRITER_PREF
+	pthread_rwlockattr_t a;
+
+	pthread_rwlockattr_init(&a);
+	pthread_rwlockattr_setkind_np(
+		&a, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+	pthread_rwlock_init(l, &a);
+	pthread_rwlockattr_destroy(&a);
+#else
+	pthread_rwlock_init(l, NULL);		/* glibc default: reader-preferring */
+#endif
+}
+
 static void dir_wlock(struct dentry *d)   { pthread_rwlock_wrlock(&d->d_lock); }
 static void dir_wunlock(struct dentry *d) { pthread_rwlock_unlock(&d->d_lock); }
 
@@ -435,7 +466,7 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 	d->d_children = NULL;
 	d->d_sib = NULL;
 	d->d_isdir = (unsigned char) (isdir != 0);
-	pthread_rwlock_init(&d->d_lock, NULL);
+	dir_lock_init(&d->d_lock);
 	return d;
 }
 

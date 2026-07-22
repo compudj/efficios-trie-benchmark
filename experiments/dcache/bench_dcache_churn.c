@@ -80,6 +80,7 @@ static inline int id_is_address(void)
 /* ---- knobs --------------------------------------------------------------- */
 
 static int nreaders = 32;
+static int readdir_mode = 0;		/* --readdir: readers list a dir vs look up */
 static int nwriters = 8;
 static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
@@ -178,6 +179,20 @@ static void mk_slot_path(struct dc_path *p, int dir, int gid)
 	dc_path_push(p, buf);
 }
 
+/* Path to a churned directory /pfx/d{dir} (its children are the slots writers
+ * add/unlink), for a readdir reader. */
+static void mk_dir_path(struct dc_path *p, int dir)
+{
+	char buf[DC_NAME_MAX];
+	int i;
+
+	dc_path_reset(p);
+	for (i = 0; i < g_prefix_len; i++)
+		dc_path_push(p, g_prefix[i]);
+	snprintf(buf, sizeof(buf), "d%d", dir);
+	dc_path_push(p, buf);
+}
+
 /* ---- workers ------------------------------------------------------------- */
 
 struct warg {
@@ -185,6 +200,7 @@ struct warg {
 	uint64_t seed;
 	long long nadds, nunlinks, errs;
 	long long nlookups, lk_wrong;
+	long long ndirents;		/* children enumerated (--readdir mode) */
 	uint8_t *present;		/* owner-private truth for its slots */
 	int *dir;			/* which dir each slot lives in */
 };
@@ -255,19 +271,37 @@ static void *reader_fn(void *arg)
 	pin_thread(me->idx);
 	wait_go();
 	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
-		int gid = (int) (xrand(&s) % (uint64_t) total_slots);
 		int dr = (int) (xrand(&s) % (uint64_t) ndirs);
 		struct dc_path p;
-		uint64_t id = ~0ULL;
 
-		mk_slot_path(&p, dr, gid);
-		/* ABSENT is legitimate -- the slot may be mid-churn, or in a
-		 * different dir than the one we guessed.  Only a POSITIVE with a
-		 * bogus id is a bug, and only a logical-id build can tell. */
-		if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
-		    !id_is_address() && id != (uint64_t) gid)
-			me->lk_wrong++;
-		me->nlookups++;
+		if (readdir_mode) {
+			/* READDIR a churned dir /pfx/d{dr}: enumerate its
+			 * currently-present slots while writers add/unlink into
+			 * the SAME child list.  POSIX-soft (a slot mid-churn may
+			 * or may not appear) but must never tear or crash. */
+			long n;
+
+			mk_dir_path(&p, dr);
+			n = dc_readdir(g_dc, &p, NULL, NULL);
+			if (n < 0)
+				me->errs++;
+			else {
+				me->nlookups++;
+				me->ndirents += n;
+			}
+		} else {
+			int gid = (int) (xrand(&s) % (uint64_t) total_slots);
+			uint64_t id = ~0ULL;
+
+			mk_slot_path(&p, dr, gid);
+			/* ABSENT is legitimate -- the slot may be mid-churn, or in
+			 * a different dir than the one we guessed.  Only a POSITIVE
+			 * with a bogus id is a bug (logical-id builds only). */
+			if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
+			    !id_is_address() && id != (uint64_t) gid)
+				me->lk_wrong++;
+			me->nlookups++;
+		}
 		dc_quiescent();
 	}
 	dc_unregister_thread();
@@ -348,7 +382,7 @@ int main(int argc, char **argv)
 	pthread_t *wt, *rt;
 	struct census c;
 	long long t0, t1;
-	long long adds = 0, unl = 0, errs = 0, lk = 0, wrong = 0;
+	long long adds = 0, unl = 0, errs = 0, lk = 0, wrong = 0, dirents = 0;
 	int i, j, anomaly = 0, total_slots;
 	double secs;
 
@@ -361,6 +395,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--prefix-depth"))  prefix_depth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))      nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))       parse_cpulist(argv[++i]);
+		else if (!strcmp(argv[i], "--readdir"))       readdir_mode = 1;
 		else usage(argv[0]);
 	}
 	if (nwriters < 1 || slots < 1 || ndirs < 1 || prefix_depth < 1 ||
@@ -451,7 +486,7 @@ int main(int argc, char **argv)
 		adds += wa[i].nadds; unl += wa[i].nunlinks; errs += wa[i].errs;
 	}
 	for (i = 0; i < nreaders; i++) {
-		lk += ra[i].nlookups; wrong += ra[i].lk_wrong;
+		lk += ra[i].nlookups; wrong += ra[i].lk_wrong; dirents += ra[i].ndirents;
 	}
 
 	/* --- invariant 1 & 2: believed state matches reality, by lookup ----- */
@@ -513,6 +548,10 @@ int main(int argc, char **argv)
 	printf("Mchurn/s: %g\n", (double) (adds + unl) / secs / 1e6);
 	printf("LOOKUP  lookups: %lld  wrong-id: %lld\n", lk, wrong);
 	printf("Mlookups/s: %g\n", (double) lk / secs / 1e6);
+	if (readdir_mode)
+		printf("READDIR dirents: %lld  Mdirents/s: %g  children/readdir~%g\n",
+		       dirents, (double) dirents / secs / 1e6,
+		       lk ? (double) dirents / (double) lk : 0.0);
 	if (anomaly)
 		printf("CONSERVATION FAILED: %d anomalies -- run is CORRUPT, "
 		       "ignore the numbers above\n", anomaly);
