@@ -56,6 +56,20 @@
 #include "seqcount.h"
 
 /*
+ * Per-directory lock TYPE.  Default is the glibc pthread_rwlock (reader- or
+ * writer-preferring, see dir_lock_init below).  -DDC_DIR_LOCK_KRWSEM swaps in
+ * the VENDORED Linux kernel rw_semaphore (krwsem/, GPL-2.0) -- the FAITHFUL
+ * fair/writer-non-starving lock the kernel actually uses for inode->i_rwsem --
+ * sized (56 B) to match pthread_rwlock_t so the dentry footprint is unchanged.
+ */
+#ifdef DC_DIR_LOCK_KRWSEM
+#include "krwsem/krwsem.h"
+typedef struct krwsem dc_dirlock_t;
+#else
+typedef pthread_rwlock_t dc_dirlock_t;
+#endif
+
+/*
  * Fair 1-CL reader layout, DEFAULT-ON.  The reference baseline must carry the
  * SAME cacheline-quality hot line as the txn port, so the footprint A/B is
  * mechanism-vs-mechanism (seqlock vs rcu-txn), not layout-vs-layout.  Opt out
@@ -120,7 +134,7 @@ struct dentry {
 	uint64_t d_id;			/* identity artifact; census/readdir/KEEPID */
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
-	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
+	dc_dirlock_t     d_lock;	/* per-dir readdir/child-list exclusion */
 	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
 					 * Kernel-faithful: tracked for -ENOTDIR
 					 * but rename_lock bumps regardless of
@@ -140,7 +154,7 @@ struct dentry {
 
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
-	pthread_rwlock_t d_lock;	/* per-dir readdir/child-list exclusion */
+	dc_dirlock_t     d_lock;	/* per-dir readdir/child-list exclusion */
 	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
 					 * Kernel-faithful: tracked for -ENOTDIR
 					 * but rename_lock bumps regardless of
@@ -365,7 +379,18 @@ static void children_remove(struct dentry *parent, struct dentry *child)
  * The truly faithful FAIR arm uses the ISC phase-fair rwlock (see the
  * DC_DIR_LOCK_ISC build); this pthread path covers the two glibc biases.
  */
-static void dir_lock_init(pthread_rwlock_t *l)
+#ifdef DC_DIR_LOCK_KRWSEM
+/* The faithful arm: the vendored Linux kernel rw_semaphore (fair, writer-non-
+ * starving).  read and write UNLOCK differ (up_read vs up_write), so the readdir
+ * path must use dir_runlock, not a generic unlock. */
+static void dir_lock_init(dc_dirlock_t *l)    { krwsem_init(l); }
+static void dir_lock_destroy(dc_dirlock_t *l) { (void) l; }
+static void dir_wlock(struct dentry *d)   { krwsem_wrlock(&d->d_lock); }
+static void dir_wunlock(struct dentry *d) { krwsem_wrunlock(&d->d_lock); }
+static void dir_rlock(struct dentry *d)   { krwsem_rdlock(&d->d_lock); }
+static void dir_runlock(struct dentry *d) { krwsem_rdunlock(&d->d_lock); }
+#else
+static void dir_lock_init(dc_dirlock_t *l)
 {
 #ifdef DC_DIR_LOCK_WRITER_PREF
 	pthread_rwlockattr_t a;
@@ -379,9 +404,12 @@ static void dir_lock_init(pthread_rwlock_t *l)
 	pthread_rwlock_init(l, NULL);		/* glibc default: reader-preferring */
 #endif
 }
-
+static void dir_lock_destroy(dc_dirlock_t *l) { pthread_rwlock_destroy(l); }
 static void dir_wlock(struct dentry *d)   { pthread_rwlock_wrlock(&d->d_lock); }
 static void dir_wunlock(struct dentry *d) { pthread_rwlock_unlock(&d->d_lock); }
+static void dir_rlock(struct dentry *d)   { pthread_rwlock_rdlock(&d->d_lock); }
+static void dir_runlock(struct dentry *d) { pthread_rwlock_unlock(&d->d_lock); }
+#endif
 
 /* Lock two (possibly equal) dirs in address order to keep the discipline tidy. */
 static void dirs_wlock2(struct dentry *a, struct dentry *b)
@@ -814,7 +842,7 @@ static void dentry_free_cb(struct rcu_head *rh)
 {
 	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
 
-	pthread_rwlock_destroy(&d->d_lock);
+	dir_lock_destroy(&d->d_lock);
 	free(d);
 }
 
@@ -1056,13 +1084,13 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 		rcu_read_unlock();
 		return -ENOENT;
 	}
-	pthread_rwlock_rdlock(&dir->d_lock);
+	dir_rlock(dir);
 	for (c = dir->d_children; c; c = c->d_sib) {
 		if (fn)
 			fn(c->d_id, &c->d_name, arg);
 		count++;
 	}
-	pthread_rwlock_unlock(&dir->d_lock);
+	dir_runlock(dir);
 	rcu_read_unlock();
 	return count;
 }
