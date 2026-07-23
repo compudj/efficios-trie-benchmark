@@ -75,17 +75,31 @@ value against the need:
 - walk-causality / generation — LRU ops are not part of walk causality (renames
   bump the gen, not `d_lru_add`).
 
-So the LRU wants exactly: a **lock + plain `WRITE_ONCE` stores** for the ≤3 list
-slots, plus the referenced bit (also a plain store). Not SW, not even `store_sw`
-(which *still* plants a selector for a reader that does not exist). This **sharpens**
-[dcache-dlm-sw.md](dcache-dlm-sw.md) §0.2 rather than contradicting it: the LRU is
-evidence for the **bucket lock**, never for the **SW commit**. The right design
-transacts the LRU in *neither* engine (MW or SW). Partition of an add/unlink:
+So the LRU never wants the **SW** form: with no lockless reader, `store_sw`'s
+resolve has no consumer, so the ≤3 list slots and the referenced bit are plain
+`WRITE_ONCE` stores under the shard lock (in the lock design). This **sharpens**
+[dcache-dlm-sw.md](dcache-dlm-sw.md) §0.2 rather than contradicting it: on the
+READER axis the LRU is evidence for the **bucket lock**, never for the **SW
+commit**.
+
+⚠ But this is NOT evidence against **MW/MCAS**.  The engine has two products —
+reader-atomic visibility (both SW and MW, dead here) and writer-atomic lock-free
+multi-slot concurrency (MW/MCAS only, and very much alive) — and §5–§7 below show
+MW/MCAS is a real candidate on the WRITE side (random-position removal, which
+neither the SW form nor a lock-partition can handle).  So the rule is **"no SW
+here", not "no txn here"** — the per-slot question is *does any slot have a
+concurrent writer*, and a random removal makes the enqueue's own tail edges MW
+even with one enqueuer.  (See the `rcu-pseudo-transaction` skill, *When it is the
+right tool — two products*.)
+
+Partition of an add/unlink (lock design):
 
 - **hash bucket + parent `d_child_head`** → SW commit (lockless lookup / readdir
   readers need the atomic flip);
-- **LRU shard head + `d_lru` links + referenced bit** → plain stores under the
-  same held locks (no reader → no txn).
+- **LRU shard head + `d_lru` links + referenced bit** → in the LOCK design, plain
+  stores under the same held locks (no reader → no **SW**); in the MCAS design
+  (§7), MW records for the concurrent edge re-points (no reader → still **MW** on
+  write-side grounds).
 
 ## 5. The real axis: write-side concurrency (shrinker vs dentry ops)
 
