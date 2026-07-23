@@ -216,7 +216,7 @@ static int commit_moves(struct urcu_txn_skiplist **src_sl,
 			struct urcu_txn_skiplist_node **rem, int cnt,
 			struct updater_attr *me)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int i, prep, st;
 
 	urcu_txn_init(&txn, &g_dom);

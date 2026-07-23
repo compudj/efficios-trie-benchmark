@@ -203,7 +203,7 @@ static int commit_moves(struct hnode **olds, struct hnode **news,
 			struct urcu_txn_hlist_head **dst, int cnt,
 			long long *naborts)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int i, prep, st;
 
 	urcu_txn_init(&txn, &g_dom);

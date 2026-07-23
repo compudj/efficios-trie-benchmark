@@ -1166,7 +1166,7 @@ static void bench_coh_check(struct urcu_txn_list_node *pos)
 static void lf_write_random(uint64_t *rng)
 {
 	int i = (int) (xorshift64(rng) % (uint64_t) g_nindex);
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	struct lf_elem *reclaim = NULL;		/* published cell to free (delete path) */
 
 	urcu_txn_init(&txn, &g_lf_dom);
@@ -1194,7 +1194,7 @@ static void lf_write_random(uint64_t *rng)
 
 		urcu_txn_begin(&txn);
 		/* Flip-latch load of the transacted index slot (resolves any proxy). */
-		raw = urcu_txn_load(&txn, (void **) &g_lf_index[i], URCU_MCAS_TAG);
+		raw = urcu_txn_load(&txn, (void **) &g_lf_index[i], URCU_TXN_TAG);
 		cur = (raw == NULL) ? NULL : IDX_DEC(raw);
 		if (cur == NULL) {		/* empty -> insert + publish index, one flip */
 			int a = (int) (xorshift64(rng) % (uint64_t) LIST_SIZE);
@@ -1211,8 +1211,8 @@ static void lf_write_random(uint64_t *rng)
 			prep = urcu_txn_list_insert_after_prepare(&txn,
 					&fresh->node, &g_lf_stable[a]->node);
 			if (prep == 0)
-				urcu_txn_store(&txn, (void **) &g_lf_index[i],
-						NULL, IDX_ENC(&fresh->node), URCU_MCAS_TAG);
+				urcu_txn_store_mw(&txn, (void **) &g_lf_index[i],
+						NULL, IDX_ENC(&fresh->node), URCU_TXN_TAG);
 		} else {			/* full -> unlink + clear index, one flip */
 #ifdef BENCH_LTTNG
 			del_cur = cur;
@@ -1221,8 +1221,8 @@ static void lf_write_random(uint64_t *rng)
 #endif
 			prep = urcu_txn_list_del_prepare(&txn, cur);
 			if (prep == 0)
-				urcu_txn_store(&txn, (void **) &g_lf_index[i],
-						raw, NULL, URCU_MCAS_TAG);
+				urcu_txn_store_mw(&txn, (void **) &g_lf_index[i],
+						raw, NULL, URCU_TXN_TAG);
 		}
 		if (prep != 0) {		/* del: cur was concurrently removed */
 			urcu_txn_end(&txn);
@@ -1252,7 +1252,7 @@ static void lf_write_random(uint64_t *rng)
 					del_prev != del_cur) {
 				void *raw = (void *) rcu_dereference(del_prev->next);
 				void *logv = (((uintptr_t) raw) &
-					(URCU_MCAS_TAG | URCU_TXN_LIST_MARK)) ?
+					(URCU_TXN_TAG | URCU_TXN_LIST_MARK)) ?
 					urcu_mcas_resolve(raw) : raw;
 				int prev_dead = urcu_txn_list_is_marked(logv);
 				struct urcu_txn_list_node *prev_succ =
@@ -1340,7 +1340,7 @@ static void lf_reset_index(void)
 	for (i = 0; i < g_nindex; i++) {
 		void *raw = g_lf_index[i];
 		struct urcu_txn_list_node *cur;
-		struct urcu_mcas_txn txn;
+		struct urcu_txn txn;
 		int removed = 0;
 
 		if (raw == NULL)
@@ -1356,8 +1356,8 @@ static void lf_reset_index(void)
 		urcu_txn_init(&txn, &g_lf_dom);
 		urcu_txn_begin(&txn);
 		if (urcu_txn_list_del_prepare(&txn, cur) == 0) {
-			urcu_txn_store(&txn, (void **) &g_lf_index[i],
-					raw, NULL, URCU_MCAS_TAG);
+			urcu_txn_store_mw(&txn, (void **) &g_lf_index[i],
+					raw, NULL, URCU_TXN_TAG);
 			removed = urcu_txn_commit(&txn) ==
 					URCU_TXN_STATUS_OK;
 		}
@@ -1907,7 +1907,7 @@ static void thl_write(int slot)
 	struct urcu_txn_hlist_head *head = &g_thl_bkt[hl_hash(key)];
 	struct urcu_txn_hlist_node *p;
 	struct thl_node *victim = NULL, *n;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int mem_err = 0;
 
 	(void) slot;
@@ -1942,12 +1942,12 @@ static void thl_write(int slot)
 		int prep, restart = 0;
 
 		urcu_txn_begin(&txn);
-		raw = urcu_txn_load(&txn, (void **) slotp, URCU_MCAS_TAG);
+		raw = urcu_txn_load(&txn, (void **) slotp, URCU_TXN_TAG);
 		cur = urcu_txn_hlist_unmark(raw);	/* head->first: never marked */
 		while (cur != NULL && thl_key(cur) < key) {
 			pred = cur;
 			slotp = &pred->next;
-			raw = urcu_txn_load(&txn, (void **) slotp, URCU_MCAS_TAG);
+			raw = urcu_txn_load(&txn, (void **) slotp, URCU_TXN_TAG);
 			if (urcu_txn_hlist_is_marked(raw)) {	/* pred being deleted */
 				restart = 1;
 				break;
