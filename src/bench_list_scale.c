@@ -1379,6 +1379,11 @@ static struct cds_list_head g_rl_head = CDS_LIST_HEAD_INIT(g_rl_head);
 static struct rl_elem **g_rl_stable;
 static struct rl_elem **g_rl_churn;
 static pthread_mutex_t g_rl_wlock = PTHREAD_MUTEX_INITIALIZER;
+static int g_rl_nolock;		/* BENCH_RL_NOLOCK: skip the per-op writer mutex,
+				 * mirroring BENCH_SU_NOLOCK -- the plain-RCU
+				 * single-writer floor (cds_list splice + call_rcu,
+				 * no writer mutual exclusion, RCU reads intact).
+				 * CORRECT ONLY with a single writer. */
 
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 static void rl_free(struct rcu_head *h)
@@ -1429,7 +1434,8 @@ static unsigned long rl_read(long *viol)
 }
 static void rl_write(int slot)
 {
-	pthread_mutex_lock(&g_rl_wlock);
+	if (!g_rl_nolock)
+		pthread_mutex_lock(&g_rl_wlock);
 	if (g_present[slot]) {
 		struct rl_elem *e = g_rl_churn[slot];
 		cds_list_del_rcu(&e->list);
@@ -1448,7 +1454,8 @@ static void rl_write(int slot)
 		g_rl_churn[slot] = e;
 		g_present[slot] = 1;
 	}
-	pthread_mutex_unlock(&g_rl_wlock);
+	if (!g_rl_nolock)
+		pthread_mutex_unlock(&g_rl_wlock);
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -2863,10 +2870,14 @@ int main(int argc, char **argv)
 	allow_smt = getenv("BENCH_ALLOW_SMT") != NULL;
 	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
 	g_su_nolock = getenv("BENCH_SU_NOLOCK") != NULL;
+	g_rl_nolock = getenv("BENCH_RL_NOLOCK") != NULL;
 	g_lat = getenv("BENCH_LATENCY") != NULL;
 	if (g_su_nolock)
 		fprintf(stderr, "txn_sw_list: writer mutex DISABLED (BENCH_SU_NOLOCK) -- "
 			"raw single-updater cost; VALID ONLY with a single writer\n");
+	if (g_rl_nolock)
+		fprintf(stderr, "rculist: writer mutex DISABLED (BENCH_RL_NOLOCK) -- "
+			"plain-RCU single-writer floor; VALID ONLY with a single writer\n");
 	if (g_random_pos && g_eng->write_random)
 		fprintf(stderr, "%s: random-position writer mode "
 			"(collisions ~ writers/LIST_SIZE)\n", g_eng->name);
