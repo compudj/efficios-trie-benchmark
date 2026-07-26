@@ -69,6 +69,11 @@
 #include <urcu/fair-mutex.h>
 
 #include "rlu.h"		/* reference Read-Log-Update engine (third_party/rlu) */
+/* MV-RLU (third_party/mvrlu) lives in its own TU: its public header ships an
+ * RLU compatibility wrapper that redefines the RLU_* macros and typedefs
+ * rlu_thread_data_t, so mvrlu.h and rlu.h cannot share a translation unit.
+ * See src/bench_mvrlu_list.h. */
+#include "bench_mvrlu_list.h"
 
 #ifdef BENCH_JEMALLOC
 /*
@@ -2293,12 +2298,37 @@ static void lfht_write(int slot)
 	rcu_read_unlock();
 }
 
+/* ── mvrlu_list: MV-RLU multi-versioned bidirectional list ──
+ *
+ * The engine itself is in src/bench_mvrlu_list.c -- mvrlu.h cannot share a TU
+ * with rlu.h (see bench_mvrlu_list.h).  This is only the build shim that hands
+ * it the harness state it needs; g_anchor/g_present/STEP_LIMIT are all set by
+ * the time g_eng->build() runs.
+ *
+ * No point_reset hook: MV-RLU has no fixed thread-id registry to rewind, unlike
+ * RLU.  No write_random hook: the transacted-index workload has no MV-RLU arm.
+ */
+static void mv_build(void)
+{
+	struct mvl_ctx ctx;
+
+	ctx.list_size  = LIST_SIZE;
+	ctx.churn      = CHURN;
+	ctx.random_pos = g_random_pos;
+	ctx.step_limit = STEP_LIMIT;
+	ctx.anchor     = g_anchor;
+	ctx.present    = g_present;
+	mvl_build(&ctx);
+}
+
 /* ── Engine registry ─────────────────────────────────────────── */
 static const struct lengine engines[] = {
 	{ "txn_sw_list",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
 	{ "txn_list",  "RCU concurrent, coherent bidir",      1, lf_build,  lf_read,  lf_write, lf_write_random, lf_reset_index },
 	{ "rlu_list",  "RLU (Read-Log-Update), coherent bidir", 0, rlu_build, rlu_read, rlu_write,
 		rlu_write_random, rlu_reset_random, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
+	{ "mvrlu_list", "MV-RLU (multi-version RLU), coherent bidir", 0, mv_build, mvl_read, mvl_write,
+		NULL, NULL, NULL, mvl_tl_begin, mvl_tl_end },
 	{ "txn_hlist", "rcu-txn hash-of-sorted-lists",       1, thl_build, thl_read, thl_write },
 	{ "rlu_hlist", "RLU hash-of-sorted-lists (home turf)", 0, rhl_build, rhl_read, rhl_write,
 		NULL, NULL, rlu_point_reset, rlu_tl_begin, rlu_tl_end },

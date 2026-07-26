@@ -323,6 +323,30 @@ HWLOC_LIBS   := $(shell pkg-config --libs hwloc)
 RLU_DIR  := third_party/rlu
 RLU_DEFS := -DRLU_MAX_THREADS=256 -DRLU_MAX_WRITE_SET_BUFFER_SIZE=8192
 
+# MV-RLU (third_party/mvrlu), the multi-versioned successor to RLU, as the
+# bench_list_scale engine `mvrlu_list`.  Its sources compile into their own
+# objects and its public header is included ONLY by src/bench_mvrlu_list.c --
+# mvrlu.h ships an RLU compatibility wrapper that redefines the RLU_* macros and
+# typedefs rlu_thread_data_t, so it cannot share a TU with rlu.h.
+#
+# MVRLU_CONF selects the clock, and the default is deliberate:
+#   gclk (default) -- global atomic clock, no calibrated constant.
+#   ordo           -- RDTSCP + __ORDO_BOUNDARY, a per-machine constant that
+#                     CORRECTNESS depends on and that must be measured with
+#                     third_party/mvrlu/tools/ordo (~18 h on this box).  The
+#                     vendored 1214 is upstream's Intel value and is NOT valid
+#                     here.  Read third_party/mvrlu/PROVENANCE.txt first.
+# Build the ordo arm with:  make bench_list_scale MVRLU_CONF=ordo MVRLU_ORDO_BOUNDARY=<measured>
+MVRLU_DIR  := third_party/mvrlu
+MVRLU_CONF ?= gclk
+MVRLU_DEFS := -I$(MVRLU_DIR)/include -I$(MVRLU_DIR)/lib
+ifeq ($(strip $(MVRLU_CONF)),ordo)
+  ifeq ($(strip $(MVRLU_ORDO_BOUNDARY)),)
+    $(error MVRLU_CONF=ordo requires MVRLU_ORDO_BOUNDARY=<cycles> measured on THIS machine; see third_party/mvrlu/PROVENANCE.txt)
+  endif
+  MVRLU_DEFS += -DMVRLU_ORDO_TIMESTAMPING -D__ORDO_BOUNDARY=$(MVRLU_ORDO_BOUNDARY)
+endif
+
 # ── Pooled-build knobs (reproduce the write-optimised profiling config) ───────
 # The default build is plain glibc malloc + non-inline rcu_head -- the FAIR READ
 # build (smaller nodes read ~1.6x faster).  These opt in to the write side of
@@ -414,11 +438,18 @@ check-jemalloc:
 	  echo "       Install it (e.g. 'apt install libjemalloc-dev') or drop JEMALLOC=1."; exit 1; }
 
 bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
+		src/bench_mvrlu_list.c $(MVRLU_DIR)/lib/mvrlu.c $(MVRLU_DIR)/lib/debug.c \
 		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-txn $(LIST_JE_CHECK)
 	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) $(LIST_POOL_CFLAGS) -I$(URCU_TXN_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
-	  -c src/bench_list_scale.c -o src/bench_list_scale.o
+	  -Isrc -c src/bench_list_scale.c -o src/bench_list_scale.o
 	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) -I$(RLU_DIR) \
 	  -c $(RLU_DIR)/rlu.c -o src/rlu.o
+	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) -Isrc \
+	  -c src/bench_mvrlu_list.c -o src/bench_mvrlu_list.o
+	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) \
+	  -c $(MVRLU_DIR)/lib/mvrlu.c -o src/mvrlu.o
+	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) \
+	  -c $(MVRLU_DIR)/lib/debug.c -o src/mvrlu_debug.o
 	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
 	  -c src/bench_iscrw.c -o src/bench_iscrw.o
 	$(CC) $(LIST_CFLAGS) -I$(ISC_SHIM) -I$(ISC_INC) \
@@ -426,6 +457,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	$(CC) $(LIST_CFLAGS) $(HWLOC_CFLAGS) -I$(TOPO_DIR) \
 	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
 	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/rlu.o src/bench_iscrw.o \
+	  src/bench_mvrlu_list.o src/mvrlu.o src/mvrlu_debug.o \
 	  src/iscrw.o src/bench_topology_list.o $(LIST_POOL_LIBS) \
 	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
