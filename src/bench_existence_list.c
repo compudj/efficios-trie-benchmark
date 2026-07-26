@@ -400,7 +400,7 @@ static void exs_node_free(struct rcu_head *rhp)
 
 /* One traversal step, resolved: skip nodes that do not exist. */
 static inline int ex_visit(struct cds_list_head *p, int *prev, int desc,
-			   long *viol, unsigned long *vis)
+			   int rnd, long *viol, unsigned long *vis)
 {
 	struct ex_lnode *n = container_of(p, struct ex_lnode, list);
 	int k;
@@ -408,7 +408,7 @@ static inline int ex_visit(struct cds_list_head *p, int *prev, int desc,
 	if (!EX_EXISTS(n))
 		return 0;			/* logically absent */
 	k = n->key;
-	if (!g_ctx.random_pos) {
+	if (!rnd) {
 		if (desc ? (k >= *prev) : (k <= *prev)) { (*viol)++; return -1; }
 		*prev = k;
 	}
@@ -421,29 +421,32 @@ unsigned long exl_read(long *viol)
 	struct cds_list_head *p;
 	unsigned long vis = 0;
 	int prev, steps;
+	/* Hoisted out of the traversal: see run_deref_cost.sh -- loading these
+	 * per iteration charges the engine memory references the harness owns. */
+	const int rnd = g_ctx.random_pos, slim = g_ctx.step_limit;
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
 	for (p = rcu_dereference(g_ex_head.next); p != &g_ex_head;
 			p = rcu_dereference(p->next)) {
-		if (++steps > g_ctx.step_limit) { (*viol)++; break; }
-		if (ex_visit(p, &prev, 0, viol, &vis) < 0)
+		if (++steps > slim) { (*viol)++; break; }
+		if (ex_visit(p, &prev, 0, rnd, viol, &vis) < 0)
 			break;
 	}
 	if (g_ctx.forward_only) {
 		prev = INT_MIN; steps = 0;
 		for (p = rcu_dereference(g_ex_head.next); p != &g_ex_head;
 				p = rcu_dereference(p->next)) {
-			if (++steps > g_ctx.step_limit) { (*viol)++; break; }
-			if (ex_visit(p, &prev, 0, viol, &vis) < 0)
+			if (++steps > slim) { (*viol)++; break; }
+			if (ex_visit(p, &prev, 0, rnd, viol, &vis) < 0)
 				break;
 		}
 	} else {
 		prev = INT_MAX; steps = 0;
 		for (p = rcu_dereference(g_ex_head.prev); p != &g_ex_head;
 				p = rcu_dereference(p->prev)) {
-			if (++steps > g_ctx.step_limit) { (*viol)++; break; }
-			if (ex_visit(p, &prev, 1, viol, &vis) < 0)
+			if (++steps > slim) { (*viol)++; break; }
+			if (ex_visit(p, &prev, 1, rnd, viol, &vis) < 0)
 				break;
 		}
 	}

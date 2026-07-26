@@ -256,6 +256,9 @@ unsigned long mvl_read(long *viol)
 	struct mv_lnode *head = g_mv_head, *h, *p;
 	unsigned long vis = 0;
 	int prev, steps;
+	/* Hoisted out of the traversal: see run_deref_cost.sh -- loading these
+	 * per iteration charges the engine memory references the harness owns. */
+	const int rnd = g_ctx.random_pos, slim = g_ctx.step_limit;
 
 	mvrlu_reader_lock(self);
 	h = mvrlu_deref(self, head);
@@ -264,8 +267,8 @@ unsigned long mvl_read(long *viol)
 			!mvrlu_cmp_ptrs(p, head);
 			p = mvrlu_deref(self, p->next)) {
 		int k = p->key;
-		if (++steps > g_ctx.step_limit) { (*viol)++; break; }
-		if (!g_ctx.random_pos) {
+		if (++steps > slim) { (*viol)++; break; }
+		if (!rnd) {
 			if (k <= prev) { (*viol)++; break; }
 			prev = k;
 		}
@@ -276,8 +279,8 @@ unsigned long mvl_read(long *viol)
 			!mvrlu_cmp_ptrs(p, head);
 			p = mvrlu_deref(self, p->prev)) {
 		int k = p->key;
-		if (++steps > g_ctx.step_limit) { (*viol)++; break; }
-		if (!g_ctx.random_pos) {
+		if (++steps > slim) { (*viol)++; break; }
+		if (!rnd) {
 			if (k >= prev) { (*viol)++; break; }
 			prev = k;
 		}

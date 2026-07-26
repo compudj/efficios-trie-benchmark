@@ -898,13 +898,14 @@ static unsigned long su_read(long *viol)
 	struct urcu_txn_sw_list_node *p;
 	unsigned long vis = 0;
 	int prev, steps;
+	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
 	for (p = urcu_txn_sw_list_next_rcu(&g_su_head.node); p != &g_su_head.node;
 			p = urcu_txn_sw_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct su_elem, node)->key;
-		if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+		if (k <= prev || ++steps > slim) { (*viol)++; break; }
 		prev = k; vis++;
 	}
 	/*
@@ -935,7 +936,7 @@ static unsigned long su_read(long *viol)
 				p != &g_su_head.node;
 				p = urcu_txn_sw_list_next_rcu(p)) {
 			int k = caa_container_of(p, struct su_elem, node)->key;
-			if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+			if (k <= prev || ++steps > slim) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	} else {
@@ -943,7 +944,7 @@ static unsigned long su_read(long *viol)
 				p != &g_su_head.node;
 				p = urcu_txn_sw_list_prev_rcu(p)) {
 			int k = caa_container_of(p, struct su_elem, node)->key;
-			if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+			if (k >= prev || ++steps > slim) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	}
@@ -1078,6 +1079,8 @@ static unsigned long lf_read(long *viol)
 	struct urcu_txn_list_node *p;
 	unsigned long vis = 0;
 	int prev, steps;
+	const int rnd = g_random_pos;	/* hoisted; see rlu_read */
+	const int slim = STEP_LIMIT;
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
@@ -1085,8 +1088,8 @@ static unsigned long lf_read(long *viol)
 			p != &g_lf_head.node;
 			p = urcu_txn_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
-		if (++steps > STEP_LIMIT) { (*viol)++; break; }	/* runaway guard: always */
-		if (!g_random_pos) {			/* sortedness only in the sorted (churn) mode */
+		if (++steps > slim) { (*viol)++; break; }	/* runaway guard: always */
+		if (!rnd) {				/* sortedness only in the sorted (churn) mode */
 			if (k <= prev) { (*viol)++; break; }
 			prev = k;
 		}
@@ -1097,8 +1100,8 @@ static unsigned long lf_read(long *viol)
 			p != &g_lf_head.node;
 			p = urcu_txn_list_prev_rcu(p)) {
 		int k = caa_container_of(p, struct lf_elem, node)->key;
-		if (++steps > STEP_LIMIT) { (*viol)++; break; }
-		if (!g_random_pos) {
+		if (++steps > slim) { (*viol)++; break; }
+		if (!rnd) {
 			if (k >= prev) { (*viol)++; break; }
 			prev = k;
 		}
@@ -1471,6 +1474,7 @@ static unsigned long rl_read(long *viol)
 	struct cds_list_head *p;
 	unsigned long vis = 0;
 	int pass, prev, steps;
+	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
 
 	rcu_read_lock();
 	for (pass = 0; pass < 2; pass++) {
@@ -1501,14 +1505,14 @@ static unsigned long rl_read(long *viol)
 			prev = INT_MAX;
 			for (p = g_rl_head.prev; p != &g_rl_head; p = p->prev) {
 				int k = caa_container_of(p, struct rl_elem, list)->key;
-				if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+				if (k >= prev || ++steps > slim) { (*viol)++; break; }
 				prev = k; vis++;
 			}
 			continue;
 		}
 		cds_list_for_each_rcu(p, &g_rl_head) {
 			int k = caa_container_of(p, struct rl_elem, list)->key;
-			if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+			if (k <= prev || ++steps > slim) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	}
@@ -1664,22 +1668,60 @@ static void rlu_build(void)
 	}
 }
 
+/*
+ * RLU_RAWCMP (compile-time): terminate the RLU walk with a plain pointer
+ * compare instead of RLU_IS_SAME_PTRS.  DIAGNOSTIC ONLY, and valid ONLY with no
+ * writer.  RLU forbids comparing pointers directly because either side may be a
+ * copy; rlu_cmp_ptrs() exists to FORCE_ACTUAL() both, and it is an OUT-OF-LINE
+ * call (nm: T rlu_cmp_ptrs) that reads object headers once per loop iteration.
+ * With no writer no copies exist, so the raw compare gives the same answer and
+ * the delta isolates what RLU's IDENTITY COMPARISON costs a traversal, apart
+ * from what its DEREFERENCE costs -- the dereference being the unit P1's cost
+ * table counts.  Measured (10k nodes, no writer, per node visit):
+ *   RLU_IS_SAME_PTRS  8.51 loads  12.01 branches
+ *   plain compare     3.01 loads   6.00 branches
+ * so the comparison alone is 5.50 loads and 6.01 branches, while the
+ * dereference is the 1 extra load the table states.
+ * Compile-time, not an env flag: a runtime test in the loop condition costs a
+ * load and a branch of its own and would tax the default path it measures.
+ */
+#ifdef RLU_RAWCMP
+#define RLU_LOOP_NE(p, head)	((p) != (head))
+#else
+#define RLU_LOOP_NE(p, head)	(!RLU_IS_SAME_PTRS((p), (head)))
+#endif
+
 static unsigned long rlu_read(long *viol)
 {
 	rlu_thread_data_t *self = rlu_self();
 	struct rlu_lnode *head = g_rlu_head, *h, *p;
 	unsigned long vis = 0;
 	int prev, steps;
+	/* Hoisted: loading this global per iteration would charge the engine a
+	 * memory reference the harness owns, not the mechanism -- and the
+	 * per-dereference load/branch measurement (scripts/run_deref_cost.sh)
+	 * differences against rculist, whose reader does not consult it. */
+	const int rnd = g_random_pos;
+	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+	/* (see RLU_LOOP_NE) terminate the walk with a plain pointer compare
+	 * instead of RLU_IS_SAME_PTRS.  DIAGNOSTIC ONLY, and valid ONLY with no
+	 * writer: RLU forbids comparing pointers directly because either side
+	 * may be a copy, and rlu_cmp_ptrs() exists to FORCE_ACTUAL() both --
+	 * an OUT-OF-LINE call (nm: T rlu_cmp_ptrs) that reads object headers,
+	 * once per loop iteration.  With no writer no copies exist, so the raw
+	 * compare gives the same answer and the delta isolates what RLU's
+	 * identity comparison costs a traversal, separately from what its
+	 * DEREFERENCE costs (which is the unit P1's cost table counts). */
 
 	RLU_READER_LOCK(self);
 	h = (struct rlu_lnode *) RLU_DEREF(self, head);
 	prev = INT_MIN; steps = 0;
 	for (p = (struct rlu_lnode *) RLU_DEREF(self, h->next);
-			!RLU_IS_SAME_PTRS(p, head);
+			RLU_LOOP_NE(p, head);
 			p = (struct rlu_lnode *) RLU_DEREF(self, p->next)) {
 		int k = p->key;
-		if (++steps > STEP_LIMIT) { (*viol)++; break; }	/* runaway guard: always */
-		if (!g_random_pos) {			/* sortedness only in the sorted (churn) mode */
+		if (++steps > slim) { (*viol)++; break; }	/* runaway guard: always */
+		if (!rnd) {				/* sortedness only in the sorted (churn) mode */
 			if (k <= prev) { (*viol)++; break; }
 			prev = k;
 		}
@@ -1687,11 +1729,11 @@ static unsigned long rlu_read(long *viol)
 	}
 	prev = INT_MAX; steps = 0;
 	for (p = (struct rlu_lnode *) RLU_DEREF(self, h->prev);
-			!RLU_IS_SAME_PTRS(p, head);
+			RLU_LOOP_NE(p, head);
 			p = (struct rlu_lnode *) RLU_DEREF(self, p->prev)) {
 		int k = p->key;
-		if (++steps > STEP_LIMIT) { (*viol)++; break; }
-		if (!g_random_pos) {
+		if (++steps > slim) { (*viol)++; break; }
+		if (!rnd) {
 			if (k >= prev) { (*viol)++; break; }
 			prev = k;
 		}
