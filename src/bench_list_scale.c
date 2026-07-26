@@ -74,6 +74,11 @@
  * rlu_thread_data_t, so mvrlu.h and rlu.h cannot share a translation unit.
  * See src/bench_mvrlu_list.h. */
 #include "bench_mvrlu_list.h"
+/* Existence structures (perfbook, GPL-2.0) likewise live in their own TU: their
+ * headers want BUG_ON/spin_lock/smp_load_acquire in the global namespace, and
+ * keeping them separate confines the GPL to that object.  See
+ * src/bench_existence_list.h. */
+#include "bench_existence_list.h"
 
 #ifdef BENCH_JEMALLOC
 /*
@@ -851,6 +856,10 @@ static int g_su_nolock;		/* BENCH_SU_NOLOCK: skip the per-op writer mutex --
 				 * with a single writer; the mutex otherwise exists so
 				 * the multi-writer sweep harness can't corrupt the
 				 * single-updater list. */
+static int g_su_forward;	/* BENCH_SU_FORWARD: second read pass walks FORWARD,
+				 * matching rculist's two forward passes so the
+				 * read-ceiling comparison measures the resolve and
+				 * not the access pattern (see su_read). */
 
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 static void su_free(struct rcu_head *h)
@@ -898,12 +907,45 @@ static unsigned long su_read(long *viol)
 		if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
 		prev = k; vis++;
 	}
-	prev = INT_MAX; steps = 0;
-	for (p = urcu_txn_sw_list_prev_rcu(&g_su_head.node); p != &g_su_head.node;
-			p = urcu_txn_sw_list_prev_rcu(p)) {
-		int k = caa_container_of(p, struct su_elem, node)->key;
-		if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
-		prev = k; vis++;
+	/*
+	 * BENCH_SU_FORWARD: make the SECOND pass forward as well, so the
+	 * traversal order matches rculist's two forward passes exactly.
+	 *
+	 * This is the apples-to-apples read-ceiling configuration, and it is
+	 * needed because traversal ORDER is worth ~15% on this workload -- far
+	 * more than the per-dereference cost being measured.  A backward second
+	 * pass re-touches the tail first, the hottest lines it just loaded,
+	 * while a second forward pass restarts at the head, the coldest; with
+	 * nodes interleaved across 24 NUMA nodes that difference dominates.
+	 * Comparing forward+backward against rculist's forward+forward
+	 * therefore measures the access pattern, not the facility, and it
+	 * flatters whichever engine reverses.
+	 *
+	 * With both engines walking forward twice, the only remaining
+	 * difference is the resolve on every dereference -- the tag test -- so
+	 * the ratio is the facility's true read-side cost.
+	 *
+	 * The coherent BACKWARD walk remains the capability rculist cannot
+	 * offer under mutation at all; that is a separate claim and should be
+	 * argued separately rather than folded into this cost number.
+	 */
+	prev = g_su_forward ? INT_MIN : INT_MAX; steps = 0;
+	if (g_su_forward) {
+		for (p = urcu_txn_sw_list_next_rcu(&g_su_head.node);
+				p != &g_su_head.node;
+				p = urcu_txn_sw_list_next_rcu(p)) {
+			int k = caa_container_of(p, struct su_elem, node)->key;
+			if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+			prev = k; vis++;
+		}
+	} else {
+		for (p = urcu_txn_sw_list_prev_rcu(&g_su_head.node);
+				p != &g_su_head.node;
+				p = urcu_txn_sw_list_prev_rcu(p)) {
+			int k = caa_container_of(p, struct su_elem, node)->key;
+			if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+			prev = k; vis++;
+		}
 	}
 	rcu_read_unlock();
 	return vis;
@@ -1389,6 +1431,11 @@ static int g_rl_nolock;		/* BENCH_RL_NOLOCK: skip the per-op writer mutex,
 				 * single-writer floor (cds_list splice + call_rcu,
 				 * no writer mutual exclusion, RCU reads intact).
 				 * CORRECT ONLY with a single writer. */
+static int g_rl_reverse;	/* BENCH_RL_REVERSE: second read pass walks
+				 * BACKWARD, matching txn_sw_list's
+				 * forward-then-backward traversal order so the
+				 * read-ceiling comparison is cache-symmetric.
+				 * CORRECT ONLY with no writer (see rl_read). */
 
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 static void rl_free(struct rcu_head *h)
@@ -1428,6 +1475,37 @@ static unsigned long rl_read(long *viol)
 	rcu_read_lock();
 	for (pass = 0; pass < 2; pass++) {
 		prev = INT_MIN; steps = 0;
+		/*
+		 * BENCH_RL_REVERSE: walk the second pass BACKWARD instead of
+		 * forward.  This exists to isolate a cache asymmetry in the
+		 * read-ceiling comparison, NOT to give rculist a capability it
+		 * has.  txn_sw_list reads forward-then-BACKWARD; rculist here
+		 * reads forward twice.  Both visit the same node count, but not
+		 * in the same order: a backward second pass re-touches the tail
+		 * first -- the hottest lines it just loaded -- while a second
+		 * forward pass restarts at the head, the coldest.  With nodes
+		 * interleaved across 24 NUMA nodes that is a systematic edge to
+		 * whichever engine reverses, from traversal order alone.
+		 *
+		 * VALID ONLY WITH NO WRITER (BENCH_NO_WRITER).  cds_list is
+		 * doubly linked, so a reverse walk is well defined on a
+		 * QUIESCENT list; under concurrent mutation it is precisely the
+		 * incoherent backward traversal that plain RCU cannot offer,
+		 * which is the whole point of the transacted list.  Asserted
+		 * below rather than trusted.
+		 */
+		if (g_rl_reverse && pass == 1) {
+			/* Validate DESCENDING, mirroring su_read's backward pass
+			 * exactly -- otherwise this pass does strictly less work
+			 * than the engine it is being compared against. */
+			prev = INT_MAX;
+			for (p = g_rl_head.prev; p != &g_rl_head; p = p->prev) {
+				int k = caa_container_of(p, struct rl_elem, list)->key;
+				if (k >= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
+				prev = k; vis++;
+			}
+			continue;
+		}
 		cds_list_for_each_rcu(p, &g_rl_head) {
 			int k = caa_container_of(p, struct rl_elem, list)->key;
 			if (k <= prev || ++steps > STEP_LIMIT) { (*viol)++; break; }
@@ -2321,6 +2399,33 @@ static void mv_build(void)
 	mvl_build(&ctx);
 }
 
+/* ── existence_list: McKenney's existence structures ──
+ *
+ * The one design in P1's cost table in the SAME guarantee class as the
+ * pseudo-transaction: both publish with a single store, both charge the reader
+ * a test per dereference, both defer a group through call_rcu.  The predicted
+ * difference is where the test's operand comes from -- a per-element field
+ * (eh_egi) versus a register the reader already held -- plus the permanent
+ * space cost of that field.  Engine in src/bench_existence_list.c.
+ *
+ * BENCH_SU_FORWARD switches this engine to forward-only too: it is the
+ * symmetric-traversal knob, and existence walks forward+backward by default
+ * exactly as txn_sw_list does.
+ */
+static void ex_build(void)
+{
+	struct exl_ctx ctx;
+
+	ctx.list_size    = LIST_SIZE;
+	ctx.churn        = CHURN;
+	ctx.random_pos   = g_random_pos;
+	ctx.step_limit   = STEP_LIMIT;
+	ctx.anchor       = g_anchor;
+	ctx.present      = g_present;
+	ctx.forward_only = g_su_forward;
+	exl_build(&ctx);
+}
+
 /* ── Engine registry ─────────────────────────────────────────── */
 static const struct lengine engines[] = {
 	{ "txn_sw_list",  "RCU single-updater, coherent bidir", 1, su_build,  su_read,  su_write  },
@@ -2329,6 +2434,8 @@ static const struct lengine engines[] = {
 		rlu_write_random, rlu_reset_random, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
 	{ "mvrlu_list", "MV-RLU (multi-version RLU), coherent bidir", 0, mv_build, mvl_read, mvl_write,
 		NULL, NULL, NULL, mvl_tl_begin, mvl_tl_end },
+	{ "existence_list", "existence structures, coherent bidir", 1, ex_build, exl_read, exl_write,
+		NULL, NULL, exl_point_reset },
 	{ "txn_hlist", "rcu-txn hash-of-sorted-lists",       1, thl_build, thl_read, thl_write },
 	{ "rlu_hlist", "RLU hash-of-sorted-lists (home turf)", 0, rhl_build, rhl_read, rhl_write,
 		NULL, NULL, rlu_point_reset, rlu_tl_begin, rlu_tl_end },
@@ -2901,6 +3008,14 @@ int main(int argc, char **argv)
 	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
 	g_su_nolock = getenv("BENCH_SU_NOLOCK") != NULL;
 	g_rl_nolock = getenv("BENCH_RL_NOLOCK") != NULL;
+	g_rl_reverse = getenv("BENCH_RL_REVERSE") != NULL;
+	g_su_forward = getenv("BENCH_SU_FORWARD") != NULL;
+	if (g_rl_reverse && !getenv("BENCH_NO_WRITER")) {
+		fprintf(stderr, "BENCH_RL_REVERSE requires BENCH_NO_WRITER: a "
+			"backward cds_list walk is well defined only on a "
+			"quiescent list\n");
+		exit(1);
+	}
 	g_lat = getenv("BENCH_LATENCY") != NULL;
 	if (g_su_nolock)
 		fprintf(stderr, "txn_sw_list: writer mutex DISABLED (BENCH_SU_NOLOCK) -- "

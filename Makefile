@@ -337,6 +337,44 @@ RLU_DEFS := -DRLU_MAX_THREADS=256 -DRLU_MAX_WRITE_SET_BUFFER_SIZE=8192
 #                     vendored 1214 is upstream's Intel value and is NOT valid
 #                     here.  Read third_party/mvrlu/PROVENANCE.txt first.
 # Build the ordo arm with:  make bench_list_scale MVRLU_CONF=ordo MVRLU_ORDO_BOUNDARY=<measured>
+# Existence structures (perfbook datastruct/existence, GPL-2.0) as the
+# bench_list_scale engine `existence_list`.  perfbook is already checked out in
+# this tree, so nothing is vendored; we compile its header-only existence.h /
+# procon.h into their own TU with an api.h-equivalent shim (see
+# src/bench_existence_list.c).  Own TU because those headers want BUG_ON,
+# spin_lock, smp_load_acquire, ... in the global namespace, and because the GPL
+# stays confined to that object.
+#
+# EXIST_CONF selects the per-element LAYOUT.  The default is `split`, and that
+# is deliberate: we are comparing the existence CONCEPT, not perfbook's struct.
+#
+#   split (default)  hot/cold split -- only existence's tagged word (8 B) rides
+#                    in the traversed node, giving a 32 B / one-cacheline
+#                    element; the 104 B of writer-only state (eh_list, eh_rh,
+#                    the three callbacks, eh_gone, eh_lock) is segregated.
+#                    Same algorithm, same single-store publish.  This is
+#                    existence at its best and is what the comparison reports.
+#   packed           perfbook's existence_head embedded, hot fields reordered
+#                    to share cacheline 0.
+#   perfbook         exactly as perfbook ships it: existence_head at offset 16,
+#                    key pushed out to offset 128 -- cacheline 2.
+#
+# The three together ARE the cache-density result (measured, 192 readers:
+# 49k / 109k / 124k Mvisits/s against txn_sw_list's 146k).  Reporting `perfbook`
+# as existence's cost would measure a struct layout, not the design.
+EXIST_DIR  := perfbook/datastruct/existence
+EXIST_CONF ?= split
+EXIST_DEFS := -I$(EXIST_DIR) -D_LGPL_SOURCE
+ifeq ($(strip $(EXIST_CONF)),split)
+  EXIST_DEFS += -DEXL_SPLIT
+else ifeq ($(strip $(EXIST_CONF)),packed)
+  EXIST_DEFS += -DEXL_HOT_PACK -DEXL_PTHREAD_LOCK
+else ifeq ($(strip $(EXIST_CONF)),perfbook)
+  EXIST_DEFS += -DEXL_PTHREAD_LOCK
+else
+  $(error EXIST_CONF must be split, packed or perfbook)
+endif
+
 MVRLU_DIR  := third_party/mvrlu
 MVRLU_CONF ?= gclk
 MVRLU_DEFS := -I$(MVRLU_DIR)/include -I$(MVRLU_DIR)/lib
@@ -439,6 +477,7 @@ check-jemalloc:
 
 bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 		src/bench_mvrlu_list.c $(MVRLU_DIR)/lib/mvrlu.c $(MVRLU_DIR)/lib/debug.c \
+		src/bench_existence_list.c \
 		bind9-src/lib/isc/rwlock.c $(TOPO_DIR)/bench_topology.c | check-urcu-txn $(LIST_JE_CHECK)
 	$(CC) $(LIST_CFLAGS) $(RLU_DEFS) $(LIST_POOL_CFLAGS) -I$(URCU_TXN_INC) -I$(RLU_DIR) -I$(TOPO_DIR) \
 	  -Isrc -c src/bench_list_scale.c -o src/bench_list_scale.o
@@ -446,6 +485,8 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	  -c $(RLU_DIR)/rlu.c -o src/rlu.o
 	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) -Isrc \
 	  -c src/bench_mvrlu_list.c -o src/bench_mvrlu_list.o
+	$(CC) $(LIST_CFLAGS) $(EXIST_DEFS) -I$(URCU_TXN_INC) -Isrc \
+	  -c src/bench_existence_list.c -o src/bench_existence_list.o
 	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) \
 	  -c $(MVRLU_DIR)/lib/mvrlu.c -o src/mvrlu.o
 	$(CC) $(LIST_CFLAGS) $(MVRLU_DEFS) \
@@ -457,7 +498,7 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 	$(CC) $(LIST_CFLAGS) $(HWLOC_CFLAGS) -I$(TOPO_DIR) \
 	  -c $(TOPO_DIR)/bench_topology.c -o src/bench_topology_list.o
 	$(CC) -O2 -pthread -o $@ src/bench_list_scale.o src/rlu.o src/bench_iscrw.o \
-	  src/bench_mvrlu_list.o src/mvrlu.o src/mvrlu_debug.o \
+	  src/bench_mvrlu_list.o src/mvrlu.o src/mvrlu_debug.o src/bench_existence_list.o \
 	  src/iscrw.o src/bench_topology_list.o $(LIST_POOL_LIBS) \
 	  -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) \
 	  -lurcu-qsbr -lurcu-cds -lurcu-common $(HWLOC_LIBS) -lnuma -lpthread
