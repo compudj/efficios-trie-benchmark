@@ -1,0 +1,5 @@
+# generated per-host build artifacts, not source
+cpuseq.h
+o/
+output/
+ordo_pairs.csv

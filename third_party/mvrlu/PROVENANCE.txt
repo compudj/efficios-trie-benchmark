@@ -1,0 +1,183 @@
+MV-RLU core (include/, lib/) vendored verbatim from https://github.com/cosmoss-jigu/mv-rlu (Apache-2.0), HEAD 63dfbb8024667f5046fbf9a6f748befa5758e922 (2021-11-07), on 2026-07-26.
+Reference implementation accompanying kim2019mvrlu (MV-RLU: Scaling Read-Log-Update with Multi-Versioning, ASPLOS 2019).
+
+NOTE: Apache-2.0, NOT MIT like third_party/rlu.  LICENSE is vendored verbatim; the
+per-file SPDX headers are intact.  Keep both when redistributing.
+
+VENDORED (the library and its full header closure -- verified by include-graph):
+  include/mvrlu.h  include/arch.h  include/ordo_clock.h
+  lib/mvrlu.c  lib/mvrlu_i.h  lib/config.h  lib/debug.c  lib/debug.h
+  lib/port.h  lib/port-user.h  lib/port-kernel.h
+  LICENSE  README-MVRLU.md (upstream README.md)
+
+NOT VENDORED (deliberately):
+  benchmark/  -- their DBx1000/kyotocabinet/rlu/versioning harnesses; we drive
+                 MV-RLU from bench_list_scale instead, on the same workload as
+                 txn_sw_list/txn_list/rlu_list.
+  tools/      -- includes tools/ordo (the boundary measurement, see below) and
+                 tools/cpu-topology.py.  cpu-topology.py generates
+                 include/numa-config.h, which upstream's Makefile builds
+                 unconditionally -- but NOTHING in include/ or lib/ includes it
+                 (only their three benchmarks do).  Our harness does its own
+                 hwloc pinning (bind9-overlay/tests/bench/bench_topology.c), so
+                 the library needs no generated machine header.
+  Makefile, Makefile.inc, lib/Makefile -- we compile the two .c files directly
+                 into the bench, the same way third_party/rlu/rlu.c is built.
+
+LOCAL PATCH:
+  include/ordo_clock.h -- __ORDO_BOUNDARY wrapped in #ifndef so it is -D
+  overridable.  Upstream hardcodes 1214, the value measured on THEIR 224-core
+  Intel machine.  Our commit is tiny; everything else is byte-identical.
+
+*** READ THIS BEFORE USING THE ordo VARIANT (analysis 2026-07-26) ***
+The ORDO boundary is a COMPILE-TIME CONSTANT that correctness depends on, and it
+is obtained by BENCHMARKING THE MACHINE.  It is load-bearing in three places:
+  mvrlu.c:1543  reader version select: lte_clock(wrt_clk, local_clk) is
+                (wrt_clk + boundary) < local_clk -- a reader accepts a version
+                only if it is at least `boundary` older.  TOO SMALL A BOUNDARY
+                => the reader accepts a version that was NOT ordered before its
+                snapshot.  Silent wrong-version read; no crash, no assert.
+  mvrlu.c:816   commit: new_clock(local_clk) = ordo_new_clock(local_clk +
+                boundary), and ordo_new_clock spins until rdtscp() exceeds
+                t + boundary -- so every commit STALLS ~2x the boundary
+                (~2400 cycles at upstream's 1214).
+  mvrlu.c:1059  reclamation: correct_qp_clk(qp) = qp - boundary, so versions are
+                deliberately retained an extra boundary's worth of time.
+The error is one-sided in the dangerous direction: too large costs throughput and
+memory, too small is a CORRECTNESS BUG.  And upstream's estimator has the wrong
+sign for safety -- gen_table.py takes the MAX OVER SAMPLED PAIRS, a LOWER bound
+on true worst-case skew, then uses it as an UPPER bound.  Nothing re-validates it
+at runtime.  It is invalidated by: a different CPU model, a microcode/firmware
+update, a socket-count change, VM migration, or any platform where cross-socket
+TSC is not synchronised -- and Linux gives no architectural guarantee there, only
+a watchdog that detects trouble and falls back.
+In short: MV-RLU does Spanner's commit-wait WITHOUT Spanner's monitored
+uncertainty bound.  TrueTime's window comes from a live monitored time service;
+ORDO's comes from a benchmark someone ran once.
+=> DEFAULT TO gclk FOR THIS TREE'S NUMBERS.  gclk needs no calibrated constant,
+   so it is what an honest deployability comparison measures.  Note also the
+   benchmark-fairness trap in ordo: because the writer spins ~2x the boundary
+   per commit, whatever safety margin we pick DIRECTLY MOVES MV-RLU's write
+   throughput -- a number we would then have to defend.  gclk has no such knob.
+   To be fair to MV-RLU: the ALGORITHM does not require ORDO.  gclk is a plain
+   global atomic counter and ORDO is purely an optimisation to decontend it.
+   A sampled (node-granular) sweep is the WORST option: it underestimates, which
+   is the unsafe direction.  If the ordo arm is ever wanted, run the FULL 192-core
+   sweep (~18 h, see tools/ordo/ordo_sweep.py), pad the result, and report it as
+   a best-case ceiling rather than a deployable configuration.
+
+TWO BUILD VARIANTS (upstream's lib/Makefile CONF= knob, reproduced with -D):
+  ordo (upstream default, -DMVRLU_ORDO_TIMESTAMPING) -- timestamps from RDTSCP
+       plus the ORDO uncertainty boundary; this is the configuration the ASPLOS
+       paper evaluates and the one that avoids a contended global clock.
+       REQUIRES a per-host __ORDO_BOUNDARY.  The vendored 1214 is upstream's
+       Intel value and is NOT valid for our 2x EPYC 9654 -- measure it with
+       upstream tools/ordo (not vendored) and pass -D__ORDO_BOUNDARY=<n> before
+       reporting any ordo-variant number.
+  gclk (CONF=gclk, no -DMVRLU_ORDO_TIMESTAMPING) -- a single global atomic
+       clock advanced with fetch-and-add.  No machine-specific constant, so it
+       is the honest out-of-the-box floor, but it reintroduces exactly the
+       central-clock contention ORDO exists to remove.
+
+BUILD STATUS (2026-07-26, this tree, gcc on 2x EPYC 9654 / 192 cores):
+  Both variants compile clean from the vendored files alone -- libmvrlu-ordo.a
+  and libmvrlu-gclk.a -- with two benign upstream warnings
+  (-Waddress-of-packed-member at mvrlu.c:625 and :918).
+WIRED 2026-07-26 as the bench_list_scale engine `mvrlu_list`:
+  src/bench_mvrlu_list.{c,h}  -- the engine, in its OWN translation unit because
+      mvrlu.h's RLU compatibility wrapper (mvrlu.h:144-172) redefines every RLU_*
+      macro AND typedefs rlu_thread_data_t, so it cannot share a TU with rlu.h.
+      The macros could be #undef'd; the typedef could not.  The engine mirrors
+      rlu_write()/rlu_read() operation for operation -- same lock order (prev,
+      cur, succ on delete; pos, succ on insert), same abort-and-retry, same
+      forward+backward traversal and sortedness validation -- so the two schemes
+      meet on identical ground.
+  Makefile  -- MVRLU_CONF selects the clock; DEFAULT gclk, for the reasons above.
+      MVRLU_CONF=ordo is a hard $(error) unless MVRLU_ORDO_BOUNDARY=<cycles> is
+      also given, so nobody can accidentally build against upstream's Intel 1214.
+  No point_reset hook (MV-RLU has no fixed thread-id registry to rewind, unlike
+      RLU); no write_random hook (no MV-RLU arm for the transacted-index mode).
+
+*** QP-THREAD PLACEMENT IS WORTH ~7x -- ROOT-CAUSED 2026-07-26 ***
+mvrlu_init() spawns the background QP (quiescence/reclaim) thread through
+port_create_thread(), which is a bare pthread_create with NO affinity
+(lib/port-user.h:205).  It inherits its creator's mask.  This harness leaves
+main unpinned (0-383) while hwloc pins every WORKER to one PU per physical
+core, so the reclaim thread was the ONE thread nobody placed -- free to wander
+a 2-socket / 24-NUMA-node / 384-PU machine while remotely touching the writer's
+512 KB log.  Observed directly: writer pinned on core 0 at 103% CPU, QP thread
+running on PSR 378, a different socket.
+  single writer, 10000/200, 3 s x 5, write Mops:
+    unconfined            1.20 1.73 1.14 1.03 1.99   <- BIMODAL, ~7x spread
+    writer's NUMA node    8.34 8.81 8.85 8.79 8.66   <- tight
+    core 0 + SMT sibling  7.42 7.72 7.65 7.72 7.57   <- tight
+Leaving it unpinned is a handicap NO OTHER ENGINE HERE SUFFERS (liburcu's
+per-CPU call_rcu workers are placed; every worker is pinned).  FIXED in
+src/bench_mvrlu_list.c: the harness confines its own affinity across
+mvrlu_init() so the QP thread inherits it, then restores.  Default is the NUMA
+node of CPU 0 (auto-detected, e.g. "0-7,192-199"); BENCH_MVRLU_QP_CPUS
+overrides with an explicit list, or "free" for upstream's floating behaviour.
+NOT papered over: MV-RLU has exactly ONE global QP thread BY DESIGN, so at high
+writer counts it is a genuine central bottleneck that no placement fixes.  That
+belongs in any write-scaling result as a property of the algorithm.
+
+NUMBERS (2026-07-26, gclk, JEMALLOC=1, LIST_SIZE=10000 CHURN=200, 3 s,
+2x EPYC 9654, QP thread confined as above; self-check passes fwd+rev, ZERO
+coherence violations throughout):
+  1 writer, 0 readers : 8.72 Mops (8.73/8.71/8.72 -- tight)
+  1 writer + 1 reader : writer 2.17 Mops, reads  282 Mvisits/s
+  1 writer + 2 readers: writer 2.04 Mops, reads  540 Mvisits/s
+  1 writer + 4 readers: writer 2.30 Mops, reads 1131 Mvisits/s
+  Same config for context: txn_sw 7.85 / rlu_sync 19.03 / rlu_defer 19.76 Mops
+  at 0 readers; at 1 reader txn_sw 7.12 (765 Mvisits) and rlu_defer 2.49 (503).
+  So at 0 readers MV-RLU-gclk (8.72) now EXCEEDS txn_sw (7.85), and its reads
+  still run ~2.7x below txn_sw -- qualitatively what P1's Table 1 predicts
+  (>=2 unconditional header loads, no pure-reader bypass, version-chain walk).
+  CAVEAT WHEN REPORTING: gclk is MV-RLU's SLOWER clock; the ASPLOS numbers are
+  ordo.  These are the deployable-configuration numbers, not the paper's, and
+  must be labelled as such.  Do not present them as "MV-RLU's performance"
+  without saying which clock.
+
+  SUPERSEDED -- the first numbers taken on 2026-07-26 (1 writer 0 readers 1.09
+  Mops; 1w+1r 2.58; 1w+8r 0.73) were measured with the QP thread UNPINNED and
+  are invalid.  They also produced an apparent "writer is faster with 1 reader
+  than with none" anomaly, which was purely an artifact of that placement
+  variance: with the QP thread confined the ordering is the expected one
+  (8.72 with no reader, ~2.2 with readers).  Do not cite the old figures.
+
+MEASUREMENT TOOL (tools/ordo/) -- vendored 2026-07-26 so the boundary, if ever
+  measured, is reproducible.  C sources (bench.c/h, config.h, reftable.c,
+  tttable.c, cc.c, membandwidthtable.c, Makefile) are upstream verbatim.  Two
+  local replacements, because upstream's drivers are PYTHON 2 and this host has
+  no python2:
+    gen_cpuseq.py -- py3 port, same algorithm (primary hyperthreads only,
+                     cpu0's package first).  Emits cpuseq.h; run it before
+                     `make o/reftable`.  cpuseq.h is a GENERATED per-host
+                     artifact -- do not commit it.
+    ordo_sweep.py -- py3 replacement for upstream gen_table.py.  Same statistic
+                     (max over pairs of min over both directions), but does NOT
+                     write upstream's per-pair sample dumps: at 192 cores those
+                     are 36672 files x 1e6 lines, ~183 GB of text, whose only
+                     use is the min it computes streamingly.  Adds --cores/
+                     --per-node subsetting and resume-from-CSV.
+  Sizing measured on this host: 1.76 s per direction at upstream's 1000000
+  iters, two directions per pair => full C(192,2)=18336-pair sweep is ~17.9 h.
+  reftable REQUIRES ROOT (sched_setscheduler(SCHED_FIFO) at reftable.c:81,:182;
+  ulimit -r is 0 for the normal user here).
+  NOT RUN.  No boundary has been measured on this machine -- see the analysis
+  above for why gclk is preferred instead.  The 1214 in include/ordo_clock.h
+  remains upstream's Intel value and must not be used for a reported number.
+
+INTEGRATION NOTE: the API maps almost 1:1 onto the RLU shims already in
+src/bench_list_scale.c --
+  RLU_READER_LOCK/UNLOCK -> mvrlu_reader_lock/unlock
+  RLU_DEREF              -> mvrlu_deref
+  RLU_TRY_LOCK           -> _mvrlu_try_lock(self, (void **)&p, sizeof(*p))
+  RLU_ASSIGN_PTR         -> _mvrlu_assign_pointer((void **)&p, v)
+  RLU_ABORT/FREE/ALLOC   -> mvrlu_abort / mvrlu_free / mvrlu_alloc
+  rlu_thread_data_t      -> mvrlu_thread_struct_t
+with mvrlu_init()/mvrlu_thread_alloc()/mvrlu_thread_init() replacing RLU_INIT
+and the per-thread registration.  Objects MUST come from mvrlu_alloc (it
+prepends its own header), exactly as RLU objects must come from RLU_ALLOC.
+Upstream links jemalloc by default (Makefile.inc MEMMGR = -ljemalloc), which
+matches the JEMALLOC=1 config P1's numbers use.
