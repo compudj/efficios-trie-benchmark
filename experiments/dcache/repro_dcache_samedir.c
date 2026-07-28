@@ -65,6 +65,44 @@ static int   g_fired;		/* one-shot: only the first descent blocks */
 static enum dc_result g_walker_res;
 static uint64_t       g_walker_id;
 
+/*
+ * Park on @s WITHOUT stalling grace periods.
+ *
+ * Under QSBR a registered thread counts as being inside a read-side section
+ * until it says otherwise, so a thread that blocks here while online holds off
+ * EVERY grace period process-wide.  When the peer this rendezvous waits for is
+ * itself waiting on a grace period, that is a three-way deadlock: we wait for
+ * the peer, the peer waits for the GP, the GP waits for us.  It presents as an
+ * INTERMITTENT hang, because it turns on whether the parked thread registered
+ * before the GP sampled the registry -- so it reads like one engine's bug
+ * rather than a harness bug affecting every engine.
+ *
+ * No engine here waits on a grace period on the writer side today, so this is
+ * currently a no-op; it is the discipline, not an optimization, and one was
+ * prototyped that did (see the git history).  stress_dcache.c and bench_dcache.c
+ * already carry the same guard on their main thread across pthread_join.
+ *
+ * Gated on was_online because these are state TRANSITIONS, not a nesting count:
+ * forcing a thread offline that was already offline and then back online would
+ * hand the caller a state it did not have.  Same guard liburcu puts on its own
+ * offline dance (urcu-qsbr.c, synchronize_rcu).  No barrier needed -- the
+ * semaphore pair is the ordering here.
+ *
+ * ONLY for threads that hold no RCU-protected reference across the park.  A
+ * walker parked mid-descent must NOT use this: staying inside its read section
+ * is precisely what these repros are testing.
+ */
+static void sem_wait_quiescent(sem_t *s)
+{
+	unsigned long was_online = rcu_read_ongoing();
+
+	if (was_online)
+		rcu_thread_offline();
+	sem_wait(s);
+	if (was_online)
+		rcu_thread_online();
+}
+
 static struct dc_path *path_of(struct dc_path *p, const char *s)
 {
 	if (dc_path_parse(p, s) != 0) {
@@ -98,7 +136,7 @@ static void *writer_fn(void *arg)
 
 	(void) arg;
 	dc_register_thread();
-	sem_wait(&g_walker_reached);		/* wait until the walker latched X_B */
+	sem_wait_quiescent(&g_walker_reached);	/* wait until the walker latched X_B */
 	if (dc_rename(g_dc, path_of(&from, "/A/B"), path_of(&to, "/A/B2")) != 0) {
 		fprintf(stderr, "rename /A/B -> /A/B2 (SAME DIR) failed\n");
 		exit(2);
@@ -134,8 +172,16 @@ int main(void)
 
 	pthread_create(&walker, NULL, walker_fn, path_of(&abk, "/A/B/K"));
 	pthread_create(&writer, NULL, writer_fn, NULL);
+	/*
+	 * Main registered with RCU but reports no quiescent state while parked in
+	 * pthread_join, so leaving it online stalls EVERY grace period process-
+	 * wide -- and any writer that waits on one then deadlocks against us.
+	 * Same guard stress_dcache.c and bench_dcache.c already carry.
+	 */
+	rcu_thread_offline();
 	pthread_join(walker, NULL);
 	pthread_join(writer, NULL);
+	rcu_thread_online();
 
 	dc_test_walk_hook = NULL;
 

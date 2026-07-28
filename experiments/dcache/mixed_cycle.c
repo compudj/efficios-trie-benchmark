@@ -233,12 +233,20 @@ int main(int argc, char **argv)
 		pthread_create(&rt[i], NULL, renamer, &idx[i]);
 		pthread_create(&et[i], NULL, exchanger, &idx[i]);
 	}
+	/*
+	 * Main registered with RCU but reports no quiescent state while parked in
+	 * pthread_join, so leaving it online stalls EVERY grace period process-
+	 * wide -- and any writer that waits on one then deadlocks against us.
+	 * Same guard stress_dcache.c and bench_dcache.c already carry.
+	 */
+	rcu_thread_offline();
 	for (i = 0; i < NPAIR; i++) {
 		pthread_join(rt[i], NULL);
 		pthread_join(et[i], NULL);
 	}
 	g_stop = 1;
 	pthread_join(chk, NULL);
+	rcu_thread_online();
 
 	for (i = 0; i < NPAIR; i++)
 		if (!reachable_now(i)) {
