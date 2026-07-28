@@ -51,6 +51,17 @@ set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 ARMS=${ARMS:-$REPO/arms-p2}
 JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+# ALLOCATOR CONFIG.  jemalloc alone is not the configuration this harness wants:
+# the engine's per-CPU descriptor slab and liburcu's reclaim both assume a node
+# freed on CPU X returns to the pool CPU X allocates from, which is what
+# percpu_arena:phycpu gives.  The 2026-07-28 capture preloaded jemalloc with its
+# DEFAULT arena policy, so the descriptor alloc/free path crossed arenas at 192
+# writers.  Both arms did it equally, so the A/B ratio stands -- but the absolute
+# Mmoves/s were understated and the two P2 measurements disagreed on setup.
+export MALLOC_CONF=${MALLOC_CONF:-percpu_arena:phycpu}
+[ -r "$JE" ] || { echo "ERROR: jemalloc not readable at $JE" >&2; exit 2; }
+LD_PRELOAD=$JE /bin/true 2>&1 | grep -q "Invalid conf" \
+	&& { echo "ERROR: jemalloc rejected MALLOC_CONF=$MALLOC_CONF" >&2; exit 2; }
 CSV=${CSV:-$REPO/scripts/p2_engine_remeasure.csv}
 DUR=${DUR:-2000}
 RUNS=${RUNS:-5}
