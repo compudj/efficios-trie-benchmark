@@ -3,6 +3,8 @@
 
 # Our liburcu clone on the urcu-txn-dev branch; rebuild with `make urcu-txn`
 /urcu-txn-build/
+/urcu-txn-build-*/
+/arms-p2/
 # TSAN-instrumented liburcu (compiler atomic builtins + -fsanitize=thread), for
 # experiments/dcache stress-tsan; built by copying + reconfiguring urcu-txn-build.
 /urcu-txn-tsan-build/
