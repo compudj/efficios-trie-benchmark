@@ -23,6 +23,16 @@
 # policy, which escalates only a handle that is losing.
 set -u
 
+# ADDRESS-SPACE LAYOUT IS PINNED (setarch -R).  ASLR moves the heap base and
+# changes cache set/way conflicts, which made the sibling list benchmark cleanly
+# BIMODAL (two clusters 19% apart, 20 reps splitting 8/12).  The skiplist panels
+# here are not visibly bimodal -- their worst spread is 2.3% -- but the SERIALIZED
+# lane arm is: at 64 writers its three runs came out 0.0575 / 0.0921 / 0.1266, a
+# 75% spread on the DENOMINATOR of the lane factor, which put that one cell
+# anywhere between ~330x and ~730x.  Every other point in that curve sits within
+# 0-7%.  Pin the layout so the quiet points stay quiet and the noisy one has a
+# chance to settle.
+
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 ARMS=${ARMS:-$REPO/arms-p2}
 JE=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
@@ -49,7 +59,7 @@ for c in $CORES; do
 	b=$((3840 / c))
 	for a in pin-sole pin-serial; do
 		for r in $(seq 1 "$RUNS"); do
-			out=$(LD_PRELOAD=$JE timeout 900 "$ARMS/$a" \
+			out=$(setarch "$(uname -m)" -R env LD_PRELOAD=$JE timeout 900 "$ARMS/$a" \
 				--nupdaters "$c" --nreaders 0 --cpustride 1 \
 				--updatespacing "$(sp "$b")" --duration "$DUR" \
 				--movesper 3 2>/dev/null); rc=$?

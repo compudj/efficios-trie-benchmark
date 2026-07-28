@@ -76,6 +76,23 @@
 # invalidates the point.
 set -u
 
+# ADDRESS-SPACE LAYOUT IS PINNED (setarch -R).  Without it this benchmark is
+# BIMODAL: 20 reps at 16 writers split 8/12 into clusters at ~36.1 and ~43.1
+# Mops/s -- 19% apart with NOTHING in the gap between 36.67 and 42.51 -- because
+# ASLR moves the heap base and changes cache set/way conflicts for the list
+# nodes.  With -R, 12 of 12 land in the upper cluster.
+#
+# That artifact is why the first writer-scaling sweep looked like it had a "dip"
+# at 16 writers: with 3 runs per point the median is decided by which mode wins
+# two of three, and it is a coin toss.  More repetitions do NOT fix a bimodal
+# distribution -- they only measure it more precisely -- so the layout is pinned
+# instead, identically for every arm, which removes a nuisance variable that has
+# nothing to do with the mechanism under test.
+#
+# Disclose it: real deployments run with ASLR on and would see the spread.  What
+# is being measured here is a comparison BETWEEN engines, and for that the
+# layout must be held still rather than resampled per process.
+
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/bench_list_scale
 CSV=${CSV:-$REPO/scripts/p2_writer_scaling.csv}
@@ -129,7 +146,7 @@ point() {
 		# because 2>/dev/null had thrown the evidence away; the absent NUMA line
 		# is what gave it away.  A sweep that cannot say how it was configured is
 		# a sweep whose numbers cannot be defended.
-		out=$(env LD_PRELOAD="$JE" MALLOC_CONF="$MALLOC_CONF_VAL" LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
+		out=$(setarch "$(uname -m)" -R env LD_PRELOAD="$JE" MALLOC_CONF="$MALLOC_CONF_VAL" LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
 			BENCH_WRITESCALE=1 BENCH_FIXED_WRITERS="$w" BENCH_READERS="$rd" \
 			${rnd:+BENCH_RANDOM_POS=1} \
 			timeout 900 "$BIN" "$arm" "$MAXTH" 2>>"$ERRLOG")
