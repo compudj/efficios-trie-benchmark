@@ -105,6 +105,9 @@ MALLOC_CONF_VAL=${MALLOC_CONF_VAL:-percpu_arena:phycpu}
 LD_PRELOAD=$JE MALLOC_CONF=$MALLOC_CONF_VAL /bin/true 2>&1 | grep -q "Invalid conf" \
 	&& { echo "ERROR: jemalloc rejected MALLOC_CONF=$MALLOC_CONF_VAL" >&2; exit 2; }
 
+ERRLOG=${ERRLOG:-${CSV%.csv}.stderr.log}
+: > "$ERRLOG"
+
 fail=0
 echo "sweep,arm,writers,readers,rate_per_writer,total_target,list_size,churn,run,write_mops,read_mvisits,violations,status" > "$CSV"
 
@@ -115,10 +118,18 @@ for w in $WRITERS; do
 	ch=$((64 * w)); ls=$((2 * ch))
 	for arm in $ARMS; do
 		for r in $(seq 1 "$RUNS"); do
-			out=$(env LD_PRELOAD="$JE" MALLOC_CONF="$MALLOC_CONF_VAL" LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
+			# Keep the binary's stderr.  It carries the harness's own diagnostics --
+		# "hwloc topology load failed; identity CPU pinning", "NUMA: interleaving
+		# allocations across all nodes", the reclaim-domain line -- and discarding
+		# it makes those unfalsifiable after the fact.  On 2026-07-28 a check for
+		# hwloc failures across three sweeps returned zero hits and meant NOTHING,
+		# because 2>/dev/null had thrown the evidence away; the absent NUMA line
+		# is what gave it away.  A sweep that cannot say how it was configured is
+		# a sweep whose numbers cannot be defended.
+		out=$(env LD_PRELOAD="$JE" MALLOC_CONF="$MALLOC_CONF_VAL" LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
 				BENCH_WRITESCALE=1 BENCH_FIXED_WRITERS="$w" \
 				BENCH_READERS="$READERS" BENCH_WRITE_RATE="$rate" \
-				timeout 900 "$BIN" "$arm" "$MAXTH" 2>/dev/null)
+				timeout 900 "$BIN" "$arm" "$MAXTH" 2>>"$ERRLOG")
 			line=$(grep -v '^#' <<< "$out" | awk 'NF>=4' | tail -1)
 			if [ -z "$line" ]; then
 				echo "!! D/$arm w=$w run=$r NO OUTPUT" >&2; fail=1

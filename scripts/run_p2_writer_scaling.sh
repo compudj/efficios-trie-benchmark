@@ -105,22 +105,40 @@ MALLOC_CONF_VAL=${MALLOC_CONF_VAL:-percpu_arena:phycpu}
 LD_PRELOAD=$JE MALLOC_CONF=$MALLOC_CONF_VAL /bin/true 2>&1 | grep -q "Invalid conf" \
 	&& { echo "ERROR: jemalloc rejected MALLOC_CONF=$MALLOC_CONF_VAL" >&2; exit 2; }
 
+ERRLOG=${ERRLOG:-${CSV%.csv}.stderr.log}
+: > "$ERRLOG"
+
 fail=0
 
 # point <sweep> <arm> <writers> <list_size> <churn> <random?> <readers>
 point() {
 	local sweep=$1 arm=$2 w=$3 ls=$4 ch=$5 rnd=$6 rd=${7:-0} r out line mops mvis viol
 	for r in $(seq 1 "$RUNS"); do
+		# 1-minute load average sampled just before the run.  The machine is
+		# shared as of 2026-07-28, and a sweep cannot tell afterwards whether a
+		# slow point was the facility or somebody else's job: the sweep-A curve
+		# came out BIMODAL at 16 and 64 writers (36/36/43 and 104/133/134 across
+		# three runs, where neighbouring points span 2%) and external load could
+		# not be ruled out because nothing recorded it.  Record it.
+		la=$(cut -d' ' -f1 /proc/loadavg)
+		# Keep the binary's stderr.  It carries the harness's own diagnostics --
+		# "hwloc topology load failed; identity CPU pinning", "NUMA: interleaving
+		# allocations across all nodes", the reclaim-domain line -- and discarding
+		# it makes those unfalsifiable after the fact.  On 2026-07-28 a check for
+		# hwloc failures across three sweeps returned zero hits and meant NOTHING,
+		# because 2>/dev/null had thrown the evidence away; the absent NUMA line
+		# is what gave it away.  A sweep that cannot say how it was configured is
+		# a sweep whose numbers cannot be defended.
 		out=$(env LD_PRELOAD="$JE" MALLOC_CONF="$MALLOC_CONF_VAL" LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
 			BENCH_WRITESCALE=1 BENCH_FIXED_WRITERS="$w" BENCH_READERS="$rd" \
 			${rnd:+BENCH_RANDOM_POS=1} \
-			timeout 900 "$BIN" "$arm" "$MAXTH" 2>/dev/null)
+			timeout 900 "$BIN" "$arm" "$MAXTH" 2>>"$ERRLOG")
 		# harness prints: writers read_mvisits write_mops violations
 		line=$(grep -v '^#' <<< "$out" | awk 'NF>=4' | tail -1)
 		if [ -z "$line" ]; then
 			echo "!! $sweep/$arm w=$w run=$r NO OUTPUT" >&2
 			fail=1
-			echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,,,,NOOUT" >> "$CSV"
+			echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,,,,$la,NOOUT" >> "$CSV"
 			continue
 		fi
 		mvis=$(awk '{print $2}' <<< "$line")
@@ -129,16 +147,16 @@ point() {
 		if [ "${viol:-1}" != "0" ]; then
 			echo "!! $sweep/$arm w=$w run=$r VIOLATIONS=$viol" >&2
 			fail=1
-			echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,$mops,$mvis,$viol,VIOLATION" >> "$CSV"
+			echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,$mops,$mvis,$viol,$la,VIOLATION" >> "$CSV"
 			continue
 		fi
-		echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,$mops,$mvis,$viol,ok" >> "$CSV"
+		echo "$sweep,$arm,$w,$rd,$ls,$ch,$r,$mops,$mvis,$viol,$la,ok" >> "$CSV"
 		printf "  %-10s %-12s w=%-4s r=%-3s run=%s  wr=%-10s rd=%s\n" \
 			"$sweep" "$arm" "$w" "$rd" "$r" "$mops" "$mvis" >&2
 	done
 }
 
-echo "sweep,arm,writers,readers,list_size,churn,run,write_mops,read_mvisits,violations,status" > "$CSV"
+echo "sweep,arm,writers,readers,list_size,churn,run,write_mops,read_mvisits,violations,loadavg,status" > "$CSV"
 
 echo ">> A: scaling, disjoint -- CHURN = 64 x writers (constant room per writer)" >&2
 for w in $WRITERS; do
