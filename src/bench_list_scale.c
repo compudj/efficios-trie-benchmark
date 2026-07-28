@@ -578,13 +578,88 @@ static inline uint64_t xorshift64(uint64_t *s)
  * Permanent per-slot churn nodes (recycled in place: safe under the
  * engine's mutual exclusion, and type-stable for the seqlock readers).
  * ════════════════════════════════════════════════════════════════ */
+/*
+ * ── Cacheline isolation for list nodes ──────────────────────────────────
+ *
+ * The writer sweeps claim the writers are DISJOINT: writer wid owns churn slots
+ * wid, wid+nw, ..., each sitting after a unique stable anchor, and the harness
+ * refuses to run when CHURN < writers.  That disjointness was true of the SLOTS
+ * and false of the CACHE LINES.
+ *
+ * The stable nodes live in a dense packed arena and the anchor stride is
+ * LIST_SIZE / CHURN, which is 2 in the writer-scaling sweep.  At 24 bytes per
+ * node that put writer 0's anchor at byte 0, writer 1's at 48 and writer 2's at
+ * 96 -- so writer 0 and writer 1 shared the first 64-byte line, writer 1 and
+ * writer 2 the second, and so on down the list.  Linking a churn node WRITES the
+ * anchor's next pointer, so every writer was ping-ponging a line with both of
+ * its neighbours while the benchmark reported it as isolated work.
+ *
+ * That is also the likeliest source of the ASLR bimodality: the arena's base
+ * alignment decided how the 24-byte nodes straddled the 64-byte lines, so a
+ * different heap base gave a systematically different amount of false sharing
+ * (~19% apart, two clean modes).
+ *
+ * So: every node type used by the list engines is aligned to a cache line and
+ * allocated on one.  Set LIST_NODE_ALIGN=0 to restore the packed layout, which
+ * is worth doing deliberately -- the difference between the two IS the false
+ * sharing, and it is the only way to size what the old numbers were measuring.
+ *
+ * Cost, stated because it is not free: a node grows from 24 bytes to 64, so the
+ * list's memory footprint and the READER's working set grow ~2.7x.  For a
+ * writer-isolation sweep that is the right trade.  For reader numbers it changes
+ * the absolute level -- equally for every arm, so comparisons hold, but a reader
+ * figure must not be compared across the two settings.
+ */
+#ifndef LIST_NODE_ALIGN
+#define LIST_NODE_ALIGN 64
+#endif
+#if LIST_NODE_ALIGN > 0
+#define LIST_NODE_ALIGNED __attribute__((aligned(LIST_NODE_ALIGN)))
+#else
+#define LIST_NODE_ALIGNED
+#endif
+
+/* One node, on its own cache line (zeroed, like the calloc it replaces). */
+static inline void *node_alloc(size_t sz)
+{
+#if LIST_NODE_ALIGN > 0
+	void *p = NULL;
+
+	if (posix_memalign(&p, LIST_NODE_ALIGN, sz) != 0)
+		return NULL;
+	memset(p, 0, sz);
+	return p;
+#else
+	return calloc(1, sz);
+#endif
+}
+
+/*
+ * An arena of @n nodes.  The BASE must be aligned too: an aligned struct in a
+ * malloc'd array still straddles lines if the array itself starts at a 16-byte
+ * boundary, which is the whole bug above.
+ */
+static inline void *node_arena(size_t n, size_t sz)
+{
+#if LIST_NODE_ALIGN > 0
+	void *p = NULL;
+
+	if (posix_memalign(&p, LIST_NODE_ALIGN, n * sz) != 0)
+		return NULL;
+	memset(p, 0, n * sz);
+	return p;
+#else
+	return calloc(n, sz);
+#endif
+}
+
 struct pnode { struct pnode *next, *prev; int key;
 #ifdef LIST_PNODE_PAD
 	/* Controlled test: fatten the plain node to the RCU node's size so the
 	 * read working set matches, isolating the rcu_head cache-footprint effect. */
 	char _pad[LIST_PNODE_PAD];
 #endif
-};
+} LIST_NODE_ALIGNED;
 
 static struct pnode  g_phead;
 static struct pnode **g_pstable;	/* [LIST_SIZE] */
@@ -597,7 +672,7 @@ static void plain_build(void)
 	g_phead.next = g_phead.prev = &g_phead;
 	g_pstable = calloc(LIST_SIZE, sizeof(*g_pstable));
 	for (i = 0; i < LIST_SIZE; i++) {
-		struct pnode *n = calloc(1, sizeof(*n));
+		struct pnode *n = node_alloc(sizeof(*n));
 		n->key = 2 * i;
 		n->prev = g_phead.prev;		/* append at tail */
 		n->next = &g_phead;
@@ -607,7 +682,7 @@ static void plain_build(void)
 	}
 	g_pchurn = calloc(CHURN, sizeof(*g_pchurn));
 	for (j = 0; j < CHURN; j++) {
-		struct pnode *n = calloc(1, sizeof(*n));
+		struct pnode *n = node_alloc(sizeof(*n));
 		n->key = 2 * g_anchor[j] + 1;
 		g_pchurn[j] = n;		/* not linked yet */
 	}
@@ -844,7 +919,7 @@ struct su_elem {
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
-};
+} LIST_NODE_ALIGNED;
 static struct urcu_txn_sw_list_head g_su_head =
 		URCU_TXN_SW_LIST_HEAD_INIT(g_su_head);
 static struct su_elem **g_su_stable;
@@ -878,13 +953,13 @@ static void su_build(void)
 	urcu_txn_sw_list_init(&g_su_head);
 	g_su_stable = calloc(LIST_SIZE, sizeof(*g_su_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
-	struct su_elem *arena = calloc(LIST_SIZE, sizeof(struct su_elem));
+	struct su_elem *arena = node_arena(LIST_SIZE, sizeof(struct su_elem));
 #endif
 	for (i = 0; i < LIST_SIZE; i++) {
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 		struct su_elem *e = &arena[i];	/* dense, packed */
 #else
-		struct su_elem *e = calloc(1, sizeof(*e));
+		struct su_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * i;
 		if (urcu_txn_sw_list_add_tail_rcu(&e->node, &g_su_head))
@@ -970,9 +1045,9 @@ static void su_write(int slot)
 		int a = g_anchor[slot];
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 		struct su_elem *e = g_pcpu_alloc ?
-			(struct su_elem *) pcpu_slab_alloc(g_slab) : malloc(sizeof(*e));
+			(struct su_elem *) pcpu_slab_alloc(g_slab) : node_alloc(sizeof(*e));
 #else
-		struct su_elem *e = malloc(sizeof(*e));
+		struct su_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * a + 1;
 		if (urcu_txn_sw_list_add_after_rcu(&e->node, &g_su_stable[a]->node))
@@ -991,7 +1066,7 @@ struct lf_elem {
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
-};
+} LIST_NODE_ALIGNED;
 static struct urcu_txn_list_head g_lf_head;
 static struct urcu_txn_domain g_lf_dom;	/* one escalation domain for the list */
 static struct lf_elem **g_lf_stable;
@@ -1057,13 +1132,13 @@ static void lf_build(void)
 	urcu_txn_domain_init(&g_lf_dom);
 	g_lf_stable = calloc(LIST_SIZE, sizeof(*g_lf_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
-	struct lf_elem *arena = calloc(LIST_SIZE, sizeof(struct lf_elem));
+	struct lf_elem *arena = node_arena(LIST_SIZE, sizeof(struct lf_elem));
 #endif
 	for (i = 0; i < LIST_SIZE; i++) {
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 		struct lf_elem *e = &arena[i];	/* dense, packed */
 #else
-		struct lf_elem *e = calloc(1, sizeof(*e));
+		struct lf_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * i;
 		if (urcu_txn_list_add_tail_rcu(&e->node, &g_lf_head, &g_lf_dom))
@@ -1134,9 +1209,9 @@ static void lf_write(int slot)
 		int a = g_anchor[slot], r;
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 		struct lf_elem *e = g_pcpu_alloc ?
-				(struct lf_elem *) pcpu_slab_alloc(g_slab) : malloc(sizeof(*e));
+				(struct lf_elem *) pcpu_slab_alloc(g_slab) : node_alloc(sizeof(*e));
 #else
-		struct lf_elem *e = malloc(sizeof(*e));
+		struct lf_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * a + 1;
 		rcu_read_lock();
@@ -1424,7 +1499,7 @@ struct rl_elem {
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
-};
+} LIST_NODE_ALIGNED;
 static struct cds_list_head g_rl_head = CDS_LIST_HEAD_INIT(g_rl_head);
 static struct rl_elem **g_rl_stable;
 static struct rl_elem **g_rl_churn;
@@ -1452,13 +1527,13 @@ static void rl_build(void)
 	CDS_INIT_LIST_HEAD(&g_rl_head);
 	g_rl_stable = calloc(LIST_SIZE, sizeof(*g_rl_stable));
 #ifndef LIST_RCU_INLINE_RCU_HEAD
-	struct rl_elem *arena = calloc(LIST_SIZE, sizeof(struct rl_elem));
+	struct rl_elem *arena = node_arena(LIST_SIZE, sizeof(struct rl_elem));
 #endif
 	for (i = 0; i < LIST_SIZE; i++) {
 #ifndef LIST_RCU_INLINE_RCU_HEAD
 		struct rl_elem *e = &arena[i];	/* dense, packed */
 #else
-		struct rl_elem *e = calloc(1, sizeof(*e));
+		struct rl_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * i;
 		cds_list_add_tail_rcu(&e->list, &g_rl_head);
@@ -1535,7 +1610,7 @@ static void rl_write(int slot)
 		g_present[slot] = 0;
 	} else {
 		int a = g_anchor[slot];
-		struct rl_elem *e = malloc(sizeof(*e));
+		struct rl_elem *e = node_alloc(sizeof(*e));
 		e->key = 2 * a + 1;
 		cds_list_add_rcu(&e->list, &g_rl_stable[a]->list);  /* after anchor */
 		g_rl_churn[slot] = e;
