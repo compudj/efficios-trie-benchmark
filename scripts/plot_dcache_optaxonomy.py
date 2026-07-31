@@ -36,13 +36,21 @@ OUT = os.environ.get("OUT",
                                   "dcache_optaxonomy.png"))
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000",
+         # the bucketlock engine's three chain strategies: greys off the shipped
+         # arm's black, so a reader groups them by eye as one engine.
+         "bucketlock-chainlock": "#7F7F7F", "bucketlock-swmw": "#4D4D4D",
+         "bucketlock-swmw-pad": "#B0B0B0"}
 ELAB = {"seqlock": "seqlock (kernel baseline)",
         "txn-global": "txn — GLOBAL rename_gen (a seqcount)",
         "txn-pernode": "txn — PER-NODE host gen",
         "txn-mark": "txn — deletion MARK",
-        "bucketlock": "bucket lock + SW txn"}
-ORDER = ("seqlock", "txn-global", "txn-pernode", "txn-mark", "bucketlock")
+        "bucketlock": "bucket lock — FOLD LOCK chain (shipped, 176 B)",
+        "bucketlock-chainlock": "bucket lock — CHAIN LOCK (legacy, 176 B)",
+        "bucketlock-swmw": "bucket lock — all-MW chain (168 B)",
+        "bucketlock-swmw-pad": "bucket lock — all-MW chain, padded (176 B ctl)"}
+ORDER = ("seqlock", "txn-global", "txn-pernode", "txn-mark", "bucketlock",
+         "bucketlock-chainlock", "bucketlock-swmw", "bucketlock-swmw-pad")
 
 # (panel, op) -> x label.  Only the taxonomy's FILE row is plotted on the leaf
 # side; the directory-leaf rows stay in the CSV (they are empty-directory ops,
@@ -62,23 +70,30 @@ for r in rows:
         continue
     val[(r["panel"], r["op"])][r["engine"]] = (float(r["mlookups_s"]),
                                                float(r["mrenames_s"]))
-engines = [e for e in ORDER if any(e in v for v in val.values())]
-
 fig, axes = plt.subplots(2, 2, figsize=(15.5, 9.0))
+handles = {}                                 # label -> bar handle, for one legend
 for col, (panel, ops, title) in enumerate((
         ("leaf", LEAF_OPS, "Leaf operations — bench_dcache (file leaves)"),
         ("dir", DIR_OPS, "Directory operations — bench_dcache_height"))):
     present = [(op, lab) for op, lab in ops if (panel, op) in val]
+    # Per-PANEL engine list: a panel re-run with a wider engine set than the
+    # other must not paint the absent engines as zero-height bars, which reads
+    # as "measured zero" rather than "not measured".
+    engines = [e for e in ORDER
+               if any(e in val[(panel, op)] for op, _ in present)]
     x = np.arange(len(present))
     w = 0.8 / max(len(engines), 1)
     for row, (metric, ylab) in enumerate(((1, "writer  Mrenames/s"),
                                           (0, "reader  Mlookups/s"))):
         ax = axes[row][col]
         for i, e in enumerate(engines):
-            ys = [val[(panel, op)].get(e, (0.0, 0.0))[metric] for op, _ in present]
-            ax.bar(x + i * w - 0.4 + w / 2, ys, w, color=COLOR[e],
-                   edgecolor="white", linewidth=0.6,
-                   label=ELAB[e] if (row == 0 and col == 0) else None)
+            # nan (not 0) for an op an engine has no OK row for -- a dropped
+            # run must leave a gap, never a bar that reads as a measurement.
+            ys = [val[(panel, op)].get(e, (np.nan, np.nan))[metric]
+                  for op, _ in present]
+            b = ax.bar(x + i * w - 0.4 + w / 2, ys, w, color=COLOR[e],
+                       edgecolor="white", linewidth=0.6)
+            handles.setdefault(ELAB[e], b)
         ax.set_xticks(x)
         ax.set_xticklabels([lab for _, lab in present], fontsize=9)
         ax.set_ylabel(ylab)
@@ -90,7 +105,9 @@ for col, (panel, ops, title) in enumerate((
 
 fig.suptitle("dcache op taxonomy: all four mutating operations, per engine",
              fontsize=13)
-fig.legend(loc="lower center", ncol=len(engines), frameon=False, fontsize=9)
+fig.legend([handles[k] for k in handles], list(handles),
+           loc="lower center", ncol=min(len(handles), 4), frameon=False,
+           fontsize=9)
 fig.tight_layout(rect=(0, 0.05, 1, 0.96))
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 fig.savefig(OUT, dpi=140)
