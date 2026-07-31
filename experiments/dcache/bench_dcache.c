@@ -16,12 +16,40 @@
  *
  * Each of `nthreads` workers runs the SAME mix (README "locked decision": one
  * homogeneous worker kind, not split reader/writer pools).  Per op it rolls the
- * dice: with probability `rename-frac` it RENAMES one of the leaves it OWNS to a
- * different d{k} (a slice of those are RENAME_EXCHANGEs between two of its own
- * leaves), otherwise it LOOKS UP a random full leaf path.  Every leaf id is owned
- * by exactly one worker, so a leaf is always reachable at exactly the path its
+ * dice: with probability `rename-frac` it MUTATES one of the leaves it OWNS,
+ * otherwise it LOOKS UP a random full leaf path.  Every leaf id is owned by
+ * exactly one worker, so a leaf is always reachable at exactly the path its
  * owner last recorded -- which is what makes the end-of-run conservation census
  * exact even though renames ran wide open.
+ *
+ * Which mutation -- the op taxonomy (--op-mix)
+ * -------------------------------------------
+ * The four mutating ops are a 2x2 of {file|directory} x {same-dir|cross-dir}:
+ * *rename* (same-dir file), *file move* (cross-dir file), *directory rename*
+ * (same-dir dir), *directory move* (cross-dir dir).  The two axes ARE the two
+ * code branches: same-vs-cross gates the O(depth) ancestry cycle-check, the
+ * d_moving lock and the reparent store; file-vs-dir sets how many reader walks
+ * the relocation invalidates.  This bench owns the LEAF axis -- its leaf type is
+ * a build switch (-DDC_BENCH_FILE_LEAVES) and its leaves have no children, so it
+ * covers `rename` and `file move`; the subtree cells belong to
+ * bench_dcache_height, which moves nodes that dominate B^H leaves.
+ *
+ * --op-mix rename=A,move=B,exchange=C weights the leaf ops (default 0/7/1, the
+ * historical hardcoded mix, whose RNG stream it reproduces exactly):
+ *   move      cross-dir: name kept, moved to a different d{k}.  Runs the whole
+ *             cross_parent branch.
+ *   rename    SAME-dir: the token flips between its two reserved names L{g} and
+ *             M{g} inside its current d{k}.  Skips the cross_parent branch
+ *             entirely -- and it is the most common op in a real filesystem,
+ *             which is why leaving it unmeasured was a coverage gap.
+ *   exchange  RENAME_EXCHANGE of two of the owner's tokens (two shells, one
+ *             commit).
+ * Two names per token is what keeps the census exact under same-dir renames: a
+ * name-slot is a permutation only if the op moves a name between FIXED slots,
+ * so each token gets a private pair and a rename is a flip between them.  The
+ * alternate qstr table is allocated whenever --op-mix is passed (even at
+ * rename=0) so every point of an op-mix sweep carries the same harness
+ * footprint, and the legacy default allocates nothing new.
  *
  * Headline metric: Mlookups/s and Mrenames/s over the same wall-clock, charted
  * against rename fraction (fixed cores) and against cores (fixed fraction).  The
@@ -36,6 +64,7 @@
  * fast one (same discipline as bench_txn_3skiplist).
  *
  * Usage: bench_dcache [--nthreads N] [--rename-frac F] [--writers K] [--readdir]
+ *                     [--op-mix rename=A,move=B,exchange=C]
  *                     [--ndirs N] [--depth N] [--leaves N] [--duration MS]
  *                     [--cpustride N] [--cpulist c0,c1,...] [--nbuckets N]
  */
@@ -119,11 +148,24 @@ static volatile uint64_t g_pollute_sink;
  * artifact, equal for every engine, and -- because it runs concurrently with the
  * descent's memory stalls -- it HIDES the per-lookup cache-footprint difference
  * the layout A/B is trying to measure (see simplification-s4.md §5).  So it is
- * the DEFAULT; --no-precomp restores the legacy per-lookup snprintf.  (The
- * leaf-qstr table is itself a co-footprint, identical for every binary.)
+ * the DEFAULT; --no-precomp restores the legacy per-lookup snprintf.  The
+ * leaf-qstr table is itself a co-footprint -- identical for every binary EXCEPT
+ * the mark arm, whose wider DC_NAME_MAX widens `struct qstr` and so both this
+ * table and every per-component path copy.  That is the matched-width control's
+ * whole subject; see dcache.h's DC_NAME_PAD.
  */
 static int precomp = 1;
 static struct qstr *g_prefix_q, *g_dir_q, *g_leaf_q;
+/*
+ * Alternate leaf-name table ("M{g}" against g_leaf_q's "L{g}"), the second half
+ * of each token's private name pair -- see the op-taxonomy note in the header.
+ * Allocated iff --op-mix was passed, so the legacy default's harness footprint
+ * (and the reader's qstr working set, which is NOT free -- see dcache.h's
+ * DC_NAME_PAD note) is byte-for-byte what it always was.
+ */
+static struct qstr *g_leaf_q_alt;
+static int    g_two_names  = 0;		/* 1 => tokens have an L/M name pair */
+static uint64_t g_alt_mask = 0;		/* 1 when g_two_names, else 0 (branchless) */
 /*
  * Ops between QSBR quiescent-state announcements (dc_quiescent()).  Tunable via
  * --quiesce (power of two).  Default 16: the per-op cost of the quiescent smp_mb
@@ -156,6 +198,67 @@ static int    g_nnames     = 0;		/* effective leaf namespace size */
 static unsigned int rename_thr;		/* rename_frac scaled into [0,1<<20) */
 #define FRAC_ONE (1u << 20)
 
+/*
+ * Leaf op mix, as cumulative thresholds over one FRAC_ONE die: [0,exch_thr) =
+ * RENAME_EXCHANGE, [exch_thr,samedir_thr) = same-dir rename, the rest = cross-dir
+ * move.  The defaults are the historical hardcoded mix: 1/8 exchange, no same-dir
+ * rename.
+ *
+ * The draw order below (j0 first, then the op die) is the historical one too, and
+ * an unmixed run consumes the same draws in the same order as the published runs
+ * -- so the stream stays ALIGNED and no later decision is shifted.  The predicate
+ * reads different bits of that die than the old `(xrand & 7) == 0` did, so which
+ * individual ops fire differs; what is preserved is the distribution and the
+ * alignment, not the exact op sequence.
+ */
+static unsigned int exch_thr    = FRAC_ONE / 8;
+static unsigned int samedir_thr = FRAC_ONE / 8;	/* == exch_thr => zero rename */
+
+/* Parse `rename=A,move=B,exchange=C` (any subset; unnamed keys are an error). */
+static void parse_op_mix(const char *s)
+{
+	double w[3] = { 0.0, 0.0, 0.0 };		/* rename, move, exchange */
+	double sum;
+
+	while (*s) {
+		const char *eq = strchr(s, '=');
+		int which;
+		char *end;
+
+		if (!eq)
+			goto bad;
+		if (!strncmp(s, "rename", (size_t) (eq - s)) && eq - s == 6)
+			which = 0;
+		else if (!strncmp(s, "move", (size_t) (eq - s)) && eq - s == 4)
+			which = 1;
+		else if (!strncmp(s, "exchange", (size_t) (eq - s)) && eq - s == 8)
+			which = 2;
+		else
+			goto bad;
+		w[which] = strtod(eq + 1, &end);
+		if (end == eq + 1 || w[which] < 0.0)
+			goto bad;
+		s = end;
+		while (*s == ',' || *s == ' ')
+			s++;
+	}
+	sum = w[0] + w[1] + w[2];
+	if (sum <= 0.0)
+		goto bad;
+	exch_thr = (unsigned int) (w[2] / sum * (double) FRAC_ONE + 0.5);
+	samedir_thr = exch_thr +
+		(unsigned int) (w[0] / sum * (double) FRAC_ONE + 0.5);
+	if (samedir_thr > FRAC_ONE)
+		samedir_thr = FRAC_ONE;
+	g_two_names = 1;
+	g_alt_mask = 1;
+	return;
+bad:
+	fprintf(stderr, "--op-mix wants rename=A,move=B,exchange=C "
+		"(non-negative weights, at least one positive)\n");
+	exit(2);
+}
+
 static struct dcache *g_dc;
 /*
  * The namespace is tracked as a PERMUTATION over fixed name-slots (a plain
@@ -165,6 +268,7 @@ static struct dcache *g_dc;
  * it.  Both are a permutation of the seed, so the census stays exact.
  */
 static int      *g_final_dir;		/* [nthreads*leaves] final dir per name */
+static int      *g_final_alt;		/* [nthreads*leaves] final L/M pick per token */
 static uint64_t *g_final_id;		/* [nthreads*leaves] final id per name */
 /*
  * Address-identity builds (dc_lookup_id_is_address): each leaf's content-host
@@ -238,8 +342,13 @@ static inline uint64_t xrand(uint64_t *s)
 
 /* ---- path construction -------------------------------------------------- */
 
-/* Build the full leaf path /p0/../d{dir}/L{gid} into p. */
-static void mk_leaf_path(struct dc_path *p, int dir, int gid)
+/*
+ * Build the full leaf path /p0/../d{dir}/{L|M}{gid} into p.  @alt picks which of
+ * the token's two reserved names to use (0 = L, the seeded one; 1 = M, its
+ * same-dir rename partner).  Both spellings are the same length, so the two
+ * names cost the walk exactly the same compare.
+ */
+static void mk_leaf_path_alt(struct dc_path *p, int dir, int gid, int alt)
 {
 	int i;
 
@@ -250,7 +359,7 @@ static void mk_leaf_path(struct dc_path *p, int dir, int gid)
 		for (i = 0; i < g_prefix_len; i++)
 			p->comp[p->ndepth++] = g_prefix_q[i];
 		p->comp[p->ndepth++] = g_dir_q[dir];
-		p->comp[p->ndepth++] = g_leaf_q[gid];
+		p->comp[p->ndepth++] = alt ? g_leaf_q_alt[gid] : g_leaf_q[gid];
 		return;
 	}
 	for (i = 0; i < g_prefix_len; i++)
@@ -260,9 +369,15 @@ static void mk_leaf_path(struct dc_path *p, int dir, int gid)
 
 		snprintf(buf, sizeof(buf), "d%d", dir);
 		dc_path_push(p, buf);
-		snprintf(buf, sizeof(buf), "L%d", gid);
+		snprintf(buf, sizeof(buf), "%c%d", alt ? 'M' : 'L', gid);
 		dc_path_push(p, buf);
 	}
+}
+
+/* Build the full leaf path at the token's seeded name L{gid}. */
+static void mk_leaf_path(struct dc_path *p, int dir, int gid)
+{
+	mk_leaf_path_alt(p, dir, gid, 0);
 }
 
 /* Prebuild the path component qstrs for --precomp (once, after build_tree). */
@@ -284,6 +399,13 @@ static void build_qstr_tables(void)
 	for (i = 0; i < g_nnames; i++) {
 		snprintf(buf, sizeof(buf), "L%d", i);
 		dc_qstr_init(&g_leaf_q[i], buf);
+	}
+	if (g_two_names) {
+		g_leaf_q_alt = calloc((size_t) g_nnames, sizeof(*g_leaf_q_alt));
+		for (i = 0; i < g_nnames; i++) {
+			snprintf(buf, sizeof(buf), "M%d", i);
+			dc_qstr_init(&g_leaf_q_alt[i], buf);
+		}
 	}
 }
 
@@ -307,8 +429,9 @@ struct warg {
 	int cpu;
 	long long nlookups;	/* lookups, or readdir calls in --readdir mode */
 	long long ndirents;	/* children enumerated (--readdir mode) */
-	long long nrenames;	/* successful renames + exchanges */
+	long long nrenames;	/* successful mutations of every kind */
 	long long nexch;
+	long long nsamedir;	/* of those, same-dir renames (--op-mix rename=) */
 	long long lk_wrong;	/* POSITIVE hit whose id left its owner's range */
 	long long errs;		/* single-owner rename/exchange failures */
 };
@@ -317,12 +440,15 @@ static void *worker(void *arg)
 {
 	struct warg *me = arg;
 	int total = g_nnames;
-	/* Per name-token j (the leaf named L{base+j}): dir[j] = the dir it lives
-	 * in; who[j] = the id currently carrying that name.  A plain rename moves
-	 * dir[j]; a RENAME_EXCHANGE swaps who[] between two tokens (the ids trade
-	 * names).  This owner is the sole writer of its tokens, so both stay a
+	/* Per name-token j (the leaf seeded as L{base+j}): dir[j] = the dir it
+	 * lives in; alt[j] = which of its two reserved names it currently wears
+	 * (0 = L, 1 = M); who[j] = the id currently carrying that name.  A file
+	 * move changes dir[j]; a same-dir rename flips alt[j]; a RENAME_EXCHANGE
+	 * swaps who[] between two tokens (the ids trade names, the names stay).
+	 * This owner is the sole writer of its tokens, so all three stay a
 	 * deterministic permutation of the seed for the end-of-run census. */
 	int *dir = calloc(leaves, sizeof(*dir));
+	int *alt = calloc(leaves, sizeof(*alt));
 	uint64_t *who = calloc(leaves, sizeof(*who));
 	size_t pbytes = (size_t) pollute_kb * 1024;
 	volatile unsigned char *pbuf = pollute ? malloc(pbytes) : NULL;
@@ -378,13 +504,15 @@ static void *worker(void *arg)
 
 		if (do_rename) {
 			int j0 = (int) (xrand(&s) % (uint64_t) leaves);
+			unsigned int die = (unsigned int)
+				(xrand(&s) & (uint64_t) (FRAC_ONE - 1));
 			int j1 = -1;
 
-			/* A slice of moves are RENAME_EXCHANGEs of two of my own
-			 * tokens: the two ids trade names in one commit (the
+			/* [0,exch_thr): RENAME_EXCHANGE of two of my own tokens
+			 * -- the two ids trade names in one commit (the
 			 * two-shells-in-one-commit path).  Both names always
 			 * exist, so a single owner never fails. */
-			if (leaves >= 2 && (xrand(&s) & 7) == 0) {
+			if (leaves >= 2 && die < exch_thr) {
 				j1 = (int) (xrand(&s) % (uint64_t) leaves);
 				if (j1 == j0)
 					j1 = (j1 + 1) % leaves;
@@ -393,27 +521,50 @@ static void *worker(void *arg)
 			if (j1 >= 0) {
 				struct dc_path a, b;
 
-				mk_leaf_path(&a, dir[j0], base + j0);
-				mk_leaf_path(&b, dir[j1], base + j1);
+				mk_leaf_path_alt(&a, dir[j0], base + j0, alt[j0]);
+				mk_leaf_path_alt(&b, dir[j1], base + j1, alt[j1]);
 				if (dc_rename_exchange(g_dc, &a, &b) == 0) {
 					uint64_t t = who[j0];
 					who[j0] = who[j1]; who[j1] = t;
+					/* the NAMES stay put; the ids trade, so
+					 * each token keeps its own dir/alt. */
 					me->nrenames++;
 					me->nexch++;
 				} else {
 					me->errs++;
 				}
+			} else if (die < samedir_thr) {
+				/* RENAME (same-dir file): flip this token between
+				 * its two private names inside its CURRENT dir.
+				 * Same parent on both sides, so the engine takes
+				 * none of the cross_parent branch -- no ancestry
+				 * cycle check, no d_moving lock, no reparent, one
+				 * child head instead of two.  The partner name is
+				 * reserved for this token and this thread owns it,
+				 * so -EEXIST/-ENOENT cannot happen. */
+				struct dc_path from, to;
+
+				mk_leaf_path_alt(&from, dir[j0], base + j0, alt[j0]);
+				mk_leaf_path_alt(&to, dir[j0], base + j0, !alt[j0]);
+				if (dc_rename(g_dc, &from, &to) == 0) {
+					alt[j0] = !alt[j0];
+					me->nrenames++;
+					me->nsamedir++;
+				} else {
+					me->errs++;
+				}
 			} else {
-				/* Plain rename: move name L{base+j0} to a new dir
-				 * (its target dir is empty of that name, so no
-				 * -EEXIST; a single owner never sees -ENOENT). */
+				/* FILE MOVE (cross-dir): move this token's current
+				 * name to a new dir (its target dir is empty of
+				 * that name, so no -EEXIST; a single owner never
+				 * sees -ENOENT). */
 				struct dc_path from, to;
 				int nd = (int) (xrand(&s) % (uint64_t) ndirs);
 
 				if (nd == dir[j0])
 					nd = (nd + 1) % ndirs;
-				mk_leaf_path(&from, dir[j0], base + j0);
-				mk_leaf_path(&to, nd, base + j0);
+				mk_leaf_path_alt(&from, dir[j0], base + j0, alt[j0]);
+				mk_leaf_path_alt(&to, nd, base + j0, alt[j0]);
 				if (dc_rename(g_dc, &from, &to) == 0) {
 					dir[j0] = nd;
 					me->nrenames++;
@@ -450,12 +601,22 @@ static void *worker(void *arg)
 			 * address), so it relies on the census + the exact post-run
 			 * g_leaf_addr[g_final_id] check below. */
 			int g = (int) (xrand(&s) % (uint64_t) total);
-			int dr = (int) (xrand(&s) % (uint64_t) ndirs);
+			uint64_t r = xrand(&s);
+			int dr = (int) (r % (uint64_t) ndirs);
+			/* Which of the token's two names to ask for.  Taken from
+			 * a HIGH bit of the dir draw rather than a fresh one: an
+			 * extra xrand on the reader's hot loop is exactly the
+			 * harness ALU that hid the 1-CL layout win once already.
+			 * g_alt_mask is 0 unless --op-mix, so a legacy run asks
+			 * for L{g} and consumes the identical RNG stream.  Asking
+			 * for both names keeps the reader's hit rate independent
+			 * of the rename weight (a renamed token wears M). */
+			int ra = (int) ((r >> 40) & g_alt_mask);
 			int owner_base = (g / leaves) * leaves;
 			struct dc_path p;
 			uint64_t id = ~0ULL;
 
-			mk_leaf_path(&p, dr, g);
+			mk_leaf_path_alt(&p, dr, g, ra);
 			if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
 			    !id_is_address() &&
 			    (id < (uint64_t) owner_base ||
@@ -481,9 +642,10 @@ static void *worker(void *arg)
 	if (owns)
 		for (i = 0; i < leaves; i++) {
 			g_final_dir[base + i] = dir[i];
+			g_final_alt[base + i] = alt[i];
 			g_final_id[base + i] = who[i];
 		}
-	free(dir); free(who);
+	free(dir); free(alt); free(who);
 	dc_unregister_thread();
 	if (crdp) {
 		set_thread_call_rcu_data(NULL);
@@ -594,6 +756,12 @@ static void usage(const char *p)
 	    "  --readdir       => (split mode) readers enumerate a random dir instead\n"
 	    "                     of a leaf lookup; only writers own the namespace so\n"
 	    "                     dir size is fixed as readers scale.\n"
+	    "  --op-mix rename=A,move=B,exchange=C\n"
+	    "                  => weight the leaf ops of the taxonomy.  `rename` is\n"
+	    "                     SAME-dir (the token flips between its two reserved\n"
+	    "                     names), so it skips the cross_parent branch --\n"
+	    "                     ancestry cycle check, d_moving lock, reparent -- that\n"
+	    "                     `move` runs.  Default 0/7/1 == the historical mix.\n"
 	    "  --quiesce N     => announce a QSBR quiescent state every N ops (power\n"
 	    "                     of two, default 16); coarser trades a little smp_mb\n"
 	    "                     tax for longer GPs -- a net LOSS for the GP-bound\n"
@@ -612,7 +780,7 @@ int main(int argc, char **argv)
 	pthread_t *tid;
 	struct warg *wa;
 	struct census c;
-	long long t0, t1, total_lk = 0, total_rn = 0, total_ex = 0;
+	long long t0, t1, total_lk = 0, total_rn = 0, total_ex = 0, total_sd = 0;
 	long long total_wrong = 0, total_err = 0, total_dirents = 0;
 	unsigned long retries0 = 0, retries1 = 0;
 	double secs, mlk_s, mrn_s, mdir_s;
@@ -634,6 +802,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--no-precomp"))  precomp = 0;
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
+		else if (!strcmp(argv[i], "--op-mix"))      parse_op_mix(argv[++i]);
 		else if (!strcmp(argv[i], "--quiesce")) {
 			int q = atoi(argv[++i]);
 			if (q < 1 || (q & (q - 1)) != 0) {
@@ -669,9 +838,21 @@ int main(int argc, char **argv)
 	rcu_register_thread();
 	g_dc = dc_create(nbuckets);
 	g_final_dir = calloc(total, sizeof(*g_final_dir));
+	g_final_alt = calloc(total, sizeof(*g_final_alt));
 	g_final_id = calloc(total, sizeof(*g_final_id));
 
 	printf("== bench_dcache (engine: %s) ==\n", dc_engine_name());
+	if (g_two_names)
+		printf("op-mix: exchange=%.4f same-dir-rename=%.4f cross-dir-move=%.4f "
+		       "(leaf type: %s)\n",
+		       (double) exch_thr / FRAC_ONE,
+		       (double) (samedir_thr - exch_thr) / FRAC_ONE,
+		       (double) (FRAC_ONE - samedir_thr) / FRAC_ONE,
+#ifdef DC_BENCH_FILE_LEAVES
+		       "file");
+#else
+		       "directory");
+#endif
 	if (nwriters >= 0)
 		printf("threads=%d SPLIT(writers=%d readers=%d) reader-op=%s ndirs=%d "
 		       "depth=%d leaves/thr=%d duration_ms=%ld total_leaves=%d "
@@ -739,6 +920,7 @@ int main(int argc, char **argv)
 		total_lk    += wa[i].nlookups;
 		total_rn    += wa[i].nrenames;
 		total_ex    += wa[i].nexch;
+		total_sd    += wa[i].nsamedir;
 		total_wrong += wa[i].lk_wrong;
 		total_err   += wa[i].errs;
 		total_dirents += wa[i].ndirents;
@@ -770,7 +952,7 @@ int main(int argc, char **argv)
 
 		if (c.seen[i] != 1)
 			anomaly++;		/* id i missing or duplicated */
-		mk_leaf_path(&p, g_final_dir[i], i);
+		mk_leaf_path_alt(&p, g_final_dir[i], i, g_final_alt[i]);
 		/* presence always; then the exact identity: name L{i} is finally
 		 * carried by id g_final_id[i], whose host address is the seed-time
 		 * g_leaf_addr[g_final_id[i]] (a host keeps its id, address-stable).
@@ -792,8 +974,13 @@ int main(int argc, char **argv)
 		printf("READDIR dirents: %lld  Mdirents/s: %g  children/readdir~%g\n",
 		       total_dirents, mdir_s,
 		       total_lk ? (double) total_dirents / (double) total_lk : 0.0);
-	printf("RENAME  renames: %lld  exchanges: %lld  Mrenames/s: %g  errors: %lld\n",
-	       total_rn, total_ex, mrn_s, total_err);
+	/* renames = every mutation; the breakdown names the taxonomy cells --
+	 * same-dir = `rename`, exchange = the two-shell commit, and the balance
+	 * (renames - same-dir - exchanges) = cross-dir `file move`. */
+	printf("RENAME  renames: %lld  exchanges: %lld  same-dir: %lld  "
+	       "cross-dir: %lld  Mrenames/s: %g  errors: %lld\n",
+	       total_rn, total_ex, total_sd, total_rn - total_ex - total_sd,
+	       mrn_s, total_err);
 	printf("OPS     Mops/s: %g\n",
 	       secs > 0 ? (double) (total_lk + total_rn) / secs / 1e6 : 0.0);
 	if (&dc_seq_walk_retries) {
@@ -816,7 +1003,7 @@ int main(int argc, char **argv)
 	free(c.seen);
 	free(tid); free(wa);
 	dc_destroy(g_dc);
-	free(g_final_dir); free(g_final_id); free(g_leaf_addr);
+	free(g_final_dir); free(g_final_alt); free(g_final_id); free(g_leaf_addr);
 	rcu_unregister_thread();
 	return anomaly ? 1 : 0;
 }
