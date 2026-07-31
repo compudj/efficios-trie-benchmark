@@ -286,25 +286,64 @@ items here are the ones that actually fired in this experiment):
 
 ## 6. Open items
 
-- **Coverage gaps** (`dcache-rename-taxonomy`): no perf bench for the
-  same-dir *rename* — the most common real op — nor for one-way *directory
-  move*; `bench_dcache` hardcodes cross-dir file moves.  Close with an
-  `--op-mix` parameterization.
-- **Mark-arm figures**: `DC_NAME_MAX` differs by arm (32 default / 40
-  mark), so published S3/S4 tables are not apples-to-apples against the
-  mark arm; any writeup mixing them needs a resweep at matched width.
+- **Coverage gaps** (`dcache-rename-taxonomy`) — *harness landed, sweep not yet
+  run*.  All four cells now have a bench.  `bench_dcache --op-mix
+  rename=A,move=B,exchange=C` adds same-dir **rename**: each token owns a
+  private name pair and a rename flips between them, which is what keeps the
+  conservation census a permutation.  `bench_dcache_height --op` adds one-way
+  **directory rename** and **directory move** beside the two exchange arms.
+  The one-way arms move a *spare* subtree parked under reserved names no digit
+  path spells: a one-way op in a complete tree needs a free name, a free name is
+  a hole, and a hole costs `B^(H-D)` of reader walks — 0.4% at H=0 but 50% at
+  H=D-1 — where an absent walk terminates early and would make the reader metric
+  silently cheaper as the swept variable climbs.  So the two groups price
+  different things by construction: the exchange arms keep the moved subtree on
+  reader paths and price the `B^H` invalidation, the one-way arms price the op
+  itself.  Sweep: `scripts/run_dcache_optaxonomy.sh` →
+  `figures/dcache_optaxonomy.png`.
+- **Mark-arm figures** — *control landed, sweep not yet run*, and the mechanism
+  turned out not to be the one recorded.  The **dentry** is not where the arms
+  differ: measured, `sizeof(dentry)` is 168 (176 bucketlock) and `d_hash` is at
+  @56 on the mark arm and on every other txn arm, so the Makefile's standing
+  claim holds.  `struct qstr` is shared with `struct dc_path`, though, so
+  `DC_NAME_MAX` also sets the **harness path object**: `sizeof(dc_path)` 964 →
+  1156 B, a 48- instead of 40-byte struct copy per path component, and a 20%
+  bigger precomputed leaf-qstr table — all on the reader's hot path, none of it
+  the mechanism under test, and all of it running *against* the mark arm (so the
+  published mark reader numbers are, if anything, conservative).  Note this also
+  contradicts the "the leaf-qstr table is a co-footprint, identical for every
+  binary" aside in `bench_dcache.c`: it is identical for every binary *except*
+  the mark arm.  Two controls, since one knob moves two things:
+  `-DDC_NAME_MAX=32 -DDC_NAME_PAD=8` leaves the dentry byte-identical and
+  matches only the harness path (the arm to publish alongside), `-DDC_NAME_MAX=32`
+  alone also shrinks the dentry 8 B and moves `d_hash` to @48.  Sweep:
+  `scripts/run_dcache_namewidth.sh` → `figures/dcache_namewidth.png`; `make
+  namectl` builds the arms.  A control landing on the shipped curve retires this
+  caveat with evidence.
 - **Phase 2 (negative dentries)**: `stack_shell` must copy pos/neg into the
   shell (today every node is born positive, so top==host coincidentally);
   this is a recorded dependency of the `d_iparent`-race fix.
 - **Phase 3 (LRU/shrinker)**: `design/dcache-lru-txn.md`; the mixed SW/MW
   commit is the enabler (SW-owned index + MW-shared LRU head in one commit).
-- **Standing hazard**: the fold TRANSFER's 40-byte plain `d_iname` copy is
-  guarded only by the comment-enforced "no reader reads a non-top node's
-  name" invariant — twice the only thing between the fold and a data race.
-  Any new reader path must be checked against it.
-- **Weak-memory validation**: per-hop ordering costs, the move-gate
-  negative, and the mark/pernode reader brackets are x86-validated only;
-  ARM/POWER runs are needed before kernel-facing ordering claims.
+- **Standing hazard** — *closed, now machine-checked*.  The fold TRANSFER's
+  plain `d_iname` copy was guarded only by the comment-enforced "no reader reads
+  a non-top node's name" invariant.  `-DDC_DEBUG_NAME_GUARD` makes the invariant
+  say so out loud: the TRANSFER brackets its copy in a per-node odd/even counter
+  and every reader-side name access validates it — a seqlock used as a detector
+  rather than a retry loop, so an overlap aborts naming the node, and it cannot
+  false-positive.  It beats relying on TSAN here because it fires in the ASan
+  and plain stress builds, which run orders of magnitude more folds per second.
+  `make check-nameguard` gates it, and gates it *both ways*:
+  `-DDC_DEBUG_NAME_GUARD_MUTATE` points the bucket-scan match at the host's name
+  — the realistic shape of the mistake — and that build MUST abort.  Worth
+  recording that the first placement of the mutation was **vacuous**: it only
+  touched `dc_readdir`'s callback copy, which `bench_dcache` calls with
+  `fn == NULL`, so the mutated line was dead code and the passing run proved
+  nothing.  Rule 4.3 fired on the test for rule 4.3.
+- **Weak-memory validation** — *still blocked, no non-x86 hardware available*.
+  Per-hop ordering costs, the move-gate negative, and the mark/pernode reader
+  brackets are x86-validated only; ARM/POWER runs are needed before any
+  kernel-facing ordering claim, and until then the claims stay scoped to x86.
 - **Kernel-facing next step**: map the bucketlock engine onto the kernel's
   `hlist_bl` (the mechanism is already shape-compatible), with the shell /
   fold machinery as the `__d_move` replacement and the mark as the
@@ -320,7 +359,7 @@ items here are the ones that actually fired in this experiment):
 | Simplification & invariant-surface analysis, LOC, 1-CL | `simplification-s4.md` |
 | Engines | `dcache_seqlock.c`, `dcache_txn.c`, `dcache_bucketlock.c` |
 | Vendored kernel rwsem (exact-fair dir-lock arm) | `krwsem/` |
-| Validation gates | `make check[-mark|-pernode|-bucketlock*][-tsan]`, `stress*`, `repro*`, `mixed_cycle` |
+| Validation gates | `make check[-mark|-pernode|-bucketlock*][-tsan]`, `check-nameguard`, `stress*`, `repro*`, `mixed_cycle` |
 | Sweeps / plots | `scripts/run_dcache*.sh`, `scripts/plot_dcache*.py` |
-| Figures | `figures/dcache_{s3,readdir,readdir_churn,churn,churn_scaling,height,optype,swmw}.png`, `figures/perf_dcache_*` |
+| Figures | `figures/dcache_{s3,readdir,readdir_churn,churn,churn_scaling,height,optype,optaxonomy,namewidth,swmw}.png`, `figures/perf_dcache_*` |
 | Hybrid-engine design notes | `design/dcache-dlm-sw.md`, `design/mixed-sw-mw-txn.md`, `design/dcache-lru-txn.md` |
