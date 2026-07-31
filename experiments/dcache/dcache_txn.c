@@ -127,6 +127,7 @@ struct dentry {
 						 * DC_HOT1CL: low bits carry host/shell +
 						 * pos/neg tags (see iparent_of()) */
 	struct qstr    d_iname;			/* inline identity: name bytes (match) */
+	DC_DENTRY_NAME_PAD			/* -DDC_NAME_PAD=N: same-size control */
 #if defined(DC_HOT1CL_SPLIT)
 	/*
 	 * SPLIT 1-CL hot line, 64 B all in CL0.  d_hash straddles so next@56 stays

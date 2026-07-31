@@ -53,12 +53,61 @@
  * A/B.  Note the name budget is a CONSEQUENCE of the mechanism, not an
  * independent knob -- a mechanism that needs a per-node version word costs you
  * those bytes, and that cost is properly attributed to it.
+ *
+ * -DDC_NAME_MAX=N overrides it, for ONE purpose: the MATCHED-WIDTH CONTROL.
+ * Because the mark arm's natural width differs from every other arm's, a
+ * mark-vs-{seqlock,global,per-node} table confounds two changes -- the causality
+ * mechanism AND the name field the mechanism paid for.  Building the mark arm at
+ * the baseline's 32 separates them: mark@32 vs per-node@32 isolates the
+ * mechanism, mark@40 vs mark@32 prices the density the mechanism bought.  The
+ * DEFAULT stays the natural width: the control is a decomposition, not the
+ * shipped configuration, and reporting only mark@32 would hide a real win.
+ * Note the two also differ in node SIZE (mark@32 spends 8 fewer bytes than
+ * mark@40), so the control moves the allocation footprint too -- which is the
+ * point: it is the "is it the mechanism or the struct" question.
  */
+#ifndef DC_NAME_MAX
 #ifdef DC_MARK_GEN
 #define DC_NAME_MAX 40
 #else
 #define DC_NAME_MAX 32
 #endif
+#endif
+
+/*
+ * DC_NAME_PAD=N: dead padding after d_iname, so a narrowed DC_NAME_MAX leaves
+ * the dentry BYTE-IDENTICAL (same sizeof, same d_hash offset) to the arm it is
+ * controlling for.  Same idea as DC_SWMW_PAD.
+ *
+ * It exists because DC_NAME_MAX is not only a dentry knob: `struct qstr` is
+ * shared between the dentry's inline name and `struct dc_path`'s component
+ * array, so the width also sets the HARNESS path object -- measured here:
+ *
+ *   arm                      sizeof(dentry)  d_hash@  sizeof(dc_path)
+ *   txn global / per-node         168          56          964
+ *   txn mark (DC_NAME_MAX 40)     168          56         1156   <- +20% path
+ *   txn mark, NAME_MAX=32         160          48          964
+ *   txn mark, NAME_MAX=32 PAD=8   168          56          964   <- the control
+ *
+ * So the dentry is NOT where the mark arm differs (the Makefile's "sizeof still
+ * 168, d_hash still @56" holds) -- `struct dc_path` is: a 20% bigger per-lookup
+ * stack object, a 48-byte instead of 40-byte struct copy per path component,
+ * and a 20% bigger precomputed leaf-qstr table.  All three sit on the reader's
+ * hot path and none of them are the mechanism under test, which is what makes a
+ * mark-vs-{global,per-node,seqlock} reader table not apples-to-apples.
+ *
+ * Hence two controls, not one:
+ *   NAME_MAX=32 PAD=8  -- dentry identical to the shipped mark arm, harness
+ *                         path matched to the baselines.  Isolates the harness
+ *                         co-footprint; this is the arm to publish alongside.
+ *   NAME_MAX=32        -- both narrowed; prices what the freed 8 bytes buy.
+ */
+#ifdef DC_NAME_PAD
+#define DC_DENTRY_NAME_PAD	char __d_name_pad[DC_NAME_PAD];
+#else
+#define DC_DENTRY_NAME_PAD
+#endif
+
 #define DC_PATH_MAX 24		/* max components below the root */
 
 /*

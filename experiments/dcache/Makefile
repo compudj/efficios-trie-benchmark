@@ -249,10 +249,10 @@ check-churn: churn
 	./bench_dcache_churn_seqlock --writers 6 --readers 6 --duration 1500
 
 # Localized walk causality with NO counter: the hlist deletion mark is the
-# version, so d_seq is gone and DC_NAME_MAX rises 32 -> 40.  Layout is otherwise
-# identical (d_hash still at @56, sizeof(dentry) still 160), and dc_qstr_eq
-# short-circuits on hash/len, so the wider name array is a capability win rather
-# than a confound for this benchmark's short names.
+# version, so d_seq is gone and DC_NAME_MAX rises 32 -> 40.  The DENTRY is
+# otherwise identical (d_hash still at @56, sizeof(dentry) still 168), and
+# dc_qstr_eq short-circuits on hash/len, so the wider name array costs the MATCH
+# nothing -- but see the w32 control below for what it does cost.
 bench_dcache_txn_mark: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
