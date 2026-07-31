@@ -202,8 +202,24 @@ absence produced a wrong conclusion at least once.
    same-dir interior rename.  Mutation-test the mechanism (sed out the
    cycle reject → the harness must wedge; inject a deliberate race → TSAN
    must fire), and audit bench coverage against the op taxonomy (the 2×2
-   rename / file move / directory rename / directory move table — two cells
-   still have no perf bench).
+   rename / file move / directory rename / directory move table — all four
+   cells now have a perf number; see §6).
+
+   **This rule has now fired three times, twice on tests written to satisfy
+   it.**  (a) The name-guard mutation first sat in `dc_readdir`'s callback
+   copy, which `bench_dcache` calls with `fn == NULL` — dead code, so the
+   mutated build passed and proved nothing.  (b) The name-width sweep's
+   readdir panel called `dc_readdir(…, NULL, NULL)` too, and
+   `fn == NULL` *only counts*: no `qstr` is ever materialized, so a panel
+   whose entire subject was per-dirent name width could not have detected a
+   width no matter how large.  It duly reported "no effect" (ratio 1.001)
+   and that null was an artifact.  Both were caught by asking *what would
+   have to execute for this to be able to fail*, not by reading the result.
+   The generalisation is sharper than "mutation-test the mechanism":
+   **a benchmark whose subject is a cost must be shown to pay that cost** —
+   print the evidence (`--readdir-names` now reports `READDIR names: 1` and
+   a non-zero name sink) and have the sweep *assert* on it, so the vacuous
+   configuration aborts instead of publishing a null.
 
 4. **Isolate the path under test.**  Homogeneous mixes are writer-bound
    (a rename ≈ 50× a lookup) and mask reader effects — role-split
@@ -218,6 +234,15 @@ absence produced a wrong conclusion at least once.
    artifact).  Per-op counters (instructions, L1d/LLC misses) are the
    robust observable when absolute throughput is pinning-sensitive; on a
    loaded box, interleave A/B runs instead of running arms sequentially.
+   **Know which column is noisy before quoting a ratio from it.**  In the
+   role-split configuration only 8 of 192 threads are writers, and the
+   writer column's run-to-run spread is correspondingly wide: repeating one
+   `txn-pernode` measurement 3× gave same-dir/cross-dir ratios of 1.19,
+   0.79 and 0.97 — best-of-5 each.  The reader column at the same points is
+   stable to a few percent.  A ratio built from two noisy writer numbers
+   inherits both spreads, so quote it only after repeating the whole
+   measurement, and prefer "no effect resolvable above noise" to a number
+   the sweep cannot support.
 
 6. **Sanitizer discipline.**  TSAN requires the compiler-atomic-builtins
    liburcu (else phantom races *and* missed real ones).  A TSAN-clean run
@@ -286,8 +311,8 @@ items here are the ones that actually fired in this experiment):
 
 ## 6. Open items
 
-- **Coverage gaps** (`dcache-rename-taxonomy`) — *harness landed, sweep not yet
-  run*.  All four cells now have a bench.  `bench_dcache --op-mix
+- **Coverage gaps** (`dcache-rename-taxonomy`) — *closed: all four cells now have
+  a number* (result block below).  `bench_dcache --op-mix
   rename=A,move=B,exchange=C` adds same-dir **rename**: each token owns a
   private name pair and a rename flips between them, which is what keeps the
   conservation census a permutation.  `bench_dcache_height --op` adds one-way
@@ -301,25 +326,116 @@ items here are the ones that actually fired in this experiment):
   reader paths and price the `B^H` invalidation, the one-way arms price the op
   itself.  Sweep: `scripts/run_dcache_optaxonomy.sh` →
   `figures/dcache_optaxonomy.png`.
-- **Mark-arm figures** — *control landed, sweep not yet run*, and the mechanism
-  turned out not to be the one recorded.  The **dentry** is not where the arms
-  differ: measured, `sizeof(dentry)` is 168 (176 bucketlock) and `d_hash` is at
-  @56 on the mark arm and on every other txn arm, so the Makefile's standing
+
+  **Result — leaf panel, file leaves, 8 writers / 184 readers, best-of-5,
+  0 conservation failures.**  Writer Mrenames/s; `rn/mv` is the same-dir-vs-
+  cross-dir ratio, i.e. what the `cross_parent` branch costs (cycle check +
+  `d_moving` lock + reparent + 2nd child head) with no subtree attached:
+
+  | engine | rename | move | exchange | rn/mv |
+  |---|--:|--:|--:|--:|
+  | seqlock | 0.47 | 0.36 | 0.35 | **1.30** |
+  | txn-global | 1.92 | 1.63 | 1.23 | 1.18 |
+  | txn-pernode | 1.90 | 1.98 | 1.21 | ~1.0 ¹ |
+  | txn-mark | 1.85 | 1.88 | 1.11 | ~0.96 ¹ |
+  | bucketlock (fold lock) | 2.74 | 2.34 | 2.17 | 1.17 |
+  | bucketlock-chainlock | 2.10 | 0.88 | 1.62 | **2.38** |
+  | bucketlock-swmw | 2.47 | 1.95 | 1.56 | 1.27 |
+  | bucketlock-swmw-pad | 2.53 | 2.07 | 1.93 | 1.22 |
+
+  ¹ ⚠ **The writer row on the txn arms is noisy — do not read a precise ratio
+  off it, and note these two rows are not single-sweep numbers.**  Repeating the
+  measurement (3× best-of-5) gave rn/mv of 1.19 / 0.79 / 0.97 for `txn-pernode`
+  and 0.99 / 0.95 / 0.95 for `txn-mark`, against a 0.82 outlier for `txn-mark`
+  in one sweep; the two txn rows above are the repeat medians rather than that
+  sweep's row, which is why they disagree with `figures/dcache_optaxonomy.png`
+  (the figure plots the sweep as measured, outlier included).  Only 8 of 192
+  threads are writers, so the writer column carries far more variance than the
+  reader column.  The supportable claim is **"no `cross_parent` cost resolvable
+  above noise on the per-node and mark arms"**, not a number.  seqlock (1.30
+  twice), bucketlock (1.17/1.20) and chainlock reproduced across independent
+  sweeps and can be read as stated.
+
+  Four readings the taxonomy pays for:
+  - **The branch cost tracks how cheap the rest of the write path is.**  Where
+    the write path is a bit-lock (seqlock) the extra cross-dir work is ~30%;
+    where a commit dominates, it disappears into the noise.
+  - **The chain lock is what made cross-dir moves expensive** — `chainlock` is
+    the only arm where `rn/mv` is large (2.38), i.e. its moves cost 2.4× its
+    same-dir renames.  That is the cost the fold-lock default was built to
+    remove, and it removes it (`bucketlock` `rn/mv` 1.17).
+  - **The published "fold lock ≈2.3× the all-MW engine on moves" does not
+    reproduce against the all-MW arm.**  Measured here the fold lock is
+    **1.20× `swmw` on moves and 1.11× on rename** (1.14× / 1.08× against the
+    same-size `swmw-pad` control; the −8 B alone is worth 1.02–1.06×).  The
+    ~2.3× is the **chain-lock** comparison (2.67× on moves), so the headline was
+    almost certainly remembered against the wrong baseline.  The rule this sweep
+    was built to settle still answers cleanly, though: the gap does *not* vanish
+    on the op a filesystem actually issues most (1.11× rename vs 1.20× move), so
+    the ordering stands — at a much smaller magnitude than recorded.
+  - The **global-gen collapse** is now quantified on this panel too: `txn-global`
+    readers fall 1578 → 193 Mlookups/s (8.2×) when leaves are directories and
+    every rename bumps the one global counter, while `txn-pernode` (1655 → 1620)
+    and `txn-mark` (1574 → 1610) are flat.  Same conclusion as §7.1 of
+    `simplification-s4.md`, reached from the op axis instead of the reader axis.
+
+  On the directory panel (`bench_dcache_height`, H=2) the split is the other way
+  round: `bucketlock` wins the writer (2.30 Mrn/s one-way rename) but **loses the
+  reader** to `txn-mark` (851) and `txn-pernode` (933) at 805, and by more on the
+  exchange arms (486 vs 681/645).  The "bucket lock is the winner" shorthand is a
+  writer-side statement; on directory-op reader throughput the mark and per-node
+  arms are ahead.
+- **Mark-arm figures** — *closed: the caveat retires, with evidence.*  The
+  mechanism was not the one originally recorded.  The **dentry** is not where the
+  arms differ: measured, `sizeof(dentry)` is 168 (176 bucketlock) and `d_hash` is
+  at @56 on the mark arm and on every other txn arm, so the Makefile's standing
   claim holds.  `struct qstr` is shared with `struct dc_path`, though, so
   `DC_NAME_MAX` also sets the **harness path object**: `sizeof(dc_path)` 964 →
   1156 B, a 48- instead of 40-byte struct copy per path component, and a 20%
   bigger precomputed leaf-qstr table — all on the reader's hot path, none of it
-  the mechanism under test, and all of it running *against* the mark arm (so the
-  published mark reader numbers are, if anything, conservative).  Note this also
-  contradicts the "the leaf-qstr table is a co-footprint, identical for every
-  binary" aside in `bench_dcache.c`: it is identical for every binary *except*
-  the mark arm.  Two controls, since one knob moves two things:
-  `-DDC_NAME_MAX=32 -DDC_NAME_PAD=8` leaves the dentry byte-identical and
-  matches only the harness path (the arm to publish alongside), `-DDC_NAME_MAX=32`
-  alone also shrinks the dentry 8 B and moves `d_hash` to @48.  Sweep:
+  the mechanism under test, and all of it running *against* the mark arm.  Note
+  this also contradicts the "the leaf-qstr table is a co-footprint, identical for
+  every binary" aside in `bench_dcache.c`: it is identical for every binary
+  *except* the mark arm.  Two controls, since one knob moves two things:
+  `-DDC_NAME_MAX=32 -DDC_NAME_PAD=8` leaves the dentry byte-identical and matches
+  only the harness path (the arm to publish alongside), `-DDC_NAME_MAX=32` alone
+  also shrinks the dentry 8 B and moves `d_hash` to @48.
   `scripts/run_dcache_namewidth.sh` → `figures/dcache_namewidth.png`; `make
-  namectl` builds the arms.  A control landing on the shipped curve retires this
-  caveat with evidence.
+  namectl` builds the arms.
+
+  **Result (245 lookup rows + 49 readdir rows, 7 runs per point, 0 conservation
+  failures).**  The matched control lands on the shipped curve on both panels, so
+  **the width was never a material confound and the caveat retires**:
+
+  | control ÷ shipped | rd=8 | 32 | 64 | 128 | 184 | readdir |
+  |---|--:|--:|--:|--:|--:|--:|
+  | `txn-mark-w32` ÷ `txn-mark` | 1.067 | 1.047 | 1.018 | 1.020 | 1.023 | 0.985 |
+  | `bucketlock-w32` ÷ `bucketlock` | 0.996 | 1.077 | 0.972 | 0.972 | 1.033 | 1.012 |
+
+  Run-to-run spread is 3–18%, and on a common-language effect size
+  (P(control run > shipped run), 7×7 pairs per point) no lookup point clears
+  0.85 consistently — the mark arm leans ≤7% *in its own favour* and bucketlock's
+  sign is mixed.  Since the residual leans against the mark arm, published mark
+  reader numbers stay conservative.
+  ⚠ Two cautions this sweep produced, both worth carrying:
+  1. **The readdir panel was vacuous on its first run** and its "no effect" meant
+     nothing — see the `--readdir-names` item below.  The numbers above are the
+     re-run.  Even non-vacuous, readdir turned out *not* to be the sensitive
+     panel it was predicted to be: building a real `qstr` per dirent costs 15–16%
+     on the txn arms and ~5% on bucketlock, but matching 40-vs-48 bytes inside it
+     is invisible.
+  2. **The shrink is not the control** and must not be read as one.
+     `-DDC_NAME_MAX=32` alone costs **bucketlock 4–11% on lookups** (P=0.00 at
+     three of five reader counts) while being neutral-to-positive on `txn-mark`
+     (+6.8% on readdir, P=1.00).  `pahole` says why: the shipped layout puts
+     `d_hash`@56 so `next`@56 is the last thing in CL0 and `pprev`@64 spills
+     cold — a deliberate straddle the engine comments call out.  The shrink moves
+     `d_hash` to @48, which pulls **`pprev`@56 onto the reader's hot line**, and
+     `pprev` is written by every hlist insert/remove.  Freeing 8 bytes bought a
+     false-sharing surface.  Why `txn-mark` tolerates the same layout change is
+     *not* established here (its hlist updates ride the MW commit and its writer
+     rate is ~1.5× lower); treat the bucketlock mechanism as strongly indicated,
+     not proven.
 - **Phase 2 (negative dentries)**: `stack_shell` must copy pos/neg into the
   shell (today every node is born positive, so top==host coincidentally);
   this is a recorded dependency of the `d_iparent`-race fix.
@@ -339,7 +455,10 @@ items here are the ones that actually fired in this experiment):
   recording that the first placement of the mutation was **vacuous**: it only
   touched `dc_readdir`'s callback copy, which `bench_dcache` calls with
   `fn == NULL`, so the mutated line was dead code and the passing run proved
-  nothing.  Rule 4.3 fired on the test for rule 4.3.
+  nothing.  Rule 4.3 fired on the test for rule 4.3 — and then fired again, the
+  same way, on the name-width sweep's readdir panel (§4.3b).  `fn == NULL` has
+  now produced two false negatives; treat any `dc_readdir` call site in a
+  measurement or a test as suspect until it is shown to pass a real callback.
 - **Weak-memory validation** — *still blocked, no non-x86 hardware available*.
   Per-hop ordering costs, the move-gate negative, and the mark/pernode reader
   brackets are x86-validated only; ARM/POWER runs are needed before any
@@ -360,6 +479,7 @@ items here are the ones that actually fired in this experiment):
 | Engines | `dcache_seqlock.c`, `dcache_txn.c`, `dcache_bucketlock.c` |
 | Vendored kernel rwsem (exact-fair dir-lock arm) | `krwsem/` |
 | Validation gates | `make check[-mark|-pernode|-bucketlock*][-tsan]`, `check-nameguard`, `stress*`, `repro*`, `mixed_cycle` |
+| Non-vacuous readdir (real per-dirent `qstr`) | `bench_dcache_churn --readdir-names`; prints `READDIR names:` + name sink |
 | Sweeps / plots | `scripts/run_dcache*.sh`, `scripts/plot_dcache*.py` |
 | Figures | `figures/dcache_{s3,readdir,readdir_churn,churn,churn_scaling,height,optype,optaxonomy,namewidth,swmw}.png`, `figures/perf_dcache_*` |
 | Hybrid-engine design notes | `design/dcache-dlm-sw.md`, `design/mixed-sw-mw-txn.md`, `design/dcache-lru-txn.md` |

@@ -427,6 +427,51 @@ regressed to ~900 Mops/s; aligned recovers to **~2050**, *above* the pre-regress
 a cacheline-resident hot line is a claim about the *object*, and must be enforced
 at allocation, not inferred from field offsets.
 
+### What the 8 bytes are actually worth — measured, and it is not free (2026-07-31)
+
+§5's budget makes the trade arithmetic: *every causality byte is a name byte*, so
+retiring a causality field hands 8 bytes back to `DC_NAME_MAX` (32 → 40 on the
+mark arm, which has no per-node gen at all). The arithmetic never said what the
+8 bytes are *worth*, and the mark arm's reader tables were carrying an
+unquantified caveat because of it. `scripts/run_dcache_namewidth.sh`
+(→ `figures/dcache_namewidth.png`) prices it with three arms per engine, because
+one knob moves two things at once:
+
+| arm | `d_iname` | `d_hash` | sizeof | reader CL0 |
+|---|---|---|--:|---|
+| shipped (`DC_NAME_MAX=40`) | 8, 48 B | @56 | 176 | `next`@56; `pprev`@64 **cold** |
+| `-DDC_NAME_MAX=32 -DDC_NAME_PAD=8` | 8, 40 B | @56 | 176 | **byte-identical** — the control |
+| `-DDC_NAME_MAX=32` (shrink) | 8, 40 B | @48 | 168 | `next`@48 **+ `pprev`@56 hot** |
+
+(bucketlock shown; `txn-mark` is the same shape at 168/168/160. `pahole`-verified.)
+
+**The control is a null, so the width caveat retires.** Matched to the baselines'
+width, the mark arm moves ≤7% on lookups and 1.5% on readdir — inside a 3–18%
+run-to-run spread, and leaning *in the mark arm's favour*, so the published
+numbers were if anything conservative. The confound was never the dentry at all:
+`struct qstr` is shared with `struct dc_path`, so `DC_NAME_MAX` was really
+setting the *harness* path object (964 → 1156 B per lookup).
+
+**The shrink is a different story, and it is the interesting one.** Actually
+taking the 8 bytes off the dentry costs **bucketlock 4–11% on lookups**
+(P(shrink > shipped) = 0.00 at three of five reader counts) while being
+neutral-to-positive on `txn-mark`. The mechanism is visible in the table above
+and is the same lesson as the alignment subsection one level in: the shipped
+layout deliberately straddles `d_hash` so `next`@56 is the last thing in CL0 and
+`pprev`@64 spills cold. Shrinking the name moves `d_hash` to @48 and pulls
+**`pprev` onto the reader's hot line** — and `pprev` is written by every hlist
+insert/remove in the bucket, so a writer now dirties the line every reader hop
+samples. The 8 "freed" bytes bought a false-sharing surface worth more than the
+name.
+
+So the §5 budget is right that the bytes are fungible, and wrong that they are
+free: *which* 64 bytes end up in CL0 matters more than how many are left over.
+Why `txn-mark` tolerates the identical offset change is not established here —
+its hlist updates ride the MW commit rather than a plain bucket-lock store, and
+its writer rate is ~1.5× lower, both of which would reduce the dirtying rate, but
+neither was isolated. Treat the bucketlock mechanism as strongly indicated, not
+proven.
+
 ## 6. Two invariants the per-node counter rests on
 
 The per-node reader (`-DDC_PER_NODE_GEN`) does something that, stated baldly,
