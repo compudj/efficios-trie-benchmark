@@ -70,7 +70,14 @@ for r in rows:
         continue
     val[(r["panel"], r["op"])][r["engine"]] = (float(r["mlookups_s"]),
                                                float(r["mrenames_s"]))
-fig, axes = plt.subplots(2, 2, figsize=(15.5, 9.0))
+# sharey="row": both panels of a row carry ONE scale, so bar height means the
+# same number left and right.  Without it each subplot auto-scales and a taller
+# directory-panel bar can stand for a smaller throughput than a shorter leaf-panel
+# one -- the columns are different harnesses, but the units are identical and the
+# reader is invited to compare them.  Costs the directory reader panel some
+# vertical resolution (its ceiling is ~half the leaf panel's); that is the honest
+# trade.
+fig, axes = plt.subplots(2, 2, figsize=(15.5, 9.0), sharey="row")
 handles = {}                                 # label -> bar handle, for one legend
 for col, (panel, ops, title) in enumerate((
         ("leaf", LEAF_OPS, "Leaf operations — bench_dcache (file leaves)"),
@@ -96,7 +103,8 @@ for col, (panel, ops, title) in enumerate((
             handles.setdefault(ELAB[e], b)
         ax.set_xticks(x)
         ax.set_xticklabels([lab for _, lab in present], fontsize=9)
-        ax.set_ylabel(ylab)
+        if col == 0:                 # shared row scale -> one label, on the left
+            ax.set_ylabel(ylab)
         ax.set_ylim(bottom=0)
         ax.grid(axis="y", alpha=0.25)
         ax.set_axisbelow(True)
