@@ -32,7 +32,9 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_namewidth.csv
+# Overridable: the header write below TRUNCATES, so a partial-panel re-run must
+# be able to write elsewhere rather than destroy the panel it is not re-running.
+CSV=${CSV:-$REPO/scripts/dcache_namewidth.csv}
 
 WRITERS=${WRITERS:-8}
 NDIRS=$((16 * WRITERS))
@@ -70,6 +72,10 @@ declare -A ADEF=( [txn-mark]="-DDC_MARK_GEN" \
 ARMS=${ARMS:-"txn-pernode txn-mark txn-mark-w32 txn-mark-w32-shrink \
               bucketlock bucketlock-w32 bucketlock-w32-shrink"}
 
+# Which panels to run: both by default.  `NWPANELS=readdir` re-runs only the
+# per-DIRENT panel (49 runs, not 294) -- what the --readdir-names fix needed.
+NWPANELS=${NWPANELS:-"lookup readdir"}
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 field() { grep -oP "$2 \K[0-9.]+" <<< "$1" | head -1; }
@@ -85,7 +91,7 @@ for a in $ARMS; do
   (cd "$BIN" && $CC $CFLAGS ${ADEF[$a]} $INC -DDC_SPLIT_KEEPID -o "$TMP/readdir_$a" \
       bench_dcache_churn.c "${ASRC[$a]}" $LIB) || { echo "build $a churn failed"; exit 1; }
 
-  for rd in $RDPTS; do
+  [[ " $NWPANELS " == *" lookup "* ]] && for rd in $RDPTS; do
     # Every run is recorded, not just the best: the question is whether two arms
     # differ, and that needs the spread, not a max.
     for r in $(seq 1 $RUNS); do
@@ -102,9 +108,17 @@ for a in $ARMS; do
   # so the width is paid per child listed rather than per path component.  The
   # churn harness reports the readdir CALL rate as Mlookups/s and the enumerated
   # -children rate as Mdirents/s; the latter is the one the width should move.
-  for r in $(seq 1 $RUNS); do
+  #
+  # --readdir-names, NOT --readdir: dc_readdir(fn == NULL) only counts and never
+  # materializes a qstr, so plain --readdir cannot see a name width at all and
+  # this panel measured nothing until the callback was passed.  The run asserts
+  # it got the mode it asked for rather than trusting the flag.
+  [[ " $NWPANELS " == *" readdir "* ]] && for r in $(seq 1 $RUNS); do
     out=$(env LD_PRELOAD="$JE" "$TMP/readdir_$a" --writers $WRITERS \
-          --readers "$RMAX" --readdir --duration $DUR $PIN 2>/dev/null)
+          --readers "$RMAX" --readdir-names --duration $DUR $PIN 2>/dev/null)
+    grep -q "READDIR names: 1" <<< "$out" || {
+      echo "FATAL: $a readdir ran WITHOUT the name callback -- the panel would"
+      echo "       be vacuous (see the --readdir-names comment).  Aborting."; exit 1; }
     cons=OK; grep -q "conservation: OK" <<< "$out" || cons=FAIL
     echo "$a,readdir,$RMAX,$WRITERS,$r,$(field "$out" 'Mlookups/s:'),$(field "$out" 'Mdirents/s:'),$cons" >> "$CSV"
   done

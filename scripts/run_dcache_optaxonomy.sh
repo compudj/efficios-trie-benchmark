@@ -36,7 +36,9 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_optaxonomy.csv
+# Overridable so a stability re-measure can write somewhere else instead of
+# overwriting the sweep it is checking (the header write below TRUNCATES).
+CSV=${CSV:-$REPO/scripts/dcache_optaxonomy.csv}
 
 WRITERS=${WRITERS:-8}
 NDIRS=$((16 * WRITERS))
@@ -58,11 +60,32 @@ CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE (set JE=)"; exit 1; }
 
 declare -A EDEF=( [seqlock]="" [txn-global]="" [txn-pernode]="-DDC_PER_NODE_GEN" \
-                  [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" )
+                  [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" \
+                  [bucketlock-chainlock]="-DDC_MARK_GEN -DDC_CHAIN_LOCK" \
+                  [bucketlock-swmw]="-DDC_MARK_GEN -DDC_CHAIN_SWMW" \
+                  [bucketlock-swmw-pad]="-DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_SWMW_PAD" )
 declare -A ESRC=( [seqlock]="dcache_seqlock.c" [txn-global]="dcache_txn.c" \
                   [txn-pernode]="dcache_txn.c" [txn-mark]="dcache_txn.c" \
-                  [bucketlock]="dcache_bucketlock.c" )
-ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock"}
+                  [bucketlock]="dcache_bucketlock.c" \
+                  [bucketlock-chainlock]="dcache_bucketlock.c" \
+                  [bucketlock-swmw]="dcache_bucketlock.c" \
+                  [bucketlock-swmw-pad]="dcache_bucketlock.c" )
+# The three chain strategies of the bucketlock engine are carried so the op
+# taxonomy can price the published "fold lock vs all-MW chain" gap on the op the
+# original measurement never took (same-dir rename) as well as on the cross-dir
+# move it did take:
+#   bucketlock            per-host FOLD LOCK dequeue (the default/shipped arm), 176 B
+#   bucketlock-chainlock  legacy per-host CHAIN LOCK (the A/B baseline), 176 B
+#   bucketlock-swmw       lock-free MW chain via the mixed commit, 168 B
+#   bucketlock-swmw-pad   the MW chain with the retired 8 B restored as dead
+#                         padding -- the SAME-SIZE control, so bucketlock-vs-pad
+#                         isolates the chain MECHANISM and pad-vs-swmw the -8 B.
+# Reading the published gap against `swmw` alone confounds mechanism with size.
+ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock \
+                    bucketlock-chainlock bucketlock-swmw bucketlock-swmw-pad"}
+# Which panels to run.  Both by default; `PANELS=leaf` re-runs only the leaf
+# taxonomy (the panel that prices the cross_parent branch on its own).
+PANELS=${PANELS:-"leaf dir"}
 
 # leaf ops: <label>:<--op-mix spec>.  Pure mixes, so each row is ONE op -- a
 # blended mix would average two branches into one number and hide the split.
@@ -92,7 +115,7 @@ echo "panel,engine,op,leaftype,readers,writers,mlookups_s,mrenames_s,conserved" 
 # without claiming the machine; the sweep itself leaves them at the default.
 RD=${RD:-$((NCORE - WRITERS))}
 HTHREADS=${HTHREADS:-$NCORE}
-for e in $ENGINES; do
+[[ " $PANELS " == *" leaf "* ]] && for e in $ENGINES; do
   for lt in file dir; do
     def=""; [[ "$lt" == file ]] && def="-DDC_BENCH_FILE_LEAVES"
     build "$e" bench_dcache.c "$def" "leaf_$lt"
@@ -119,7 +142,7 @@ done
 # The moved node dominates B^HEIGHT leaves.  exchange-cross and move need two
 # parents at band-depth D-H-1, i.e. HEIGHT <= TREE_DEPTH-2 (the harness rejects
 # the rest rather than silently running the same-dir op).
-for e in $ENGINES; do
+[[ " $PANELS " == *" dir "* ]] && for e in $ENGINES; do
   build "$e" bench_dcache_height.c "" "height"
   for op in $DIR_OPS; do
     best_lk=0 best_rn=0 cons=OK
