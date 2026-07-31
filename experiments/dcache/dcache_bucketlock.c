@@ -198,6 +198,7 @@ struct dentry {
 						 * DC_HOT1CL: low bits carry host/shell +
 						 * pos/neg tags (see iparent_of()) */
 	struct qstr    d_iname;			/* inline identity: name bytes (match) */
+	DC_DENTRY_NAME_GUARD			/* -DDC_DEBUG_NAME_GUARD only */
 	DC_DENTRY_NAME_PAD			/* -DDC_NAME_PAD=N: same-size control */
 #if defined(DC_HOT1CL_SPLIT)
 	/*
@@ -1147,7 +1148,8 @@ static struct dentry *find_top_rcu(struct dcache *dc, struct dentry *parent,
 	for (n = bl_hlist_first_rcu(b); n; n = bl_hlist_next_rcu(n)) {
 		struct dentry *d = hnode_dentry(n);
 
-		if (DC_IPARENT(d) == parent && dc_qstr_eq(&d->d_iname, name))
+		if (DC_IPARENT(d) == parent &&
+		    DC_INAME_EQ(DC_MATCH_NAME_SRC(d), name))
 			return d;
 	}
 	return NULL;
@@ -1173,7 +1175,7 @@ static struct dentry *find_top_raw_rcu(struct dcache *dc, struct dentry *parent,
 		uintptr_t raw = iparent_raw(d);
 
 		if ((struct dentry *) (raw & ~DC_TAG_MASK) == parent &&
-		    dc_qstr_eq(&d->d_iname, name)) {
+		    DC_INAME_EQ(DC_MATCH_NAME_SRC(d), name)) {
 			*raw_out = raw;
 			return d;
 		}
@@ -2006,7 +2008,9 @@ static void fold(struct dcache *dc, struct dentry *n)
 #else
 		m->d_iparent = n->d_iparent;
 #endif
+		DC_NAME_XFER_BEGIN(m);
 		m->d_iname = n->d_iname;
+		DC_NAME_XFER_END(m);
 
 		urcu_txn_sw_init(&txn);
 		bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
@@ -2292,7 +2296,9 @@ static void fold(struct dcache *dc, struct dentry *n)
 #else
 			m->d_iparent = n->d_iparent;
 #endif
+			DC_NAME_XFER_BEGIN(m);
 			m->d_iname = n->d_iname;
+			DC_NAME_XFER_END(m);
 
 			bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
 			bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
@@ -2444,7 +2450,9 @@ static void fold(struct dcache *dc, struct dentry *n)
 #else
 			m->d_iparent = n->d_iparent;
 #endif
+			DC_NAME_XFER_BEGIN(m);
 			m->d_iname = n->d_iname;
+			DC_NAME_XFER_END(m);
 			{
 				struct urcu_txn txn;
 				enum urcu_txn_status st;
@@ -2991,7 +2999,8 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 
 		if (path->ndepth >= DC_PATH_MAX)
 			continue;
-		path->comp[path->ndepth++] = top->d_iname;	/* current name */
+		/* current name, read off the write-once TOP (never a host) */
+		DC_INAME_COPY(&path->comp[path->ndepth++], top);
 		walk_rec(host, path, fn, arg);
 		path->ndepth--;
 	}
@@ -3042,8 +3051,22 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 		struct dentry *top = sib_dentry(n);
 		struct dentry *host = host_of_rcu(top);		/* O(1) */
 
-		if (fn)
+		if (fn) {
+#ifdef DC_DEBUG_NAME_GUARD
+			/* Debug builds copy through the guard (and
+			 * DC_DEBUG_NAME_GUARD_MUTATE aims it at the HOST, the
+			 * deliberate violation that proves the guard fires).
+			 * The shipped path below is untouched: handing out a
+			 * pointer instead of a 48-byte copy is what makes
+			 * readdir cheap, and the readdir panels measure it. */
+			struct qstr nm;
+
+			DC_INAME_COPY(&nm, DC_READDIR_NAME_SRC(top, host));
+			fn(host->d_id, &nm, arg);
+#else
 			fn(host->d_id, &top->d_iname, arg);
+#endif
+		}
 		count++;
 	}
 	rcu_read_unlock();

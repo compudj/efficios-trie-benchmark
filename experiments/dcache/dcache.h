@@ -108,6 +108,44 @@
 #define DC_DENTRY_NAME_PAD
 #endif
 
+/*
+ * -DDC_DEBUG_NAME_GUARD: make the fold TRANSFER's plain d_iname copy checkable.
+ *
+ * The fold's TRANSFER hands a node's identity one hop down the transition chain
+ * with a plain 40/48-byte struct copy into the successor.  It is safe for
+ * exactly one reason: the successor is the UNINDEXED content host at that
+ * moment, and no reader reads a non-top node's name -- match and pos/neg come
+ * off the write-once top.  That reason is an invariant enforced by a comment,
+ * and it is the last thing standing between the fold and a data race; it has
+ * already had to be re-argued twice.  A new reader path that reaches a node by
+ * any route other than an index scan -- d_host, d_fwd, a child pointer -- and
+ * reads its name breaks it silently.
+ *
+ * So make the invariant say so out loud.  The TRANSFER brackets its copy in a
+ * per-node odd/even counter and every reader-side name access validates it, in
+ * the shape of a seqlock used as a detector rather than as a retry loop: an
+ * overlap ABORTS with the offending node.  It cannot false-positive -- the
+ * counter is odd only while a TRANSFER owns that node's name, which by the
+ * invariant no reader may be looking at -- so a fire is a real violation.
+ *
+ * Why not just TSAN: TSAN sees this race only if its shadow cells still hold
+ * the write when the read lands, and the review's own rule 4.6 records that a
+ * TSAN-clean run is non-exhaustive (this engine's d_iparent race survived one).
+ * The guard is deterministic given an overlap, and it runs in the ASan and
+ * plain stress builds, which execute orders of magnitude more folds per second
+ * than a TSAN build does.
+ *
+ * -DDC_DEBUG_NAME_GUARD_MUTATE additionally points dc_readdir at the HOST's
+ * name instead of the top's -- a deliberate violation, since hosts are exactly
+ * the nodes a TRANSFER writes.  The guard MUST fire under churn; if a run of
+ * the mutated build passes, the guard is vacuous and proves nothing.
+ */
+#ifdef DC_DEBUG_NAME_GUARD
+#define DC_DENTRY_NAME_GUARD	unsigned long __d_name_xfer;
+#else
+#define DC_DENTRY_NAME_GUARD
+#endif
+/* The guard's accessors live below dc_qstr_eq, which they wrap. */
 #define DC_PATH_MAX 24		/* max components below the root */
 
 /*
@@ -246,6 +284,95 @@ static inline int dc_qstr_eq(const struct qstr *a, const struct qstr *b)
 	return a->hash == b->hash && a->len == b->len &&
 	       memcmp(a->name, b->name, a->len) == 0;
 }
+
+/* ---- fold TRANSFER name guard (see DC_DEBUG_NAME_GUARD above) ----------- */
+#ifdef DC_DEBUG_NAME_GUARD
+#include <stdio.h>
+#include <stdlib.h>
+
+/* TRANSFER brackets: __d_name_xfer is odd exactly while the copy is in flight. */
+#define DC_NAME_XFER_BEGIN(d)	do {					\
+	__atomic_add_fetch(&(d)->__d_name_xfer, 1, __ATOMIC_RELEASE);	\
+} while (0)
+#define DC_NAME_XFER_END(d)	do {					\
+	__atomic_add_fetch(&(d)->__d_name_xfer, 1, __ATOMIC_RELEASE);	\
+} while (0)
+
+static inline void dc_name_guard_fail(const void *d, unsigned long s0,
+				      unsigned long s1, const char *what)
+{
+	fprintf(stderr,
+		"NAME GUARD: %s read dentry %p's name across a fold TRANSFER "
+		"(xfer %lu -> %lu).\nA reader reached a node that was NOT the "
+		"indexed top and read its name -- the invariant the TRANSFER's "
+		"plain copy rests on is broken.\n", what, d, s0, s1);
+	abort();
+}
+
+/* Bracket a name MATCH.  @xfer is the same node's counter. */
+static inline int dc_name_guard_eq(const struct qstr *iname,
+				   const unsigned long *xfer,
+				   const struct qstr *name, const void *d)
+{
+	unsigned long s0 = __atomic_load_n(xfer, __ATOMIC_ACQUIRE);
+	int r = dc_qstr_eq(iname, name);
+	unsigned long s1 = __atomic_load_n(xfer, __ATOMIC_ACQUIRE);
+
+	if ((s0 & 1UL) || s0 != s1)
+		dc_name_guard_fail(d, s0, s1, "match");
+	return r;
+}
+
+/* Bracket a name COPY-OUT (readdir / walk hand the name to a caller). */
+static inline void dc_name_guard_copy(struct qstr *dst, const struct qstr *iname,
+				      const unsigned long *xfer, const void *d)
+{
+	unsigned long s0 = __atomic_load_n(xfer, __ATOMIC_ACQUIRE);
+	unsigned long s1;
+
+	*dst = *iname;
+	s1 = __atomic_load_n(xfer, __ATOMIC_ACQUIRE);
+	if ((s0 & 1UL) || s0 != s1)
+		dc_name_guard_fail(d, s0, s1, "copy-out");
+}
+
+#define DC_INAME_EQ(d, name)						\
+	dc_name_guard_eq(&(d)->d_iname, &(d)->__d_name_xfer, (name), (d))
+#define DC_INAME_COPY(dst, d)						\
+	dc_name_guard_copy((dst), &(d)->d_iname, &(d)->__d_name_xfer, (d))
+
+#else  /* the shipped build carries none of this */
+#define DC_NAME_XFER_BEGIN(d)	do { } while (0)
+#define DC_NAME_XFER_END(d)	do { } while (0)
+#define DC_INAME_EQ(d, name)	dc_qstr_eq(&(d)->d_iname, (name))
+#define DC_INAME_COPY(dst, d)	do { *(dst) = (d)->d_iname; } while (0)
+#endif
+
+/*
+ * Non-vacuity hooks.  MUTATE points name reads at the HOST instead of the top,
+ * and hosts are exactly the nodes a fold TRANSFER writes, so the guard must fire
+ * under churn.  A mutated build that SURVIVES a stress run is the bug: it means
+ * the guard cannot see the thing it exists to see.
+ *
+ * The mutation has to sit on a path the harnesses actually run.  The first
+ * attempt mutated only dc_readdir's callback copy -- which bench_dcache calls
+ * with fn == NULL, so the mutated line was DEAD CODE and a passing run would
+ * have "proved" a guard that had never been exercised: rule 4.3's trap, caught
+ * by mutation-testing the mutation.  So the bucket-scan MATCH carries it too --
+ * that one runs on every component of every lookup in every harness, and
+ * "resolve the host, then compare its name" is the realistic shape of the
+ * mistake this guard exists to catch.
+ *
+ * Defined for every build (not just guarded ones) so the shipped sources
+ * compile: outside a MUTATE build both are the identity.
+ */
+#ifdef DC_DEBUG_NAME_GUARD_MUTATE
+#define DC_READDIR_NAME_SRC(top, host)	(host)
+#define DC_MATCH_NAME_SRC(d)		host_of_rcu(d)
+#else
+#define DC_READDIR_NAME_SRC(top, host)	(top)
+#define DC_MATCH_NAME_SRC(d)		(d)
+#endif
 
 static inline void dc_path_reset(struct dc_path *p)
 {

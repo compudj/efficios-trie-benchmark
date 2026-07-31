@@ -242,6 +242,48 @@ bench_dcache_churn_bucketlock: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) 
 bench_dcache_churn_bucketlock_swmw: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(HCPP) -o $@ bench_dcache_churn.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
+# ---- fold TRANSFER name-guard gate (REVIEW.md standing hazard) ------------
+#
+# The fold's TRANSFER copies 40/48 bytes of d_iname into the successor with a
+# plain store, safe only because no reader reads a non-top node's name.  That
+# was a comment; -DDC_DEBUG_NAME_GUARD makes it a check (see dcache.h).
+#
+# The gate is TWO runs per engine, because a detector that never fires proves
+# nothing: the correct build must stay silent, and the MUTATED build -- which
+# matches against the HOST's name, exactly the mistake the invariant forbids --
+# must ABORT.  A mutated build that survives means the guard is vacuous and the
+# silent run above was worthless.
+NAMEGUARD_RUN := --nthreads 8 --writers 3 --leaves 16 --ndirs 8 --duration 2000
+NAMEGUARD_BINS := bench_dcache_nameguard_bucketlock \
+		  bench_dcache_nameguard_bucketlock_mutate \
+		  bench_dcache_nameguard_txn bench_dcache_nameguard_txn_mutate
+
+bench_dcache_nameguard_bucketlock: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_DEBUG_NAME_GUARD $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_nameguard_bucketlock_mutate: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_DEBUG_NAME_GUARD \
+	  -DDC_DEBUG_NAME_GUARD_MUTATE $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_nameguard_txn: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_DEBUG_NAME_GUARD $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_nameguard_txn_mutate: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_DEBUG_NAME_GUARD \
+	  -DDC_DEBUG_NAME_GUARD_MUTATE $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+check-nameguard: $(NAMEGUARD_BINS)
+	@for e in bucketlock txn; do \
+	  ./bench_dcache_nameguard_$$e $(NAMEGUARD_RUN) > /dev/null 2>&1 || \
+	    { echo "FAIL: $$e fired the name guard on CORRECT code"; exit 1; }; \
+	  echo "  ok: $$e clean under the guard"; \
+	  if ./bench_dcache_nameguard_$${e}_mutate $(NAMEGUARD_RUN) > /dev/null 2>&1; then \
+	    echo "FAIL: mutated $$e SURVIVED -- the name guard is VACUOUS"; exit 1; \
+	  fi; \
+	  echo "  ok: mutated $$e aborted (guard is live)"; \
+	done
+
 # Quick correctness gate for the churn invariant (state + census + ids).
 check-churn: churn
 	./bench_dcache_churn_txn_mark --writers 6 --readers 6 --duration 1500
@@ -256,6 +298,66 @@ check-churn: churn
 bench_dcache_txn_mark: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+# ---- matched-name-width controls (REVIEW.md open item) --------------------
+#
+# DC_NAME_MAX is not only a dentry knob: struct qstr is shared with struct
+# dc_path, so the mark arm's 40 also makes the HARNESS path object 20% bigger
+# (sizeof(dc_path) 964 -> 1156), the per-component path copy 48 B instead of
+# 40 B, and the precomputed leaf-qstr table 20% bigger.  Those sit on the
+# reader's hot path and are NOT the mechanism under test, so a mark-vs-{global,
+# per-node,seqlock} reader table mixes the two.  See dcache.h's DC_NAME_PAD.
+#
+#   _w32        NAME_MAX=32 + 8 B pad: dentry BYTE-IDENTICAL to the shipped mark
+#               arm (sizeof 168/176, d_hash @56), harness path matched to the
+#               baselines.  Isolates the harness co-footprint -- the arm to
+#               publish alongside mark.
+#   _w32_shrink NAME_MAX=32, no pad: dentry shrinks 8 B and d_hash moves @56 ->
+#               @48.  Prices what the 8 bytes the mark mechanism freed buy.
+#
+# A _w32 that lands on the mark curve RETIRES the caveat with evidence; a gap
+# says the published mark reader numbers were paying a harness tax.
+namectl: bench_dcache_txn_mark_w32 bench_dcache_txn_mark_w32_shrink \
+	 bench_dcache_bucketlock_w32 bench_dcache_bucketlock_w32_shrink \
+	 bench_dcache_height_txn_mark_w32 bench_dcache_height_bucketlock_w32 \
+	 bench_dcache_churn_txn_mark_w32 bench_dcache_churn_bucketlock_w32
+
+NAME_W32       := -DDC_NAME_MAX=32 -DDC_NAME_PAD=8
+NAME_W32_SHRINK := -DDC_NAME_MAX=32
+
+bench_dcache_txn_mark_w32: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_txn_mark_w32_shrink: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32_SHRINK) $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_bucketlock_w32: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_bucketlock_w32_shrink: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32_SHRINK) $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_txn_mark_w32: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(CPPFLAGS) -o $@ \
+	  bench_dcache_height.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_bucketlock_w32: bench_dcache_height.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(CPPFLAGS) -o $@ \
+	  bench_dcache_height.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+
+# readdir is the most exposed panel: dc_readdir COPIES each child's d_iname into
+# the caller's dc_path, so the qstr width is paid per dirent, not per lookup.
+bench_dcache_churn_txn_mark_w32: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(HCPP) -o $@ \
+	  bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_churn_bucketlock_w32: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(NAME_W32) $(HCPP) -o $@ \
+	  bench_dcache_churn.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
 # bucket lock+SW reader bench (address default): the reader path is IDENTICAL to the
 # txn-mark arm (same resolve + mark), so this A/B isolates the writer-engine swap
