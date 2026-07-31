@@ -81,6 +81,21 @@ static inline int id_is_address(void)
 
 static int nreaders = 32;
 static int readdir_mode = 0;		/* --readdir: readers list a dir vs look up */
+/*
+ * --readdir-names: pass a real callback to dc_readdir instead of NULL.
+ *
+ * dc_readdir(fn == NULL) only COUNTS -- it never materializes a name -- so the
+ * default readdir mode never exercises the per-dirent qstr handoff.  That makes
+ * it useless for any measurement whose subject IS the name: DC_NAME_MAX is paid
+ * once per DIRENT here (not once per path component as in a lookup), and with a
+ * NULL callback that cost is structurally absent, so a name-width A/B over the
+ * default mode is vacuous and will report "no effect" no matter the width.
+ *
+ * Kept opt-in rather than made the default so the already-published readdir
+ * figures stay comparable; note those are therefore COUNT-ONLY and understate a
+ * real getdents(), which does copy every name out.
+ */
+static int readdir_names = 0;
 static int nwriters = 8;
 static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
@@ -201,6 +216,9 @@ struct warg {
 	long long nadds, nunlinks, errs;
 	long long nlookups, lk_wrong;
 	long long ndirents;		/* children enumerated (--readdir mode) */
+	unsigned long dsink;		/* --readdir-names: consumes the qstr so
+					 * the per-dirent name copy cannot be
+					 * optimized away */
 	uint8_t *present;		/* owner-private truth for its slots */
 	int *dir;			/* which dir each slot lives in */
 };
@@ -261,6 +279,22 @@ static void *writer_fn(void *arg)
 	return NULL;
 }
 
+/*
+ * --readdir-names sink: what a getdents() would do with each dirent, minus the
+ * copy_to_user.  Touches the length, the hash AND two name bytes, so the qstr
+ * the engine materializes per child is genuinely read rather than just handed
+ * over -- reading only the header would leave the inline name untouched and the
+ * width invisible again, which is the same vacuity one level down.
+ */
+static void dirent_sink(uint64_t id, const struct qstr *name, void *arg)
+{
+	unsigned long *acc = arg;
+
+	*acc += (unsigned long) id + name->len + name->hash
+	      + (unsigned long) name->name[0]
+	      + (unsigned long) name->name[name->len ? name->len - 1 : 0];
+}
+
 static void *reader_fn(void *arg)
 {
 	struct warg *me = arg;
@@ -282,7 +316,9 @@ static void *reader_fn(void *arg)
 			long n;
 
 			mk_dir_path(&p, dr);
-			n = dc_readdir(g_dc, &p, NULL, NULL);
+			n = readdir_names
+			  ? dc_readdir(g_dc, &p, dirent_sink, &me->dsink)
+			  : dc_readdir(g_dc, &p, NULL, NULL);
 			if (n < 0)
 				me->errs++;
 			else {
@@ -383,6 +419,7 @@ int main(int argc, char **argv)
 	struct census c;
 	long long t0, t1;
 	long long adds = 0, unl = 0, errs = 0, lk = 0, wrong = 0, dirents = 0;
+	unsigned long dsink = 0;
 	int i, j, anomaly = 0, total_slots;
 	double secs;
 
@@ -396,6 +433,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--nbuckets"))      nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))       parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))       readdir_mode = 1;
+		else if (!strcmp(argv[i], "--readdir-names")) { readdir_mode = 1;
+							       readdir_names = 1; }
 		else usage(argv[0]);
 	}
 	if (nwriters < 1 || slots < 1 || ndirs < 1 || prefix_depth < 1 ||
@@ -487,6 +526,7 @@ int main(int argc, char **argv)
 	}
 	for (i = 0; i < nreaders; i++) {
 		lk += ra[i].nlookups; wrong += ra[i].lk_wrong; dirents += ra[i].ndirents;
+		dsink += ra[i].dsink;
 	}
 
 	/* --- invariant 1 & 2: believed state matches reality, by lookup ----- */
@@ -548,10 +588,15 @@ int main(int argc, char **argv)
 	printf("Mchurn/s: %g\n", (double) (adds + unl) / secs / 1e6);
 	printf("LOOKUP  lookups: %lld  wrong-id: %lld\n", lk, wrong);
 	printf("Mlookups/s: %g\n", (double) lk / secs / 1e6);
-	if (readdir_mode)
+	if (readdir_mode) {
 		printf("READDIR dirents: %lld  Mdirents/s: %g  children/readdir~%g\n",
 		       dirents, (double) dirents / secs / 1e6,
 		       lk ? (double) dirents / (double) lk : 0.0);
+		/* names=0 means dc_readdir only COUNTED: no qstr was built, so
+		 * this run says nothing about name width.  Printed so a reader
+		 * of the log can tell the two modes apart after the fact. */
+		printf("READDIR names: %d  name-sink: %lu\n", readdir_names, dsink);
+	}
 	if (anomaly)
 		printf("CONSERVATION FAILED: %d anomalies -- run is CORRUPT, "
 		       "ignore the numbers above\n", anomaly);
