@@ -105,6 +105,11 @@ for col, (panel, ops, title) in enumerate((
         ax.set_xticklabels([lab for _, lab in present], fontsize=9)
         if col == 0:                 # shared row scale -> one label, on the left
             ax.set_ylabel(ylab)
+        # sharey hides the inner column's tick labels, which leaves the right
+        # panel with no numbers at all -- so the shared scale becomes something
+        # the reader has to take on trust instead of something they can check.
+        # Put them back: the redundancy is the point.
+        ax.tick_params(labelleft=True)
         ax.set_ylim(bottom=0)
         ax.grid(axis="y", alpha=0.25)
         ax.set_axisbelow(True)
