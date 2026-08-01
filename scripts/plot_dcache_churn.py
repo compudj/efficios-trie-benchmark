@@ -18,16 +18,24 @@ txn arms coincide here.
 
 The three panels tell a SPLIT story -- a genuine tradeoff, not one engine
 dominating:
-  writers  the pure WRITE path.  The bit-lock BASELINE LEADS ~1.4-2x: a bit-lock
-           + hlist splice is lighter than txn's per-op MCAS (two commits + a
-           descriptor per churn op).
+  writers  the pure WRITE path.  The bit-lock baselines lead here -- but MOST of
+           that gap is NOT the engine.  A churn op allocates a transaction
+           descriptor, and on the DEFAULT retirement route (one call_rcu per
+           descriptor) the slab spills to posix_memalign under load, so the txn
+           arms flatten around 34-41 Mops/s.  Retire by the batch instead
+           (URCU_TXN_SLAB_BATCH) and the same engines reach ~113-124 against the
+           bit-lock's ~164: 3.0-3.5x more, from the allocator alone.  What is
+           left after that IS the per-op MCAS cost (two commits + a descriptor
+           per churn op), but it is a fraction of what this panel shows.  See
+           figures/dcache_slabroute.png and REVIEW.md section 6.
   churn_rd the READ path under create/delete load.  Here TXN LEADS ~1.3-1.6x:
            its reader does an inline name compare with no sequence counter, while
            the seqlock reader validates d_seq + rename_lock and is disturbed more
            by concurrent churn.
   churn_scale reader scaling at fixed churn -- same read-path story, TXN ahead.
-So the txn engine earns its keep on the reader path; the faithful bit-lock wins
-the writer path.
+So the txn engine earns its keep on the reader path.  On the writer path the
+bit-lock leads as drawn, but read that panel with the slab route in mind: the
+default route is allocator-bound, and batching recovers 3.0-3.5x of it.
 
 NOTE these binaries are built -DDC_SPLIT_KEEPID (a re-added dentry is a new
 allocation, so the harness's identity checks need logical ids).  Reader rates are
@@ -123,9 +131,9 @@ if ax1.has_data():
     plain_y(ax1)
     lo, hi = ax1.get_ylim(); ax1.set_ylim(lo, hi * 1.35)
 ax1.set_title("Writers only — insert/remove Mops/s vs writer count\n"
-              "the pure WRITE path.  Bump-free churn, decontended ndirs +\n"
-              "jemalloc: the faithful bit-lock BASELINE LEADS — a bit-lock +\n"
-              "hlist splice beats txn's per-op MCAS (× = seqlock ÷ txn)",
+              "the pure WRITE path.  The baselines lead here, but MOST of the\n"
+              "gap is the descriptor slab, not the engine: see\n"
+              "figures/dcache_slabroute.png (× = seqlock ÷ txn)",
               fontsize=9.5)
 ax1.set_xlabel("churn writer threads")
 ax1.set_ylabel("insert+remove Mops/s   (higher is better)")
@@ -180,7 +188,8 @@ ax3.grid(alpha=0.3, ls=":")
 ax3.legend(fontsize=8, loc="best")
 
 fig.suptitle("Userspace dcache — INSERT/REMOVE (dc_add / dc_unlink) under "
-             "concurrent lookups: bit-lock wins writes, txn wins reads   ·   "
+             "concurrent lookups: txn wins reads; the write gap is mostly "
+             "the descriptor slab   ·   "
              "2×96-core EPYC", fontsize=12)
 fig.tight_layout(rect=[0, 0, 1, 0.94])
 fig.savefig(OUT, dpi=140)

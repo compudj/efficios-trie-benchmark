@@ -18,12 +18,20 @@ decontention buys (matched ndirs=writers is child-hlist-head bound; 16*writers
 lifts it ~6x at the top).  Right panel: the widest ndirs (16*writers), four
 engines -- who scales.  Churn is BUMP-FREE (add never bumped; unlink no longer
 does), so the three txn arms are indistinguishable.  The result inverts the old
-figure: the faithful bit-lock baseline is the FASTEST here -- ~1.4-2x ahead of
-the transactional engine across the range, because a bit-lock + hlist splice is
-lighter than txn's per-op MCAS (two commits + a descriptor per churn op); the
-txn arms only draw level at the full 192-writer machine.  The txn engine earns
-its keep on the READ path and on renames (see dcache_churn.png / dcache_s3.png),
-not on pure insert/remove.
+figure: the faithful bit-lock baseline is the FASTEST here, ahead of the
+transactional engine across the range.
+
+Read that with the DESCRIPTOR SLAB in mind, though, because most of the gap is
+not the engine.  A churn op allocates a transaction descriptor, and on the
+default retirement route -- one call_rcu per descriptor -- the slab spills to
+posix_memalign under load.  Retiring by the batch instead
+(URCU_TXN_SLAB_BATCH) is worth 3.0-3.5x on the same engines, closing most of
+the distance to the bit-lock; what remains after that is the genuine per-op
+MCAS cost (two commits + a descriptor per churn op).  See
+figures/dcache_slabroute.png and REVIEW.md section 6.
+
+The txn engine still earns its keep on the READ path and on renames (see
+dcache_churn.png / dcache_s3.png) rather than on pure insert/remove.
 
 Env: ENGINES / OUT overrides as usual.
 """
@@ -101,8 +109,8 @@ for w in Ws:
 linx(ax2)
 ax2.set_title("Decontended (ndirs = 16×writers, jemalloc) — who scales\n"
               "insert+remove Mops/s vs writers.  Churn is BUMP-FREE, so the\n"
-              "three txn arms coincide; the faithful bit-lock BASELINE LEADS\n"
-              "(× = seqlock ÷ txn) — MCAS is per-op overhead on pure churn",
+              "three txn arms coincide; the bit-lock baseline leads — but most\n"
+              "of the gap is the descriptor slab, not MCAS (× = seqlock ÷ txn)",
               fontsize=9.5)
 ax2.set_xlabel("writer threads")
 ax2.set_ylabel("insert+remove Mops/s   (higher is better)")

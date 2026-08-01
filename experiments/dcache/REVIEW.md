@@ -228,6 +228,18 @@ absence produced a wrong conclusion at least once.
    config, prime all engines, keep NUMA placement of the measured role
    stable across the sweep variable.
 
+   **And know which layer you are actually measuring.**  Every mutation here
+   allocates a transaction descriptor, so past a few writers the writer numbers
+   belong as much to liburcu's descriptor slab as to the dcache (§6).  Two
+   consequences.  First, the harness must let reclaim RUN: a registered thread
+   that never quiesces — main, parked in `nanosleep()` for the measured window —
+   blocks every QSBR grace period, and the symptom is not a hang but an
+   allocator that appears to leak while conservation passes and every gate stays
+   green.  Second, reclaim needs its own cpu budget: a non-sleeping
+   `URCU_CALL_RCU_RT` worker co-pinned with a writer that never yields simply
+   halves it.  Neither shows up as a failure; both show up as the engine looking
+   slow.
+
 5. **Strip harness ALU that hides memory effects.**  The per-lookup
    `snprintf` was ~74% of instructions and ran concurrently with descent
    stalls — it hid the entire 1-CL layout win ("neutral" was a harness
@@ -436,6 +448,76 @@ items here are the ones that actually fired in this experiment):
      *not* established here (its hlist updates ride the MW commit and its writer
      rate is ~1.5× lower); treat the bucketlock mechanism as strongly indicated,
      not proven.
+- **The allocator underneath** — *investigated, and it is where the writer
+  numbers actually come from.*  Every mutation allocates one transaction
+  descriptor, so past a few writers this experiment measures liburcu's
+  descriptor slab as much as the dcache.  Three defects, recorded in the order
+  found because each hid the next:
+
+  1. **The harness stalled every grace period.**  `bench_dcache_churn` left main
+     RCU-*online* in `nanosleep()` for the whole measured window, and one stuck
+     online QSBR thread blocks all reclaim.  No `call_rcu` callback ran, so no
+     freed descriptor returned to a freelist, so every allocation carved a fresh
+     block — which presents as an *allocator leak*: reuse ~11%, footprint
+     growing linearly to 48.7 GiB at 8 s.  It is not a leak; at ONE writer the
+     same slab reuses 99.6% and sits at 20 MiB.  Every churn number this
+     experiment had published was measured that way.
+  2. **The reclaim worker shared a cpu with its writer.**  `URCU_CALL_RCU_RT`
+     does not sleep, so co-pinning it with a writer that never yields halves
+     reclaim.  `DC_CRDP_CPU_OFFSET` moves it: the SMT sibling is best (75% reuse
+     vs 62% co-pinned), a free core on the same socket is *worse* (56.6%) and
+     the other socket is catastrophic (33.2%) — locality with the writer beats
+     dedicated execution resources.
+  3. **Batch retirement had no in-tree user.**  liburcu carried
+     `urcu_slab_free_pending()` — retire a whole batch with one `call_rcu`
+     instead of one per descriptor — and both engines still freed one at a time,
+     so the machinery contributed only its costs.  Wiring it up
+     (`URCU_TXN_SLAB_BATCH`) is worth **3.0–3.5×** on churn at 48 writers --
+     33.9/35.0/41.1 → 113.4/123.9/121.7 Mops/s for global/per-node/mark, against
+     seqlock's 152.5 and bucket lock's 164.4, neither of which uses this slab --
+     *and* bounds the footprint at 194 MiB with reuse at 99.6%.  Quoted as a
+     range across the three engines rather than a median, because that is what
+     was measured.
+
+  Wiring it up also surfaced two liburcu bugs that nothing could have found
+  while the path was dead: a per-call store to a *process-wide* word costing
+  ~55% of cycles (which made batching look 2× slower than what it replaces, and
+  hid the 3.4×), and a plain-write/atomic-read race on the arena floor that
+  failed all six TSAN gates.  Both fixed upstream.
+
+  ⚠ **A footprint cap is a memory safety valve, not a tuning knob.**  Raising it
+  does buy throughput — ~36 → ~99 Mchurn/s here — but only by letting the
+  footprint climb; with the cap out of the way the slab grows linearly and never
+  plateaus.  Fixing the recycling instead buys *more* (~122) with memory
+  bounded.  A cap sized to absorb an unbounded working set has stopped being a
+  cap.  An earlier version of this work shipped exactly that mistake, as a
+  "budget floor scaled to the arena count", before it was dropped.
+
+  Sweep: four descriptor-slab arms
+  (`scripts/dcache_*{,_rseq,_batch,_batch_rseq}.csv`, `figures/dcache_slabroute.png`).
+
+  **rseq per-cpu local lists are only worth enabling WITH batching, and cost
+  throughput without it.**  Its fast paths require a *same-cpu* free; on the
+  default route the descriptor is freed from the call_rcu worker, a different
+  cpu, so ~12.5% of frees took the local path and the list the allocator pops
+  from stays empty.  Every operation then pays `rseq_registered()` and the
+  `rseq_ok` load and falls back to the atomic path regardless, and the cost
+  grows with contention:
+
+  	writers        1     4     8    16    32    48
+  	rseq/default 1.04  1.02  0.99  0.95  0.90  0.88
+
+  monotone, below a control band that stays flat at 0.98–1.01 from 8 writers
+  up — i.e. **−12% at 48 writers**, not a null.  (A median over all writer
+  counts reads 1.007 and hides it; the trend is the finding.)  Under batching
+  the committing writer frees on its own cpu, the fast path is reachable, and
+  the same comparison turns positive: 21/21 points at 1.02–1.05 against a
+  control flat at 0.99–1.00, i.e. ~3%, on the churn workload only.
+
+  The lesson generalises past rseq: an arm whose fast path the workload never
+  reaches does not return a clean null — it returns the *cost* of the disabled
+  mechanism, which is worse than uninformative because it looks like evidence
+  against it.  Rule §4.3 wearing a different hat.
 - **Phase 2 (negative dentries)**: `stack_shell` must copy pos/neg into the
   shell (today every node is born positive, so top==host coincidentally);
   this is a recorded dependency of the `d_iparent`-race fix.
@@ -481,5 +563,7 @@ items here are the ones that actually fired in this experiment):
 | Validation gates | `make check[-mark|-pernode|-bucketlock*][-tsan]`, `check-nameguard`, `stress*`, `repro*`, `mixed_cycle` |
 | Non-vacuous readdir (real per-dirent `qstr`) | `bench_dcache_churn --readdir-names`; prints `READDIR names:` + name sink |
 | Sweeps / plots | `scripts/run_dcache*.sh`, `scripts/plot_dcache*.py` |
+| Descriptor-slab arms | `scripts/dcache_*.csv` = default; `_rseq`, `_batch`, `_batch_rseq` suffixes are the other three routes (§6) |
+| Slab route selection | `URCU_BUILD=` picks the liburcu build; the sweeps and the Makefile DERIVE `-DURCU_SLAB_RSEQ` / `-DURCU_TXN_SLAB_BATCH` from it, since both are header-inline and must match the library |
 | Figures | `figures/dcache_{s3,readdir,readdir_churn,churn,churn_scaling,height,optype,optaxonomy,namewidth,swmw}.png`, `figures/perf_dcache_*` |
 | Hybrid-engine design notes | `design/dcache-dlm-sw.md`, `design/mixed-sw-mw-txn.md`, `design/dcache-lru-txn.md` |
