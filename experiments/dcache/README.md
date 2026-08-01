@@ -1,13 +1,18 @@
 # dcache-in-userspace: can urcu-txn dissolve `rename_lock`?
 
-Status: **S1 done; S2 functional + walk-causality landed** (2026-07-15). Both
-engines pass the single-threaded harness (52/52, ASan clean). The txn rename
-mechanism is specified in [`rename-shell-transition.md`](rename-shell-transition.md).
-The first concurrency race — a walker misdirected by a mid-walk rename
-(`rename_lock`'s job) — is reproduced deterministically (`repro_dcache.c`) and
-closed with a global rename generation counter. Remaining S2 concurrency work:
-async `call_rcu` fold + splice, transacted `d_parent` loop check, atomic
-exchange.
+Status: **S1–S4 done** (2026-08-01). Three engines behind one interface —
+the kernel-style `seqlock` baseline, `dcache_txn` (global / per-node / mark
+causality arms) and `dcache_bucketlock` (per-bucket lock + SW txn, the winner on
+writes) — all at 103/103 with ASan- and TSAN-clean stress. The txn rename
+mechanism is specified in [`rename-shell-transition.md`](rename-shell-transition.md);
+the simplification and invariant-surface analysis is in
+[`simplification-s4.md`](simplification-s4.md); and
+[`REVIEW.md`](REVIEW.md) is the retrospective — verdict, the design and
+methodology rules the experiment produced, and what is still open.
+
+Read `REVIEW.md` §4 before adding a benchmark here. Most of the wrong numbers
+this experiment produced came from a harness that passed while measuring
+nothing, not from an engine that was slow.
 
 ### Files
 
@@ -16,11 +21,19 @@ exchange.
 | `dcache.h` | engine-agnostic interface + inline qstr/path helpers; the two bolt-on seams |
 | `seqcount.h` | userspace seqcount + seqlock over urcu barriers (the `rename_lock`/`d_seq` machinery) |
 | `dcache_seqlock.c` | faithful kernel-style baseline (RCU hlist + global `rename_lock` + per-dentry `d_seq`) |
-| `dcache_txn.c` | **lock-free** urcu-txn engine (S2, in progress) — see the design note |
+| `dcache_txn.c` | urcu-txn engine; `-DDC_PER_NODE_GEN` / `-DDC_MARK_GEN` select the causality arm |
+| `dcache_bucketlock.c` | per-bucket lock + SW txn; `-DDC_CHAIN_LOCK` / `-DDC_CHAIN_SWMW` select the chain strategy |
+| `krwsem/` | vendored Linux `rw_semaphore` (GPL-2.0), the exact-fair dir-lock arm |
 | `rename-shell-transition.md` | the lock-free rename design: shell-stacking + fold cascade + ancestor-validate loop check |
+| `simplification-s4.md` | S4: LOC + invariant-surface analysis, the 1-cacheline hot line, S3 scaling curves |
+| `REVIEW.md` | retrospective: verdict, design rules, **methodology rules**, open items |
 | `test_dcache.c` | single-threaded correctness + namespace-conservation harness |
 | `repro_dcache.c` | deterministic 1-writer/1-walker repro of the walk-causality race (`make repro`) |
-| `Makefile` | `make check` builds+runs; `ENGINE=txn` swaps engine; `make repro` runs the race repro |
+| `stress_dcache*.c` | concurrent stress: namespace, cross-dir moves, exchange (ASan/TSAN arms) |
+| `bench_dcache.c` | path-lookup bench: role-split readers/writers, `--op-mix`, conservation-gated |
+| `bench_dcache_churn.c` | add/unlink churn + `readdir`; `--readdir-names` builds a real per-dirent `qstr` |
+| `bench_dcache_height.c` | directory-op bench at a chosen subtree height (`--op`) |
+| `Makefile` | `make check` builds+runs; `ENGINE=` swaps engine; `check-*` are the gates |
 
 Build/run: `cd experiments/dcache && make check` (needs `make urcu-txn` at the
 repo root once).
@@ -212,8 +225,51 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   churn-sensitive: under a saturating rename load it **stays ~2× above** the rwsem
   (48 writers: ~27–35 vs ~14) instead of dipping below. Both engines
   conservation-clean + ASan-clean.
-- **S4** — simplification analysis (LOC + invariant surface: which
-  counters/fallbacks disappear) + scaling figures + writeup back into `design/`.
+- **S4** ✅ — simplification analysis (LOC + invariant surface: which
+  counters/fallbacks disappear) + scaling figures, in
+  [`simplification-s4.md`](simplification-s4.md). Also produced the 1-cacheline
+  reader hot line (and the lesson that a "1-CL" claim is about the *object*, so
+  it must be enforced at allocation, not inferred from field offsets).
+  [`REVIEW.md`](REVIEW.md) closes the experiment out.
+- **S5** ✅ — **the allocator underneath**. The engines allocate one transaction
+  descriptor per mutation, so above a few writers this experiment stops
+  measuring the dcache and starts measuring liburcu's descriptor slab. Three
+  defects came out of chasing that, and the order matters — each was hidden by
+  the one before it:
+
+  1. **The harness stalled every grace period.** `bench_dcache_churn` left the
+     main thread RCU-*online* in `nanosleep()` for the whole measured window,
+     and one stuck online QSBR thread blocks all reclaim: no `call_rcu` callback
+     ran, so no freed descriptor returned, so every allocation carved a fresh
+     block. It read as an allocator leak — reuse ~11%, footprint growing
+     linearly to 48.7 GiB at 8 s. Every churn number this harness had ever
+     produced was measured that way.
+  2. **The reclaim worker shared a cpu with its writer.** `URCU_CALL_RCU_RT`
+     does not sleep, so co-pinning it with a writer that never yields halves
+     reclaim. `DC_CRDP_CPU_OFFSET` moves it; the SMT sibling wins (75% reuse vs
+     62% co-pinned), and a free core on the *other socket* is far worse (33%) —
+     cache locality with the writer beats dedicated execution resources.
+  3. **The slab's batch retirement had no in-tree user.** liburcu carried
+     `urcu_slab_free_pending()` — retire a whole batch with one `call_rcu`
+     instead of one per descriptor — and both engines still freed one at a time.
+     Wiring it up (`URCU_TXN_SLAB_BATCH`) is worth **3.4×** on churn at 48
+     writers *and* bounds the footprint at 194 MiB instead of growing without
+     limit.
+
+  Two liburcu bugs fell out of wiring it: a per-call store to a process-wide
+  word that cost ~55% of cycles (and made batching look 2× slower than what it
+  replaces), and a plain/atomic race on the arena floor that failed all six
+  TSAN gates. Both fixed upstream.
+
+  Sweep: four descriptor-slab arms (`scripts/dcache_*{,_rseq,_batch,_batch_rseq}.csv`,
+  5012 rows, zero conservation failures). **rseq per-cpu local lists are a null
+  on the default route** — its fast path needs a same-cpu free, and reclaim runs
+  on another cpu, so ~12.5% of frees took it — and worth ~3% under batching, on
+  the churn workload only.
+
+  The standing lesson: a footprint cap is a **memory safety valve**, not a
+  tuning knob. Raising it does buy throughput, by letting the leak run further;
+  fixing the recycling buys more, with the memory bounded.
 
 ## Locked decisions (2026-07-15)
 
