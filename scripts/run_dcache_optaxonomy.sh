@@ -141,7 +141,10 @@ build() {   # <engine> <harness> <extra-defs> -> $TMP/<engine>_<tag>
   # resolves librseq; the runtime half (rseq_registered() per thread, and the
   # membarrier RSEQ registration the arena's rseq_ok depends on) is checked once
   # below.
-  if [[ -n "$SLABDEF" ]]; then
+  # The seqlock engine is the kernel baseline: it never touches the txn
+  # descriptor slab, so it references no rseq symbol and the linker drops
+  # -lrseq as unneeded.  Requiring the link there aborts a CORRECT run.
+  if [[ -n "$SLABDEF" && "$e" != *seqlock* ]]; then
     ldd "$TMP/${e}_${tag}" 2>/dev/null | grep -q librseq || {
       echo "FATAL: $e/$tag built for the rseq slab but does not link librseq --"
       echo "       the arm would silently measure the atomic path.  Aborting."

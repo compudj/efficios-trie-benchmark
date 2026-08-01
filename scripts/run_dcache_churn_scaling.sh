@@ -23,7 +23,7 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_churn_scaling.csv
+CSV=${CSV:-$REPO/scripts/dcache_churn_scaling.csv}
 
 SLOTS=32
 DUR=${DUR:-1000}

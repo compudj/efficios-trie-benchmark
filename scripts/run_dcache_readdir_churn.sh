@@ -29,16 +29,34 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_readdir_churn.csv
+CSV=${CSV:-$REPO/scripts/dcache_readdir_churn.csv}
 
 NDIRS=${NDIRS:-16}		# hot: readers & writers collide on these dirs
 SLOTS=32
 DUR=${DUR:-1000}
 RUNS=${RUNS:-5}
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
-Bd=$REPO/urcu-txn-build
-INC="-I$Bd/include -I$BIN"
-LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread"
+# liburcu build to link against; URCU_BUILD=$REPO/urcu-txn-build-rseq selects the
+# descriptor slab's rseq arm.  Keep the COMMIT fixed across arms: the slab's
+# freelist changed wfstack -> lfstack and retirement became batched in 0d83f466,
+# so arms from different commits are not an A/B of the rseq flag.
+Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
+# URCU_SLAB_RSEQ is header-inline and rcu-txn-slab.h requires it IDENTICAL in
+# every TU of the process, so it must be repeated on these compiles.  Derive it
+# from the build being linked (from its CPPFLAGS -- configure appends the flag
+# rather than AC_DEFINE-ing it, so config.h never mentions it) so the two cannot
+# disagree; a mismatch is silent undefined behaviour.
+SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+INC="-I$Bd/include -I$BIN $SLABDEF $SLABINC"
+LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread $SLABLIB"
+printf '>> liburcu %s (%s)  slab: %s\n' \
+  "$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)" "$Bd" "$SLABMODE" >&2
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native -DDC_SPLIT_KEEPID"
 

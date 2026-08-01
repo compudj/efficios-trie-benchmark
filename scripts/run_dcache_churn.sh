@@ -33,7 +33,7 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_churn.csv
+CSV=${CSV:-$REPO/scripts/dcache_churn.csv}
 
 SLOTS=32
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}

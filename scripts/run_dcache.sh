@@ -27,7 +27,7 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_sweep.csv
+CSV=${CSV:-$REPO/scripts/dcache_sweep.csv}
 
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 DEPTH=4

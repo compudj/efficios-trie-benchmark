@@ -18,7 +18,7 @@
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
 BIN=$REPO/experiments/dcache
-CSV=$REPO/scripts/dcache_height.csv
+CSV=${CSV:-$REPO/scripts/dcache_height.csv}
 
 WRITERS=8
 READERS=32
