@@ -69,14 +69,22 @@ CFLAGS="-O2 -g -pthread -march=native"
 # the two must not be independently settable.
 # NB: configure appends -DURCU_SLAB_RSEQ to CPPFLAGS, it does NOT AC_DEFINE it,
 # so config.h never mentions it -- read the build's own CPPFLAGS instead.
-SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+SLABDEF=""; SLABINC=""; SLABLIB=""; RSEQ_ON=0; SLABMODE="lfstack (atomic paths)"
 if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
-  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"; RSEQ_ON=1
   # Same librseq the liburcu build used, taken from that build, for the same
   # can-never-disagree reason.
   SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+# URCU_TXN_SLAB_BATCH is header-inline too: urcu_txn_retire() is compiled into
+# THIS TU, so linking a batch-built liburcu without defining it here compiles the
+# DEFAULT route and silently measures the wrong thing under the right label --
+# and mixes the two routes in one process, which rcu-txn-slab.h forbids.
+if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="$SLABDEF -DURCU_TXN_SLAB_BATCH"
+  SLABMODE="$SLABMODE + batch retirement"
 fi
 INC="$INC $SLABDEF $SLABINC"
 LIB="$LIB $SLABLIB"
@@ -144,7 +152,7 @@ build() {   # <engine> <harness> <extra-defs> -> $TMP/<engine>_<tag>
   # The seqlock engine is the kernel baseline: it never touches the txn
   # descriptor slab, so it references no rseq symbol and the linker drops
   # -lrseq as unneeded.  Requiring the link there aborts a CORRECT run.
-  if [[ -n "$SLABDEF" && "$e" != *seqlock* ]]; then
+  if [[ "$RSEQ_ON" = 1 && "$e" != *seqlock* ]]; then
     ldd "$TMP/${e}_${tag}" 2>/dev/null | grep -q librseq || {
       echo "FATAL: $e/$tag built for the rseq slab but does not link librseq --"
       echo "       the arm would silently measure the atomic path.  Aborting."
@@ -155,7 +163,7 @@ build() {   # <engine> <harness> <extra-defs> -> $TMP/<engine>_<tag>
 # Runtime half of the same check, once per sweep: rseq must be available AND the
 # membarrier RSEQ registration must succeed, or urcu_slab_init() leaves every
 # arena's rseq_ok clear and the whole arm is the atomic path under another name.
-if [[ -n "$SLABDEF" ]]; then
+if [[ "$RSEQ_ON" = 1 ]]; then
   cat > "$TMP/rseqchk.c" <<'CHK'
 #define _GNU_SOURCE
 #include <stdio.h>

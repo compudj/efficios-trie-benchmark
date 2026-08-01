@@ -58,12 +58,20 @@ CFLAGS="-O2 -g -pthread -march=native"
 # linked so the dcache TUs cannot disagree with the library.
 # configure appends -DURCU_SLAB_RSEQ to CPPFLAGS rather than AC_DEFINE-ing it,
 # so config.h never mentions it -- read the build's own CPPFLAGS.
-SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+SLABDEF=""; SLABINC=""; SLABLIB=""; RSEQ_ON=0; SLABMODE="lfstack (atomic paths)"
 if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
-  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"; RSEQ_ON=1
   SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+# URCU_TXN_SLAB_BATCH is header-inline too: urcu_txn_retire() is compiled into
+# THIS TU, so linking a batch-built liburcu without defining it here compiles the
+# DEFAULT route and silently measures the wrong thing under the right label --
+# and mixes the two routes in one process, which rcu-txn-slab.h forbids.
+if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="$SLABDEF -DURCU_TXN_SLAB_BATCH"
+  SLABMODE="$SLABMODE + batch retirement"
 fi
 INC="$INC $SLABDEF $SLABINC"
 LIB="$LIB $SLABLIB"
@@ -116,7 +124,7 @@ for a in $ARMS; do
   # Non-vacuity: the slab falls back to sched_getcpu() when rseq is unusable, so
   # an rseq arm can silently run the atomic path and report a difference of zero
   # -- a false negative indistinguishable from a real one.  Require the link.
-  if [[ -n "$SLABDEF" ]]; then
+  if [[ "$RSEQ_ON" = 1 ]]; then
     for b in "$TMP/lookup_$a" "$TMP/readdir_$a"; do
       ldd "$b" 2>/dev/null | grep -q librseq || {
         echo "FATAL: $(basename "$b") built for the rseq slab but does not link"

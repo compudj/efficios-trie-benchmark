@@ -42,12 +42,20 @@ Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
 # from the build being linked (from its CPPFLAGS -- configure appends the flag
 # rather than AC_DEFINE-ing it, so config.h never mentions it) so the two cannot
 # disagree; a mismatch is silent undefined behaviour.
-SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+SLABDEF=""; SLABINC=""; SLABLIB=""; RSEQ_ON=0; SLABMODE="lfstack (atomic paths)"
 if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
-  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"; RSEQ_ON=1
   SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
   [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+# URCU_TXN_SLAB_BATCH is header-inline too: urcu_txn_retire() is compiled into
+# THIS TU, so linking a batch-built liburcu without defining it here compiles the
+# DEFAULT route and silently measures the wrong thing under the right label --
+# and mixes the two routes in one process, which rcu-txn-slab.h forbids.
+if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="$SLABDEF -DURCU_TXN_SLAB_BATCH"
+  SLABMODE="$SLABMODE + batch retirement"
 fi
 INC="-I$Bd/include -I$BIN $SLABDEF $SLABINC"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread $SLABLIB"
