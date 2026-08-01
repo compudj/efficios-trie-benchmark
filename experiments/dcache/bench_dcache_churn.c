@@ -247,8 +247,23 @@ static void *writer_fn(void *arg)
 	 * caps writer scaling at the reclaim thread's throughput rather than the
 	 * engine's, and makes the numbers drift between runs as it migrates.
 	 */
+	/*
+	 * DC_CRDP_CPU_OFFSET shifts the reclaim worker off the writer's own cpu.
+	 * URCU_CALL_RCU_RT means the worker does not sleep, so co-pinning it with
+	 * a writer that never yields makes the two timeshare one hardware thread
+	 * and caps reclaim at roughly half -- which shows up not as latency but
+	 * as an unbounded call_rcu backlog, since the writer keeps allocating at
+	 * full rate while its own reclaim gets half a cpu.  0 = the historical
+	 * co-pinned behaviour.
+	 */
 	if (cpu >= 0) {
-		crdp = create_call_rcu_data(URCU_CALL_RCU_RT, cpu);
+		const char *e = getenv("DC_CRDP_CPU_OFFSET");
+		int off = e ? atoi(e) : 0;
+		long nconf = sysconf(_SC_NPROCESSORS_CONF);
+		int ccpu = off ? (int) (((long) cpu + off) % (nconf > 0 ? nconf : 1))
+			       : cpu;
+
+		crdp = create_call_rcu_data(URCU_CALL_RCU_RT, ccpu);
 		if (crdp)
 			set_thread_call_rcu_data(crdp);
 	}
