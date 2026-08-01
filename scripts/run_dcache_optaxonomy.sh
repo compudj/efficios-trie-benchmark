@@ -48,11 +48,43 @@ HEIGHT=${HEIGHT:-2}		# move height for the directory panel (needs <= D-2)
 BRANCH=${BRANCH:-2}
 TREE_DEPTH=${TREE_DEPTH:-8}
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
-Bd=$REPO/urcu-txn-build
+# liburcu build to link against.  Overridable so the descriptor slab's arms can
+# be swept against the SAME liburcu commit -- URCU_BUILD=$REPO/urcu-txn-build-rseq
+# is the rseq arm.  Comparing arms across different liburcu commits is not an
+# A/B; the engine under the engine changed (wfstack -> lfstack + batch
+# retirement landed in 0d83f466), so pin the commit and vary one flag.
+Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
 INC="-I$Bd/include -I$BIN"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread"
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native"
+
+# URCU_SLAB_RSEQ is a HEADER-inline switch, not a library one: rcu-txn-slab.h is
+# static inline, and it states that the macro must be IDENTICAL across every TU
+# of a process -- a TU built without it takes the arena's pop lock while one
+# built with it pops the same freelist locklessly, which lfstack's
+# synchronization matrix forbids.  So it has to be repeated on the dcache
+# compiles.  DERIVE it from the liburcu build we are linking rather than taking
+# it as a second knob: a mismatch here is silent and is undefined behaviour, so
+# the two must not be independently settable.
+# NB: configure appends -DURCU_SLAB_RSEQ to CPPFLAGS, it does NOT AC_DEFINE it,
+# so config.h never mentions it -- read the build's own CPPFLAGS instead.
+SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  # Same librseq the liburcu build used, taken from that build, for the same
+  # can-never-disagree reason.
+  SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+INC="$INC $SLABDEF $SLABINC"
+LIB="$LIB $SLABLIB"
+
+# Provenance: which liburcu, which slab mode.  Recorded because a sweep whose
+# numbers cannot be attributed to a commit is a sweep that has to be re-run.
+URCU_ID=$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)
+printf '>> liburcu %s (%s)  slab: %s\n' "$URCU_ID" "$Bd" "$SLABMODE" >&2
 
 CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 [[ -n "$CPULIST" ]] && PIN="--cpulist $CPULIST" && \
@@ -102,7 +134,49 @@ build() {   # <engine> <harness> <extra-defs> -> $TMP/<engine>_<tag>
   local e=$1 src=$2 def=$3 tag=$4
   (cd "$BIN" && $CC $CFLAGS ${EDEF[$e]} $def $INC -o "$TMP/${e}_${tag}" \
       "$src" "${ESRC[$e]}" $LIB) || { echo "build $e/$tag failed"; exit 1; }
+  # Non-vacuity: an rseq arm that silently ran the atomic path would report a
+  # difference of zero and look like a clean negative result.  rcu-txn-slab.h
+  # falls back to sched_getcpu() whenever rseq is not registered, so "built with
+  # the flag" is not the same as "ran rseq".  Assert the binary actually
+  # resolves librseq; the runtime half (rseq_registered() per thread, and the
+  # membarrier RSEQ registration the arena's rseq_ok depends on) is checked once
+  # below.
+  if [[ -n "$SLABDEF" ]]; then
+    ldd "$TMP/${e}_${tag}" 2>/dev/null | grep -q librseq || {
+      echo "FATAL: $e/$tag built for the rseq slab but does not link librseq --"
+      echo "       the arm would silently measure the atomic path.  Aborting."
+      exit 1; }
+  fi
 }
+
+# Runtime half of the same check, once per sweep: rseq must be available AND the
+# membarrier RSEQ registration must succeed, or urcu_slab_init() leaves every
+# arena's rseq_ok clear and the whole arm is the atomic path under another name.
+if [[ -n "$SLABDEF" ]]; then
+  cat > "$TMP/rseqchk.c" <<'CHK'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <syscall.h>
+#include <unistd.h>
+#include <linux/membarrier.h>
+#include <rseq/rseq.h>
+int main(void) {
+	if (rseq_init() != 0 && !rseq_registered()) { printf("no-rseq\n"); return 1; }
+	if (!rseq_registered()) { printf("not-registered\n"); return 1; }
+	if (syscall(__NR_membarrier,
+			MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0)) {
+		printf("no-membarrier-rseq\n"); return 1; }
+	printf("rseq-active\n"); return 0;
+}
+CHK
+  $CC -O2 $SLABINC -o "$TMP/rseqchk" "$TMP/rseqchk.c" $SLABLIB 2>/dev/null && \
+    [[ "$("$TMP/rseqchk" 2>/dev/null)" == "rseq-active" ]] || {
+      echo "FATAL: rseq slab requested but the runtime cannot use it"
+      echo "       ($("$TMP/rseqchk" 2>/dev/null || echo 'probe failed to build'))."
+      echo "       The sweep would report the atomic path as if it were rseq."
+      exit 1; }
+  echo ">> rseq runtime check: active" >&2
+fi
 
 field() { grep -oP "$2 \K[0-9.]+" <<< "$1" | head -1; }
 

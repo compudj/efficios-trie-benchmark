@@ -42,11 +42,34 @@ DUR=${DUR:-1000}
 RUNS=${RUNS:-7}		# more than the usual 5: this is a null-result test, and
 			# "within noise" is only a claim if the noise is measured
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
-Bd=$REPO/urcu-txn-build
+# liburcu build to link against; URCU_BUILD=$REPO/urcu-txn-build-rseq selects the
+# descriptor slab's rseq arm.  Keep the COMMIT fixed across arms -- the slab's
+# freelist changed wfstack -> lfstack in 0d83f466, so arms from different
+# commits are not an A/B of the flag.
+Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
 INC="-I$Bd/include -I$BIN"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread"
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native"
+
+# URCU_SLAB_RSEQ is header-inline and rcu-txn-slab.h requires it to be IDENTICAL
+# in every TU of the process (a TU without it takes the arena pop lock while one
+# with it pops locklessly -- forbidden).  Derive it from the liburcu build being
+# linked so the dcache TUs cannot disagree with the library.
+# configure appends -DURCU_SLAB_RSEQ to CPPFLAGS rather than AC_DEFINE-ing it,
+# so config.h never mentions it -- read the build's own CPPFLAGS.
+SLABDEF=""; SLABINC=""; SLABLIB=""; SLABMODE="lfstack (atomic paths)"
+if grep -qE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="-DURCU_SLAB_RSEQ"; SLABMODE="rseq per-cpu local lists"
+  SLABINC=$(grep -ohE '\-I[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  rl=$(grep -ohE '\-L[^ ]*librseq[^ ]*' "$Bd/src/Makefile" 2>/dev/null | head -1)
+  [[ -n "$rl" ]] && SLABLIB="$rl -Wl,-rpath,${rl#-L} -lrseq"
+fi
+INC="$INC $SLABDEF $SLABINC"
+LIB="$LIB $SLABLIB"
+
+URCU_ID=$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)
+printf '>> liburcu %s (%s)  slab: %s\n' "$URCU_ID" "$Bd" "$SLABMODE" >&2
 
 CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 [[ -n "$CPULIST" ]] && PIN="--cpulist $CPULIST" && \
@@ -90,6 +113,17 @@ for a in $ARMS; do
       bench_dcache.c "${ASRC[$a]}" $LIB) || { echo "build $a failed"; exit 1; }
   (cd "$BIN" && $CC $CFLAGS ${ADEF[$a]} $INC -DDC_SPLIT_KEEPID -o "$TMP/readdir_$a" \
       bench_dcache_churn.c "${ASRC[$a]}" $LIB) || { echo "build $a churn failed"; exit 1; }
+  # Non-vacuity: the slab falls back to sched_getcpu() when rseq is unusable, so
+  # an rseq arm can silently run the atomic path and report a difference of zero
+  # -- a false negative indistinguishable from a real one.  Require the link.
+  if [[ -n "$SLABDEF" ]]; then
+    for b in "$TMP/lookup_$a" "$TMP/readdir_$a"; do
+      ldd "$b" 2>/dev/null | grep -q librseq || {
+        echo "FATAL: $(basename "$b") built for the rseq slab but does not link"
+        echo "       librseq -- the arm would measure the atomic path.  Aborting."
+        exit 1; }
+    done
+  fi
 
   [[ " $NWPANELS " == *" lookup "* ]] && for rd in $RDPTS; do
     # Every run is recorded, not just the best: the question is whether two arms
