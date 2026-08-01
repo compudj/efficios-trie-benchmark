@@ -494,6 +494,24 @@ int main(int argc, char **argv)
 	       nwriters + nreaders)
 		sched_yield();
 
+	/*
+	 * Main is RCU-registered and never quiesces, so it must be OFFLINE for
+	 * the whole time the workers run -- not merely across the join.
+	 *
+	 * Offlining only around the join (as this did) leaves main online and
+	 * asleep in nanosleep() for the entire MEASURED window, and one stuck
+	 * online QSBR thread blocks every grace period: no call_rcu callback
+	 * fires, so no freed descriptor returns to a slab freelist, so every
+	 * allocation carves a fresh block.  The whole run's frees then land at
+	 * teardown, when this thread finally goes offline.
+	 *
+	 * That is not a small distortion.  It made the descriptor slab's reuse
+	 * rate read ~11% and its footprint grow LINEARLY with duration (3.8 GiB
+	 * at 0.5 s to 48.7 GiB at 8 s) -- an unbounded-growth signature that is
+	 * an artifact of this line's placement, not a property of the slab.
+	 */
+	rcu_thread_offline();
+
 	t0 = now_ns();
 	__atomic_store_n(&goflag, GOFLAG_RUN, __ATOMIC_RELEASE);
 	{
@@ -504,9 +522,6 @@ int main(int argc, char **argv)
 	__atomic_store_n(&goflag, GOFLAG_STOP, __ATOMIC_RELEASE);
 	t1 = now_ns();
 
-	/* The main thread is registered but never quiesces inside the loop, so
-	 * take it offline while joining or the writers' call_rcu work stalls. */
-	rcu_thread_offline();
 	for (i = 0; i < nwriters; i++)
 		pthread_join(wt[i], NULL);
 	for (i = 0; i < nreaders; i++)
