@@ -8,6 +8,12 @@
 # TSAN-instrumented liburcu (compiler atomic builtins + -fsanitize=thread), for
 # experiments/dcache stress-tsan; built by copying + reconfiguring urcu-txn-build.
 /urcu-txn-tsan-build/
+/urcu-txn-tsan-*/
+
+# librseq, built to a local prefix for the descriptor slab's rseq arm
+# (--enable-slab-rseq).  The system librseq is too old for it: liburcu's
+# configure needs rseq_init(), which predates the installed 0.1.0-pre.
+/librseq-build/
 
 # Our clean bind9 clone + overlay + build (the MT benchmarks); make bind9
 /bind9-src/
