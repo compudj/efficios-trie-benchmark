@@ -14,11 +14,51 @@ URCU_TXN_BUILD ?= $(abspath ../../urcu-txn-build)
 URCU_TXN_INC   := $(URCU_TXN_BUILD)/include
 URCU_TXN_LIB   := $(URCU_TXN_BUILD)/src/.libs
 
+# The descriptor slab's rseq arm.  URCU_SLAB_RSEQ is HEADER-inline
+# (rcu-txn-slab.h is static inline) and that header requires the macro to be
+# IDENTICAL across every TU of a process: a TU built without it takes the
+# arena's pop lock while one built with it pops the same freelist locklessly,
+# which lfstack's synchronization matrix forbids.  So selecting the rseq arm
+# with URCU_TXN_BUILD alone -- linking the rseq library but compiling these TUs
+# without the macro -- silently produces exactly that broken build.
+#
+# Derive it from the liburcu build being linked instead of offering a second
+# knob, so the two cannot disagree.  It is read from that build's CPPFLAGS, not
+# its config.h: configure appends -DURCU_SLAB_RSEQ rather than AC_DEFINE-ing it.
+comma := ,
+URCU_SLAB_RSEQ := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' \
+		     $(URCU_TXN_BUILD)/src/Makefile && echo yes)
+# URCU_TXN_SLAB_BATCH routes the engines' descriptor retirement through the
+# slab's batch machinery (urcu_slab_free_pending at commit) instead of one
+# call_rcu per descriptor.  urcu_txn_retire() is a static inline compiled into
+# THESE TUs, so the flag has to reach them too -- derived from the liburcu build
+# for the same can-never-disagree reason as the rseq flag above.
+URCU_TXN_SLAB_BATCH := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' \
+			  $(URCU_TXN_BUILD)/src/Makefile && echo yes)
+ifeq ($(URCU_TXN_SLAB_BATCH),yes)
+SLAB_CPP += -DURCU_TXN_SLAB_BATCH
+endif
+
+ifeq ($(URCU_SLAB_RSEQ),yes)
+RSEQ_INC := $(shell grep -shoE '\-I[^ ]*librseq[^ ]*' $(URCU_TXN_BUILD)/src/Makefile | head -1)
+RSEQ_L   := $(shell grep -shoE '\-L[^ ]*librseq[^ ]*' $(URCU_TXN_BUILD)/src/Makefile | head -1)
+SLAB_CPP += -DURCU_SLAB_RSEQ $(RSEQ_INC)
+SLAB_LD  := $(RSEQ_L) $(patsubst -L%,-Wl$(comma)-rpath$(comma)%,$(RSEQ_L))
+SLAB_LIB := -lrseq
+endif
+
 CC       ?= gcc
 CFLAGS   ?= -O2 -g -pthread -Wall -Wextra -march=native
-CPPFLAGS := -I$(URCU_TXN_INC) -I.
-LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB)
-LDLIBS   := -lurcu-qsbr -lurcu-common -lpthread
+CPPFLAGS := -I$(URCU_TXN_INC) -I. $(SLAB_CPP)
+LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) $(SLAB_LD)
+LDLIBS   := -lurcu-qsbr -lurcu-common $(SLAB_LIB) -lpthread
+
+# Rebuild when the LIBRARY changes, not only when our sources do.  Without this
+# every binary here silently survives a liburcu rebuild: the prerequisites are
+# .c/.h files, so make sees nothing to do, and the stale binary either segfaults
+# on an ABI change ("urcu_txn_slab has different size in shared object") or,
+# worse, runs and reports numbers for the previous library.  Both have happened.
+URCU_DEP := $(URCU_TXN_LIB)/liburcu-qsbr.so
 
 # The default 1-CL split layout returns the host ADDRESS as identity.  The
 # correctness harnesses assert logical ids (id==gid torn-read checks), so they
@@ -28,7 +68,9 @@ KEEPID   := -DDC_SPLIT_KEEPID
 HCPP     := $(KEEPID) $(CPPFLAGS)
 
 ENGINE   ?= seqlock
-HDRS     := dcache.h seqcount.h
+# $(URCU_DEP) rides in HDRS because nearly every target here already lists HDRS,
+# so one line makes a liburcu rebuild invalidate every binary that links it.
+HDRS     := dcache.h seqcount.h $(URCU_DEP)
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
@@ -123,12 +165,23 @@ stress-asan: stress_dcache.c dcache_txn.c $(HDRS) | check-lib
 #     LDFLAGS="-fsanitize=thread" && make -C src
 URCU_TSAN_BUILD ?= $(abspath ../../urcu-txn-tsan-build)
 URCU_TSAN_INC   := $(URCU_TSAN_BUILD)/include
+# Slab-route flags for the TSAN builds, derived from the TSAN liburcu -- NOT
+# from $(SLAB_CPP), which is derived from URCU_TXN_BUILD and would describe a
+# different library.  These recipes do not use $(CPPFLAGS), so without this a
+# TSAN run compiles the DEFAULT route against a batch-built liburcu: a mixed
+# configuration that tests neither route and is exactly the state
+# rcu-txn-slab.h forbids.  A gate that silently tests the wrong thing is worse
+# than no gate.
+TSAN_SLAB_CPP := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' \
+		    $(URCU_TSAN_BUILD)/src/Makefile && echo -DURCU_TXN_SLAB_BATCH)
+TSAN_SLAB_CPP += $(shell grep -sqE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' \
+		    $(URCU_TSAN_BUILD)/src/Makefile && echo -DURCU_SLAB_RSEQ)
 URCU_TSAN_LIB   := $(URCU_TSAN_BUILD)/src/.libs
 stress-tsan: stress_dcache.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see the recipe"; \
 	  echo "       in the stress-tsan comment in this Makefile."; exit 1; }
-	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. -o stress_dcache_tsan \
 	  stress_dcache.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_tsan 4 2 8 8 15000
@@ -150,7 +203,7 @@ stress-dirs-tsan: stress_dcache_dirs.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_dirs_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. -o stress_dcache_dirs_tsan \
 	  stress_dcache_dirs.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	# TSAN's ~10x slowdown pushes the heavier dir-move config past the GP-bound
@@ -173,7 +226,7 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) $(KEEPID) -I$(URCU_TSAN_INC) -I. -o stress_dcache_xchg_tsan \
+	$(CC) $(TSANFLAGS) $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. -o stress_dcache_xchg_tsan \
 	  stress_dcache_xchg.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_tsan 4 4 6 8 15000
@@ -538,15 +591,15 @@ check-bucketlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_bucketlock_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_tsan 4 2 8 8 15000
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_xchg_bucketlock_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_tsan 4 4 6 8 15000
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_dirs_bucketlock_tsan stress_dcache_dirs.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_bucketlock_tsan 2 4 2 1 4000
@@ -586,11 +639,11 @@ check-bucketlock-chainlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dca
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_bucketlock_chainlock_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_chainlock_tsan 4 2 8 8 15000
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_LOCK $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_xchg_bucketlock_chainlock_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_chainlock_tsan 4 4 6 8 15000
@@ -636,15 +689,15 @@ check-bucketlock-swmw-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_d
 	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
 	  exit 1; }
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_bucketlock_swmw_tsan stress_dcache.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_bucketlock_swmw_tsan 4 2 8 8 15000
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_xchg_bucketlock_swmw_tsan stress_dcache_xchg.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_bucketlock_swmw_tsan 4 4 6 8 15000
-	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) -I$(URCU_TSAN_INC) -I. \
+	$(CC) $(TSANFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
 	  -o stress_dcache_dirs_bucketlock_swmw_tsan stress_dcache_dirs.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_bucketlock_swmw_tsan 2 4 2 1 4000
