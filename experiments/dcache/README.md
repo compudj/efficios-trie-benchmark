@@ -252,7 +252,7 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   3. **The slab's batch retirement had no in-tree user.** liburcu carried
      `urcu_slab_free_pending()` — retire a whole batch with one `call_rcu`
      instead of one per descriptor — and both engines still freed one at a time.
-     Wiring it up (`URCU_TXN_SLAB_BATCH`) is worth **3.4×** on churn at 48
+     Wiring it up (`URCU_TXN_SLAB_BATCH`) is worth **3.0–3.5×** on churn at 48
      writers *and* bounds the footprint at 194 MiB instead of growing without
      limit.
 
@@ -261,11 +261,25 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
   replaces), and a plain/atomic race on the arena floor that failed all six
   TSAN gates. Both fixed upstream.
 
+  **The grace period turned out to be the batching clock, not the threshold.**
+  The slab closes a batch either at `batch_max` blocks *or* on a closer armed at
+  the first deferred free and re-armed only once the previous has run — and the
+  second is the mechanism. Closing early cannot make a block reusable sooner
+  (it still owes a grace period from the close), so it buys nothing and costs a
+  `call_rcu`. Counted at 48 writers, the GP-clocked half is identical either
+  way — 37941 vs 37921 closes — and the threshold merely interleaves 19151 more
+  on top, +20% `call_rcu` traffic for the same reclaim latency, footprint and
+  reuse. The default is now out of reach (`ULONG_MAX`), which measures the same
+  as any sufficiently high value: the effect saturates.
+
   Sweep: four descriptor-slab arms (`scripts/dcache_*{,_rseq,_batch,_batch_rseq}.csv`,
-  5012 rows, zero conservation failures). **rseq per-cpu local lists are a null
-  on the default route** — its fast path needs a same-cpu free, and reclaim runs
-  on another cpu, so ~12.5% of frees took it — and worth ~3% under batching, on
-  the churn workload only.
+  `figures/dcache_slabroute.png`). **rseq per-cpu local lists are not merely a
+  null on the default route — they cost**, and the cost grows with contention
+  (1.04 at one writer to 0.88 at 48, against a control band flat at 0.98–1.01):
+  the fast path needs a same-cpu free, reclaim runs elsewhere, so every op pays
+  the rseq checks and takes the atomic path anyway. Under batching, where the
+  committing writer frees on its own cpu, it turns positive — ~3%, on the churn
+  workload only.
 
   The standing lesson: a footprint cap is a **memory safety valve**, not a
   tuning knob. Raising it does buy throughput, by letting the leak run further;

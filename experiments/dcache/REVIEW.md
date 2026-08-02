@@ -246,6 +246,20 @@ absence produced a wrong conclusion at least once.
    artifact).  Per-op counters (instructions, L1d/LLC misses) are the
    robust observable when absolute throughput is pinning-sensitive; on a
    loaded box, interleave A/B runs instead of running arms sequentially.
+   **A control only controls for what it shares with the arm.**  The seqlock and
+   bucket-lock arms are the standing "did the machine move" check here, and they
+   are worthless for anything touching the transaction descriptor slab, because
+   they do not use it.  Measured: one configuration (batch retirement,
+   batch_max=1024, 48 writers) read 121.7 Mchurn/s in one sweep and 109.3 in
+   another a day later -- ~11% apart -- while seqlock and bucket lock moved <1%
+   across the same pair.  Whatever drifts between sessions (allocator state, THP
+   availability, fragmentation after days of runs) reaches only the arms that
+   allocate, so the controls stay flat and certify nothing.  Two consequences:
+   a cross-sweep delta on a slab-using engine is not evidence below ~10%, and
+   the only reliable A/B is INTERLEAVED reps of both arms on one binary in one
+   session.  That is how the batch-clock question was actually settled, after a
+   cross-sweep comparison pointed the opposite way.
+
    **Know which column is noisy before quoting a ratio from it.**  In the
    role-split configuration only 8 of 192 threads are writers, and the
    writer column's run-to-run spread is correspondingly wide: repeating one
