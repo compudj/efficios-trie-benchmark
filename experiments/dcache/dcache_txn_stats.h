@@ -50,6 +50,11 @@ struct dc_ts_row {
 	unsigned long published;	/* attempts that RAISED domain->active */
 	unsigned long eagain;		/* prepare returned -EAGAIN (successor
 					 * mid-delete) -- a RETRY, not a conflict */
+	unsigned long casfail[6];	/* failing install CAS, by RECORD INDEX --
+					 * which EDGE of the committed structure
+					 * lost, which localises a self-conflict
+					 * (always the same index) apart from a
+					 * live competitor (spread) */
 	unsigned long begins;		/* urcu_txn_begin() calls that RETURNED */
 	unsigned long begin_in_lane;	/* ... of those, already holding the lane */
 	unsigned long begin_funnel_on;	/* ... of those, with domain->active set */
@@ -73,6 +78,11 @@ struct dc_ts_row {
 extern struct dc_ts_row dc_ts_tab[DC_TS_MAX_THREADS][DC_TS_NR];
 extern unsigned long dc_ts_next_slot;
 extern __thread int dc_ts_slot;
+extern __thread int dc_ts_cur_site;
+extern __thread void *dc_ts_last_slot;
+extern __thread void *dc_ts_last_old;
+extern __thread void *dc_ts_last_seen;
+
 
 static inline struct dc_ts_row *dc_ts_row(enum dc_ts_site s)
 {
@@ -132,6 +142,7 @@ static inline void dc_ts_begin(enum dc_ts_site s, const struct urcu_txn *txn)
 {
 	struct dc_ts_row *r = dc_ts_row(s);
 
+	dc_ts_cur_site = (int) s;
 	r->begins++;
 	if (txn->in_fallback)
 		r->begin_in_lane++;
@@ -141,6 +152,27 @@ static inline void dc_ts_begin(enum dc_ts_site s, const struct urcu_txn *txn)
 
 #define DC_TS_COMMIT(site, txnp, st)	dc_ts_commit((site), (txnp), (st))
 #define DC_TS_BEGIN(site, txnp)		dc_ts_begin((site), (txnp))
+
+/*
+ * The failing install CAS, routed here from liburcu's URCU_TXN_CAS_FAIL hook.
+ * Attributed to whichever site is CURRENTLY committing on this thread -- the
+ * hook fires deep inside the engine, which does not know the caller, so the
+ * site is stashed at begin() and read back here.
+ */
+
+static inline void dc_ts_cas_fail(unsigned int idx, void *slot, void *old,
+				  void *seen)
+{
+	struct dc_ts_row *r;
+
+	if (dc_ts_cur_site < 0)
+		return;
+	r = dc_ts_row((enum dc_ts_site) dc_ts_cur_site);
+	r->casfail[idx < 6 ? idx : 5]++;
+	dc_ts_last_slot = slot;
+	dc_ts_last_old = old;
+	dc_ts_last_seen = seen;
+}
 #define DC_TS_EAGAIN(site)		(dc_ts_row(site)->eagain++)
 
 /* dcache.h declares this as void dc_txn_stats_dump(void *stream); the void*
@@ -150,6 +182,10 @@ static inline void dc_ts_begin(enum dc_ts_site s, const struct urcu_txn *txn)
 struct dc_ts_row dc_ts_tab[DC_TS_MAX_THREADS][DC_TS_NR];
 unsigned long dc_ts_next_slot;
 __thread int dc_ts_slot = -1;
+__thread int dc_ts_cur_site = -1;
+__thread void *dc_ts_last_slot;
+__thread void *dc_ts_last_old;
+__thread void *dc_ts_last_seen;
 
 void dc_txn_stats_dump(void *stream)
 {
@@ -159,7 +195,7 @@ void dc_txn_stats_dump(void *stream)
 		"lru_add", "lru_del", "lru_evict"
 	};
 	unsigned long nthr = uatomic_load(&dc_ts_next_slot, CMM_RELAXED);
-	unsigned long t, i;
+	unsigned long t, i, k;
 
 	if (nthr > DC_TS_MAX_THREADS)
 		nthr = DC_TS_MAX_THREADS;
@@ -183,6 +219,8 @@ void dc_txn_stats_dump(void *stream)
 			a.begins += r->begins;
 			a.begin_in_lane += r->begin_in_lane;
 			a.begin_funnel_on += r->begin_funnel_on;
+			for (k = 0; k < 6; k++)
+				a.casfail[k] += r->casfail[k];
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
 		}
@@ -194,6 +232,10 @@ void dc_txn_stats_dump(void *stream)
 		fprintf(f, "TXNSTATS %-9s begins %lu  in-lane %lu  funnel-on %lu  "
 			"poisoned %lu\n", name[i], a.begins, a.begin_in_lane,
 			a.begin_funnel_on, a.poison);
+		fprintf(f, "TXNSTATS %-9s cas-fail by record idx:", name[i]);
+		for (k = 0; k < 6; k++)
+			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
+		fprintf(f, "\n");
 	}
 }
 #endif	/* DC_TXN_STATS_IMPL */

@@ -681,9 +681,36 @@ items here are the ones that actually fired in this experiment):
   transaction that cannot complete, is never released — so this is absorbing by
   construction rather than merely slow.
 
-  It is a liburcu-level question now, not a dcache one, and the next measurement
-  belongs inside `begin()`/`commit()`: which SLOT the doomed descriptor keeps
-  failing its CAS on.
+  ⭐⭐ **INSTRUMENTED THE INSTALL CAS (new `URCU_TXN_CAS_FAIL` hook in
+  `rcu-txn-mcas.h`, same embedder contract as `URCU_TXN_STAT`), and the answer is
+  that THE CAS IS NOT FAILING.**  Per-record-index histogram of failed install
+  CASes, against the abort count, from three wedged runs:
+
+  | run | commit aborts | install-CAS failures | `-EAGAIN` from `del_prepare` |
+  |---|--:|--:|--:|
+  | A | 3 | 3 | **380,354,944** |
+  | B | 26,640,926 | **2** | 0 |
+  | C | 25,750,551 | **9** | 1 |
+
+  26 million aborts against *two* failed CASes.  The abort therefore happens
+  **before installation**, on the pre-install validation — i.e. on
+  `del_prepare`'s neighbour guard, the `{v -> v}` load-validate it folds in on
+  the neighbour whose `next` it does not write (the tombstone guard).  Run A is
+  the same fault surfacing at prepare time instead of commit time, which is why
+  the split between the two columns moves between runs while the total does not.
+
+  So the loop is: **`lru_del` cannot validate its neighbour guard, forever**, and
+  it does so while holding the escalation lane with every competitor parked
+  behind it — which is what makes it absorbing rather than slow.  Nothing here
+  is contention in the ordinary sense; the counters say there is no competitor
+  left to contend with.
+
+  Next, and it is now firmly a liburcu question: why that guard never validates
+  when nothing else is mutating the list.  The two candidates the counters
+  cannot separate are a neighbour left permanently MARKED-but-linked, and a
+  stale guard surviving the `conflict()/end()/begin()` retry protocol — the
+  header notes the `-EAGAIN` path "HAS already appended a {v -> v} validate",
+  which is exactly the kind of thing that would.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:

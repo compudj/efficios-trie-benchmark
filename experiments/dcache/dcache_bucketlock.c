@@ -48,6 +48,16 @@
 #define _GNU_SOURCE
 #define _LGPL_SOURCE
 
+#ifdef DC_TXN_STATS
+/* Route liburcu's install-CAS failure hook into the per-site counters.  Must be
+ * defined BEFORE <urcu/rcu-txn*.h> is included, per that header's contract. */
+struct dc_ts_fwd;
+static inline void dc_ts_cas_fail(unsigned int idx, void *slot, void *old,
+				  void *seen);
+#define URCU_TXN_CAS_FAIL(idx, slot, old, seen) \
+	dc_ts_cas_fail((idx), (void *) (slot), (void *) (old), (void *) (seen))
+#endif
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
