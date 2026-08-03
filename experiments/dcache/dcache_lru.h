@@ -251,10 +251,13 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
  * shard is not an empty list, it is a NULL-edged one that faults on the first
  * insert.  Returns 0, or -ENOMEM.
  */
+struct dcache *dc_lru_validate_dc;
+
 static int lru_shards_init(struct dcache *dc)
 {
 	unsigned int i;
 
+	dc_lru_validate_dc = dc;
 	dc->nlru = lru_nshards();
 	if (posix_memalign((void **) &dc->lru, 64,
 			   (size_t) dc->nlru * sizeof(*dc->lru)) != 0)
@@ -504,6 +507,77 @@ static void lru_del(struct dcache *dc, struct dentry *d)
 
 
 
+/*
+ * Walk every shard and report any node that is MARKED but still LINKED -- the
+ * state every measurement so far points at, and which nothing in the engine is
+ * supposed to be able to leave behind (a del applies its mark and both unlinks
+ * in one commit, or none of them).
+ *
+ * Reports position, because that is what distinguishes the candidates: a marked
+ * SENTINEL is a different bug from a marked interior node, and "the list is a
+ * cycle that never reaches the sentinel" is a third.  Bounded so a corrupt list
+ * cannot hang the reporter.
+ */
+void dc_lru_validate(void *stream)
+{
+	FILE *f = stream;
+	struct dcache *dc = dc_lru_validate_dc;
+	unsigned int i;
+
+	if (!dc)
+		return;
+	for (i = 0; i < dc->nlru; i++) {
+		struct urcu_txn_list_head *h = &dc->lru[i].list;
+		struct urcu_txn_list_node *n;
+		unsigned long pos = 0, marked = 0, proxies = 0;
+		unsigned long cnt = uatomic_load(&dc->lru[i].count, CMM_RELAXED);
+
+		if (!cnt)
+			continue;
+		n = (struct urcu_txn_list_node *)
+			((uintptr_t) uatomic_load(&h->node.next, CMM_RELAXED)
+			 & ~3UL);
+		while (n && n != &h->node && pos < 10000) {
+			void *raw = uatomic_load(&n->next, CMM_RELAXED);
+
+			/*
+			 * BIT 0 is the engine's proxy tag, BIT 1 the deletion
+			 * mark.  A slot holding a parked DESCRIPTOR has bit 0
+			 * set and arbitrary bits above it, so testing bit 1 on
+			 * an unresolved value reports proxies as marks -- which
+			 * at a wedge, where a stuck transaction has a planted
+			 * prefix, is exactly the common case.  Classify them
+			 * apart and resolve before following the link, or the
+			 * walk reports corruption that is really work in flight.
+			 */
+			if ((uintptr_t) raw & 0x1UL) {
+				proxies++;
+				break;		/* mid-commit: stop, do not follow */
+			}
+			if ((uintptr_t) raw & 0x2UL) {
+				marked++;
+				if (marked <= 4)
+					fprintf(f, "LRUCHK shard %u pos %lu: "
+						"MARKED-but-LINKED node=%p next=%p\n",
+						i, pos, (void *) n, raw);
+			}
+			n = (struct urcu_txn_list_node *)
+				((uintptr_t) raw & ~3UL);
+			pos++;
+		}
+		fprintf(f, "LRUCHK shard %u: count=%lu walked=%lu marked=%lu "
+			"proxy-stop=%lu%s\n", i, cnt, pos, marked, proxies,
+			pos >= 10000 ? "  (WALK CAPPED -- cycle?)" : "");
+		{
+			void *sr = uatomic_load(&h->node.next, CMM_RELAXED);
+
+			if ((uintptr_t) sr & 0x2UL)
+				fprintf(f, "LRUCHK shard %u: THE SENTINEL ITSELF "
+					"IS MARKED (next=%p)\n", i, sr);
+		}
+	}
+}
+
 unsigned long dc_lru_count(struct dcache *dc)
 {
 	unsigned long n = 0;
@@ -515,6 +589,9 @@ unsigned long dc_lru_count(struct dcache *dc)
 }
 
 #else	/* ================= THE LOCK ARM (per-shard spinlock) ================ */
+
+/* MCAS-only diagnostic; the lock arm has no marked-but-linked state. */
+void dc_lru_validate(void *stream) { (void) stream; }
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
 
 static inline void lru_lock(struct dc_lru_shard *sh)
@@ -600,6 +677,7 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return n;
 }
 #endif	/* DC_LRU_MCAS */
+
 
 #else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
 static inline void lru_retain(struct dcache *dc, struct dentry *d)

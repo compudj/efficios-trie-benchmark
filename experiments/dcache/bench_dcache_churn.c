@@ -615,6 +615,7 @@ static void stats_signal(int sig)
 	if (dc_txn_stats_supported) {
 		dc_txn_stats_dump(stdout);
 		dc_txn_stats_last(stdout);
+		dc_lru_validate(stdout);
 	}
 	fflush(stdout);
 	_exit(3);

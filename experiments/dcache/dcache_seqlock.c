@@ -303,6 +303,7 @@ const int dc_txn_stats_supported = 1;
 const int dc_txn_stats_supported = 0;
 void dc_txn_stats_dump(void *stream) { (void) stream; }
 void dc_txn_stats_last(void *stream) { (void) stream; }
+void dc_lru_validate(void *stream) { (void) stream; }
 #endif
 
 #ifdef DC_NO_LRU

@@ -804,10 +804,35 @@ items here are the ones that actually fired in this experiment):
   (`same-as-old` 0), and the two modes being the same corruption seen from the
   successor side (`-EAGAIN`) or the predecessor side (CAS loss).
 
-  What remains open is how a node reaches marked-but-linked in the first place,
-  given MCAS atomicity — the settle path after a partially-planted abort
-  (`urcu_txn_settle(t, planted, FAILED)`) is the only place a mark can outlive
-  its unlink, and is where I would look next.
+  **`settle` checks out**: it restores `[0..planted)` to `old_ptr` on FAILED, and
+  `planted` is the true prefix from both installers.  Not the leak.
+
+  ⭐⭐ **THE CORRUPT STATE IS NOW OBSERVED DIRECTLY**, not inferred.  A validator
+  (`dc_lru_validate()`) walks every shard at the wedge:
+
+  | run | shard | `count` | walked | **marked-but-linked** |
+  |---|--:|--:|--:|--:|
+  | 1 | 0 | 20 | 23 | **5** |
+  | 2 | 1 | 16 | 15 | **1** |
+  | 4 | 15 | 24 | 16 | **1** |
+
+  So nodes really are MARKED yet still reachable from the sentinel — and the
+  shard counter disagrees with the actual list length in both directions.
+
+  ⚠ **The first version of this validator was wrong and would have been a ninth
+  false lead.**  Bit 0 is the engine's proxy tag and bit 1 the deletion mark; a
+  slot holding a parked DESCRIPTOR has bit 0 set and arbitrary bits above it, so
+  testing bit 1 on an unresolved value reports proxies as marks — and at a wedge,
+  where a stuck transaction has a planted prefix, that is the common case.  It
+  reported whole runs of consecutive "marked" nodes that were simply work in
+  flight.  Fixed to classify the two apart and stop at a proxy rather than follow
+  it; the numbers above are post-fix.
+
+  Where that leaves it: a del applies its mark and both unlinks in ONE commit, so
+  a marked-but-linked node should be unreachable — yet it is reachable, and the
+  counter drifts with it.  The next step is to catch the transition rather than
+  the aftermath: log every `del` commit's outcome together with the three slots
+  it wrote, and find the one whose mark landed while its forward unlink did not.
 
   ⚠ **Process note, having been wrong four times here:** three of the four bad
   readings came from *incomplete instrumentation*, not bad reasoning — one
