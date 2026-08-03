@@ -50,6 +50,9 @@ struct dc_ts_row {
 	unsigned long published;	/* attempts that RAISED domain->active */
 	unsigned long eagain;		/* prepare returned -EAGAIN (successor
 					 * mid-delete) -- a RETRY, not a conflict */
+	unsigned long begins;		/* urcu_txn_begin() calls that RETURNED */
+	unsigned long begin_in_lane;	/* ... of those, already holding the lane */
+	unsigned long begin_funnel_on;	/* ... of those, with domain->active set */
 	unsigned long poison;		/* the ABORT was a POISONED descriptor, not
 					 * contention: a mis-built expected-old that
 					 * can never match, so every retry aborts
@@ -105,7 +108,39 @@ static inline void dc_ts_commit(enum dc_ts_site s, struct urcu_txn *txn,
 		r->max_retry = txn->retry;
 }
 
+/*
+ * Record that a begin() RETURNED.  Counting the funnel at commit time is not
+ * enough and was actively misleading: a transaction that funnels PARKS inside
+ * begin(), so until it is granted the lane it reaches no commit and shows up as
+ * "never escalated" -- which is how a first reading of these counters concluded
+ * the fast path was ignoring domain->active when it was in fact blocked in it.
+ *
+ * begin_funnel_on samples domain->active as this attempt saw it, so "the funnel
+ * was on and I still did not enter" is distinguishable from "the funnel was off".
+ *
+ * ⚠ STILL POST-PARK, and read the numbers accordingly.  This runs after begin()
+ * RETURNS, so a thread currently blocked in cds_fair_mutex_park() inside begin()
+ * is counted nowhere at all.  A site showing "begins N, in-lane 0, funnel-on 0"
+ * therefore does NOT mean it ignored the funnel -- it can equally mean its
+ * threads are parked in the funnel right now and will be counted only if they
+ * are ever granted the lane.  Confirmed by gdb: with lru_add reporting
+ * funnel-on 0, both writer threads were sitting in cds_fair_mutex_park() inside
+ * urcu_txn__enter_fallback() from lru_add.  Counting the DECISION rather than
+ * its outcome needs a hook inside begin(), i.e. in liburcu.
+ */
+static inline void dc_ts_begin(enum dc_ts_site s, const struct urcu_txn *txn)
+{
+	struct dc_ts_row *r = dc_ts_row(s);
+
+	r->begins++;
+	if (txn->in_fallback)
+		r->begin_in_lane++;
+	if (txn->domain && uatomic_load(&txn->domain->active, CMM_RELAXED))
+		r->begin_funnel_on++;
+}
+
 #define DC_TS_COMMIT(site, txnp, st)	dc_ts_commit((site), (txnp), (st))
+#define DC_TS_BEGIN(site, txnp)		dc_ts_begin((site), (txnp))
 #define DC_TS_EAGAIN(site)		(dc_ts_row(site)->eagain++)
 
 /* dcache.h declares this as void dc_txn_stats_dump(void *stream); the void*
@@ -145,6 +180,9 @@ void dc_txn_stats_dump(void *stream)
 			a.published += r->published;
 			a.eagain += r->eagain;
 			a.poison += r->poison;
+			a.begins += r->begins;
+			a.begin_in_lane += r->begin_in_lane;
+			a.begin_funnel_on += r->begin_funnel_on;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
 		}
@@ -153,7 +191,9 @@ void dc_txn_stats_dump(void *stream)
 		fprintf(f, "TXNSTATS %-9s %12lu %12lu %12lu %12lu %9lu %12lu\n",
 			name[i], a.attempts, a.aborts, a.escalations,
 			a.published, a.max_retry, a.eagain);
-		fprintf(f, "TXNSTATS %-9s poisoned-aborts: %lu\n", name[i], a.poison);
+		fprintf(f, "TXNSTATS %-9s begins %lu  in-lane %lu  funnel-on %lu  "
+			"poisoned %lu\n", name[i], a.begins, a.begin_in_lane,
+			a.begin_funnel_on, a.poison);
 	}
 }
 #endif	/* DC_TXN_STATS_IMPL */
@@ -161,6 +201,7 @@ void dc_txn_stats_dump(void *stream)
 #else	/* !DC_TXN_STATS */
 
 #define DC_TS_COMMIT(site, txnp, st)	do { } while (0)
+#define DC_TS_BEGIN(site, txnp)		do { } while (0)
 #define DC_TS_EAGAIN(site)		do { } while (0)
 
 #endif	/* DC_TXN_STATS */

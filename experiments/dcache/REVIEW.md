@@ -656,10 +656,34 @@ items here are the ones that actually fired in this experiment):
     the lane never confers exclusivity and the victim can be invalidated
     indefinitely by transactions that never queue behind it.
 
-  So the question moves off the dcache entirely and onto the escalation
-  qualification rule (`urcu_txn__self_qualifies` / the `domain->active` funnel):
-  why a publishing escalation does not pull the competing writer in.  Next
-  measurement: instrument the funnel decision itself, not the dcache.
+  **FUNNEL INSTRUMENTED (begin-time counters + gdb), and the "escalation is not
+  helping" reading above was itself an artifact.**  `DC_TS_COMMIT` fires after a
+  commit, and a thread that funnels *parks inside `begin()`* — so it reaches no
+  commit and is counted nowhere.  `lru_add` showing 0 escalations did not mean it
+  ignored `domain->active`; it meant its threads were **blocked in the funnel at
+  that moment**.  Confirmed directly: with `lru_add` reporting `funnel-on 0`,
+  gdb showed *both* writer threads in `cds_fair_mutex_park()` inside
+  `urcu_txn__enter_fallback()` called from `lru_add`.
+
+  The funnel is therefore working exactly as designed.  What is left is sharper
+  and stranger:
+
+  1. the shrinker's `lru_del` retries, crosses the aging threshold, enters the
+     lane and publishes `domain->active`;
+  2. every writer's next `begin()` sees `active` and parks — correctly;
+  3. the shrinker holds the lane (`want_fallback` is `!in_fallback && …`, so it
+     never re-enters and never yields it) and keeps retrying **inside** it;
+  4. ⭐ **it aborts 32M times for contention while every competitor is parked.**
+
+  That is the anomaly to chase: a transaction that keeps taking *contention*
+  aborts when there is no live competitor left to contend with.  Not poison (0),
+  not `-EAGAIN` (0). ⚠ Note step 3 also means the lane, once taken by a
+  transaction that cannot complete, is never released — so this is absorbing by
+  construction rather than merely slow.
+
+  It is a liburcu-level question now, not a dcache one, and the next measurement
+  belongs inside `begin()`/`commit()`: which SLOT the doomed descriptor keeps
+  failing its CAS on.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:

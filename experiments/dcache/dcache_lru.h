@@ -295,6 +295,7 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 		int p;
 
 		urcu_txn_begin(&txn);
+		DC_TS_BEGIN(DC_TS_LRU_ADD, &txn);
 		p = urcu_txn_list_insert_before_prepare(&txn, n, &head->node);
 		if (p) {
 			urcu_txn_conflict(&txn);
@@ -322,6 +323,7 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 		int p;
 
 		urcu_txn_begin(&txn);
+		DC_TS_BEGIN(DC_TS_LRU_DEL, &txn);
 		p = urcu_txn_list_del_prepare(&txn, n);
 		if (p) {
 			urcu_txn_conflict(&txn);
