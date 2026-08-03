@@ -925,7 +925,45 @@ items here are the ones that actually fired in this experiment):
   it" rule this section already carries — applied to a whole experiment rather
   than a counter.
 
-  ⭐ **Design note (M. Desnoyers): if in-place re-add is to be allowed at all**,
+  ⭐⭐ **THE REFRAMING THAT DISSOLVES IT (M. Desnoyers): a rotate is a MOVE TO
+  TAIL, not a remove followed by an add.**  The node should never leave the list
+  at all — so there is no tombstone, no re-add-after-remove window, no
+  grace-period question and no shell to fold.
+
+  And that is exactly the arm asymmetry, finally stated properly:
+  `lru_rotate_locked()` is unlink + link_tail **under one lock**, so it is
+  atomic and the node never observably leaves; the MCAS arm decomposed the same
+  operation into TWO independent commits, which is what manufactured the
+  marked-and-unlinked window in the first place.  The lock arm is not "luckier"
+  — it expresses the right operation and the MCAS arm does not.
+
+  `rcu-txn-list.h` has no move primitive (only `replace`, which still marks the
+  old node), and composing the two existing ones does NOT work: `del_prepare`
+  records `elem->next : next -> MARK(next)` while `insert_before_prepare`
+  plain-stores `newp->next = pos` — the same slot with disagreeing values, i.e.
+  precisely the poison case its own comment warns about.
+
+  So the fix is a new primitive, `move_tail_prepare`, recording SIX edges in one
+  commit and **no mark**:
+
+      prev->next   : elem    -> next        (unlink forward)
+      next->prev   : elem    -> prev        (unlink backward)
+      elem->next   : next    -> head        (elem is the new tail)
+      elem->prev   : prev    -> oldtail
+      oldtail->next: head    -> elem
+      head->prev   : oldtail -> elem
+
+  A stale traverser standing on `elem` then follows to the sentinel and
+  terminates cleanly rather than being teleported — well-defined, and harmless
+  for a CLOCK that is fuzzy by design.
+
+  ⚠ This supersedes the shell/fold sketch below, which solved the wrong problem:
+  the shell exists to let a node be re-added while stale traversers hold it, and
+  a move means it is never removed, so nothing needs re-adding.  Keeping the
+  sketch only because the reasoning is reusable if a genuine remove-then-re-add
+  is ever needed.
+
+  ⭐ **Superseded sketch — if in-place RE-ADD were needed at all**,
   the shape is the engine's own rename mechanism, reused.  Stamp a node with the
   RCU epoch at removal; on re-add, compare against the current epoch, and if no
   grace period has elapsed — so a traverser may still hold it — link a **SHELL**
