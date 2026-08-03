@@ -1152,7 +1152,9 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 	urcu_txn_init(&txn, &dc->domain);
 	for (;;) {
 		enum urcu_txn_status st;
+#ifdef DC_HOT1CL
 		uintptr_t raw;
+#endif
 
 		urcu_txn_begin(&txn);
 		top = find_top_rcu(dc, parent, name);
@@ -1163,16 +1165,32 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 			goto out;
 		}
 		host = host_of_rcu(top);
+#ifdef DC_HOT1CL
 		raw = iparent_raw(host);
 		if (!(raw & DC_TAG_NEG)) {	/* already has an inode */
+#else
+		if (DC_IS_POSITIVE(host)) {	/* already has an inode */
+#endif
 			urcu_txn_abandon(&txn);
 			urcu_txn_end(&txn);
 			ret = -EEXIST;
 			goto out;
 		}
 		host->d_id = id;		/* cold; ordered before the publish */
-		host->d_inode = 1;
-#ifdef DC_IPARENT_TXN
+#ifndef DC_HOT1CL
+		/* Legacy 3-CL layout: pos/neg is its own word (d_inode) rather
+		 * than a tag in d_iparent, and no reader resolves it through a
+		 * txn slot -- so there is nothing to commit and the flip is one
+		 * aligned store to a plainly-sampled word.  Old-or-new, never a
+		 * tear.  This layout keeps d_seq too, so it is the arm closest
+		 * to the baseline: it never needed the transaction here. */
+		CMM_STORE_SHARED(host->d_inode, 1);
+#else
+		host->d_inode = 1;		/* cold under HOT1CL: the tag rules */
+#endif
+#if !defined(DC_HOT1CL)
+		/* nothing further to publish */
+#elif defined(DC_IPARENT_TXN)
 		/* The slot is transacted (the fold publishes identity through
 		 * it), so the flip rides the same commit discipline and a
 		 * concurrent reader resolves old-or-new, never a tear. */

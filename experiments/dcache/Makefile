@@ -717,6 +717,36 @@ check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_pernode_asan 4 4 8 16 15000
 
+# LAYOUT arms.  The gates above sweep the causality arms and the chain
+# strategies, but they all build the DEFAULT 1-CL split layout -- while the
+# benchmark matrix also builds _nosplit (legacy 3-CL: d_seq kept, pos/neg in its
+# own d_inode word, no d_iparent tags) and _hot1cl (the fair-weather pack).
+# Those are the arms a tag-encoded feature silently breaks, and phase 2 DID
+# break both txn _nosplit arms: the gate matrix did not cover the build matrix,
+# so the breakage only surfaced when a sweep tried to build.  This gate makes
+# the two matrices meet.  It runs the tests, not just the compiler: pos/neg
+# lives in a different WORD in this layout, so a build-only check would miss a
+# wrong one being published.
+check-layouts: test_dcache.c dcache_txn.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o test_dcache_txn_nosplit \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txn_nosplit
+	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) \
+	  -o test_dcache_pernode_nosplit test_dcache.c dcache_txn.c \
+	  $(LDFLAGS) $(LDLIBS)
+	./test_dcache_pernode_nosplit
+	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o test_dcache_txn_hot1cl \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txn_hot1cl
+	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) \
+	  -o test_dcache_seqlock_nosplit test_dcache.c dcache_seqlock.c \
+	  $(LDFLAGS) $(LDLIBS)
+	./test_dcache_seqlock_nosplit
+	$(CC) $(ASANFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) \
+	  -o stress_dcache_nosplit_asan stress_dcache.c dcache_txn.c \
+	  $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_nosplit_asan 4 4 8 16 15000
+
 # Sanitizer smoke of the harness itself on both engines (small, short).
 bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(ASANFLAGS) $(CPPFLAGS) -o bench_dcache_seqlock_asan \
