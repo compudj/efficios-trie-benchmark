@@ -28,15 +28,13 @@
  * lru_del_claimed() returning 0 means a peer changed the node's state under us
  * (an unlink, or another shrinker); the pass simply moves on.
  */
-long dc_shrink(struct dcache *dc, long nr)
+static long lru_shrink_range(struct dcache *dc, long nr,
+			     unsigned int lo, unsigned int hi)
 {
 	long freed = 0;
 	unsigned int i;
 
-	if (nr <= 0)
-		return 0;
-
-	for (i = 0; i < dc->nlru && freed < nr; i++) {
+	for (i = lo; i < hi && freed < nr; i++) {
 		struct dc_lru_shard *sh = &dc->lru[i];
 		unsigned long scanned = 0, budget;
 
@@ -79,10 +77,10 @@ long dc_shrink(struct dcache *dc, long nr)
 }
 #else
 /* Move @d to the tail of @sh (second chance).  Caller holds @sh. */
-static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
-			      unsigned int idx)
+/* Link @d at the TAIL of @sh.  @d must be OFF the list.  Caller holds @sh. */
+static void lru_link_tail_locked(struct dc_lru_shard *sh, struct dentry *d,
+				 unsigned int idx)
 {
-	lru_unlink_locked(sh, d);
 	d->d_lru.prev = sh->tail;
 	d->d_lru.next = NULL;
 	if (sh->tail)
@@ -92,6 +90,21 @@ static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
 	sh->tail = d;
 	sh->count++;
 	d->d_lru.shard = DC_LRU_ON(idx);
+}
+
+/*
+ * LRU_ROTATE: move @d, which IS on the list, to the tail.  Unlink then link --
+ * and keeping those two separable matters: the shrinker's isolate path has
+ * ALREADY unlinked its victim, so re-adding it must use link_tail alone.
+ * Calling rotate there instead unlinks a node that is off the list, which
+ * decrements the count a second time (it underflowed to -78 within 300ms of
+ * churn) and writes sh->head from the node's NULL next -- corrupting the list.
+ */
+static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
+			      unsigned int idx)
+{
+	lru_unlink_locked(sh, d);
+	lru_link_tail_locked(sh, d, idx);
 }
 
 /*
@@ -119,15 +132,13 @@ static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
  * unlink.  Isolate under the lock, release, then unlink -- mainline's
  * batch-isolate shape at batch size one.
  */
-long dc_shrink(struct dcache *dc, long nr)
+static long lru_shrink_range(struct dcache *dc, long nr,
+			     unsigned int lo, unsigned int hi)
 {
 	long freed = 0;
 	unsigned int i;
 
-	if (nr <= 0)
-		return 0;
-
-	for (i = 0; i < dc->nlru && freed < nr; i++) {
+	for (i = lo; i < hi && freed < nr; i++) {
 		struct dc_lru_shard *sh = &dc->lru[i];
 		unsigned long scanned = 0, budget;
 
@@ -175,7 +186,7 @@ long dc_shrink(struct dcache *dc, long nr)
 				/* not evictable right now -- put it BACK, or it
 				 * would be silently un-evictable forever */
 				lru_lock(sh);
-				lru_rotate_locked(sh, victim, i);
+				lru_link_tail_locked(sh, victim, i);
 				lru_unlock(sh);
 			}
 			rcu_read_unlock();
@@ -183,4 +194,36 @@ long dc_shrink(struct dcache *dc, long nr)
 	}
 	return freed;
 }
+
 #endif	/* DC_LRU_MCAS */
+
+/*
+ * dc_shrink: sweep EVERY shard -- the pressure-driven shrinker's shape, where a
+ * single consumer is responsible for the whole cache.
+ *
+ * dc_shrink_local: sweep only the CALLER'S OWN shard.  This is what an
+ * evict-on-insert bounded cache wants, and the distinction is not cosmetic: a
+ * continuous evictor running dc_shrink on every op makes every producer a
+ * consumer of every OTHER producer's shard, which destroys exactly the
+ * isolation sharding exists to provide.  Measured, that is not a slowdown but a
+ * collapse -- on the MCAS arm the cross-shard collisions drove the transaction
+ * front-end into its fair-mutex fallback and the benchmark stopped making
+ * progress.  Evict where you allocate.
+ */
+long dc_shrink(struct dcache *dc, long nr)
+{
+	if (nr <= 0)
+		return 0;
+	return lru_shrink_range(dc, nr, 0, dc->nlru);
+}
+
+long dc_shrink_local(struct dcache *dc, long nr)
+{
+	unsigned int i;
+
+	if (nr <= 0)
+		return 0;
+	i = lru_shard_index(dc);
+	return lru_shrink_range(dc, nr, i, i + 1);
+}
+

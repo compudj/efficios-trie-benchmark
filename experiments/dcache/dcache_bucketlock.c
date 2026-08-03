@@ -1300,31 +1300,15 @@ struct dcache *dc_create(unsigned int nbuckets)
 		urcu_txn_sw_hlist_init(&dc->buckets[i]);
 	dc->mask = n - 1;
 #ifndef DC_NO_LRU
-	/* PHASE 3: the LRU shards.  Cacheline-aligned so shards do not share a
-	 * line with each other -- the whole point of sharding is defeated if two
-	 * shards' head/tail/count words sit together. */
-	dc->nlru = lru_nshards();
-	if (posix_memalign((void **) &dc->lru, 64,
-			   (size_t) dc->nlru * sizeof(*dc->lru)) != 0) {
+	if (lru_shards_init(dc) != 0) {		/* shared; see dcache_lru.h */
 		free(dc->buckets);
 		free(dc);
 		return NULL;
 	}
-	memset(dc->lru, 0, (size_t) dc->nlru * sizeof(*dc->lru));
-#ifdef DC_LRU_MCAS
-	/* The transacted list is CIRCULAR: its sentinel must point at itself, so
-	 * a zeroed shard is not an empty list, it is a NULL-edged one that faults
-	 * on the first insert. */
-	for (i = 0; i < dc->nlru; i++)
-		urcu_txn_list_init(&dc->lru[i].list);
-#endif
 #endif
 	/* One escalation domain type now (the canonical urcu_txn_domain); LIVE only
 	 * for a DC_CHAIN_MIXED build's shell ops, vestigial otherwise. */
 	urcu_txn_domain_init(&dc->domain);
-#if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU)
-	urcu_txn_domain_init(&dc->lru_domain);	/* NOT shared with the index */
-#endif
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1, 1); /* root: dir, positive */

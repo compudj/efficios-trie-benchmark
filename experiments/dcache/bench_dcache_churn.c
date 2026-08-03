@@ -51,6 +51,8 @@
  * Usage: bench_dcache_churn [--readers R] [--writers W] [--ndirs N]
  *                           [--slots S] [--duration MS] [--cpulist c0,c1,...]
  *                           [--prefix-depth D]
+ *                           [--evict continuous|bursty|off] [--evict-cap N]
+ *                           [--evict-period MS] [--evict-batch N]
  *   --slots S   slots owned per writer (the churn working set)
  * Output mirrors bench_dcache: "Mlookups/s:" for the reader rate and
  * "Mchurn/s:" for the writer op rate, with a "conservation: OK" gate line.
@@ -59,6 +61,7 @@
 #define _GNU_SOURCE
 #define _LGPL_SOURCE
 
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -101,6 +104,46 @@ static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
 static long duration_ms = 1000;
 static int prefix_depth = 2;
+/*
+ * ---- PHASE 3: RECLAIM CADENCE (--evict) -----------------------------------
+ *
+ * design/dcache-lru-txn.md section 7 says which LRU mechanism wins -- per-shard
+ * lock or MCAS -- is decided by CADENCE, not by readers, and section 8 asks for
+ * exactly this arm.  So make the cadence an explicit knob rather than an
+ * accident of when a shrinker happens to run:
+ *
+ *   off         no shrinking (the historical behaviour, and the control).
+ *   continuous  a BOUNDED cache: every writer, after its own op, evicts down
+ *               toward --evict-cap.  The consumer is always on and is spread
+ *               across all the producers, which is the adversarial case for the
+ *               lock design -- producer and consumer contend on the same shard
+ *               lock continuously -- and the case MCAS exists to win.
+ *   bursty      a single shrinker thread wakes every --evict-period-ms and
+ *               shrinks back to the cap.  This is mainline's shape
+ *               (pressure-driven, batch-isolate), where contention is a burst
+ *               rather than a steady state and the lock should hold up.
+ *
+ * The LIVE-SET SIZE is reported alongside throughput because throughput alone
+ * cannot distinguish "kept up" from "fell behind": a retention regression --
+ * the tombstone hazard of section 6 -- shows up as a population that climbs
+ * away from the cap while the op rate still looks fine.
+ *
+ * ⚠ KNOWN, UNRESOLVED: --evict bursty on the MCAS LRU arm (-DDC_LRU_MCAS) does
+ * not complete.  A single sweeper walking every shard issues MCAS del/rotate on
+ * each sentinel while every writer is concurrently enqueueing on it, the
+ * conflicts drive the transaction front-end into its fair-mutex fallback, and
+ * throughput collapses (a 400ms run had not finished after 45s).  Continuous
+ * eviction does NOT do this, because dc_shrink_local keeps each producer on its
+ * own shard.  Whether that is inherent to a global sweeper over MCAS lists or
+ * just escalation tuning is open, and it has to be settled before a bursty-arm
+ * number means anything.  --evict bursty on the LOCK arm is fine.
+ */
+static long evict_cap = 0;		/* 0 = --evict off */
+static int evict_continuous = 0;
+static long evict_period_ms = 10;
+static long evict_batch = 64;		/* bursty: max evictions per wakeup */
+static unsigned long long g_evictions;	/* total, summed across evictors */
+static unsigned long g_lru_peak;
 static unsigned int nbuckets = 1u << 16;
 static int *cpulist, cpulist_len;
 
@@ -180,6 +223,46 @@ static uint64_t xrand(uint64_t *s)
 }
 
 /* /p0/../d{dir}/S{gid} */
+/*
+ * Recreate a writer's prefix directories after the shrinker evicted one.
+ *
+ * Only reachable with --evict on.  A directory is normally safe: every writer
+ * op resolves THROUGH it, which is the retain_dentry touch, so it is marked
+ * referenced and the CLOCK gives it a second chance instead of evicting it.
+ * The leaves are never resolved through and so are never marked -- which is
+ * exactly the shape we want, hot directories and cold leaves.  But a directory
+ * that goes momentarily empty just as its bit is cleared can still be taken,
+ * so the writer has to be able to put it back.
+ *
+ * Idempotent: -EEXIST means a peer rebuilt it first, which is success.
+ */
+static int rebuild_prefix(int dir)
+{
+	struct dc_path p;
+	char buf[DC_NAME_MAX];
+	int i, ret;
+
+	/*
+	 * ID MATTERS: the census classifies by id -- anything below DIR_ID_BASE
+	 * is a slot, anything at or above it is a directory and is skipped.  An
+	 * earlier draft rebuilt with id 0, which made every rebuilt directory
+	 * masquerade as slot 0 and show up as a census DUPLICATE.  The exact
+	 * value is irrelevant since directories are never counted; being in the
+	 * right RANGE is not.
+	 */
+	dc_path_reset(&p);
+	for (i = 0; i < g_prefix_len; i++) {
+		dc_path_push(&p, g_prefix[i]);
+		ret = dc_add(g_dc, &p, DIR_ID_BASE);
+		if (ret != 0 && ret != -EEXIST)
+			return ret;
+	}
+	snprintf(buf, sizeof(buf), "d%d", dir);
+	dc_path_push(&p, buf);
+	ret = dc_add(g_dc, &p, DIR_ID_BASE);
+	return (ret == 0 || ret == -EEXIST) ? 0 : ret;
+}
+
 static void mk_slot_path(struct dc_path *p, int dir, int gid)
 {
 	char buf[DC_NAME_MAX];
@@ -214,6 +297,8 @@ struct warg {
 	int idx, base;			/* thread index; first slot id owned */
 	uint64_t seed;
 	long long nadds, nunlinks, errs;
+	long long nlost;	/* slots the shrinker took first */
+	long long nrebuild;	/* prefix directories the shrinker took */
 	long long nlookups, lk_wrong;
 	long long ndirents;		/* children enumerated (--readdir mode) */
 	unsigned long dsink;		/* --readdir-names: consumes the qstr so
@@ -278,11 +363,47 @@ static void *writer_fn(void *arg)
 		if (me->present[j]) {
 			ret = dc_unlink(g_dc, &p);
 			if (ret == 0) { me->present[j] = 0; me->nunlinks++; }
-			else me->errs++;
+			/*
+			 * Under eviction -ENOENT is the EXPECTED answer, not an
+			 * error: the shrinker reached this slot first.  Counting
+			 * it as an error would make every eviction look like a
+			 * bug, and hiding it would lose the signal -- so it gets
+			 * its own counter and the writer's belief is corrected.
+			 */
+			else if (evict_cap && ret == -ENOENT) {
+				me->present[j] = 0;
+				me->nlost++;
+			} else me->errs++;
 		} else {
 			ret = dc_add(g_dc, &p, (uint64_t) gid);
 			if (ret == 0) { me->present[j] = 1; me->nadds++; }
-			else me->errs++;
+			/*
+			 * -ENOENT on an ADD means the PREFIX went: a writer's
+			 * directory became empty and unreferenced at the wrong
+			 * moment and the shrinker took it.  Rebuild and retry
+			 * once, and count it -- silently dropping these would
+			 * quietly turn the benchmark into a no-op as the tree
+			 * eroded, with the op rate still looking healthy.
+			 */
+			else if (evict_cap && ret == -ENOENT) {
+				me->nrebuild++;
+				if (rebuild_prefix(me->dir[j]) == 0 &&
+				    dc_add(g_dc, &p, (uint64_t) gid) == 0) {
+					me->present[j] = 1;
+					me->nadds++;
+				}
+			} else me->errs++;
+		}
+		if (evict_continuous && (long) dc_lru_count(g_dc) > evict_cap) {
+			/* LOCAL: evict where we allocate.  A continuous evictor
+			 * calling dc_shrink() would make every writer a consumer
+			 * of every other writer's shard -- see dcache.h. */
+			long n = dc_shrink_local(g_dc, 1);
+
+			if (n > 0)
+				__atomic_fetch_add(&g_evictions,
+						   (unsigned long long) n,
+						   __ATOMIC_RELAXED);
 		}
 		dc_quiescent();
 	}
@@ -308,6 +429,53 @@ static void dirent_sink(uint64_t id, const struct qstr *name, void *arg)
 	*acc += (unsigned long) id + name->len + name->hash
 	      + (unsigned long) name->name[0]
 	      + (unsigned long) name->name[name->len ? name->len - 1 : 0];
+}
+
+/*
+ * The BURSTY evictor: one thread, waking every --evict-period-ms and shrinking
+ * back toward the cap in a bounded batch.  Mainline's shape -- reclaim is
+ * pressure-driven, and the shrinker batch-isolates under the shard lock and
+ * processes outside it -- so contention with the producers is a burst rather
+ * than a steady state, which is the regime the lock design is built for.
+ *
+ * Deliberately ONE thread, not one per writer: the point of the arm is a
+ * consumer that is mostly idle, and spreading it would turn it back into the
+ * continuous case.
+ */
+static void *shrinker_fn(void *arg)
+{
+	(void) arg;
+	dc_register_thread();
+	wait_go();
+	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
+		struct timespec ts = {
+			.tv_sec  = evict_period_ms / 1000,
+			.tv_nsec = (evict_period_ms % 1000) * 1000000L,
+		};
+		unsigned long pop;
+		long over;
+
+		rcu_thread_offline();		/* never park while online */
+		nanosleep(&ts, NULL);
+		rcu_thread_online();
+
+		pop = dc_lru_count(g_dc);
+		if (pop > (unsigned long) g_lru_peak)
+			__atomic_store_n(&g_lru_peak, pop, __ATOMIC_RELAXED);
+		over = (long) pop - evict_cap;
+		if (over > 0) {
+			long n = dc_shrink(g_dc, over > evict_batch
+						 ? evict_batch : over);
+
+			if (n > 0)
+				__atomic_fetch_add(&g_evictions,
+						   (unsigned long long) n,
+						   __ATOMIC_RELAXED);
+		}
+		dc_quiescent();
+	}
+	dc_unregister_thread();
+	return NULL;
 }
 
 static void *reader_fn(void *arg)
@@ -432,6 +600,7 @@ int main(int argc, char **argv)
 	struct warg *wa, *ra;
 	pthread_t *wt, *rt;
 	struct census c;
+	pthread_t shrinker_th;
 	long long t0, t1;
 	long long adds = 0, unl = 0, errs = 0, lk = 0, wrong = 0, dirents = 0;
 	unsigned long dsink = 0;
@@ -447,6 +616,17 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--prefix-depth"))  prefix_depth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))      nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))       parse_cpulist(argv[++i]);
+		else if (!strcmp(argv[i], "--evict-cap"))     evict_cap = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--evict-period"))  evict_period_ms = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--evict-batch"))   evict_batch = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--evict")) {
+			const char *m = argv[++i];
+
+			if (!strcmp(m, "continuous"))      evict_continuous = 1;
+			else if (!strcmp(m, "bursty"))     evict_continuous = 0;
+			else if (!strcmp(m, "off"))      { evict_cap = 0; evict_continuous = 0; }
+			else { fprintf(stderr, "--evict continuous|bursty|off\n"); return 2; }
+		}
 		else if (!strcmp(argv[i], "--readdir"))       readdir_mode = 1;
 		else if (!strcmp(argv[i], "--readdir-names")) { readdir_mode = 1;
 							       readdir_names = 1; }
@@ -505,6 +685,8 @@ int main(int argc, char **argv)
 		pthread_create(&wt[i], NULL, writer_fn, &wa[i]);
 	for (i = 0; i < nreaders; i++)
 		pthread_create(&rt[i], NULL, reader_fn, &ra[i]);
+	if (evict_cap && !evict_continuous)
+		pthread_create(&shrinker_th, NULL, shrinker_fn, NULL);
 	while (__atomic_load_n(&nthreads_running, __ATOMIC_SEQ_CST) <
 	       nwriters + nreaders)
 		sched_yield();
@@ -543,6 +725,9 @@ int main(int argc, char **argv)
 		pthread_join(rt[i], NULL);
 	rcu_thread_online();
 
+	if (evict_cap && !evict_continuous)
+		pthread_join(shrinker_th, NULL);
+
 	/* Let any deferred frees drain before the census. */
 	rcu_quiescent_state();
 	synchronize_rcu();
@@ -557,6 +742,40 @@ int main(int argc, char **argv)
 	for (i = 0; i < nreaders; i++) {
 		lk += ra[i].nlookups; wrong += ra[i].lk_wrong; dirents += ra[i].ndirents;
 		dsink += ra[i].dsink;
+	}
+
+	/*
+	 * --- eviction reconciliation, BEFORE the invariants ---
+	 *
+	 * The shrinker destroys names the writers still believe present, so their
+	 * present[] is stale by construction.  Rather than weaken invariant 3 to
+	 * "missing is allowed" -- which would blind it to the corruption it exists
+	 * to catch -- REFRESH the belief from the cache now that every thread has
+	 * stopped and nothing more can be evicted, and then keep the exact match.
+	 * A slot the writer thinks is there and the cache says is not was evicted;
+	 * anything else is still a hard failure.
+	 *
+	 * It has to run before invariant 2 as well as 3 -- invariant 2 compares
+	 * present[] against the cache by lookup, so a stale belief fails it
+	 * first, and reconciling only for the census left "26 present-but-missing"
+	 * reported as corruption.
+	 */
+	if (evict_cap) {
+		long refreshed = 0;
+
+		for (i = 0; i < nwriters; i++)
+			for (j = 0; j < slots; j++) {
+				struct dc_path p;
+
+				if (!wa[i].present[j])
+					continue;
+				mk_slot_path(&p, wa[i].dir[j], wa[i].base + j);
+				if (dc_lookup(g_dc, &p, NULL) != DC_POSITIVE) {
+					wa[i].present[j] = 0;
+					refreshed++;
+				}
+			}
+		printf("evicted-behind-writer: %ld\n", refreshed);
 	}
 
 	/* --- invariant 1 & 2: believed state matches reality, by lookup ----- */
@@ -616,6 +835,36 @@ int main(int argc, char **argv)
 	printf("CHURN   adds: %lld  unlinks: %lld  errors: %lld\n",
 	       adds, unl, errs);
 	printf("Mchurn/s: %g\n", (double) (adds + unl) / secs / 1e6);
+	if (evict_cap) {
+		long long lost = 0, rebuilt = 0;
+		unsigned long pop = dc_lru_count(g_dc);
+
+		for (i = 0; i < nwriters; i++) {
+			lost += wa[i].nlost;
+			rebuilt += wa[i].nrebuild;
+		}
+		if (pop > g_lru_peak)
+			g_lru_peak = pop;
+		/*
+		 * LIVE-SET SIZE alongside throughput, because throughput alone
+		 * cannot tell "kept up" from "fell behind".  A retention
+		 * regression -- section 6's tombstone hazard, where a node's
+		 * call_rcu free waits on the shrinker instead of on the grace
+		 * period -- shows up as a population climbing away from the cap
+		 * while the op rate still looks perfectly healthy.  Compare
+		 * lru-final and lru-peak against the cap, not just Mchurn/s.
+		 */
+		printf("EVICT   mode: %s  cap: %ld  evictions: %llu  "
+		       "Mevict/s: %g\n",
+		       evict_continuous ? "continuous" : "bursty", evict_cap,
+		       g_evictions, (double) g_evictions / secs / 1e6);
+		printf("EVICT   lru-final: %lu  lru-peak: %lu  over-cap: %+ld\n",
+		       pop, g_lru_peak, (long) pop - evict_cap);
+		printf("EVICT   lost-under-writer: %lld  prefix-rebuilds: %lld\n",
+		       lost, rebuilt);
+		printf("EVICT   arm: %s/%s\n", dc_lru_arm(),
+		       dc_lru_supported ? "on" : "OFF");
+	}
 	printf("LOOKUP  lookups: %lld  wrong-id: %lld\n", lk, wrong);
 	printf("Mlookups/s: %g\n", (double) lk / secs / 1e6);
 	if (readdir_mode) {

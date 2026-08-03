@@ -394,6 +394,13 @@ extern const int dc_delete_dir_supported;
  */
 extern const int dc_lru_supported;
 long dc_shrink(struct dcache *dc, long nr);
+/*
+ * Shrink only the CALLER'S OWN shard.  What an evict-on-insert bounded cache
+ * wants: a continuous evictor calling dc_shrink() instead makes every producer
+ * a consumer of every other producer's shard, destroying the isolation that
+ * sharding exists for.  On the MCAS arm that is not a slowdown but a collapse.
+ */
+long dc_shrink_local(struct dcache *dc, long nr);
 unsigned long dc_lru_count(struct dcache *dc);
 
 /*

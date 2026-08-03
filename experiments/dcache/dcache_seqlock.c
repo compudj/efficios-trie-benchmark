@@ -533,6 +533,7 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+long dc_shrink_local(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 const char *dc_lru_arm(void) { return "none"; }
 #endif	/* DC_NO_LRU */
 
@@ -1619,15 +1620,13 @@ static int lru_kill(struct dcache *dc, struct dentry *d)
 	return ret;
 }
 
-long dc_shrink(struct dcache *dc, long nr)
+static long lru_shrink_nodes(struct dcache *dc, long nr,
+			     unsigned int lo, unsigned int hi)
 {
 	long freed = 0;
 	unsigned int i;
 
-	if (nr <= 0)
-		return 0;
-
-	for (i = 0; i < DC_LRU_NODES && freed < nr; i++) {
+	for (i = lo; i < hi && freed < nr; i++) {
 		struct dc_lru_one *l = &dc->s_dentry_lru[i];
 		struct dentry *batch[DC_SHRINK_BATCH];
 		unsigned long scanned, budget;
@@ -1675,6 +1674,23 @@ long dc_shrink(struct dcache *dc, long nr)
 		} while (n == DC_SHRINK_BATCH && freed < nr);
 	}
 	return freed;
+}
+
+long dc_shrink(struct dcache *dc, long nr)
+{
+	if (nr <= 0)
+		return 0;
+	return lru_shrink_nodes(dc, nr, 0, DC_LRU_NODES);
+}
+
+/* Only the caller's own node shard; see dcache.h. */
+long dc_shrink_local(struct dcache *dc, long nr)
+{
+	unsigned int nid = lru_nid();
+
+	if (nr <= 0)
+		return 0;
+	return lru_shrink_nodes(dc, nr, nid, nid + 1);
 }
 #endif	/* DC_NO_LRU */
 
