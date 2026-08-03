@@ -424,6 +424,7 @@ const char *dc_lru_arm(void);
  */
 extern const int dc_txn_stats_supported;
 void dc_txn_stats_dump(void *stream);
+void dc_txn_stats_last(void *stream);
 
 /*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam

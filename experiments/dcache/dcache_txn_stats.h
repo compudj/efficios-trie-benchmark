@@ -66,6 +66,18 @@ struct dc_ts_row {
 	 * relink_after_fail counts exactly that mistake being made.
 	 */
 	unsigned long del_ok, del_peer, del_fail, relink_after_fail;
+	/*
+	 * What the slot actually held when the CAS lost, versus the expected
+	 * old.  This is the classification that separates the causes:
+	 *   same    seen == old.  The CAS "failed" against the value it wanted
+	 *           -- ABA, or a spurious failure.  Nothing else can explain it.
+	 *   marked  a deletion tombstone (bit 1) -- the neighbour really is
+	 *           marked-but-linked, i.e. mode A leaking into mode B.
+	 *   proxy   another descriptor (bit 0) is parked on the slot -- a live
+	 *           competitor after all.
+	 *   other   a plain, different pointer -- the slot moved on.
+	 */
+	unsigned long seen_same, seen_marked, seen_proxy, seen_other;
 	unsigned long begins;		/* urcu_txn_begin() calls that RETURNED */
 	unsigned long begin_in_lane;	/* ... of those, already holding the lane */
 	unsigned long begin_funnel_on;	/* ... of those, with domain->active set */
@@ -90,9 +102,12 @@ extern struct dc_ts_row dc_ts_tab[DC_TS_MAX_THREADS][DC_TS_NR];
 extern unsigned long dc_ts_next_slot;
 extern __thread int dc_ts_slot;
 extern __thread int dc_ts_cur_site;
-extern __thread void *dc_ts_last_slot;
-extern __thread void *dc_ts_last_old;
-extern __thread void *dc_ts_last_seen;
+/* NOT thread-local: the signal handler that prints these runs on whichever
+ * thread takes the signal, which is not the one that lost the CAS.  A racy
+ * last-writer-wins snapshot is exactly right for a diagnostic. */
+extern void *dc_ts_last_slot;
+extern void *dc_ts_last_old;
+extern void *dc_ts_last_seen;
 
 
 static inline struct dc_ts_row *dc_ts_row(enum dc_ts_site s)
@@ -200,9 +215,17 @@ static inline void dc_ts_cas_fail(unsigned int idx, void *slot, void *old,
 		return;
 	r = dc_ts_row((enum dc_ts_site) dc_ts_cur_site);
 	r->casfail[idx < 6 ? idx : 5]++;
-	dc_ts_last_slot = slot;
-	dc_ts_last_old = old;
-	dc_ts_last_seen = seen;
+	if (seen == old)
+		r->seen_same++;
+	else if ((uintptr_t) seen & 0x2UL)	/* list deletion MARK */
+		r->seen_marked++;
+	else if ((uintptr_t) seen & 0x1UL)	/* engine proxy tag */
+		r->seen_proxy++;
+	else
+		r->seen_other++;
+	uatomic_store(&dc_ts_last_slot, slot, CMM_RELAXED);
+	uatomic_store(&dc_ts_last_old, old, CMM_RELAXED);
+	uatomic_store(&dc_ts_last_seen, seen, CMM_RELAXED);
 }
 #define DC_TS_EAGAIN(site)		(dc_ts_row(site)->eagain++)
 
@@ -214,9 +237,26 @@ struct dc_ts_row dc_ts_tab[DC_TS_MAX_THREADS][DC_TS_NR];
 unsigned long dc_ts_next_slot;
 __thread int dc_ts_slot = -1;
 __thread int dc_ts_cur_site = -1;
-__thread void *dc_ts_last_slot;
-__thread void *dc_ts_last_old;
-__thread void *dc_ts_last_seen;
+void *dc_ts_last_slot;
+void *dc_ts_last_old;
+void *dc_ts_last_seen;
+
+/* The most recent losing CAS, raw.  One concrete triple is worth more than a
+ * histogram when the question is "what is actually in that slot". */
+void dc_txn_stats_last(void *stream)
+{
+	FILE *f = stream;
+
+	if (!dc_ts_last_slot) {
+		fprintf(f, "TXNSTATS last-cas-loss: none recorded\n");
+		return;
+	}
+	fprintf(f, "TXNSTATS last-cas-loss slot=%p old=%p seen=%p%s%s%s\n",
+		dc_ts_last_slot, dc_ts_last_old, dc_ts_last_seen,
+		dc_ts_last_seen == dc_ts_last_old ? "  (SAME AS OLD)" : "",
+		((uintptr_t) dc_ts_last_seen & 0x2UL) ? "  (MARKED)" : "",
+		((uintptr_t) dc_ts_last_seen & 0x1UL) ? "  (PROXY)" : "");
+}
 
 void dc_txn_stats_dump(void *stream)
 {
@@ -256,6 +296,10 @@ void dc_txn_stats_dump(void *stream)
 			a.del_peer += r->del_peer;
 			a.del_fail += r->del_fail;
 			a.relink_after_fail += r->relink_after_fail;
+			a.seen_same += r->seen_same;
+			a.seen_marked += r->seen_marked;
+			a.seen_proxy += r->seen_proxy;
+			a.seen_other += r->seen_other;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
 		}
@@ -276,6 +320,11 @@ void dc_txn_stats_dump(void *stream)
 		for (k = 0; k < 6; k++)
 			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
 		fprintf(f, "\n");
+		if (a.seen_same || a.seen_marked || a.seen_proxy || a.seen_other)
+			fprintf(f, "TXNSTATS %-9s cas-lost-to: same-as-old %lu  "
+				"MARKED %lu  proxy %lu  other %lu\n", name[i],
+				a.seen_same, a.seen_marked, a.seen_proxy,
+				a.seen_other);
 	}
 }
 #endif	/* DC_TXN_STATS_IMPL */

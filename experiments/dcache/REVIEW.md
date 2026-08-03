@@ -753,13 +753,36 @@ items here are the ones that actually fired in this experiment):
     once `retry != 0`, so the position is an allocation artifact; the shape —
     *one* record, essentially every attempt — is not.
 
-  ⭐ The remaining question is now narrow and concrete: **why one record's
-  expected-old never matches when every competitor is parked.**  `del_prepare`
-  rebuilds its record set each attempt, so a stale expected-old would have to be
-  surviving inside `urcu_txn_load()`'s RYW view rather than in the caller.  That
-  is one experiment, not a hypothesis: log the failing record's `old` against
-  what the slot actually holds — the `URCU_TXN_CAS_FAIL` hook already passes
-  both, and only the dcache-side sink discards them.
+  ⭐⭐ **ANSWERED: the slot holds a MARKED pointer.**  Logging the failing
+  record's expected `old` against what the slot actually held, and classifying:
+
+  | run | aborts | `-EAGAIN` | same-as-old | **MARKED** | proxy | other |
+  |---|--:|--:|--:|--:|--:|--:|
+  | 1 | 21,873,334 | 0 | 0 | **21,873,321** | 7 | 6 |
+  | 2 | 21,978,031 | 0 | 0 | **21,978,029** | 2 | 0 |
+  | 3 | 12 | 249,132,454 | 0 | 3 | 1 | 8 |
+  | 4 | 21,950,297 | 0 | 0 | **21,950,289** | 3 | 5 |
+  | 5 | 22,062,232 | 0 | 0 | 2 | 3 | 22,062,227 |
+  | 6 | 11 | 130,970,550 | 0 | 3 | 6 | 2 |
+
+  Raw, from three wedges: `seen=0x…842 (MARKED)`, `seen=0x…402 (MARKED)`,
+  `seen=0x…e82 (MARKED)` — bit 1 set, i.e. a deletion tombstone, where a plain
+  successor pointer was expected.
+
+  ⭐ **So the two "modes" are ONE bug seen from two sides.**  Mode A catches it at
+  PREPARE (`del_prepare`'s guard finds the successor's `next` marked → `-EAGAIN`);
+  mode B catches it at INSTALL (a record's expected-old loses to a marked slot).
+  Both say the same thing: **a node is left MARKED-BUT-STILL-LINKED, permanently**,
+  so every neighbour operation retries forever.  `same-as-old` is 0 everywhere,
+  which rules out ABA and spurious CAS failure.
+
+  And that is precisely the corruption `del_prepare`'s own comment predicts:
+  *"the descriptor's per-slot reconcile would silently merge them into a bogus
+  record under -DNDEBUG, committing a corrupt edge (a marked-but-still-linked
+  node)"* — the case it guards with `next != prev`.  The remaining work is to
+  find the record set that reaches that merge despite the guard; the shape is
+  now known, so it is a targeted read of `del_prepare`/`insert_*_prepare` against
+  a two- and three-element list, not another sweep.
 
   ⚠ **Process note, having been wrong four times here:** three of the four bad
   readings came from *incomplete instrumentation*, not bad reasoning — one

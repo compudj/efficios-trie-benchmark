@@ -1241,6 +1241,7 @@ const int dc_txn_stats_supported = 1;
 #else
 const int dc_txn_stats_supported = 0;
 void dc_txn_stats_dump(void *stream) { (void) stream; }
+void dc_txn_stats_last(void *stream) { (void) stream; }
 #endif
 
 #ifdef DC_NO_LRU

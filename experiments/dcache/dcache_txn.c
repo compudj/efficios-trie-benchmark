@@ -576,6 +576,7 @@ const int dc_txn_stats_supported = 1;
 #else
 const int dc_txn_stats_supported = 0;
 void dc_txn_stats_dump(void *stream) { (void) stream; }
+void dc_txn_stats_last(void *stream) { (void) stream; }
 #endif
 
 /* phase 3: the shared LRU (dcache_lru.h); lock arm by default, -DDC_LRU_MCAS */

@@ -612,8 +612,10 @@ static void usage(const char *p)
 static void stats_signal(int sig)
 {
 	(void) sig;
-	if (dc_txn_stats_supported)
+	if (dc_txn_stats_supported) {
 		dc_txn_stats_dump(stdout);
+		dc_txn_stats_last(stdout);
+	}
 	fflush(stdout);
 	_exit(3);
 }
