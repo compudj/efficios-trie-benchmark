@@ -911,13 +911,40 @@ items here are the ones that actually fired in this experiment):
   value the losing CAS sees (that stale predecessor is itself deleted, hence
   marked).
 
-  ⚠ **Tested by disabling the rotate — still collapses, but the test was
-  INCOMPLETE, so this is untested rather than refuted.**  The rotate is only one
-  of TWO paths that re-insert a previously-removed node with no intervening
-  grace period; the other is `lru_retain()`'s "re-arm after an LRU_REMOVED"
-  (`dcache_lru.h`), which the experiment left in place.  A real test has to close
-  both — or, better, insert a grace period between removal and re-insertion and
-  see the wedge go.
+  ⚠ **STILL UNTESTED after two attempts, both of which failed as TESTS rather
+  than as answers:**
+  1. disabling the rotate — still collapsed, but the rotate is only ONE of two
+     paths that re-insert a previously-removed node with no intervening grace
+     period; `lru_retain()`'s "re-arm after an LRU_REMOVED" was left in place;
+  2. deferring EVERY insert through `call_rcu` so a full grace period elapses
+     first — the arm **hangs with `--evict off`**, a configuration the baseline
+     runs clean, so the arm is broken and its result says nothing.
+
+  A working test has to survive `--evict off` first.  That is the check the
+  second attempt skipped, and it is the same "verify the probe before trusting
+  it" rule this section already carries — applied to a whole experiment rather
+  than a counter.
+
+  ⭐ **Design note (M. Desnoyers): if in-place re-add is to be allowed at all**,
+  the shape is the engine's own rename mechanism, reused.  Stamp a node with the
+  RCU epoch at removal; on re-add, compare against the current epoch, and if no
+  grace period has elapsed — so a traverser may still hold it — link a **SHELL**
+  rather than the host, then **FOLD** the shell out once a grace period has
+  passed.  That preserves the RCU contract (the removed node's `next` stays
+  valid for stale traversers) while still allowing an immediate re-add, and it
+  reuses machinery whose proofs already exist here.
+
+  Two things to weigh before building it: a rotate is the shrinker's COMMON
+  action, so a shell per rotate makes reclaim allocate — precisely what you do
+  not want under memory pressure — and the same-epoch test will be true for most
+  of them under an aggressive shrinker.  The cheaper alternative is to not re-add
+  at all: answer LRU_REMOVED and let `retain_dentry` re-arm it on the next touch,
+  which is what the kernel does and what this code already does for the in-use
+  case.  That costs CLOCK quality (a second-chance entry leaves the list instead
+  of moving to the tail) and costs no allocation.
+
+  ⚠ Judge that design on CORRECTNESS grounds, not as a fix for this wedge: the
+  one experiment that would have connected them was the broken one.
 
   ⚠⚠ **Ten hypotheses, nine refuted and one untested — and the pattern in HOW
   they failed is the real output of this investigation.**  Almost every one died not to better
