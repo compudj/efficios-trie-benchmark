@@ -88,12 +88,32 @@ void (*dc_test_fold_hook)(void);
  * another thread.  NULL and never compiled into normal builds.
  */
 void (*dc_test_transfer_hook)(void);
+/*
+ * Test-only rendezvous for the two halves of the negative-directory guard pair
+ * (dc_set_negative_txn).  dc_add fires ADD after reading the parent's state and
+ * before its commit; d_delete fires DEL after finding the child list empty and
+ * before its commit.  A repro parks in one and runs the other, which is the only
+ * way to exercise the guards -- single-threaded they never fire, because each
+ * side's own up-front check already answers.
+ */
+void (*dc_test_add_hook)(void);
+void (*dc_test_del_hook)(void);
 #define DC_TEST_TRANSFER_HOOK()	do {					\
 		if (dc_test_transfer_hook)				\
 			dc_test_transfer_hook();			\
 	} while (0)
+#define DC_TEST_ADD_HOOK()	do {					\
+		if (dc_test_add_hook)					\
+			dc_test_add_hook();				\
+	} while (0)
+#define DC_TEST_DEL_HOOK()	do {					\
+		if (dc_test_del_hook)					\
+			dc_test_del_hook();				\
+	} while (0)
 #else
 #define DC_TEST_TRANSFER_HOOK()	do { } while (0)
+#define DC_TEST_ADD_HOOK()	do { } while (0)
+#define DC_TEST_DEL_HOOK()	do { } while (0)
 #endif
 
 /*
@@ -501,7 +521,12 @@ const char *dc_engine_name(void)
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
 /* rmdir-to-negative: see dcache.h.  lock-free engine: nothing spans the check and the flip */
-const int dc_delete_dir_supported = 0;
+#ifdef DC_IPARENT_TXN
+const int dc_delete_dir_supported = 1;	/* guard/write pair, no lock: see
+					 * dc_set_negative_txn */
+#else
+const int dc_delete_dir_supported = 0;	/* d_iparent untransacted on this arm */
+#endif
 
 #if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
 const int dc_lookup_id_is_address = 1;
@@ -1076,7 +1101,43 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	urcu_txn_init(&txn, &dc->domain);
 	urcu_txn_declare_disjoint(&txn);	/* two distinct heads: no same-slot WAW */
 	for (;;) {
+#ifdef DC_IPARENT_TXN
+		uintptr_t parent_raw;
+#endif
+
 		urcu_txn_begin(&txn);
+#ifdef DC_IPARENT_TXN
+		/* Read the parent's state INSIDE the transaction, so the guard
+		 * below records what this add actually decided on.  A negative
+		 * parent is refused outright: the name is not there. */
+		parent_raw = iparent_raw(parent);
+		if (parent_raw & DC_TAG_NEG) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			free(d);		/* never published */
+			return -ENOENT;
+		}
+#endif
+#ifdef DC_IPARENT_TXN
+		/*
+		 * GUARD the parent's state word.  A concurrent d_delete of an
+		 * empty DIRECTORY flips DC_TAG_NEG in this very slot, and a
+		 * negative must never gain a child -- so make that flip and this
+		 * insert mutually exclusive by recording the value this add
+		 * decided on.  d_delete guards the child head we WRITE below, so
+		 * each side's write set hits the other's read set and the two
+		 * cannot both commit, in either order.
+		 *
+		 * The cost is one read-set entry on the add path, and one real
+		 * consequence worth measuring: this slot also carries the parent
+		 * POINTER and the shell tag, so an add under a directory aborts
+		 * when that directory is itself renamed or its fold runs -- not
+		 * only when it goes negative.
+		 */
+		urcu_txn_validate(&txn, (void **) &parent->d_iparent,
+				  (void *) parent_raw, DC_IPARENT_TAG);
+		DC_TEST_ADD_HOOK();		/* repro parks here */
+#endif
 		p = urcu_txn_hlist_insert_head_prepare(&txn, &d->d_hash, bucket);
 		if (!p)
 			p = urcu_txn_hlist_insert_head_prepare(&txn, &d->d_sib,
@@ -1175,6 +1236,55 @@ int dc_add_negative(struct dcache *dc, const struct dc_path *path)
  * (DC_SPLIT_KEEPID) and the census, and a reader that sees the node positive
  * must already see the id that came with it.
  */
+#ifdef DC_IPARENT_TXN
+/*
+ * TRANSACTED flip, for the arms that already transact d_iparent (the mark arm).
+ * @isdir additionally GUARDS the host's child list as still EMPTY at the install
+ * point, which is what makes rmdir-to-negative possible without a lock:
+ *
+ *   dc_add   WRITES parent->d_child_head and GUARDS parent->d_iparent
+ *   this     GUARDS host->d_child_head   and WRITES host->d_iparent
+ *
+ * Each one's write set hits the other's read set, so the two cannot both
+ * commit -- in EITHER order.  A guard on only one side would be one-directional:
+ * dc_add's guard alone lets a child land after this checked emptiness, and this
+ * guard alone lets a child land after dc_add read the parent positive.
+ *
+ * Costs the READER nothing on this arm: iparent_raw() already resolves this slot
+ * (DC_IPARENT_TXN), which until now resolved a proxy that was never installed.
+ * Making the fold's handover and this flip real MW records is what makes that
+ * resolve earn its keep.
+ */
+static int dc_set_negative_txn(struct urcu_txn *txn, struct dentry *host,
+			       int negative, int isdir, uint64_t id)
+{
+	uintptr_t raw = iparent_raw(host);
+
+	if (!!(raw & DC_TAG_NEG) == !!negative)
+		return negative ? -ENOENT : -EEXIST;
+	if (isdir) {
+		if (!children_empty(host))
+			return -ENOTEMPTY;
+		urcu_txn_validate(txn, (void **) &host->d_child_head.first,
+				  NULL, URCU_TXN_HLIST_TAG);
+		DC_TEST_DEL_HOOK();		/* repro parks here */
+	}
+	if (!negative) {
+		host->d_id = id;
+		cmm_smp_wmb();			/* id before positive */
+	}
+	if (urcu_txn_store_mw(txn, (void **) &host->d_iparent,
+			      (void *) raw,
+			      (void *) (negative ? (raw | DC_TAG_NEG)
+					         : (raw & ~DC_TAG_NEG)),
+			      DC_IPARENT_TAG))
+		return -ENOMEM;
+	host->d_inode = negative ? 0 : 1;	/* cold bookkeeping; tag rules */
+	return 0;
+}
+#endif
+
+#ifndef DC_IPARENT_TXN		/* the transacted arms use dc_set_negative_txn */
 static int dc_set_negative(struct dentry *host, int negative, uint64_t id)
 {
 #ifdef DC_HOT1CL
@@ -1215,6 +1325,7 @@ static int dc_set_negative(struct dentry *host, int negative, uint64_t id)
 	return 0;
 #endif
 }
+#endif
 
 int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
@@ -1239,7 +1350,34 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 		goto out;
 	}
 	host = host_of_rcu(top);
+#ifdef DC_IPARENT_TXN
+	{
+		struct urcu_txn txn;
+
+		urcu_txn_init(&txn, &dc->domain);
+		for (;;) {
+			enum urcu_txn_status st;
+
+			urcu_txn_begin(&txn);
+			ret = dc_set_negative_txn(&txn, host, 0,
+						  host->d_isdir, id);
+			if (ret) {
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
+				break;
+			}
+			st = urcu_txn_commit(&txn);
+			urcu_txn_end(&txn);
+			if (st == URCU_TXN_STATUS_ABORT)
+				continue;	/* a racing add/fold: re-decide */
+			if (st < 0)
+				ret = -ENOMEM;
+			break;
+		}
+	}
+#else
 	ret = dc_set_negative(host, 0, id);
+#endif
 out:
 	rcu_read_unlock();
 	return ret;
@@ -1311,9 +1449,10 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		goto out;
 	}
 	host = host_of_rcu(top);
+#ifndef DC_IPARENT_TXN
 	if (host->d_isdir) {
 		/*
-		 * rmdir-to-negative is NOT implemented on this engine, and the
+		 * rmdir-to-negative is NOT implemented on this ARM, and the
 		 * reason is structural rather than an omission (dc_delete_dir_
 		 * supported == 0, see dcache.h).  A negative directory could
 		 * gain a child, so children_empty must still hold at the flip
@@ -1330,6 +1469,7 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		ret = -ENOTSUP;
 		goto out;
 	}
+#endif
 	/*
 	 * d_id is deliberately NOT cleared.  Clearing it after the flip would
 	 * race a reader that latched the node positive and then read the id;
@@ -1339,7 +1479,34 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 	 * negatives for the same reason (walk_rec) -- it counts OBJECTS, and a
 	 * negative holds a name, not an object.
 	 */
+#ifdef DC_IPARENT_TXN
+	{
+		struct urcu_txn txn;
+
+		urcu_txn_init(&txn, &dc->domain);
+		for (;;) {
+			enum urcu_txn_status st;
+
+			urcu_txn_begin(&txn);
+			ret = dc_set_negative_txn(&txn, host, 1,
+						  host->d_isdir, 0);
+			if (ret) {
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
+				break;
+			}
+			st = urcu_txn_commit(&txn);
+			urcu_txn_end(&txn);
+			if (st == URCU_TXN_STATUS_ABORT)
+				continue;	/* a racing add/fold: re-decide */
+			if (st < 0)
+				ret = -ENOMEM;
+			break;
+		}
+	}
+#else
 	ret = dc_set_negative(host, 1, 0);
+#endif
 out:
 	rcu_read_unlock();
 	return ret;
@@ -1509,6 +1676,22 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	if (cross_parent && host == dc->root)
 		return -EINVAL;
 
+#ifdef DC_IPARENT_TXN
+	/*
+	 * Same guard dc_add carries, for the OTHER way a directory gains a
+	 * child: this commit inserts the shell into new_parent's child list, so
+	 * a concurrent d_delete of new_parent must conflict with it.
+	 *
+	 * ONLY the guard belongs here.  A permanent refusal must NOT be returned
+	 * from this function -- a non-zero return means "retry" to the caller,
+	 * so refusing a negative parent here spins forever (the parent stays
+	 * negative until someone instantiates it).  The caller makes that
+	 * decision; this just makes the two commits conflict, after which the
+	 * caller re-reads and refuses.
+	 */
+	urcu_txn_validate(txn, (void **) &new_parent->d_iparent,
+			  (void *) iparent_raw(new_parent), DC_IPARENT_TAG);
+#endif
 	p = urcu_txn_hlist_del_prepare(txn, &top->d_hash);
 	if (p)					/* -ENOENT: top demoted; -EAGAIN */
 		return p;
@@ -1615,6 +1798,16 @@ static int stack_shell(struct dcache *dc,
 		 * (see urcu_txn_abandon).  Each terminal path here pairs abandon+end.
 		 */
 		urcu_txn_begin(&txn);
+#ifdef DC_IPARENT_TXN
+		/* A NEGATIVE destination directory refuses the move outright --
+		 * the decision, as opposed to the guard inside the commit. */
+		if (iparent_raw(new_parent) & DC_TAG_NEG) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -ENOENT;
+			goto out_free;
+		}
+#endif
 		DC_RENAME_CONFLICT_HINT(&txn);
 
 		top = find_top_rcu(dc, from_parent, from_name);
@@ -1757,6 +1950,9 @@ static void fold(struct dcache *dc, struct dentry *n)
 {
 	struct dentry *host_to_free = NULL;
 	struct urcu_txn txn;
+#ifdef DC_IPARENT_TXN
+	struct dentry *xfer_from = NULL;
+#endif
 
 	rcu_read_lock();
 	urcu_txn_init(&txn, &dc->domain);
@@ -1821,6 +2017,16 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * did.  The three writers of this word therefore all use
 			 * atomics on it and no update can be lost.
 			 */
+#ifdef DC_IPARENT_TXN
+			/* The handover is PUBLISHED BY THE COMMIT (recorded
+			 * below, after urcu_txn_begin) rather than stored here.
+			 * That is what lets d_delete/d_instantiate guard this
+			 * slot from their own transactions -- a cmpxchg here
+			 * could not be conflicted against a descriptor install.
+			 * The comment at the top of this file has claimed this
+			 * since DC_IPARENT_TXN was introduced; it is now true. */
+			xfer_from = n;
+#else
 			{
 				uintptr_t nam = (uintptr_t) n->d_iparent &
 					~(DC_TAG_SHELL | DC_TAG_NEG);
@@ -1840,6 +2046,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 						break;
 				}
 			}
+#endif
 #else
 			m->d_iparent = n->d_iparent;	/* pre-publish: m unindexed */
 #endif
@@ -1849,6 +2056,22 @@ static void fold(struct dcache *dc, struct dentry *n)
 
 			urcu_txn_begin(&txn);
 			DC_FOLD_CONFLICT_HINT(&txn);
+#ifdef DC_IPARENT_TXN
+			{	/* identity handover, as an MW record */
+				uintptr_t nam = iparent_raw(xfer_from) &
+					~(DC_TAG_SHELL | DC_TAG_NEG);
+				uintptr_t own = iparent_raw(m);
+
+				DC_TEST_TRANSFER_HOOK();
+				if (urcu_txn_store_mw(&txn,
+						(void **) &m->d_iparent,
+						(void *) own,
+						(void *) (nam | (own &
+						  (DC_TAG_SHELL | DC_TAG_NEG))),
+						DC_IPARENT_TAG))
+					goto transfer_retry;
+			}
+#endif
 			p = urcu_txn_hlist_replace_prepare(&txn, &n->d_hash,
 							   &m->d_hash);
 			if (p == -ENOENT) {

@@ -316,22 +316,39 @@ int dc_delete(struct dcache *dc, const struct dc_path *path);
  *   dcache_bucketlock  FREE.  dc_add takes its parent's d_child_head bit-lock,
  *                      so dc_delete takes the victim's -- the same head, and one
  *                      it can pair with the bucket it already holds.
- *   dcache_txn         NOT FREE, hence 0.  It is lock-free by design: nothing it
- *                      already holds spans the check and the flip.  The flip is a
- *                      cmpxchg rather than a commit (the fold writes that word
- *                      non-transactionally), so it cannot simply join a guarded
- *                      transaction, and making it one would force d_iparent to be
- *                      MW-transacted on EVERY arm -- resolving reads on the
- *                      hottest field, which d0e7955 rejected.  The alternative is
- *                      a per-parent lock (d_moving exists) taken by dc_add, i.e.
- *                      a cmpxchg added to the hot add path.  Either way the
- *                      lock-free engine pays for what the lock-bearing ones get
- *                      for nothing, so the choice is left explicit rather than
- *                      taken silently.
+ *   dcache_txn         1 on the arms that already transact d_iparent (the MARK
+ *                      arm), 0 otherwise.  No lock: a GUARD PAIR, which is the
+ *                      lock-free answer to the same question --
  *
- * That asymmetry is the point: the feature is free exactly where a lock already
- * covers the child list, which is the kernel's own arrangement -- and it is one
- * more thing the hybrid winner inherits by ending on the bucket lock.
+ *                          dc_add    WRITES parent->d_child_head
+ *                                    GUARDS parent->d_iparent
+ *                          d_delete  GUARDS host->d_child_head
+ *                                    WRITES host->d_iparent
+ *
+ *                      Each side's write set hits the other's read set, so the
+ *                      two cannot both commit, in EITHER order.  BOTH guards are
+ *                      required: one alone is one-directional (dc_add's alone
+ *                      lets a child land after emptiness was checked; d_delete's
+ *                      alone lets a child land after the parent was read
+ *                      positive).  repro_negdir.c drives both directions and is
+ *                      mutation-verified -- removing either guard fails exactly
+ *                      its own direction and leaves the other passing.
+ *
+ *                      Costs the READER nothing on that arm: iparent_raw()
+ *                      already resolves the slot (DC_IPARENT_TXN), a resolve
+ *                      that until now handled a proxy nobody installed.  It does
+ *                      cost the WRITER one read-set entry, with one consequence
+ *                      to measure: the guarded word also carries the parent
+ *                      POINTER and the shell tag, so an add under a directory
+ *                      now aborts when that directory is itself renamed or its
+ *                      fold runs -- not only when it goes negative.  Sealing the
+ *                      child-list head instead would avoid that (the seal exists
+ *                      only while the directory IS negative) at the price of a
+ *                      tag every child-list traversal must resolve.
+ *
+ * So the feature is free where a lock already covers the child list -- the
+ * kernel's own arrangement, and one more thing the hybrid winner inherits by
+ * ending on the bucket lock -- and costs a read-set entry where nothing does.
  */
 extern const int dc_delete_dir_supported;
 

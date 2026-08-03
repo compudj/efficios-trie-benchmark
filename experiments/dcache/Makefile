@@ -144,6 +144,13 @@ repro-delete-fold: repro_delete_fold.c dcache_txn.c dcache_bucketlock.c $(HDRS) 
 	  repro_delete_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./repro_delete_fold_bl
 
+# The negative-directory guard pair (all-MW engine).  Both directions, since a
+# single guard is one-directional and single-threaded tests miss both.
+repro-negdir: repro_negdir.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -DDC_TEST_HOOKS -o repro_negdir_mark \
+	  repro_negdir.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./repro_negdir_mark
+
 repro-asan: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(ASANFLAGS) \
 	  $(HCPP) -DDC_TEST_HOOKS -o repro_dcache_asan \
