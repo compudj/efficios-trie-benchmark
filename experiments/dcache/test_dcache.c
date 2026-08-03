@@ -357,6 +357,87 @@ static void test_negative_dentries(void)
 }
 
 /*
+ * A moved directory's name RECREATED at the old location while the move's fold
+ * is still outstanding, then populated.  This is the misdirection the whole
+ * experiment is about, in its sharpest single-threaded form: two distinct
+ * directories legitimately carry the same name at the same time -- the old one
+ * living on a transition chain under its NEW parent, the new one freshly
+ * indexed under the OLD parent -- and a file added under the new one must not
+ * follow the old one when the fold finally collapses the chain.
+ */
+static void test_recreate_over_moved_dir(void)
+{
+	struct dcache *dc = dc_create(1024);
+
+	CHECK(dc_add(dc, P("/a"), 900) == 0, "rc: add /a");
+	CHECK(dc_add(dc, P("/b"), 901) == 0, "rc: add /b");
+	CHECK(dc_add(dc, P("/a/d"), 902) == 0, "rc: add dir /a/d");
+	CHECK(dc_add_file(dc, P("/a/d/old"), 903) == 0, "rc: add /a/d/old");
+
+	/* MOVE it cross-dir; NO quiescence, so the shell and its pending fold
+	 * are still in flight for everything that follows. */
+	CHECK(dc_rename(dc, P("/a/d"), P("/b/d")) == 0, "rc: move /a/d -> /b/d");
+	expect_absent(dc, "/a/d");
+	expect_positive(dc, "/b/d", 902);
+	expect_positive(dc, "/b/d/old", 903);
+
+	/* RECREATE the same name at the OLD location, mid-transition. */
+	CHECK(dc_add(dc, P("/a/d"), 904) == 0, "rc: recreate /a/d");
+	expect_positive(dc, "/a/d", 904);
+	expect_positive(dc, "/b/d", 902);	/* still the moved one */
+
+	/* populate BOTH, while the fold is still outstanding */
+	CHECK(dc_add_file(dc, P("/a/d/new"), 905) == 0, "rc: add /a/d/new");
+	CHECK(dc_add_file(dc, P("/b/d/also"), 906) == 0, "rc: add /b/d/also");
+
+	expect_positive(dc, "/a/d/new", 905);
+	expect_positive(dc, "/b/d/also", 906);
+	expect_absent(dc, "/a/d/also");		/* must NOT cross over */
+	expect_absent(dc, "/b/d/new");
+	expect_positive(dc, "/b/d/old", 903);	/* rode along with the move */
+	expect_absent(dc, "/a/d/old");
+
+	/* NOW let the fold collapse the chain -- the moment the moved
+	 * directory's identity is transferred down onto the content host. */
+	dc_quiescent();
+	synchronize_rcu();
+	rcu_barrier();
+	synchronize_rcu();
+	rcu_barrier();
+
+	/* everything must still be exactly where it was put */
+	expect_positive(dc, "/a/d", 904);
+	expect_positive(dc, "/b/d", 902);
+	expect_positive(dc, "/a/d/new", 905);
+	expect_positive(dc, "/b/d/also", 906);
+	expect_positive(dc, "/b/d/old", 903);
+	expect_absent(dc, "/a/d/also");
+	expect_absent(dc, "/b/d/new");
+	expect_absent(dc, "/a/d/old");
+
+	/* and the census sees each name exactly once, under one parent each */
+	{
+		static const char *const paths[] = {
+			"/a", "/b", "/a/d", "/a/d/new",
+			"/b/d", "/b/d/old", "/b/d/also",
+		};
+		static const uint64_t ids[] = {
+			900, 901, 904, 905, 902, 903, 906,
+		};
+
+		expect_namespace(dc, paths, ids, 7);
+	}
+
+	/* the recreated directory is a normal one: it renames and rmdirs */
+	CHECK(dc_rename(dc, P("/a/d"), P("/a/e")) == 0, "rc: rename the new one");
+	expect_positive(dc, "/a/e/new", 905);
+	expect_absent(dc, "/a/d/new");
+
+	dc_destroy(dc);
+	printf("  ok: name recreated over a moved directory\n");
+}
+
+/*
  * Phase 2 remainder: d_delete leaves a NEGATIVE behind instead of unhashing.
  * The state change now runs on a live, already-indexed node -- the shape the
  * txn engines' write-once-identity assumption forbids -- in BOTH directions.
@@ -500,6 +581,7 @@ int main(void)
 	test_midtransition();		/* mid-transition unlink + exchange edges */
 	test_negative_dentries();	/* phase 2: negative -> instantiate */
 	test_delete_to_negative();	/* phase 2: positive -> negative in place */
+	test_recreate_over_moved_dir();	/* same name, old location, fold in flight */
 
 	/* Build a small tree.
 	 *   /a(1) /a/b(2) /a/b/c(3) /a/x(4) /d(5) /d/e(6)
