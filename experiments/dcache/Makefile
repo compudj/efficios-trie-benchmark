@@ -752,12 +752,21 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_LRU_MM_CID $(HCPP) -o test_dcache_lru_mmcid \
 	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_lru_mmcid
+	$(CC) $(CFLAGS) -DDC_LRU_MCAS $(HCPP) -o test_dcache_lru_mcas \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_lru_mcas
+	$(CC) $(CFLAGS) -DDC_LRU_MCAS -DDC_LRU_PERCPU $(HCPP) -o test_dcache_lru_mcas_percpu \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_lru_mcas_percpu
 	$(CC) $(CFLAGS) -DDC_NO_LRU $(HCPP) -o test_dcache_no_lru \
 	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_no_lru
 	$(CC) $(ASANFLAGS) -DDC_LRU_PERCPU $(HCPP) -o stress_lru_percpu_asan \
 	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./stress_lru_percpu_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) -DDC_LRU_MCAS $(HCPP) -o stress_lru_mcas_asan \
+	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_lru_mcas_asan 4 4 8 16 15000
 
 # LAYOUT arms.  The gates above sweep the causality arms and the chain
 # strategies, but they all build the DEFAULT 1-CL split layout -- while the
