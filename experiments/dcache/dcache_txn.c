@@ -58,6 +58,12 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>			/* generic rcu_* names => QSBR flavor */
 #include <urcu-call-rcu.h>
+#ifndef DC_NO_LRU
+#include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
+#ifdef DC_LRU_MCAS
+#include <urcu/rcu-txn-list.h>		/* phase 3: the lock-free LRU arm */
+#endif
+#endif
 #include <urcu/rcu-txn.h>		/* AFTER the RCU flavor */
 #include <urcu/rcu-txn-hlist.h>
 
@@ -286,6 +292,25 @@ struct dentry {
 	struct urcu_txn_hlist_node d_hash;
 #endif
 	struct rcu_head d_rcu;
+#ifndef DC_NO_LRU
+	/*
+	 * ---- PHASE 3: LRU, ON ITS OWN CACHELINE --------------------------------
+	 * Off CL0 because a lookup never touches the LRU, and off every OTHER line
+	 * because splicing a node out writes its NEIGHBOURS' links -- dirtying a
+	 * line belonging to two arbitrary other dentries on every add/del/rotate.
+	 * See dcache_lru.h.
+	 */
+	struct {
+#ifdef DC_LRU_MCAS
+		struct urcu_txn_list_node link;
+#else
+		struct dentry *prev;
+		struct dentry *next;
+#endif
+		unsigned int   shard;
+		unsigned char  referenced;
+	} d_lru __attribute__((aligned(64)));
+#endif
 };
 
 #define sib_dentry(n) caa_container_of((n), struct dentry, d_sib)
@@ -446,6 +471,10 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 # define DC_RENAME_CONFLICT_HINT(txn) ((void) (txn))
 #endif
 
+#define DCACHE_LRU_TYPES
+#include "dcache_lru.h"		/* PHASE 3: shard types + axis arms */
+#undef DCACHE_LRU_TYPES
+
 struct dcache {
 	struct urcu_txn_hlist_head *buckets;
 	unsigned long mask;			/* nbuckets - 1 (power of two) */
@@ -463,6 +492,16 @@ struct dcache {
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
 	void *rename_gen;
+#ifndef DC_NO_LRU
+	struct dc_lru_shard *lru;		/* phase 3; see dcache_lru.h */
+	unsigned int nlru;
+#ifdef DC_LRU_MCAS
+	/* SEPARATE from the index domain: the LRU is not part of the namespace
+	 * index, and sharing a fair-mutex lane would let an escalation raised by
+	 * a rename capture every concurrent LRU commit. */
+	struct urcu_txn_domain lru_domain;
+#endif
+#endif
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
@@ -521,26 +560,13 @@ const char *dc_engine_name(void)
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
 /* rmdir-to-negative: see dcache.h.  lock-free engine: nothing spans the check and the flip */
-/* phase 3 LRU not implemented on this engine yet */
+/* phase 3: the shared LRU (dcache_lru.h); lock arm by default, -DDC_LRU_MCAS */
+#ifdef DC_NO_LRU
 const int dc_lru_supported = 0;
+#else
+const int dc_lru_supported = 1;
+#endif
 
-
-/* Phase 3 stubs: dc_lru_supported is 0, so a harness must not call these to do
- * anything.  They answer honestly rather than aborting, so engine-agnostic code
- * can call them unconditionally and observe that nothing is evictable here. */
-long dc_shrink(struct dcache *dc, long nr)
-{
-	(void) dc; (void) nr;
-	return 0;
-}
-
-unsigned long dc_lru_count(struct dcache *dc)
-{
-	(void) dc;
-	return 0;
-}
-
-const char *dc_lru_arm(void) { return "none"; }
 
 #ifdef DC_IPARENT_TXN
 const int dc_delete_dir_supported = 1;	/* guard/write pair, no lock: see
@@ -594,6 +620,10 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	return d;
 }
 
+#ifndef DC_NO_LRU
+static int lru_shards_init(struct dcache *dc);
+#endif
+
 struct dcache *dc_create(unsigned int nbuckets)
 {
 	struct dcache *dc = calloc(1, sizeof(*dc));
@@ -613,6 +643,13 @@ struct dcache *dc_create(unsigned int nbuckets)
 		urcu_txn_hlist_init(&dc->buckets[i]);
 	dc->mask = n - 1;
 	urcu_txn_domain_init(&dc->domain);
+#ifndef DC_NO_LRU
+	if (lru_shards_init(dc) != 0) {
+		free(dc->buckets);
+		free(dc);
+		return NULL;
+	}
+#endif
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1, 1); /* root: dir, positive */
@@ -650,6 +687,9 @@ void dc_destroy(struct dcache *dc)
 	rcu_barrier();				/* run the frees they queued */
 	free_subtree(dc->root);
 	free(dc->buckets);
+#ifndef DC_NO_LRU
+	free(dc->lru);
+#endif
 	free(dc);
 }
 
@@ -1059,6 +1099,10 @@ static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 		cur = __child_lookup(dc, cur, &p->comp[i]);
 		if (!cur)
 			return NULL;
+		/* retain_dentry: the WRITER-side walk, so it stands in for the
+		 * ref-walk's dget/dput of each component.  dc_lookup does not
+		 * come through here, which is why the reader pays nothing. */
+		lru_retain(dc, cur);
 	}
 	return cur;
 }
@@ -1076,6 +1120,69 @@ static int children_empty(struct dentry *d)
 }
 
 static void dentry_free_cb(struct rcu_head *rh);
+
+#ifndef DC_NO_LRU
+/*
+ * Evict one SETTLED dentry: remove it from BOTH indexes in one commit and defer
+ * the free, i.e. dc_unlink's core taking the dentry instead of a path.
+ *
+ * It takes the dentry rather than rebuilding a path because a host's own
+ * d_iname is stale while a shell is stacked above it -- the live name is on the
+ * top -- so naming a victim mid-rename would name it wrongly.  Settled nodes
+ * have no such gap.  Anything on a transition chain is SKIPPED; renames are
+ * transient, so it is a candidate again next pass (mainline does the same
+ * whenever it cannot get d_lock).  Returns 0, or -EAGAIN to skip.
+ */
+static int lru_evict_settled(struct dcache *dc, struct dentry *d)
+{
+	struct dentry *parent;
+	struct urcu_txn txn;
+	int p_, ret = -EAGAIN;
+
+	if (urcu_txn_read((void **) &d->d_back, DC_FWD_TAG) ||
+	    urcu_txn_read((void **) &d->d_fwd, DC_FWD_TAG))
+		return -EAGAIN;			/* on a transition chain */
+	parent = parent_of_rcu(d);
+	if (!parent || parent == d)
+		return -EAGAIN;			/* the root anchors the tree */
+
+	urcu_txn_init(&txn, &dc->domain);
+	for (;;) {
+		enum urcu_txn_status st;
+
+		urcu_txn_begin(&txn);
+		if (!children_empty(d) ||
+		    urcu_txn_read((void **) &d->d_back, DC_FWD_TAG)) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			return -EAGAIN;
+		}
+		p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_hash);
+		if (!p_)
+			p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_sib);
+		if (p_) {			/* -ENOENT (gone) / -EAGAIN */
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			return -EAGAIN;
+		}
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		if (st < 0)
+			return -EAGAIN;
+		break;
+	}
+	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
+	ret = 0;
+	return ret;
+}
+#endif
+
+#include "dcache_lru.h"			/* PHASE 3: the shared LRU */
+#ifndef DC_NO_LRU
+#include "dcache_lru_shrink.h"	/* PHASE 3: the shared CLOCK shrinker */
+#endif
 
 /* ---- add / unlink ------------------------------------------------------ */
 
@@ -1183,6 +1290,10 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		}
 		break;				/* published into both indexes */
 	}
+	/* PHASE 3: on the LRU at the TAIL (newest), after publishing and outside
+	 * the commit -- the LRU has no reader, so it need not be atomic with the
+	 * index edit. */
+	lru_add(dc, d);
 	return 0;
 fail:
 	free(d);
@@ -1640,6 +1751,13 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		}
 		break;				/* removed from both indexes */
 	}
+	/* PHASE 3: off the LRU IMMEDIATELY, never lazily -- the call_rcu free
+	 * below cannot fire while a shard still points at the node, so deferring
+	 * this to the shrinker would gate reclaim on memory pressure instead of
+	 * on the grace period (design/dcache-lru-txn.md section 6). */
+	lru_del(dc, host);
+	if (top != host)
+		lru_del(dc, top);
 	rcu_read_unlock();
 	if (settled)				/* host has no fold queued: free it */
 		call_rcu(&top->d_rcu, dentry_free_cb);

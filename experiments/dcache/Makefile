@@ -74,7 +74,7 @@ HCPP     := $(KEEPID) $(CPPFLAGS)
 ENGINE   ?= seqlock
 # $(URCU_DEP) rides in HDRS because nearly every target here already lists HDRS,
 # so one line makes a liburcu rebuild invalidate every binary that links it.
-HDRS     := dcache.h seqcount.h $(URCU_DEP)
+HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 
 .PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
@@ -742,7 +742,18 @@ check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 # default; per-CPU and mm_cid are the userspace refinements this compares against.
 # Correctness must hold on all three -- a shard axis is not allowed to change what
 # the cache CONTAINS, only how the eviction order is approximated.
-check-lru-arms: test_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-lib
+	@echo "--- txn engine (all-MW): lock arm, MCAS arm, no-LRU control ---"
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_txn_lru \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txn_lru
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_LRU_MCAS $(HCPP) -o test_dcache_txn_lru_mcas \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txn_lru_mcas
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_NO_LRU $(HCPP) -o test_dcache_txn_no_lru \
+	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txn_no_lru
+	@echo "--- bucketlock engine ---"
 	$(CC) $(CFLAGS) $(HCPP) -o test_dcache_lru_pernode \
 	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_lru_pernode

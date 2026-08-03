@@ -1,0 +1,440 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/*
+ * dcache_lru.h -- PHASE 3: the dentry LRU, shared by the txn engines.
+ *
+ * Included by dcache_bucketlock.c and dcache_txn.c AFTER each has defined its
+ * own struct dentry, struct dcache, children_empty() and lru_evict_settled().
+ * One copy rather than one per engine, because the policy here is not
+ * engine-specific and a divergence would be silent -- the retain_dentry bug
+ * this file's history records had to be fixed in two places at once.
+ *
+ * dcache_seqlock.c deliberately does NOT include it: the baseline carries its
+ * own kernel-shaped `struct list_lru` (per-node shard, batch-isolate shrinker),
+ * and sharing an implementation with the engines it is meant to be compared
+ * against would let it borrow their refinements.
+ *
+ * WHAT THE INCLUDING ENGINE MUST PROVIDE:
+ *   struct dentry { ... struct { <links>; unsigned int shard;
+ *                               unsigned char referenced; } d_lru; }
+ *   struct dcache { ... struct dc_lru_shard *lru; unsigned int nlru;
+ *                       dc_domain_t lru_domain; }   (domain: MCAS arm only)
+ *   int children_empty(struct dentry *);
+ *   int lru_evict_settled(struct dcache *, struct dentry *);  -- 0 on success
+ *
+ * The design (design/dcache-lru-txn.md), in one paragraph: the order is FUZZY on
+ * purpose (CLOCK / second chance), a lookup touches the list ZERO times because
+ * this port takes no reference on the read side, and the LRU wants no SW
+ * transaction because it has no lockless reader to consume a reader-atomic flip.
+ * That last point argues against SW, not against MW -- an arbitrary mid-list
+ * splice is a genuine multi-writer problem, which is what -DDC_LRU_MCAS is for.
+ */
+
+
+/*
+ * Two sections, selected by DCACHE_LRU_TYPES, because the shard type must be
+ * declared BEFORE struct dcache (which holds a pointer to an array of them)
+ * while the implementation needs struct dcache, children_empty() and
+ * lru_evict_settled() -- so the including engine takes it in two bites:
+ *
+ *	#define DCACHE_LRU_TYPES
+ *	#include "dcache_lru.h"
+ *	#undef  DCACHE_LRU_TYPES
+ *	... struct dcache { ... struct dc_lru_shard *lru; ... } ...
+ *	... children_empty(), lru_evict_settled() ...
+ *	#include "dcache_lru.h"
+ */
+#ifdef DCACHE_LRU_TYPES
+/*
+ * WHICH AXIS TO SHARD ON is a real question with a measurable answer, so it is a
+ * build arm rather than a decision baked in:
+ *
+ *   default          per NUMA NODE   -- what the kernel does (lru->node[nid]),
+ *                                       and so the faithful arm.  Coarse: every
+ *                                       CPU on a node shares one lock and one
+ *                                       pair of head/tail cachelines.
+ *   -DDC_LRU_PERCPU  per CPU         -- the obvious userspace refinement.  Kills
+ *                                       producer-vs-producer outright, at the
+ *                                       price of a shard array sized by the
+ *                                       MACHINE and an LRU order that is now
+ *                                       fuzzy across CPUs as well as in time.
+ *   -DDC_LRU_MM_CID  per mm_cid      -- rseq's dense per-process concurrency id.
+ *                                       Same isolation as per-CPU while the
+ *                                       shard array is sized by how many threads
+ *                                       are ACTUALLY running, not by how many
+ *                                       CPUs exist, so the shard heads stay in
+ *                                       cache instead of scattering.
+ *
+ * The comparison is the point.  Finer sharding trivially wins the enqueue
+ * microbenchmark; what it costs is eviction QUALITY -- N independent clocks mean
+ * the global order is only as good as the shard balance -- and shard-array
+ * footprint.  Per-node keeps one clock per node, which is why the kernel can
+ * still call the result an LRU.
+ */
+#if defined(DC_LRU_PERCPU) && defined(DC_LRU_MM_CID)
+# error "pick one LRU shard axis"
+#endif
+
+/*
+ * State word encoding, shared by both mechanisms.  Three states rather than a
+ * bare "shard+1" because with no lock the add and del paths must CLAIM the node
+ * before touching the list, or two concurrent retains would both enqueue the
+ * same dentry and corrupt the edges.
+ */
+#define DC_LRU_OFF	0u		/* not on any shard */
+#define DC_LRU_BUSY	1u		/* a transition is in flight */
+#define DC_LRU_ON(i)	((i) + 2u)	/* on shard i */
+
+struct dc_lru_shard {
+#ifdef DC_LRU_MCAS
+	/*
+	 * THE MCAS ARM.  No lock: the list is <urcu/rcu-txn-list.h>, a
+	 * bidirectional list whose every structural change flips BOTH edges in
+	 * one MCAS commit, so an arbitrary mid-list splice is atomic and
+	 * lock-free.  That is the property the whole arm exists for -- it is the
+	 * one thing neither the two-lock FIFO nor a lazy/tombstone scheme can do
+	 * (design/dcache-lru-txn.md sections 6-7), and unlink NEEDS it.
+	 *
+	 * What it buys: the shrinker never shares a lock with dentry ops, so
+	 * producer-vs-consumer contention disappears rather than being bounded.
+	 * What it costs: a descriptor and a multi-CAS on EVERY enqueue and EVERY
+	 * unlink -- a constant tax on the hot churn path to decouple a consumer
+	 * that may be idle.  Section 7 says which wins is decided by RECLAIM
+	 * CADENCE, not by readers: bursty reclaim favours the lock, continuous
+	 * eviction favours this.  That is a measurement, hence both arms.
+	 */
+	struct urcu_txn_list_head list;
+	unsigned long count;			/* atomic; no lock to protect it */
+	char pad[64 - (sizeof(unsigned long) +
+		       sizeof(struct urcu_txn_list_head)) % 64];
+#else
+	unsigned long lock;		/* test-and-set; see fold_lock */
+	struct dentry *head;		/* oldest -- the shrinker's end */
+	struct dentry *tail;		/* newest -- the enqueue end */
+	unsigned long count;
+	/* keep shards off each other's cachelines */
+	char pad[64 - (2 * sizeof(unsigned long) + 2 * sizeof(void *)) % 64];
+#endif
+};
+
+
+/*
+ * Forward declarations, so an engine can call these from code that sits ABOVE
+ * the implementation section -- resolve() in particular, which is defined long
+ * before it.
+ */
+struct dcache;
+struct dentry;
+#ifndef DC_NO_LRU
+static int lru_shards_init(struct dcache *dc);
+static unsigned int lru_nshards(void);
+#endif
+static void lru_add(struct dcache *dc, struct dentry *d);
+static void lru_del(struct dcache *dc, struct dentry *d);
+static inline void lru_retain(struct dcache *dc, struct dentry *d);
+
+#else	/* the implementation */
+
+#ifndef DC_NO_LRU
+/* ---- PHASE 3: the sharded LRU ------------------------------------------ */
+/* ---- shard AXIS: chosen independently of the mechanism below ----------- */
+/*
+ * Pick a shard: the NUMA NODE, exactly the axis the kernel shards on
+ * (`lru->node[nid]`, one list + one lock per node).
+ *
+ * Read from the RSEQ ABI page -- rseq_current_node_id() is a plain load of a
+ * field the kernel maintains in thread-local memory, so it costs a load and no
+ * syscall, no vDSO call, and no libnuma.
+ *
+ * WHICH node, though, is worth stating, because the kernel and this differ in
+ * derivation and agree in effect.  The kernel takes the node of the OBJECT'S
+ * MEMORY (`list_lru_add_obj` -> `page_to_nid(virt_to_page(item))`) -- the list
+ * links live inside the dentry, so it wants the shard whose lock and head are
+ * near that memory.  This takes the node of the ENQUEUEING THREAD, which under
+ * a first-touch allocator is the node that dentry's memory is on, since the same
+ * thread allocated it moments earlier.  Same shard, one load instead of a page
+ * lookup.
+ *
+ * The node is captured ONCE, at enqueue, and stored in d_lru.shard -- a dentry
+ * unlinked from a different node must splice out of the list it is actually on,
+ * not the caller's.  The kernel gets that property for free by recomputing from
+ * the object; we get it by remembering.
+ *
+ * Without rseq node ids (old kernel, or rseq unavailable) everything lands on
+ * shard 0.  That is honest rather than degraded-but-plausible: we genuinely do
+ * not know the node, and pretending otherwise -- sharding by CPU, say -- would
+ * silently make this arm FINER-grained than the kernel's and flatter it in
+ * exactly the comparison it exists to inform.
+ */
+static inline unsigned int lru_shard_index(const struct dcache *dc)
+{
+	unsigned int id;
+
+#if defined(DC_LRU_PERCPU)
+	int raw = rseq_current_cpu_raw();
+
+	id = raw < 0 ? 0u : (unsigned int) raw;
+#elif defined(DC_LRU_MM_CID)
+	id = rseq_mm_cid_available() ? rseq_current_mm_cid() : 0u;
+#else
+	id = rseq_node_id_available() ? rseq_current_node_id() : 0u;
+#endif
+	return id < dc->nlru ? id : id % dc->nlru;
+}
+
+const char *dc_lru_arm(void)
+{
+#if defined(DC_LRU_PERCPU)
+	return "percpu";
+#elif defined(DC_LRU_MM_CID)
+	return "mm_cid";
+#else
+	return "pernode";
+#endif
+}
+
+/* How many shards this arm wants. */
+static unsigned int lru_nshards(void)
+{
+#if defined(DC_LRU_PERCPU)
+	int n = rseq_get_max_nr_cpus();
+
+	return n > 0 ? (unsigned int) n : 1u;
+#elif defined(DC_LRU_MM_CID)
+	int n = rseq_get_max_nr_cpus();		/* mm_cid <= nr_cpus, and dense */
+
+	return n > 0 ? (unsigned int) n : 1u;
+#else
+	return 64u;				/* >= nr_node_ids anywhere we run */
+#endif
+}
+
+/*
+ * retain_dentry (fs/dcache.c), the kernel's last-dput action:
+ *
+ *	not on the LRU -> d_lru_add() at the tail
+ *	already on it  -> d_flags |= DCACHE_REFERENCED, and do NOT move it
+ *
+ * Not moving an already-listed dentry is the load-bearing half: recency becomes
+ * a per-object bit rather than a shared list-head write, which is the only
+ * reason one list per shard survives a busy cache.
+ *
+ * The re-add half matters just as much, and an earlier cut of this missed it.
+ * It is what lets the shrinker answer LRU_REMOVED for an in-use entry the way
+ * the kernel does -- an entry taken off the list is not lost, it is waiting for
+ * its next touch.  Without a re-arm the only safe answer is to rotate, which
+ * keeps un-evictable entries circulating and burning scan budget forever.
+ *
+ * Called from the WRITER-side resolve only; dc_lookup does not come through
+ * there, so the reader pays nothing.  Test-then-set on the bit so a hot
+ * directory costs a shared-state load and no invalidation.
+ */
+static void lru_add(struct dcache *dc, struct dentry *d);
+
+static inline void lru_retain(struct dcache *dc, struct dentry *d)
+{
+	if (caa_likely(uatomic_load(&d->d_lru.shard, CMM_RELAXED)
+		       >= DC_LRU_ON(0))) {
+		if (!uatomic_load(&d->d_lru.referenced, CMM_RELAXED))
+			uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
+		return;
+	}
+	lru_add(dc, d);				/* re-arm after an LRU_REMOVED */
+}
+
+
+/*
+ * Allocate the shard array.  Cacheline-aligned because sharding is pointless if
+ * two shards' head/tail/count words share a line.  Under -DDC_LRU_MCAS each
+ * shard's list is CIRCULAR, so its sentinel must point at itself -- a zeroed
+ * shard is not an empty list, it is a NULL-edged one that faults on the first
+ * insert.  Returns 0, or -ENOMEM.
+ */
+static int lru_shards_init(struct dcache *dc)
+{
+	unsigned int i;
+
+	dc->nlru = lru_nshards();
+	if (posix_memalign((void **) &dc->lru, 64,
+			   (size_t) dc->nlru * sizeof(*dc->lru)) != 0)
+		return -ENOMEM;
+	memset(dc->lru, 0, (size_t) dc->nlru * sizeof(*dc->lru));
+#ifdef DC_LRU_MCAS
+	for (i = 0; i < dc->nlru; i++)
+		urcu_txn_list_init(&dc->lru[i].list);
+	/* SEPARATE from the index domain: the LRU is not part of the namespace
+	 * index, so an escalation raised by a rename must not capture it. */
+	urcu_txn_domain_init(&dc->lru_domain);
+#else
+	(void) i;
+#endif
+	return 0;
+}
+
+#ifdef DC_LRU_MCAS
+/* ======================= THE MCAS ARM (lock-free) ======================= */
+
+/* dentry <-> list node */
+static inline struct dentry *lru_dentry(struct urcu_txn_list_node *n)
+{
+	return caa_container_of(n, struct dentry, d_lru.link);
+}
+
+/*
+ * Enqueue at the TAIL.  CLAIM the node first (OFF -> BUSY): with no lock, two
+ * concurrent retains would otherwise both enqueue the same dentry and corrupt
+ * its edges.  The claim is what the shard lock did for free in the other arm.
+ */
+static void lru_add(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx = lru_shard_index(dc);
+	struct dc_lru_shard *sh = &dc->lru[idx];
+
+	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_BUSY)
+	    != DC_LRU_OFF)
+		return;				/* someone else owns the change */
+	if (urcu_txn_list_add_tail_rcu(&d->d_lru.link, &sh->list,
+				       &dc->lru_domain) != 0) {
+		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
+		return;				/* -ENOMEM: simply not listed */
+	}
+	uatomic_inc(&sh->count);
+	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELEASE);
+}
+
+/*
+ * IMMEDIATE physical removal from anywhere in the list -- the operation that
+ * justifies this arm.  del_rcu splices via the node's OWN edges, so unlike the
+ * lock arm it does not even need to find the shard head; the shard is consulted
+ * only to decrement the counter.
+ *
+ * Returns 1 if THIS call removed it.  del_rcu reports that directly (0 means a
+ * peer won), so the claim below is only needed to keep an ADD from racing in.
+ */
+static int lru_del_claimed(struct dcache *dc, struct dentry *d)
+{
+	unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+
+	if (st < DC_LRU_ON(0))
+		return 0;			/* off, or a peer is mid-change */
+	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
+		return 0;
+	if (urcu_txn_list_del_rcu(&d->d_lru.link, &dc->lru_domain) == 1)
+		uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
+	uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
+	return 1;
+}
+
+static void lru_del(struct dcache *dc, struct dentry *d)
+{
+	(void) lru_del_claimed(dc, d);
+}
+
+
+unsigned long dc_lru_count(struct dcache *dc)
+{
+	unsigned long n = 0;
+	unsigned int i;
+
+	for (i = 0; i < dc->nlru; i++)
+		n += uatomic_load(&dc->lru[i].count, CMM_RELAXED);
+	return n;
+}
+
+#else	/* ================= THE LOCK ARM (per-shard spinlock) ================ */
+/* ---- PHASE 3: the sharded LRU ------------------------------------------- */
+
+static inline void lru_lock(struct dc_lru_shard *sh)
+{
+	while (uatomic_cmpxchg(&sh->lock, 0UL, 1UL) != 0UL)
+		caa_cpu_relax();
+	cmm_smp_mb();
+}
+
+static inline void lru_unlock(struct dc_lru_shard *sh)
+{
+	uatomic_store(&sh->lock, 0UL, CMM_RELEASE);
+}
+
+/* Add at the TAIL (newest).  Called with no lock held. */
+static void lru_add(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx = lru_shard_index(dc);
+	struct dc_lru_shard *sh = &dc->lru[idx];
+
+	lru_lock(sh);
+	d->d_lru.prev = sh->tail;
+	d->d_lru.next = NULL;
+	if (sh->tail)
+		sh->tail->d_lru.next = d;
+	else
+		sh->head = d;
+	sh->tail = d;
+	sh->count++;
+	d->d_lru.shard = DC_LRU_ON(idx);
+	lru_unlock(sh);
+}
+
+/* Splice out, wherever it sits.  Caller holds @sh. */
+static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
+{
+	if (d->d_lru.prev)
+		d->d_lru.prev->d_lru.next = d->d_lru.next;
+	else
+		sh->head = d->d_lru.next;
+	if (d->d_lru.next)
+		d->d_lru.next->d_lru.prev = d->d_lru.prev;
+	else
+		sh->tail = d->d_lru.prev;
+	d->d_lru.prev = d->d_lru.next = NULL;
+	d->d_lru.shard = DC_LRU_OFF;
+	sh->count--;
+}
+
+/*
+ * IMMEDIATE physical removal, from an arbitrary position.  This is the operation
+ * that decides the whole design (design/dcache-lru-txn.md section 6): the
+ * tempting alternative -- mark it dead and let the shrinker reap it -- fails
+ * under unlink churn with no memory pressure, because the node's call_rcu free
+ * cannot fire while the list still points at it.  That turns "freeable after one
+ * grace period" into "freeable whenever reclaim wanders by", i.e. unbounded live
+ * memory exactly where a dcache is busiest.  A Harris-style logical mark does not
+ * rescue it either: Harris needs every traverser to help unlink, and this list
+ * has exactly one traverser.
+ */
+static void lru_del(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx;
+	struct dc_lru_shard *sh;
+
+	idx = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+	if (idx < DC_LRU_ON(0))
+		return;				/* not on any shard */
+	sh = &dc->lru[idx - DC_LRU_ON(0)];
+	lru_lock(sh);
+	if (d->d_lru.shard >= DC_LRU_ON(0))	/* re-check under the lock */
+		lru_unlink_locked(sh, d);
+	lru_unlock(sh);
+}
+
+unsigned long dc_lru_count(struct dcache *dc)
+{
+	unsigned long n = 0;
+	unsigned int i;
+
+	for (i = 0; i < dc->nlru; i++)
+		n += uatomic_load(&dc->lru[i].count, CMM_RELAXED);
+	return n;
+}
+#endif	/* DC_LRU_MCAS */
+
+#else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
+static inline void lru_retain(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+static inline void lru_add(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+static inline void lru_del(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
+long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+#endif	/* DC_NO_LRU */
+#endif	/* DCACHE_LRU_TYPES */
