@@ -857,169 +857,46 @@ items here are the ones that actually fired in this experiment):
   - it is **not** poison, not a same-slot merge, not a stale read of the
     victim's own next, not `settle`, and **not a broken `del`**.
 
-  ⭐⭐ **THE INSERT PATH IS WHERE IT BREAKS — audited and confirmed.**
-  `urcu_txn_list_insert_before_prepare()` does `newp->next = pos` as a **PLAIN,
-  non-transactional store at PREPARE time**, before the commit.  That clears any
-  residual deletion MARK on the node whether or not the commit then succeeds.
-  Auditing the node's mark across prepare-and-abort:
+  ⛔ **AND THE INSERT "ROOT CAUSE" IS WRONG TOO — retracted.**  The audit does
+  fire (`aborted-after-clearing-mark` 1–3 per run), and the claim built on it was
+  that `insert_before_prepare`'s plain `newp->next = pos` clears a *live* node's
+  tombstone.  It does not, because the node is not live:
 
-  | run | **aborted after clearing the mark** | bad tail edge |
-  |---|--:|--:|
-  | 1 | **3** | 1 |
-  | 2 | **2** | 1 |
-  | 3 | **1** | 0 |
-  | 4 | **2** | 2 |
+  - the rotate is `lru_del_claimed()` **then** `lru_add_at()`, and the del has
+    already COMMITTED — the post-commit audit proved it atomic, marked *and*
+    unlinked;
+  - `lru_add_at()` claims `OFF -> BUSY` before touching the list.
 
-  Fires in every run.  The counts are small, but the failure is ABSORBING — one
-  occurrence is enough, which is exactly why the wedge has stochastic onset and
-  never recovers.
+  So at insert time the node is already **out of the list and exclusively owned
+  by this thread**.  Clearing its tombstone is exactly what re-insertion means,
+  and an aborted insert leaves it unmarked-and-unlinked in a state **no other
+  thread can reach or claim** — the owner simply retries.  `del_prepare` can
+  never see it: `lru_del_claimed` requires `shard >= ON(0)` and ours reads BUSY.
+  The counter was measuring correct behaviour.
 
-  The check cannot be explained away as a race: it compares the mark on **one
-  node, before and after, while this thread owns it** via the `OFF -> BUSY`
-  claim.  Nothing else may touch it in that window.
+  (`bad-tail-edge` is likewise a check artifact — it reads `head->prev` after the
+  commit without exclusion, so a concurrent tail insert legitimately moves it.)
 
-  **Why it wedges.**  The abort leaves the node UNMARKED and UNLINKED, with
-  `next`/`prev` already overwritten to the tail's neighbours.  A subsequent
-  `del_prepare` on it then reads an unmarked `next` (so it does not answer
-  `-ENOENT`), derives `prev` from the clobbered `prev`, and records
-  `prev->next : elem -> next` — against a predecessor that does not name it.
-  That CAS can never match, so the transaction retries forever, ages, takes the
-  escalation lane, and parks every other writer behind it.  Every earlier
-  measurement is a consequence: the MARKED value the CAS loses to, `same-as-old`
-  0, no poison, no same-slot merge, and a `del` that is itself perfectly atomic.
+  **So the bug is still not found.**  What survives is the negative space, which
+  is at least large and solid: not poison, not a same-slot merge, not a stale
+  read of the victim's own `next`, not `settle`, not `del` (atomic, audited), not
+  the insert's prepare-time store, not the funnel, not the shard axis, not batch
+  size, not eviction volume, not domain count, not quiescence.  The wedge remains
+  `lru_del` retrying forever on a `prev->next` CAS that loses to a MARKED value,
+  with `same-as-old` 0, while every competitor is parked in the lane it holds.
 
-  **The library-side statement:** a prepare must not mutate shared node state.
-  `newp` is not private here — it is a node the caller may have just deleted, and
-  whose tombstone other operations depend on until the insert actually commits.
-  The two neighbour edges are recorded transactionally; the node's own two are
-  not, and that asymmetry is the bug.
+  ⚠⚠ **Nine hypotheses, nine refuted — and the pattern in HOW they failed is the
+  real output of this investigation.**  Almost every one died not to better
+  reasoning but to a probe that was itself wrong: one installer hooked out of
+  four; a stale build header; a counter conflating prepare failures with commit
+  aborts; a counter read after `end()` had cleared it; a tag tested on an
+  UNRESOLVED value (proxies read as marks); the same tag tested on a RESOLVED
+  value (marks stripped); and finally a state read without establishing who was
+  allowed to touch it.  Rules earned, in order of what they cost:
 
-  ⚠ **Process note, having been wrong four times here:** three of the four bad
-  readings came from *incomplete instrumentation*, not bad reasoning — one
-  installer hooked out of four, a stale header, a counter conflating prepare
-  failures with commit aborts, a counter read after `end()` cleared it.  Before
-  trusting a zero in this subsystem, verify the counter can be made non-zero.
-
-  <!-- superseded first attempt kept below for the reasoning, not the verdict -->
-  The chain that was proposed, and is at most half the story:
-
-  `urcu_txn__enter_fallback()` → `cds_fair_mutex_lock()` → `cds_fair_mutex_park()`
-  blocks on a futex **with the thread still RCU-online**.  Under QSBR an online
-  thread that is not running holds off *every* grace period, so escalation stalls
-  `call_rcu`, which stalls descriptor reclaim, which raises allocation pressure
-  and conflict, which causes **more** escalation.  Self-reinforcing, and it never
-  recovers.
-
-  Evidence: two threads in `cds_fair_mutex_park` and the `call_rcu` worker still
-  inside `urcu_qsbr_synchronize_rcu()` on samples six seconds apart, for a 300 ms
-  benchmark.  ⚠ **Onset is stochastic** — the same command line completes on one
-  run and wedges on the next — so a run that finishes is *not* evidence the
-  configuration is safe.
-
-  It is the same park-while-online hazard the repro harnesses guard with
-  `sem_wait_quiescent()`, except the parking is inside liburcu's own lane where a
-  caller cannot guard it.  The fix belongs there: go offline across the park.
-  Whether that is safe at the fallback entry — the transaction is at `begin()`
-  and holds no resolved pointers yet, which is the argument that it is — is a
-  liburcu decision.
-
-  ⛔ A bounded/yielding shrinker-side delete (mainline's `spin_trylock` +
-  `LRU_SKIP`) was implemented to dodge it and **measured strictly worse**:
-  escalation is a property of the DOMAIN, not the transaction, so a fresh handle
-  still enters the lane and four attempts cost four futex handoffs instead of
-  one.  A real trylock needs a front-end that can attempt a commit *without*
-  entering the fallback lane.
-
-- ⭐⭐ **rmdir-to-negative: free where a lock already covers the child list,
-  and only there.**  The invariant a negative must hold is that it cannot GAIN a
-  child.  For a FILE that is free on every engine (`d_isdir` is write-once, so
-  `dc_add` already answers `-ENOTDIR`).  A directory can legitimately take one,
-  so `children_empty` must still hold at the instant the state flips — which
-  means excluding a concurrent `dc_add`.  Exposed as a capability
-  (`dc_delete_dir_supported`) because the engines genuinely differ:
-
-  | engine | cost | why |
-  |---|---|---|
-  | `seqlock` | **free** | `dc_add` takes its parent's dir lock; `dc_delete` takes the VICTIM's — the same lock.  Exactly why the kernel's `rmdir` holds the victim's `i_rwsem`. |
-  | `bucketlock` | **free** | `dc_add` takes its parent's `d_child_head` bit-lock; `dc_delete` takes the victim's — the same head, paired with the bucket it already holds. |
-  | `txn` (all-MW) | **`-ENOTSUP`** | lock-free by design: nothing it holds spans the check and the flip. |
-
-  On the two lock-bearing engines the whole price is **one predicted
-  load-and-branch inside a critical section `dc_add` already entered** — no new
-  lock, no read-set entry, nothing on the reader.  It is that cheap only because
-  the lock `dc_add` and the fold already share is the one the invariant needs.
-
-  The all-MW engine's options are both real costs: transact `d_iparent` MW on
-  every arm (a resolving read on the hottest field — what `d0e7955` rejected),
-  or take a per-parent lock in `dc_add` (a cmpxchg on the hot add path).  Left
-  explicit rather than chosen silently.
-
-  ⭐ **This is a second instance of the review's own headline**: the hybrid wins
-  by ending on the kernel's per-bucket lock, and the feature is free precisely
-  where that lock already sits.  The lock-free engine pays for what the
-  lock-bearing ones get for nothing — the same shape as the churn result.
-
-  ⚠ Lock ordering: `dc_delete` must acquire the bucket and the victim's child
-  head **address-ordered together** (`bl_lock2`), not escalate to the child head
-  with the bucket in hand — both are bucket-head-class locks, so escalating
-  deadlocks against a `dc_add` wanting the same pair.  seqlock has the same
-  shape and peeks the victim locklessly to learn its type before locking
-  (`d_isdir` is write-once, so the peek cannot be stale about the type; the
-  re-find under the lock catches a stale *identity*).
-
-- ⛔⭐⭐ **THE LOST STATE CHANGE — phase 2's own prediction, come true.**
-  `d0e7955` left the fold's in-place identity write plain, said exactly why that
-  was safe, and dated its own expiry: *"benign today only because rename
-  preserves inode-ness ... but it is UB and a latent correctness bug once
-  phase-2 negative dentries land."*  It landed.  `d_delete`/`d_instantiate`
-  write a live host's `d_iparent` from another thread, so two plain
-  read-modify-writes share one word: the fold reads the host positive, a
-  concurrent delete publishes NEGATIVE, the fold writes back the bit it read,
-  and **the delete is gone with both callers returning success**.
-
-  **The two engines close it differently, and that split is the interesting
-  result.**  `dcache_txn.c` is lock-free by design, so it leaves the fold and
-  the state change concurrent and makes each an **atomic RMW**.  Not `store_mw`
-  (it installs a descriptor every reader must resolve, and the global/per-node
-  arms deliberately leave `d_iparent` untransacted).
-
-  `dcache_bucketlock.c` **excludes them with the bucket lock it already holds**:
-  the fold takes the named top's bucket head across its handover in all three
-  chain variants, so `dc_delete`/`dc_instantiate` take the same bucket — plus
-  the re-verify `dc_unlink` already does, since a concurrent transfer can make a
-  *different* node the top of that *same* bucket between the find and the
-  acquire — and the fold keeps a plain store.
-
-  ⛔ **The FOLD lock is not the answer, and "bucket then fold lock if shelled"
-  is a deadlock.**  The hierarchy is `{fold locks < bucket-head locks}`, chosen
-  so that *"no bucket is ever held while waiting on a fold lock"*, and the fold
-  acquires `fold_lock(host)` **before** its buckets — so reaching for it with a
-  bucket in hand is ABBA.  It is also unnecessary: the TRANSFER writes the top's
-  immediate SUCCESSOR while `dc_delete` writes the chain TAIL, and those coincide
-  only when the chain is `top→host`, where both hold the same bucket.  SPLICE and
-  RECLAIM never touch the word.
-
-  ⭐ **Writer-writer exclusion does not make the store plain.**  Both engines
-  keep a relaxed atomic store, because readers sample this word for pos/neg
-  while holding no lock — a different race from the lost update, and the one
-  TSAN caught.
-
-  `repro_delete_fold.c` pins it on both engines through a new
-  `dc_test_transfer_hook` fired between the fold's read and its write-back.  Its
-  rendezvous is **timed, and the timeout is load-bearing**: the all-MW engine
-  lets the deleter COMPLETE inside the window while the bucket-lock engine makes
-  it BLOCK, so waiting unconditionally would deadlock the second design rather
-  than test it.  Mutation-verified per engine — restoring the plain RMW (txn) or
-  dropping the bucket lock (bucketlock) makes each report *"/d/g reads POSITIVE
-  (id 42) -- the d_delete was LOST"*.
-
-  ⚠ **TSAN then found the other half, which no gate had run**: phase 2 made
-  `host_is_positive` re-read the host's `d_iparent` — the read `d0e7955` had
-  *removed* — so the reader's plain load raced the fold's write.  `iparent_raw`
-  is now a relaxed atomic load.  The rule this pays for: **when a fix works by
-  removing a read, adding that read back is a change to the fix, not a use of
-  it** — and the gate that would have caught it (TSAN) was not in the phase-2
-  gate set.
+  1. **Verify a counter can be made non-zero before trusting its zero.**
+  2. **Raw for the tag, resolved for the pointer, neither mid-commit.**
+  3. **Before calling a state corrupt, establish who is allowed to touch it.**
 
 - ⚠ **The gate matrix must cover the BUILD matrix.**  Phase 2 broke both txn
   `_nosplit` arms (legacy 3-CL: pos/neg is its own `d_inode` word, no
