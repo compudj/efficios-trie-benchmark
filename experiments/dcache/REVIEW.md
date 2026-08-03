@@ -604,8 +604,37 @@ items here are the ones that actually fired in this experiment):
   `urcu_qsbr_synchronize_rcu()` on samples **six seconds apart** — i.e. grace
   periods are stalled and it is absorbing, never recovering.  That park-while-
   online interaction is real and worth fixing on its own, but on the evidence it
-  is how the failure *manifests*, not why it starts.  Next: instrument abort and
-  escalation counts per call site to find which commit is actually starving.
+  is how the failure *manifests*, not why it starts.
+
+  **DOMAIN AUDIT — clean, and it rules out the obvious suspects.**  Every
+  transaction in both txn engines is accounted for:
+
+  | site | domain | abortable? |
+  |---|---|---|
+  | `dcache_txn.c` ×8 (add, unlink, instantiate, delete, stack, fold, exchange) | `&dc->domain` | yes — correct |
+  | `dcache_bucketlock.c` ×3 (stack_shell ×2, exchange) | `&dc->domain` | yes — correct |
+  | `dcache_bucketlock.c` fold TRANSFER | `NULL` | **no** — `commit_sw`, pure SW, cannot contention-abort, so it has no lane by design |
+  | `urcu_txn_sw_init` ×3 (SW chain ops) | none by construction | no |
+  | LRU list add/del (MCAS arm) | `&dc->lru_domain` | yes — correct, and it IS initialised (`lru_shards_init`) |
+
+  So there is no MCAS commit running off-domain, and no abortable commit without
+  a lane.  ⚠ Note `gdb` reports the `domain=` argument differently in every
+  inlined frame at `-O2` (one pointed into the stack) — that is inlined-argument
+  noise, not evidence; do not read those values.
+
+  ⛔ **Four hypotheses tested and FALSIFIED** — recorded so they are not retried:
+  | hypothesis | result |
+  |---|---|
+  | sweep breadth / batch size | wedges at `--evict-batch 1` |
+  | park-while-online is the *cause* | it is the manifestation; fixing around it made things worse |
+  | the sweeper's shard migration | **was a real bug, fixed** — wedge unchanged |
+  | LRU on a separate domain from the index | forcing both onto `&dc->domain`: still wedges |
+  | shrinker not reporting quiescent states | `dc_quiescent()` after every single eviction: still wedges |
+
+  Next step is INSTRUMENTATION, not another hypothesis: per-call-site abort and
+  escalation counts (`URCU_TXN_CACHE_STATS` and friends) to find which commit
+  actually starves first.  Five guesses have now cost more than measuring would
+  have.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:
