@@ -53,7 +53,7 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			if (victim->d_lru.referenced) {
 				victim->d_lru.referenced = 0;	/* LRU_ROTATE */
 				if (lru_del_claimed(dc, victim))
-					lru_add(dc, victim);
+					lru_add_at(dc, victim, i);	/* THIS shard */
 				rcu_read_unlock();
 				continue;
 			}
@@ -69,7 +69,7 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			if (lru_evict_settled(dc, victim) == 0)
 				freed++;
 			else
-				lru_add(dc, victim);	/* not evictable now */
+				lru_add_at(dc, victim, i);	/* THIS shard */
 			rcu_read_unlock();
 		}
 	}

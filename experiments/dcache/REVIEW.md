@@ -573,9 +573,42 @@ items here are the ones that actually fired in this experiment):
   corollary.  Files first; **rmdir-to-negative followed**, and it produced the cleanest
   cost measurement of phase 2 (below).
 
-- ⛔⭐⭐ **The txn escalation lane PARKS WHILE RCU-ONLINE, and under QSBR that is
-  an absorbing collapse.**  Found chasing why `--evict bursty` on the MCAS LRU
-  arm wedges (`bench_dcache_churn`).  Not a dcache bug — the chain is:
+- ⚠ **OPEN: `--evict bursty` on the MCAS LRU arm wedges, cause NOT yet found.**
+
+  ⛔ **A first "root cause" was published here and was wrong**, which is the
+  lesson worth keeping: an escalation-lane symptom is normally the EFFECT of a
+  deeper bug, not the cause.  Acting on the symptom produced one fix that was
+  measured *worse* (a bounded/yielding shrinker delete — escalation is a property
+  of the DOMAIN, so a fresh handle still enters the lane and N attempts cost N
+  futex handoffs) and one confident write-up that the next experiment refuted.
+
+  Looking for the deeper bug did find a REAL one — the sweeper's rotate re-added
+  through the caller's shard, migrating the whole cache onto the sweeper's shard
+  over successive sweeps (see `lru_add_at` in `dcache_lru.h`).  Fixed, and worth
+  fixing; it did **not** stop the wedge.
+
+  Where the evidence stands, so the next attempt does not redo it:
+  | observation | |
+  |---|---|
+  | needs a SEPARATE shrinker thread | writers self-evicting (`continuous`) never wedge — at **60,945 evictions/300 ms** |
+  | needs FREQUENCY | `--evict-period 50` completes; `5` wedges |
+  | not eviction VOLUME | continuous does 100× more evictions and is fine |
+  | not the shard axis | per-node and per-CPU both wedge |
+  | not the batch size | wedges at `--evict-batch 1` |
+  | MCAS-only | the LOCK arm at identical settings: 446–480 evictions, no wedge |
+  | shrinker thread alone is innocent | cap set unreachable → runs clean |
+  | onset is STOCHASTIC | same command line completes on one run, wedges on the next |
+
+  Symptom at the wedge: two threads parked in `cds_fair_mutex_park` (via
+  `urcu_txn__enter_fallback`) and the `call_rcu` worker inside
+  `urcu_qsbr_synchronize_rcu()` on samples **six seconds apart** — i.e. grace
+  periods are stalled and it is absorbing, never recovering.  That park-while-
+  online interaction is real and worth fixing on its own, but on the evidence it
+  is how the failure *manifests*, not why it starts.  Next: instrument abort and
+  escalation counts per call site to find which commit is actually starving.
+
+  <!-- superseded first attempt kept below for the reasoning, not the verdict -->
+  The chain that was proposed, and is at most half the story:
 
   `urcu_txn__enter_fallback()` → `cds_fair_mutex_lock()` → `cds_fair_mutex_park()`
   blocks on a futex **with the thread still RCU-online**.  Under QSBR an online

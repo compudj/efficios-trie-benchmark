@@ -129,6 +129,7 @@ static int lru_shards_init(struct dcache *dc);
 static unsigned int lru_nshards(void);
 #endif
 static void lru_add(struct dcache *dc, struct dentry *d);
+static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx);
 static void lru_del(struct dcache *dc, struct dentry *d);
 static inline void lru_retain(struct dcache *dc, struct dentry *d);
 
@@ -229,6 +230,7 @@ static unsigned int lru_nshards(void)
  * directory costs a shared-state load and no invalidation.
  */
 static void lru_add(struct dcache *dc, struct dentry *d);
+static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx);
 
 static inline void lru_retain(struct dcache *dc, struct dentry *d)
 {
@@ -284,9 +286,8 @@ static inline struct dentry *lru_dentry(struct urcu_txn_list_node *n)
  * concurrent retains would otherwise both enqueue the same dentry and corrupt
  * its edges.  The claim is what the shard lock did for free in the other arm.
  */
-static void lru_add(struct dcache *dc, struct dentry *d)
+static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 {
-	unsigned int idx = lru_shard_index(dc);
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
 	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_BUSY)
@@ -299,6 +300,23 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 	}
 	uatomic_inc(&sh->count);
 	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELEASE);
+}
+
+/*
+ * Enqueue on the CALLER'S shard -- the producer path (dc_add, retain_dentry).
+ *
+ * The shrinker must NOT use this, and getting that wrong is what made
+ * --evict bursty collapse.  A rotate is del + re-add, and re-adding through the
+ * caller's shard MIGRATES the node onto the SWEEPER'S shard: sweep after sweep
+ * the whole cache drains into one shard while the producers keep enqueueing on
+ * their own, so a single sentinel ends up carrying every rotate, every producer
+ * add, and every unlink.  That is a permanent hot slot, which is what actually
+ * drove the transaction domain into escalation.  The lock arm never had it --
+ * lru_rotate_locked re-links into the shard being swept.  Use lru_add_at(.., i).
+ */
+static void lru_add(struct dcache *dc, struct dentry *d)
+{
+	lru_add_at(dc, d, lru_shard_index(dc));
 }
 
 /*
