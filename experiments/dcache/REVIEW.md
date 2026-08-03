@@ -957,6 +957,33 @@ items here are the ones that actually fired in this experiment):
   terminates cleanly rather than being teleported — well-defined, and harmless
   for a CLOCK that is fuzzy by design.
 
+  ⭐ **And it must NOT declare the transaction disjoint** (M. Desnoyers).  Every
+  single-op bracket in `rcu-txn-list.h` calls `urcu_txn_declare_disjoint()`, but
+  the header is explicit that the line may not be copied into a composed bracket
+  "unless the COMBINED write set is provably distinct too … that is
+  data-dependent — not knowable from the keys", and that on a disjoint handle a
+  colliding prepare "blind-appends a duplicate record: silent corruption".
+
+  A move's six edges over four node pointers alias in ordinary shapes:
+
+  | shape | aliasing |
+  |---|---|
+  | `elem` already near the tail | `oldtail == prev`, or `oldtail == elem` |
+  | moving the second-to-last | `next == oldtail` |
+  | moving the sole element | `prev == next == head`, `oldtail == elem` |
+
+  So the move takes the DEFAULT read-your-own-writes handle, where a collision
+  chains into one record instead of appending a second.  That is also why
+  `del_prepare` carries its `next != prev` skip: the same aliasing, handled by
+  hand for the one case a single del can hit.
+
+  ⚠ **Control gap worth recording**: the two builds measured all session differ
+  here and I did not notice.  The normal build calls the library's
+  `del_rcu`/`add_tail_rcu`, which DECLARE disjoint; the `-DDC_TXN_STATS` build
+  uses my `_prepare` wrappers, which do not.  Both wedge, so it is not the
+  differentiator and the measurements stand — but an instrumented build that
+  changes transaction semantics is not the control it was being used as.
+
   ⚠ This supersedes the shell/fold sketch below, which solved the wrong problem:
   the shell exists to let a node be re-added while stale traversers hold it, and
   a move means it is never removed, so nothing needs re-adding.  Keeping the
