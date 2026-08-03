@@ -329,6 +329,54 @@ static void lru_del(struct dcache *dc, struct dentry *d)
 	(void) lru_del_claimed(dc, d);
 }
 
+/*
+ * ⚠ A BOUNDED, YIELDING shrinker-side delete was TRIED HERE AND MEASURED WORSE.
+ *
+ * The intent was mainline's rule -- dentry_lru_isolate takes spin_trylock(&d_lock)
+ * and answers LRU_SKIP rather than block, so reclaim never makes a foreground op
+ * wait.  The port was a fresh transaction per attempt (so age never accumulates),
+ * a 4-attempt bound, and skip on exhaustion.
+ *
+ * It made the collapse STRICTLY WORSE: with it, --evict bursty stopped completing
+ * even at --evict-batch 1, which had been fine before.  The reason is that
+ * escalation is a property of the DOMAIN, not of the transaction -- once any
+ * writer escalates on lru_domain, every subsequent urcu_txn_begin() on it enters
+ * the fair-mutex lane, fresh handle or not.  So a "cheap retry" is not cheap: each
+ * extra begin() is another futex handoff, and four attempts cost four times the
+ * lane traffic that one did.
+ *
+ * A trylock analogue therefore needs support the front-end does not currently
+ * offer -- a way to attempt a commit WITHOUT entering the fallback lane, and to
+ * fail rather than queue.  Recorded so the next attempt starts from that, not
+ * from the retry-count idea again.
+ *
+ * ⛔⭐ AND THE UNDERLYING PROBLEM IS NOT IN THIS FILE.  Chasing the collapse to
+ * the bottom: urcu_txn__enter_fallback() -> cds_fair_mutex_lock() ->
+ * cds_fair_mutex_park() blocks on a futex WHILE THE THREAD IS STILL RCU-ONLINE.
+ * Under QSBR an online thread that is not running holds off EVERY grace period,
+ * so:
+ *
+ *	escalate -> park (online) -> grace periods stall -> call_rcu never runs
+ *	-> descriptors are never reclaimed -> allocation pressure and conflict
+ *	rise -> more escalation
+ *
+ * which is self-reinforcing and ABSORBING: it never recovers.  Observed exactly
+ * that -- two threads in cds_fair_mutex_park and the call_rcu worker still
+ * inside urcu_qsbr_synchronize_rcu() on samples six seconds apart -- and the
+ * onset is stochastic, which is why the same command line sometimes finishes.
+ *
+ * It is the park-while-online hazard the repro harnesses already guard against
+ * with sem_wait_quiescent(), except here the parking is inside liburcu's own
+ * escalation lane, where a caller cannot guard it.  The fix belongs there:
+ * go offline across the park and online again after, as every other blocking
+ * wait in a QSBR program must.  Whether that is safe at the fallback entry point
+ * -- the transaction is at begin() and holds no resolved pointers yet, which is
+ * the argument that it is -- is a liburcu decision, not a dcache one.
+ */
+
+
+
+
 
 unsigned long dc_lru_count(struct dcache *dc)
 {

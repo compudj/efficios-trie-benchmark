@@ -128,15 +128,18 @@ static int prefix_depth = 2;
  * the tombstone hazard of section 6 -- shows up as a population that climbs
  * away from the cap while the op rate still looks fine.
  *
- * ⚠ KNOWN, UNRESOLVED: --evict bursty on the MCAS LRU arm (-DDC_LRU_MCAS) does
- * not complete.  A single sweeper walking every shard issues MCAS del/rotate on
- * each sentinel while every writer is concurrently enqueueing on it, the
- * conflicts drive the transaction front-end into its fair-mutex fallback, and
- * throughput collapses (a 400ms run had not finished after 45s).  Continuous
- * eviction does NOT do this, because dc_shrink_local keeps each producer on its
- * own shard.  Whether that is inherent to a global sweeper over MCAS lists or
- * just escalation tuning is open, and it has to be settled before a bursty-arm
- * number means anything.  --evict bursty on the LOCK arm is fine.
+ * ⛔ --evict bursty ON THE MCAS ARM (-DDC_LRU_MCAS) CAN WEDGE THE PROCESS, and
+ * the cause is NOT in this harness -- see dcache_lru.h and REVIEW.md.  Short
+ * version: escalation parks a thread while it is still RCU-ONLINE, which stalls
+ * every grace period, which stalls call_rcu descriptor reclaim, which deepens
+ * the contention that caused the escalation.  Self-reinforcing and absorbing:
+ * once entered it never recovers, and gdb shows the call_rcu worker still inside
+ * synchronize_rcu() six seconds apart.
+ *
+ * Onset is STOCHASTIC -- the same command line completes on one run and wedges
+ * on the next -- so a bursty MCAS sweep needs a watchdog, and a run that does
+ * finish is not evidence the configuration is safe.  --evict bursty on the LOCK
+ * arm and --evict continuous on either arm are unaffected.
  */
 static long evict_cap = 0;		/* 0 = --evict off */
 static int evict_continuous = 0;

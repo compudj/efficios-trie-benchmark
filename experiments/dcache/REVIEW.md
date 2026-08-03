@@ -573,6 +573,37 @@ items here are the ones that actually fired in this experiment):
   corollary.  Files first; **rmdir-to-negative followed**, and it produced the cleanest
   cost measurement of phase 2 (below).
 
+- ⛔⭐⭐ **The txn escalation lane PARKS WHILE RCU-ONLINE, and under QSBR that is
+  an absorbing collapse.**  Found chasing why `--evict bursty` on the MCAS LRU
+  arm wedges (`bench_dcache_churn`).  Not a dcache bug — the chain is:
+
+  `urcu_txn__enter_fallback()` → `cds_fair_mutex_lock()` → `cds_fair_mutex_park()`
+  blocks on a futex **with the thread still RCU-online**.  Under QSBR an online
+  thread that is not running holds off *every* grace period, so escalation stalls
+  `call_rcu`, which stalls descriptor reclaim, which raises allocation pressure
+  and conflict, which causes **more** escalation.  Self-reinforcing, and it never
+  recovers.
+
+  Evidence: two threads in `cds_fair_mutex_park` and the `call_rcu` worker still
+  inside `urcu_qsbr_synchronize_rcu()` on samples six seconds apart, for a 300 ms
+  benchmark.  ⚠ **Onset is stochastic** — the same command line completes on one
+  run and wedges on the next — so a run that finishes is *not* evidence the
+  configuration is safe.
+
+  It is the same park-while-online hazard the repro harnesses guard with
+  `sem_wait_quiescent()`, except the parking is inside liburcu's own lane where a
+  caller cannot guard it.  The fix belongs there: go offline across the park.
+  Whether that is safe at the fallback entry — the transaction is at `begin()`
+  and holds no resolved pointers yet, which is the argument that it is — is a
+  liburcu decision.
+
+  ⛔ A bounded/yielding shrinker-side delete (mainline's `spin_trylock` +
+  `LRU_SKIP`) was implemented to dodge it and **measured strictly worse**:
+  escalation is a property of the DOMAIN, not the transaction, so a fresh handle
+  still enters the lane and four attempts cost four futex handoffs instead of
+  one.  A real trylock needs a front-end that can attempt a commit *without*
+  entering the fallback lane.
+
 - ⭐⭐ **rmdir-to-negative: free where a lock already covers the child list,
   and only there.**  The invariant a negative must hold is that it cannot GAIN a
   child.  For a FILE that is free on every engine (`d_isdir` is write-once, so
