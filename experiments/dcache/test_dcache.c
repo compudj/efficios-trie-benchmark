@@ -813,21 +813,34 @@ static void test_lru_shrinker(void)
 	expect_absent(dc, "/p/q");
 
 	/*
-	 * LRU_REMOVED, not rotate.  /p was in use when the shrinker reached it,
-	 * so the kernel's isolate takes it OFF the list rather than cycling it --
-	 * and an entry off the list is not a candidate, however hard we shrink.
-	 * It is not lost either: retain_dentry re-adds it on the next touch,
-	 * which is what makes dropping safe.  (Rotating instead would keep
-	 * un-evictable entries circulating and burning scan budget forever.)
+	 * What the shrinker does with an IN-USE entry is mechanism-forced, so
+	 * assert the REAL behaviour on each side rather than accepting either --
+	 * see dc_lru_inuse_is_removed in dcache.h.
 	 */
-	CHECK(dc_lru_count(dc) == 0, "pop: /p was REMOVED from the list, not rotated");
-	CHECK(shrink_all(dc) == 0, "pop: an entry off the list cannot be evicted");
-	CHECK(dc_lookup(dc, P("/p"), NULL) == DC_POSITIVE, "pop: /p still there");
-
-	/* touch it -- retain_dentry re-arms it -- and now it evicts */
-	CHECK(dc_add_file(dc, P("/p/z"), 5003) == 0, "pop: write through /p re-arms it");
-	CHECK(dc_unlink(dc, P("/p/z")) == 0, "pop: drop the child again");
-	CHECK(dc_lru_count(dc) == 1, "pop: /p is back on the list");
+	if (dc_lru_inuse_is_removed) {
+		/* LRU_REMOVED (kernel, lock arm): off the list entirely, so no
+		 * amount of shrinking touches it, and retain_dentry re-adds it. */
+		CHECK(dc_lru_count(dc) == 0,
+		      "pop: /p was REMOVED from the list, not rotated");
+		CHECK(shrink_all(dc) == 0,
+		      "pop: an entry off the list cannot be evicted");
+		CHECK(dc_lookup(dc, P("/p"), NULL) == DC_POSITIVE,
+		      "pop: /p still there");
+		CHECK(dc_add_file(dc, P("/p/z"), 5003) == 0,
+		      "pop: write through /p re-arms it");
+		CHECK(dc_unlink(dc, P("/p/z")) == 0, "pop: drop the child again");
+		CHECK(dc_lru_count(dc) == 1, "pop: /p is back on the list");
+	} else {
+		/* MOVED (MCAS arm): it stayed ON the list rather than leaving it,
+		 * so no re-arm is needed and none happens.  /p is EMPTY by now --
+		 * its child was the previous eviction -- so the shared drain
+		 * below takes it, which is the same end state by a different
+		 * route. */
+		CHECK(dc_lru_count(dc) == 1,
+		      "pop: /p was MOVED to the tail, not removed");
+		CHECK(dc_lookup(dc, P("/p"), NULL) == DC_POSITIVE,
+		      "pop: /p still there");
+	}
 	CHECK(shrink_all(dc) == 1, "pop: and now the empty /p evicts");
 	expect_absent(dc, "/p");
 

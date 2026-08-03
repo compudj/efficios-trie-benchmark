@@ -533,6 +533,7 @@ unsigned long dc_lru_count(struct dcache *dc)
 }
 
 const char *dc_lru_arm(void) { return "pernode"; }
+const int dc_lru_inuse_is_removed = 1;	/* kernel-faithful: LRU_REMOVED */
 
 #else	/* DC_NO_LRU */
 static inline void lru_add(struct dcache *dc, struct dentry *d)
@@ -545,6 +546,7 @@ unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 long dc_shrink_local(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 const char *dc_lru_arm(void) { return "none"; }
+const int dc_lru_inuse_is_removed = 1;
 #endif	/* DC_NO_LRU */
 
 static void children_add(struct dentry *parent, struct dentry *child)

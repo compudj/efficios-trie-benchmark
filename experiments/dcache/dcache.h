@@ -415,6 +415,17 @@ unsigned long dc_lru_count(struct dcache *dc);
 const char *dc_lru_arm(void);
 
 /*
+ * Does the shrinker REMOVE an in-use entry from the list (1), or MOVE it to the
+ * tail (0)?  A mechanism-forced difference, not a policy choice.  The kernel and
+ * the lock arm remove, and let a later retain_dentry re-add -- safe because
+ * re-adding under the lock cannot race a traverser.  The MCAS arm cannot: a
+ * removal there makes the following re-add a genuine insert, and an insert
+ * rewrites `next` on a node a lockless traverser may still hold.  It moves
+ * instead, which costs the same single commit and leaves nothing to re-arm.
+ */
+extern const int dc_lru_inuse_is_removed;
+
+/*
  * -DDC_TXN_STATS: per-call-site transaction counters (attempts / contention
  * aborts / fallback-lane entries / aging depth).  Built to answer WHICH commit
  * site starves first, because escalation is domain-wide -- once any site

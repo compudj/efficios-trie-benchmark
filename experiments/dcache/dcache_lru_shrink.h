@@ -59,8 +59,32 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				rcu_read_unlock();
 				continue;
 			}
-			if (!children_empty(victim)) {	/* LRU_REMOVED */
-				(void) lru_del_claimed(dc, victim);
+			if (!children_empty(victim)) {
+				/*
+				 * IN USE.  The kernel answers LRU_REMOVED here
+				 * and lets a later retain_dentry re-add it, and
+				 * the LOCK arm does the same -- safely, because
+				 * re-adding under the lock cannot race a
+				 * traverser.
+				 *
+				 * THIS ARM MOVES IT INSTEAD, and the divergence
+				 * is forced by the mechanism rather than chosen.
+				 * A remove here is a GENUINE removal, so the
+				 * re-add that follows is a genuine insert, and
+				 * an insert rewrites `next` on a node a lockless
+				 * traverser may still be standing on -- the one
+				 * hazard a move exists to avoid.  Moving costs
+				 * the same single commit and leaves nothing to
+				 * re-arm: lru_retain()'s re-add path becomes
+				 * reachable only after an allocation failure.
+				 *
+				 * The price is that an in-use entry keeps
+				 * circulating instead of leaving the list, so it
+				 * spends scan budget -- bounded per pass, and
+				 * the same cost the referenced-bit rotate above
+				 * already pays.
+				 */
+				(void) lru_move_tail(dc, victim, i);
 				rcu_read_unlock();
 				continue;
 			}

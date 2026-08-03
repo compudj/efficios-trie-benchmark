@@ -995,10 +995,25 @@ items here are the ones that actually fired in this experiment):
   its own terms.  A fix justified by its own semantics rather than by a
   measurement it did not deliver.
 
-  ⚠ Note the rotate is not the last del+add pair: `lru_retain()`'s re-arm after
-  an `LRU_REMOVED` still adds a previously-removed node.  That one is a genuine
-  re-add (the node really did leave the list), so a move cannot express it — it
-  is the case the shell/fold sketch below would actually be for.
+  ✅ **THE RE-ARM PATH IS CLOSED TOO.**  `lru_retain()`'s re-add was reachable
+  from exactly one place: the shrinker answering `LRU_REMOVED` for an in-use
+  entry.  That removal is genuine, so the re-add is a genuine insert — the one
+  thing a move cannot express.  The fix is not to remove: the MCAS arm now
+  **moves** in-use entries to the tail as well, so nothing routinely leaves the
+  list and `lru_retain()`'s re-add is reachable only after an allocation failure.
+
+  ⭐ **That makes the arms diverge on policy, and the divergence is
+  MECHANISM-FORCED rather than chosen** — which is the kind of result this
+  comparison exists to produce.  The kernel and the lock arm answer
+  `LRU_REMOVED` and let a later `retain_dentry` re-add, safely, because
+  re-adding under the lock cannot race a traverser.  The MCAS arm cannot afford
+  that and moves instead, at the same one-commit cost, paying only scan budget
+  (an in-use entry keeps circulating).  Exposed as `dc_lru_inuse_is_removed` so
+  the test asserts the REAL behaviour on each side rather than accepting either.
+
+  ⛔ **And it STILL does not fix the wedge** — 4/4 collapse with both del+add
+  pairs gone from the MCAS arm.  So the whole re-insert-after-remove family is
+  now eliminated as the cause, not just the rotate.
 
   ⚠ This supersedes the shell/fold sketch below AS A ROTATE FIX, which solved the
   wrong problem:

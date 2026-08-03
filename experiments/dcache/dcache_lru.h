@@ -240,7 +240,17 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 			uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
 		return;
 	}
-	lru_add(dc, d);				/* re-arm after an LRU_REMOVED */
+	/*
+	 * Re-arm.  On the LOCK arm this is retain_dentry's second half and the
+	 * normal way an LRU_REMOVED entry comes back.  On the MCAS arm the
+	 * shrinker MOVES in-use entries rather than removing them, so nothing
+	 * routinely lands here -- it is reachable only after an allocation
+	 * failure left the node off the list.  That matters because a re-add is
+	 * a genuine insert, and an insert rewrites `next` on a node a lockless
+	 * traverser may still hold; keeping the path rare is what keeps that
+	 * exposure rare.  See lru_move_tail().
+	 */
+	lru_add(dc, d);
 }
 
 
@@ -558,6 +568,8 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
  * one.  Returns 1 if it moved, 0 if it was already the tail or a peer removed
  * it, -1 on failure.
  */
+const int dc_lru_inuse_is_removed = 0;	/* MCAS arm MOVES; see dcache.h */
+
 static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 {
 	struct dc_lru_shard *sh = &dc->lru[idx];
@@ -707,6 +719,8 @@ unsigned long dc_lru_count(struct dcache *dc)
 
 #else	/* ================= THE LOCK ARM (per-shard spinlock) ================ */
 
+const int dc_lru_inuse_is_removed = 1;	/* LOCK arm REMOVES, as the kernel does */
+
 /* MCAS-only diagnostic; the lock arm has no marked-but-linked state. */
 void dc_lru_validate(void *stream) { (void) stream; }
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
@@ -805,5 +819,6 @@ static inline void lru_del(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+const int dc_lru_inuse_is_removed = 1;
 #endif	/* DC_NO_LRU */
 #endif	/* DCACHE_LRU_TYPES */
