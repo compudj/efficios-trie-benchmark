@@ -776,13 +776,38 @@ items here are the ones that actually fired in this experiment):
   so every neighbour operation retries forever.  `same-as-old` is 0 everywhere,
   which rules out ABA and spurious CAS failure.
 
-  And that is precisely the corruption `del_prepare`'s own comment predicts:
-  *"the descriptor's per-slot reconcile would silently merge them into a bogus
-  record under -DNDEBUG, committing a corrupt edge (a marked-but-still-linked
-  node)"* — the case it guards with `next != prev`.  The remaining work is to
-  find the record set that reaches that merge despite the guard; the shape is
-  now known, so it is a targeted read of `del_prepare`/`insert_*_prepare` against
-  a two- and three-element list, not another sweep.
+  The obvious suspect was `del_prepare`'s own documented hazard — two records on
+  one slot merging into *"a corrupt edge (a marked-but-still-linked node)"*.
+  **Three tests say it is not that:**
+
+  | test | result |
+  |---|---|
+  | build with `-DDEBUG_RCU` (enables `urcu_assert_debug`) | **no assertion trips**, 4/4 wedges |
+  | new `URCU_TXN_POISON` hook on the silent `t->poisoned = 1` merge | **never fires** |
+  | raw read of the victim's own `next` vs what `del_prepare` sees | **never marked**; no stale-read either |
+
+  So there is no same-slot merge, no poisoned descriptor, and the victim node
+  itself is clean.  What the losing CAS sees is a **MARKED value on a NEIGHBOUR's
+  slot**, consistently:
+
+      slot=0x7fab6c124680  old=0x7fab6c2b5bc0  seen=0x7fab6c213502  (MARKED)
+      slot=0x7fd2000b4ec0  old=0x7fd200215f80  seen=0x7fd2000b5002  (MARKED)
+      slot=0x7f91481d0200  old=0x7f91481cc880  seen=0x7f91481d0342  (MARKED)
+
+  ⭐ **The live hypothesis, and what makes it plausible:** `del_prepare` checks
+  the victim (up front, `-ENOENT`) and the SUCCESSOR (the tombstone guard,
+  `-EAGAIN`) — but it never checks the **PREDECESSOR**.  A predecessor left
+  marked-but-linked is therefore invisible to it: it records
+  `prev->next : elem -> next` expecting a plain `elem`, the slot holds
+  `MARK(elem)`, and the CAS must lose on every attempt forever.  That fits every
+  measurement — the marked neighbour, the untouched victim, no poison, no ABA
+  (`same-as-old` 0), and the two modes being the same corruption seen from the
+  successor side (`-EAGAIN`) or the predecessor side (CAS loss).
+
+  What remains open is how a node reaches marked-but-linked in the first place,
+  given MCAS atomicity — the settle path after a partially-planted abort
+  (`urcu_txn_settle(t, planted, FAILED)`) is the only place a mark can outlive
+  its unlink, and is where I would look next.
 
   ⚠ **Process note, having been wrong four times here:** three of the four bad
   readings came from *incomplete instrumentation*, not bad reasoning — one

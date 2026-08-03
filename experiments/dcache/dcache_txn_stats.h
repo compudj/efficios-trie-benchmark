@@ -78,6 +78,11 @@ struct dc_ts_row {
 	 *   other   a plain, different pointer -- the slot moved on.
 	 */
 	unsigned long seen_same, seen_marked, seen_proxy, seen_other;
+	unsigned long stale_unmarked;	/* memory says MARKED, prepare proceeded */
+	unsigned long marked_seen;	/* memory says MARKED, prepare agreed */
+	unsigned long poison_set;	/* two records on one slot that do not
+					 * chain -- the SILENT merge del_prepare
+					 * warns about */
 	unsigned long begins;		/* urcu_txn_begin() calls that RETURNED */
 	unsigned long begin_in_lane;	/* ... of those, already holding the lane */
 	unsigned long begin_funnel_on;	/* ... of those, with domain->active set */
@@ -196,6 +201,18 @@ static inline void dc_ts_relink_after_fail(enum dc_ts_site s)
 	dc_ts_row(s)->relink_after_fail++;
 }
 
+static inline void dc_ts_poison_set(void *slot, void *want, void *got)
+{
+	if (dc_ts_cur_site < 0)
+		return;
+	dc_ts_row((enum dc_ts_site) dc_ts_cur_site)->poison_set++;
+	uatomic_store(&dc_ts_last_slot, slot, CMM_RELAXED);
+	uatomic_store(&dc_ts_last_old, want, CMM_RELAXED);
+	uatomic_store(&dc_ts_last_seen, got, CMM_RELAXED);
+}
+
+#define DC_TS_STALE(site)	(dc_ts_row(site)->stale_unmarked++)
+#define DC_TS_MARKEDSEEN(site)	(dc_ts_row(site)->marked_seen++)
 #define DC_TS_DEL_RET(site, ret)	dc_ts_del_ret((site), (ret))
 #define DC_TS_RELINK_BAD(site)		dc_ts_relink_after_fail(site)
 
@@ -300,6 +317,9 @@ void dc_txn_stats_dump(void *stream)
 			a.seen_marked += r->seen_marked;
 			a.seen_proxy += r->seen_proxy;
 			a.seen_other += r->seen_other;
+			a.poison_set += r->poison_set;
+			a.stale_unmarked += r->stale_unmarked;
+			a.marked_seen += r->marked_seen;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
 		}
@@ -320,6 +340,13 @@ void dc_txn_stats_dump(void *stream)
 		for (k = 0; k < 6; k++)
 			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
 		fprintf(f, "\n");
+		if (a.stale_unmarked || a.marked_seen)
+			fprintf(f, "TXNSTATS %-9s raw-MARKED: prepare-agreed %lu  "
+				"PREPARE-PROCEEDED(stale) %lu\n", name[i],
+				a.marked_seen, a.stale_unmarked);
+		if (a.poison_set)
+			fprintf(f, "TXNSTATS %-9s POISON-SET (same-slot records "
+				"that do not chain): %lu\n", name[i], a.poison_set);
 		if (a.seen_same || a.seen_marked || a.seen_proxy || a.seen_other)
 			fprintf(f, "TXNSTATS %-9s cas-lost-to: same-as-old %lu  "
 				"MARKED %lu  proxy %lu  other %lu\n", name[i],
@@ -336,6 +363,8 @@ void dc_txn_stats_dump(void *stream)
 #define DC_TS_EAGAIN(site)		do { } while (0)
 #define DC_TS_DEL_RET(site, ret)	do { } while (0)
 #define DC_TS_RELINK_BAD(site)		do { } while (0)
+#define DC_TS_STALE(site)		do { } while (0)
+#define DC_TS_MARKEDSEEN(site)		do { } while (0)
 
 #endif	/* DC_TXN_STATS */
 #endif	/* DCACHE_TXN_STATS_H */

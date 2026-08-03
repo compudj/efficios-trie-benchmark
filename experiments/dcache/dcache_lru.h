@@ -324,7 +324,27 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 
 		urcu_txn_begin(&txn);
 		DC_TS_BEGIN(DC_TS_LRU_DEL, &txn);
-		p = urcu_txn_list_del_prepare(&txn, n);
+		/*
+		 * RAW read of the node's own next, bypassing the transaction, to
+		 * compare against what del_prepare's up-front marked-check sees
+		 * through urcu_txn_load().  If the slot is ALREADY marked in
+		 * memory and prepare still proceeds (returns 0 rather than
+		 * -ENOENT), the transaction is reading a stale value: it will
+		 * then record an expected-old that memory no longer holds, and
+		 * its CAS must lose forever.  That is the difference between "a
+		 * node is marked-but-linked" and "we cannot SEE that it is
+		 * marked", and nothing measured so far separates them.
+		 */
+		{
+			void *raw = uatomic_load(&n->next, CMM_RELAXED);
+			int marked_now = ((uintptr_t) raw & 0x2UL) != 0;
+
+			p = urcu_txn_list_del_prepare(&txn, n);
+			if (marked_now && p == 0)
+				DC_TS_STALE(DC_TS_LRU_DEL);
+			else if (marked_now)
+				DC_TS_MARKEDSEEN(DC_TS_LRU_DEL);
+		}
 		if (p) {
 			urcu_txn_conflict(&txn);
 			urcu_txn_end(&txn);

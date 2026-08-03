@@ -56,6 +56,9 @@ static inline void dc_ts_cas_fail(unsigned int idx, void *slot, void *old,
 				  void *seen);
 #define URCU_TXN_CAS_FAIL(idx, slot, old, seen) \
 	dc_ts_cas_fail((idx), (void *) (slot), (void *) (old), (void *) (seen))
+static inline void dc_ts_poison_set(void *slot, void *want, void *got);
+#define URCU_TXN_POISON(slot, want, got) \
+	dc_ts_poison_set((void *) (slot), (void *) (want), (void *) (got))
 #endif
 
 #include <errno.h>
