@@ -857,12 +857,42 @@ items here are the ones that actually fired in this experiment):
   - it is **not** poison, not a same-slot merge, not a stale read of the
     victim's own next, not `settle`, and **not a broken `del`**.
 
-  Everything about the aftermath has now been measured and come back clean, so
-  the next probe should be on the OTHER side: the insert path.  `newp->next = pos`
-  in `insert_before_prepare` is a PLAIN store executed at prepare time, before
-  the commit — so an insert that later aborts has already cleared a mark on a
-  node that is still logically deleted.  Whether that is reachable here is the
-  one hypothesis left standing, and it is testable the same way.
+  ⭐⭐ **THE INSERT PATH IS WHERE IT BREAKS — audited and confirmed.**
+  `urcu_txn_list_insert_before_prepare()` does `newp->next = pos` as a **PLAIN,
+  non-transactional store at PREPARE time**, before the commit.  That clears any
+  residual deletion MARK on the node whether or not the commit then succeeds.
+  Auditing the node's mark across prepare-and-abort:
+
+  | run | **aborted after clearing the mark** | bad tail edge |
+  |---|--:|--:|
+  | 1 | **3** | 1 |
+  | 2 | **2** | 1 |
+  | 3 | **1** | 0 |
+  | 4 | **2** | 2 |
+
+  Fires in every run.  The counts are small, but the failure is ABSORBING — one
+  occurrence is enough, which is exactly why the wedge has stochastic onset and
+  never recovers.
+
+  The check cannot be explained away as a race: it compares the mark on **one
+  node, before and after, while this thread owns it** via the `OFF -> BUSY`
+  claim.  Nothing else may touch it in that window.
+
+  **Why it wedges.**  The abort leaves the node UNMARKED and UNLINKED, with
+  `next`/`prev` already overwritten to the tail's neighbours.  A subsequent
+  `del_prepare` on it then reads an unmarked `next` (so it does not answer
+  `-ENOENT`), derives `prev` from the clobbered `prev`, and records
+  `prev->next : elem -> next` — against a predecessor that does not name it.
+  That CAS can never match, so the transaction retries forever, ages, takes the
+  escalation lane, and parks every other writer behind it.  Every earlier
+  measurement is a consequence: the MARKED value the CAS loses to, `same-as-old`
+  0, no poison, no same-slot merge, and a `del` that is itself perfectly atomic.
+
+  **The library-side statement:** a prepare must not mutate shared node state.
+  `newp` is not private here — it is a node the caller may have just deleted, and
+  whose tombstone other operations depend on until the insert actually commits.
+  The two neighbour edges are recorded transactionally; the node's own two are
+  not, and that asymmetry is the bug.
 
   ⚠ **Process note, having been wrong four times here:** three of the four bad
   readings came from *incomplete instrumentation*, not bad reasoning — one

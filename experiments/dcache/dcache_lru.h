@@ -303,8 +303,22 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 		enum urcu_txn_status st;
 		int p;
 
+		void *pre;
+
 		urcu_txn_begin(&txn);
 		DC_TS_BEGIN(DC_TS_LRU_ADD, &txn);
+		/*
+		 * insert_before_prepare does `newp->next = pos` as a PLAIN store
+		 * at PREPARE time, before the commit -- so it clears any residual
+		 * deletion MARK on the node whether or not the commit then
+		 * succeeds.  Snapshot the mark first (RAW: resolve() would strip
+		 * exactly the bit under test) so an ABORT can be checked for
+		 * having left the node unmarked AND unlinked, which is a state no
+		 * later operation can make sense of: a del of it would record
+		 * prev->next : elem -> next against a prev that does not name it,
+		 * and that CAS can never match.
+		 */
+		pre = uatomic_load(&n->next, CMM_RELAXED);
 		p = urcu_txn_list_insert_before_prepare(&txn, n, &head->node);
 		if (p) {
 			urcu_txn_conflict(&txn);
@@ -316,6 +330,21 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 		st = urcu_txn_commit(&txn);
 		DC_TS_COMMIT(DC_TS_LRU_ADD, &txn, st);
 		urcu_txn_end(&txn);
+		if (st != URCU_TXN_STATUS_OK) {
+			void *now = uatomic_load(&n->next, CMM_RELAXED);
+
+			if (!((uintptr_t) pre & 0x1UL) &&
+			    urcu_txn_list_is_marked(pre) &&
+			    !((uintptr_t) now & 0x1UL) &&
+			    !urcu_txn_list_is_marked(now))
+				DC_TS_INSCLEAR(DC_TS_LRU_ADD);
+		} else {
+			void *pn = urcu_txn_list_resolve(
+				uatomic_load(&head->node.prev, CMM_RELAXED));
+
+			if (urcu_txn_list_node_ptr(pn) != n)
+				DC_TS_INSEDGE(DC_TS_LRU_ADD);
+		}
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
 		return st < 0 ? -1 : 0;

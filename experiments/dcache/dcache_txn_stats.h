@@ -78,6 +78,11 @@ struct dc_ts_row {
 	 *   other   a plain, different pointer -- the slot moved on.
 	 */
 	unsigned long seen_same, seen_marked, seen_proxy, seen_other;
+	unsigned long ins_cleared_mark;	/* insert ABORTED after its plain store had
+					 * already cleared the node's tombstone --
+					 * leaves it unmarked AND unlinked */
+	unsigned long ins_edge_bad;	/* insert committed OK but the tail edge
+					 * does not name it */
 	unsigned long audit_no_mark;	/* commit OK but the victim is NOT marked */
 	unsigned long audit_still_linked;/* commit OK but prev->next STILL names it */
 	unsigned long stale_unmarked;	/* memory says MARKED, prepare proceeded */
@@ -223,6 +228,8 @@ static inline void dc_ts_delaudit(enum dc_ts_site s, int no_mark, int linked)
 		r->audit_still_linked++;
 }
 
+#define DC_TS_INSCLEAR(site)	(dc_ts_row(site)->ins_cleared_mark++)
+#define DC_TS_INSEDGE(site)	(dc_ts_row(site)->ins_edge_bad++)
 #define DC_TS_DELAUDIT(site, nm, lk)	dc_ts_delaudit((site), (nm), (lk))
 #define DC_TS_STALE(site)	(dc_ts_row(site)->stale_unmarked++)
 #define DC_TS_MARKEDSEEN(site)	(dc_ts_row(site)->marked_seen++)
@@ -333,6 +340,8 @@ void dc_txn_stats_dump(void *stream)
 			a.poison_set += r->poison_set;
 			a.stale_unmarked += r->stale_unmarked;
 			a.audit_no_mark += r->audit_no_mark;
+			a.ins_cleared_mark += r->ins_cleared_mark;
+			a.ins_edge_bad += r->ins_edge_bad;
 			a.audit_still_linked += r->audit_still_linked;
 			a.marked_seen += r->marked_seen;
 			if (r->max_retry > a.max_retry)
@@ -355,6 +364,10 @@ void dc_txn_stats_dump(void *stream)
 		for (k = 0; k < 6; k++)
 			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
 		fprintf(f, "\n");
+		if (a.ins_cleared_mark || a.ins_edge_bad)
+			fprintf(f, "TXNSTATS %-9s INSERT AUDIT: aborted-after-clearing-mark "
+				"%lu  bad-tail-edge %lu\n", name[i],
+				a.ins_cleared_mark, a.ins_edge_bad);
 		if (a.audit_no_mark || a.audit_still_linked)
 			fprintf(f, "TXNSTATS %-9s POST-COMMIT AUDIT: not-marked %lu  "
 				"STILL-LINKED %lu\n", name[i], a.audit_no_mark,
@@ -385,6 +398,8 @@ void dc_txn_stats_dump(void *stream)
 #define DC_TS_STALE(site)		do { } while (0)
 #define DC_TS_MARKEDSEEN(site)		do { } while (0)
 #define DC_TS_DELAUDIT(site, nm, lk)	do { } while (0)
+#define DC_TS_INSCLEAR(site)		do { } while (0)
+#define DC_TS_INSEDGE(site)		do { } while (0)
 
 #endif	/* DC_TXN_STATS */
 #endif	/* DCACHE_TXN_STATS_H */
