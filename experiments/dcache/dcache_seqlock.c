@@ -212,6 +212,9 @@ static inline int d_is_positive(const struct dentry *d)
 #define DC_IS_UNHASHED(d)  ((d)->d_unhashed)
 #define DC_IS_POSITIVE(d)  ((d)->d_inode)
 #define DC_SET_UNHASHED(d) CMM_STORE_SHARED((d)->d_unhashed, 1)
+/* No tags in this layout (the state lives in its own fields), so a rename's
+ * tag-preserving mask is a no-op rather than a special case. */
+#define DC_TAG_MASK        ((uintptr_t) 0)
 #endif
 
 /*
@@ -912,7 +915,17 @@ static void __d_move(struct dcache *dc, struct dentry *victim,
 	if (old_parent != new_parent)
 		children_remove(old_parent, victim);
 	victim->d_name = *new_name;			/* identity change */
-	rcu_assign_pointer(victim->d_parent, new_parent);
+	/*
+	 * PRESERVE the low-bit tags.  Under the 1-CL split layout d_parent
+	 * carries DC_TAG_UNHASHED and DC_TAG_NEG, so assigning the bare pointer
+	 * here would silently make a renamed dentry POSITIVE (and hashed).  A
+	 * rename changes the name, never the inode-ness -- phase 2 is what makes
+	 * that observable, since before it every dentry was born positive and the
+	 * lost bit could not be seen.
+	 */
+	rcu_assign_pointer(victim->d_parent, (struct dentry *)
+			   ((uintptr_t) new_parent |
+			    ((uintptr_t) victim->d_parent & DC_TAG_MASK)));
 	hlist_add_head_rcu(nb, &victim->d_hash);	/* enter new bucket */
 	if (old_parent != new_parent)
 		children_add(new_parent, victim);
