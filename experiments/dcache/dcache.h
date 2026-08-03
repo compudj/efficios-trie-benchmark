@@ -220,6 +220,47 @@ int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id);
 int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id);
 
 /*
+ * PHASE 2 -- negative dentries.
+ *
+ * dc_add_negative creates a dentry that caches the ABSENCE of a name: hashed
+ * under its parent, carrying a name, but with no inode.  dc_lookup reports it
+ * DC_NEGATIVE and yields no id.  This is what a failed filesystem lookup
+ * installs, so a second miss on the same name is a hash lookup rather than a
+ * trip to the filesystem.
+ *
+ * dc_instantiate turns one positive: the kernel's d_instantiate, called when the
+ * name is created.  The dentry keeps its address, its place in the bucket and
+ * its children; only its state changes.  -ENOENT if absent, -EEXIST if already
+ * positive.
+ *
+ * WHY THIS IS NOT A TRIVIAL ADDITION, and where the two engine families differ.
+ * The seqlock baseline gets it nearly free: it has a per-dentry d_seq whose job
+ * is exactly to make multi-field dentry state coherent to a lockless reader, and
+ * instantiate is one more update inside that bracket -- which is what d_seq is
+ * FOR.  The txn engines DELETED d_seq (the mark arm spends its 8 bytes on the
+ * inline name), and paid for that by declaring pos/neg a write-once-per-identity
+ * property so the reader could test it off the already-loaded d_iparent.
+ * Instantiate is a node changing kind while live and reachable, which is the one
+ * shape that assumption forbids.  So the txn engines publish the state through a
+ * single-slot COMMIT on the transacted d_iparent instead -- the transaction being
+ * this engine's replacement for the seqcount it removed.
+ *
+ * The state is authoritative on the content HOST, not on the named top: an inode
+ * is content, a rename replaces the name and must not disturb it, and keeping it
+ * on the host is what makes rename correct for free rather than by copying the
+ * bit into every shell.  Costs the reader one host-line load at the TERMINAL
+ * component (never per hop).
+ *
+ * Unlink still REMOVES rather than leaving a negative behind.  The kernel does
+ * leave one, and it is a larger source of negatives than failed lookups are --
+ * but dc_unlink's "no walk-causality bump is owed" proof rests on unlink being a
+ * REMOVE of a terminal, and a negative that survives the call is a live
+ * reachable node changing state.  Deferred deliberately; see REVIEW.md.
+ */
+int dc_add_negative(struct dcache *dc, const struct dc_path *path);
+int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id);
+
+/*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam
  * (b)).  0 on success, -ENOENT, -ENOTEMPTY (still has children).
  */

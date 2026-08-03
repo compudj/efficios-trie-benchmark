@@ -470,7 +470,7 @@ const char *dc_engine_name(void)
 
 static struct dentry *dentry_alloc(const struct qstr *name,
 				   struct dentry *parent, uint64_t id,
-				   int isdir)
+				   int isdir, int positive)
 {
 	struct dentry *d;
 
@@ -489,8 +489,12 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 	d->d_name = *name;
 	d->d_parent = parent;		/* clean low bits => hashed + positive */
 	d->d_id = id;
-#if !defined(DC_HOT1CL_SPLIT)
-	d->d_inode = 1;			/* phase 1: every dentry is positive */
+#if defined(DC_HOT1CL_SPLIT)
+	if (!positive)			/* phase 2: cache the ABSENCE of this name */
+		d->d_parent = (struct dentry *)
+			((uintptr_t) d->d_parent | DC_TAG_NEG);
+#else
+	d->d_inode = positive ? 1 : 0;
 	d->d_unhashed = 0;
 #endif
 	seqcount_init(&d->d_seq);
@@ -522,7 +526,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	/* calloc left every bucket head NULL with bit 0 clear -- all unlocked. */
 
 	dc_qstr_init(&rootname, "");
-	dc->root = dentry_alloc(&rootname, NULL, 0, 1);	/* root is a directory */
+	dc->root = dentry_alloc(&rootname, NULL, 0, 1, 1);	/* root: directory, positive */
 	dc->root->d_parent = dc->root;	/* root is its own parent */
 	return dc;
 }
@@ -778,8 +782,8 @@ static int is_subdir(struct dentry *a, struct dentry *b)
 
 /* ---- mutators ----------------------------------------------------------- */
 
-static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
-			uint64_t id, int isdir)
+static int dc_add_typed_state(struct dcache *dc, const struct dc_path *path,
+			uint64_t id, int isdir, int positive)
 {
 	struct dentry *parent, *d;
 	const struct qstr *name;
@@ -813,7 +817,7 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		ret = -EEXIST;
 		goto unlock;
 	}
-	d = dentry_alloc(name, parent, id, isdir);
+	d = dentry_alloc(name, parent, id, isdir, positive);
 	if (!d) {
 		ret = -ENOMEM;
 		goto unlock;
@@ -833,12 +837,82 @@ unlock:
  * -ENOTDIR only; rename_lock still bumps regardless of type (see dcache.h). */
 int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
-	return dc_add_typed(dc, path, id, 1);
+	return dc_add_typed_state(dc, path, id, 1, 1);
 }
 
 int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
-	return dc_add_typed(dc, path, id, 0);
+	return dc_add_typed_state(dc, path, id, 0, 1);
+}
+
+/*
+ * Phase 2.  A negative dentry is a leaf by construction -- it caches the absence
+ * of a name, and a name that is not there has no children -- so it is created
+ * with the FILE type, which also makes an add-under-it return -ENOTDIR rather
+ * than inventing children below a name that does not exist.
+ */
+int dc_add_negative(struct dcache *dc, const struct dc_path *path)
+{
+	return dc_add_typed_state(dc, path, 0, 0, 0);
+}
+
+/*
+ * Phase 2: d_instantiate.  The dentry keeps its address, its bucket and its
+ * place in the child list; only its state changes.
+ *
+ * This is the case the per-dentry seqcount already exists for.  The lockless
+ * reader validates d_seq before consuming a component, so bracketing the state
+ * change in write_seqcount_begin/end makes a walk that straddles it retry rather
+ * than mix an old inode-ness with a new one -- no new mechanism, which is
+ * precisely the baseline's advantage here and the thing the txn engines had to
+ * replace after deleting d_seq.
+ *
+ * Taken under the bucket lock, like every other state change on a hashed dentry,
+ * so a concurrent unlink or add of the same name serializes against it.
+ */
+int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	struct dentry *parent, *d;
+	const struct qstr *name;
+	struct dc_bucket *b;
+	int ret = 0;
+
+	if (path->ndepth == 0)
+		return -EEXIST;			/* the root is always positive */
+
+	rcu_read_lock();
+	parent = resolve_dentry_rcu(dc, path, path->ndepth - 1);
+	if (!parent) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	name = &path->comp[path->ndepth - 1];
+	b = bucket_of(dc, parent, name->hash);
+	dir_wlock(parent);
+	bl_lock(b);
+	d = __child_lookup(dc, parent, name);
+	if (!d) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	if (DC_IS_POSITIVE(d)) {
+		ret = -EEXIST;
+		goto unlock;
+	}
+	write_seqcount_begin(&d->d_seq);
+#if defined(DC_HOT1CL_SPLIT)
+	CMM_STORE_SHARED(d->d_parent, (struct dentry *)
+			 ((uintptr_t) d->d_parent & ~DC_TAG_NEG));
+#else
+	CMM_STORE_SHARED(d->d_inode, 1);
+#endif
+	d->d_id = id;
+	write_seqcount_end(&d->d_seq);
+unlock:
+	bl_unlock(b);
+	dir_wunlock(parent);
+	rcu_read_unlock();
+	return ret;
 }
 
 static void dentry_free_cb(struct rcu_head *rh)

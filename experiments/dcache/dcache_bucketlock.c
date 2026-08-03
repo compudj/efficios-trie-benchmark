@@ -1011,7 +1011,7 @@ const int dc_lookup_id_is_address = 0;
 
 static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 				   const struct qstr *name, uint64_t id,
-				   int isdir)
+				   int isdir, int positive)
 {
 	struct dentry *d;
 
@@ -1035,7 +1035,12 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	d->d_dc = dc;
 	urcu_txn_sw_hlist_init(&d->d_child_head);
 	d->d_id = id;
-	d->d_inode = 1;
+	d->d_inode = positive ? 1 : 0;
+#ifdef DC_HOT1CL
+	if (!positive)			/* phase 2: this name is known ABSENT */
+		d->d_iparent = (struct dentry *)
+			((uintptr_t) d->d_iparent | DC_TAG_NEG);
+#endif
 	d->d_isdir = (unsigned char) (isdir != 0);
 #ifndef DC_IPARENT_TXN
 	d->d_seq = NULL;		/* per-node gen (DC_PER_NODE_GEN); even */
@@ -1066,7 +1071,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	urcu_txn_domain_init(&dc->domain);
 
 	dc_qstr_init(&rootname, "");
-	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1);	/* root is a directory */
+	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1, 1); /* root: dir, positive */
 	dc->root->d_parent = dc->root;		/* root is its own parent */
 	dc->root->d_iparent = dc->root;
 	return dc;
@@ -1187,7 +1192,15 @@ static inline struct dentry *host_of_raw(struct dentry *top, uintptr_t raw)
 {
 	return (raw & DC_TAG_SHELL) ? rcu_dereference(top->d_host) : top;
 }
-#define DC_IS_POSITIVE_RAW(top, raw)	(((raw) & DC_TAG_NEG) == 0)
+/* PHASE 2: pos/neg is authoritative on the content HOST (see dcache.h).  Free
+ * when no rename is in flight -- top IS the host and @raw is already its word. */
+static inline int host_is_positive(uintptr_t raw, struct dentry *host)
+{
+	if (caa_likely(!(raw & DC_TAG_SHELL)))
+		return (raw & DC_TAG_NEG) == 0;
+	return (iparent_raw(host) & DC_TAG_NEG) == 0;
+}
+#define DC_HOST_IS_POSITIVE(top, raw, host)	host_is_positive((raw), (host))
 #else
 static inline struct dentry *find_top_raw_rcu(struct dcache *dc,
 					      struct dentry *parent,
@@ -1202,7 +1215,7 @@ static inline struct dentry *host_of_raw(struct dentry *top, uintptr_t raw)
 	(void) raw;
 	return host_of_rcu(top);
 }
-#define DC_IS_POSITIVE_RAW(top, raw)	DC_IS_POSITIVE(top)
+#define DC_HOST_IS_POSITIVE(top, raw, host)	DC_IS_POSITIVE(host)
 #endif
 
 /*
@@ -1348,13 +1361,11 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			d = host_of_raw(top, raw);	/* O(1) skip to host */
 			cur = d;
 			id = DC_FAST_ID(d);
-			/* pos/neg is read off the WRITE-ONCE top, not the host: a
-			 * fold's TRANSFER mutates the host's d_iparent in place, so
-			 * reading it there would race that write (the host is
-			 * reachable via the d_host skip pointer, not just the
-			 * index).  The top is never mutated and carries the same
-			 * pos/neg (rename preserves inode-ness). */
-			res = DC_IS_POSITIVE_RAW(top, raw) ? DC_POSITIVE
+			/* pos/neg is authoritative on the HOST (phase 2, see
+			 * dcache.h): an inode is content and a rename must not
+			 * disturb it.  Free when no rename is in flight -- top IS
+			 * the host and @raw is already its word. */
+			res = DC_HOST_IS_POSITIVE(top, raw, d) ? DC_POSITIVE
 							   : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
@@ -1413,11 +1424,9 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			nlatched++;
 			cur = host;
 			id = DC_FAST_ID(host);
-			/* pos/neg off the WRITE-ONCE top (not the host, whose
-			 * d_iparent a fold's TRANSFER mutates in place) -- see the
-			 * global arm above. */
-			res = DC_IS_POSITIVE_RAW(top, raw) ? DC_POSITIVE
-							   : DC_NEGATIVE;
+			/* pos/neg off the HOST -- see the global arm above. */
+			res = DC_HOST_IS_POSITIVE(top, raw, host) ? DC_POSITIVE
+								  : DC_NEGATIVE;
 #ifdef DC_TEST_HOOKS
 			if (dc_test_walk_hook)
 				dc_test_walk_hook((int) i);
@@ -1487,7 +1496,7 @@ static void dentry_free_cb(struct rcu_head *rh);
 /* ---- add / unlink ------------------------------------------------------ */
 
 static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
-			uint64_t id, int isdir)
+			uint64_t id, int isdir, int positive)
 {
 	struct dentry *parent, *d;
 	const struct qstr *name;
@@ -1509,7 +1518,7 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	name = &path->comp[path->ndepth - 1];
 	if (__child_lookup(dc, parent, name))
 		return -EEXIST;
-	d = dentry_alloc(dc, parent, name, id, isdir);
+	d = dentry_alloc(dc, parent, name, id, isdir, positive);
 	if (!d)
 		return -ENOMEM;
 	bucket = bucket_of(dc, parent, name->hash);
@@ -1539,12 +1548,96 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
  */
 int dc_add(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
-	return dc_add_typed(dc, path, id, 1);
+	return dc_add_typed(dc, path, id, 1, 1);
 }
 
 int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
-	return dc_add_typed(dc, path, id, 0);
+	return dc_add_typed(dc, path, id, 0, 1);
+}
+
+/* Phase 2 -- see dcache.h.  A negative dentry is a leaf by construction. */
+int dc_add_negative(struct dcache *dc, const struct dc_path *path)
+{
+	return dc_add_typed(dc, path, 0, 0, 0);
+}
+
+/*
+ * Phase 2: d_instantiate.  Publishes inode-ness on the content HOST through a
+ * single-slot commit on the transacted d_iparent -- the same discipline the fold
+ * uses to hand identity down, so a reader resolving that slot sees old or new
+ * and never a tear.  This engine deleted d_seq like the txn engines did, so a
+ * plain in-place store here would be exactly the write-once-per-identity
+ * violation the layout assumes away.
+ */
+int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
+{
+	struct dentry *parent, *top, *host;
+	const struct qstr *name;
+	struct urcu_txn txn;
+	int ret = 0;
+
+	if (path->ndepth == 0)
+		return -EEXIST;			/* the root is always positive */
+
+	rcu_read_lock();
+	parent = resolve(dc, path, path->ndepth - 1);
+	if (!parent) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	name = &path->comp[path->ndepth - 1];
+
+	urcu_txn_init(&txn, &dc->domain);
+	for (;;) {
+		enum urcu_txn_status st;
+		uintptr_t raw;
+
+		urcu_txn_begin(&txn);
+		top = find_top_rcu(dc, parent, name);
+		if (!top) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -ENOENT;
+			goto out;
+		}
+		host = host_of_rcu(top);
+		raw = iparent_raw(host);
+		if (!(raw & DC_TAG_NEG)) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -EEXIST;
+			goto out;
+		}
+		host->d_id = id;		/* cold; ordered before the publish */
+		host->d_inode = 1;
+#ifdef DC_IPARENT_TXN
+		if (urcu_txn_store_sw(&txn, (void **) &host->d_iparent,
+				      (void *) raw,
+				      (void *) (raw & ~DC_TAG_NEG),
+				      DC_IPARENT_TAG)) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -ENOMEM;
+			goto out;
+		}
+#else
+		CMM_STORE_SHARED(host->d_iparent, (struct dentry *)
+				 (raw & ~DC_TAG_NEG));
+#endif
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		if (st < 0) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		break;
+	}
+out:
+	rcu_read_unlock();
+	return ret;
 }
 
 static void dentry_free_cb(struct rcu_head *rh)
@@ -1795,7 +1888,7 @@ static int stack_shell(struct dcache *dc,
 		bucket_of(dc, from_parent, from_name->hash);
 	struct urcu_txn_sw_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
-	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0);
+	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
 	struct dentry *top = NULL, *host = NULL;
 	int ret;
 
@@ -2003,8 +2096,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 		 * match + pos/neg come off the write-once top). */
 #if defined(DC_HOT1CL)
 		m->d_iparent = (struct dentry *) (
-			((uintptr_t) n->d_iparent & ~DC_TAG_SHELL) |
-			((uintptr_t) m->d_iparent & DC_TAG_SHELL));
+			((uintptr_t) n->d_iparent & ~(DC_TAG_SHELL | DC_TAG_NEG)) |
+			((uintptr_t) m->d_iparent & (DC_TAG_SHELL | DC_TAG_NEG)));
 #else
 		m->d_iparent = n->d_iparent;
 #endif
@@ -2066,7 +2159,7 @@ static int stack_shell(struct dcache *dc,
 		bucket_of(dc, from_parent, from_name->hash);
 	struct urcu_txn_sw_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
-	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0);
+	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
 	struct dentry *top = NULL, *host = NULL;
 	struct urcu_txn txn;
 	int ret;
@@ -2291,8 +2384,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * lock (m->d_back == n is stable while @n is unmarked). */
 #if defined(DC_HOT1CL)
 			m->d_iparent = (struct dentry *) (
-				((uintptr_t) n->d_iparent & ~DC_TAG_SHELL) |
-				((uintptr_t) m->d_iparent & DC_TAG_SHELL));
+				((uintptr_t) n->d_iparent & ~(DC_TAG_SHELL | DC_TAG_NEG)) |
+				((uintptr_t) m->d_iparent & (DC_TAG_SHELL | DC_TAG_NEG)));
 #else
 			m->d_iparent = n->d_iparent;
 #endif
@@ -2445,8 +2538,8 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * m (plain store under the fold lock). */
 #if defined(DC_HOT1CL)
 			m->d_iparent = (struct dentry *) (
-				((uintptr_t) n->d_iparent & ~DC_TAG_SHELL) |
-				((uintptr_t) m->d_iparent & DC_TAG_SHELL));
+				((uintptr_t) n->d_iparent & ~(DC_TAG_SHELL | DC_TAG_NEG)) |
+				((uintptr_t) m->d_iparent & (DC_TAG_SHELL | DC_TAG_NEG)));
 #else
 			m->d_iparent = n->d_iparent;
 #endif
@@ -2611,8 +2704,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	cross = pa != pb;
 	bucket_a = bucket_of(dc, pa, na->hash);
 	bucket_b = bucket_of(dc, pb, nb->hash);
-	sa = dentry_alloc(dc, pb, nb, 0, 0); /* A's new top (name nb, parent pb) */
-	sb = dentry_alloc(dc, pa, na, 0, 0); /* B's new top (name na, parent pa) */
+	sa = dentry_alloc(dc, pb, nb, 0, 0, 1); /* A's new top (name nb, parent pb) */
+	sb = dentry_alloc(dc, pa, na, 0, 0, 1); /* B's new top (name na, parent pa) */
 	if (!sa || !sb) {
 		free(sa);
 		free(sb);
@@ -2810,8 +2903,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	cross = pa != pb;
 	bucket_a = bucket_of(dc, pa, na->hash);
 	bucket_b = bucket_of(dc, pb, nb->hash);
-	sa = dentry_alloc(dc, pb, nb, 0, 0); /* A's new top (name nb, parent pb) */
-	sb = dentry_alloc(dc, pa, na, 0, 0); /* B's new top (name na, parent pa) */
+	sa = dentry_alloc(dc, pb, nb, 0, 0, 1); /* A's new top (name nb, parent pb) */
+	sb = dentry_alloc(dc, pa, na, 0, 0, 1); /* B's new top (name na, parent pa) */
 	if (!sa || !sb) {
 		free(sa);
 		free(sb);

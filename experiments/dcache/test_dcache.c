@@ -63,6 +63,19 @@ static void expect_positive(struct dcache *dc, const char *path, uint64_t id)
 	      (unsigned long) id, (unsigned long) got);
 }
 
+static void expect_negative(struct dcache *dc, const char *path)
+{
+	uint64_t got = ~0ULL;
+	enum dc_result r = dc_lookup(dc, P(path), &got);
+
+	CHECK(r == DC_NEGATIVE, "%s: expected NEGATIVE got %d", path, r);
+	/* A negative dentry yields NO id: dc_lookup writes *out_id only on
+	 * DC_POSITIVE, so the caller's value must be untouched.  Checked because
+	 * a negative that leaked a stale id would still pass a state-only test. */
+	CHECK(got == ~0ULL, "%s: negative yielded an id (%lu)", path,
+	      (unsigned long) got);
+}
+
 static void expect_absent(struct dcache *dc, const char *path)
 {
 	enum dc_result r = dc_lookup(dc, P(path), NULL);
@@ -264,6 +277,85 @@ static void test_midtransition(void)
 
 /* ---- the scripted test -------------------------------------------------- */
 
+/*
+ * PHASE 2 -- negative dentries and d_instantiate.
+ *
+ * The interesting case is the LAST one: a negative dentry that is RENAMED before
+ * being instantiated.  Inode-ness is authoritative on the content host, and a
+ * rename stacks a shell as the new top, so this is what proves the state stayed
+ * with the content instead of being left behind on the old name -- the failure
+ * the pre-phase-2 code would have had, since its shell was always born positive.
+ */
+static void test_negative_dentries(void)
+{
+	struct dcache *dc = dc_create(1024);
+	uint64_t got = ~0ULL;
+
+	CHECK(dc_add(dc, P("/n"), 700) == 0, "neg: add dir /n");
+
+	/* a name cached as ABSENT is present-but-negative, not absent */
+	CHECK(dc_add_negative(dc, P("/n/miss")) == 0, "neg: add_negative");
+	expect_negative(dc, "/n/miss");
+	CHECK(dc_lookup(dc, P("/n/miss"), &got) == DC_NEGATIVE, "neg: still neg");
+
+	/* NON-VACUITY: a positive dentry must NOT read as negative, or the
+	 * assertion above would pass on an engine that reports everything
+	 * negative. */
+	CHECK(dc_add_file(dc, P("/n/real"), 701) == 0, "neg: add file");
+	expect_positive(dc, "/n/real", 701);
+
+	/* duplicate create fails, and instantiate on a positive is -EEXIST */
+	CHECK(dc_add_negative(dc, P("/n/miss")) == -EEXIST, "neg: dup negative");
+	CHECK(dc_instantiate(dc, P("/n/real"), 999) == -EEXIST,
+	      "neg: instantiate an already-positive dentry");
+	CHECK(dc_instantiate(dc, P("/n/nothere"), 1) == -ENOENT,
+	      "neg: instantiate an absent name");
+
+	/* d_instantiate: same dentry, now positive, carrying its new id */
+	CHECK(dc_instantiate(dc, P("/n/miss"), 702) == 0, "neg: instantiate");
+	expect_positive(dc, "/n/miss", 702);
+
+	/* unlink still REMOVES (phase 2 deliberately does not leave a negative
+	 * behind -- see dcache.h), so the name goes fully absent */
+	CHECK(dc_unlink(dc, P("/n/miss")) == 0, "neg: unlink");
+	expect_absent(dc, "/n/miss");
+
+	/* THE HOST-AUTHORITY CASE: rename a negative, THEN instantiate it.  The
+	 * rename stacks a shell; the state must travel with the content host, so
+	 * the renamed name is still negative and instantiating it still works. */
+	CHECK(dc_add_negative(dc, P("/n/old")) == 0, "neg: add_negative /n/old");
+	expect_negative(dc, "/n/old");
+	CHECK(dc_rename(dc, P("/n/old"), P("/n/new")) == 0, "neg: rename");
+	expect_absent(dc, "/n/old");
+	expect_negative(dc, "/n/new");		/* pos/neg followed the host */
+
+	/*
+	 * DRAIN THE FOLD before re-checking, or this case does not test what it
+	 * claims to.  Immediately after the rename the chain is shell(top) ->
+	 * host, and the reader takes pos/neg off the HOST -- so it reads
+	 * correctly no matter what the fold's TRANSFER does with the bit.  Only
+	 * once the chain collapses does the TRANSFER's choice become the state
+	 * the reader sees.  Verified by mutation: without this drain, reverting
+	 * TRANSFER to adopt-from-top (the pre-phase-2 behaviour) still passes.
+	 */
+	dc_quiescent();
+	synchronize_rcu();
+	rcu_barrier();
+	synchronize_rcu();
+	rcu_barrier();
+	expect_negative(dc, "/n/new");		/* survived the fold's TRANSFER */
+
+	CHECK(dc_instantiate(dc, P("/n/new"), 703) == 0, "neg: instantiate renamed");
+	expect_positive(dc, "/n/new", 703);
+
+	/* and the converse: a POSITIVE dentry renamed stays positive with its id */
+	CHECK(dc_rename(dc, P("/n/real"), P("/n/moved")) == 0, "neg: rename pos");
+	expect_positive(dc, "/n/moved", 701);
+
+	dc_destroy(dc);
+	printf("  ok: negative dentries + d_instantiate\n");
+}
+
 int main(void)
 {
 	struct dcache *dc;
@@ -274,6 +366,7 @@ int main(void)
 	printf("== test_dcache (engine: %s) ==\n", dc_engine_name());
 
 	test_midtransition();		/* mid-transition unlink + exchange edges */
+	test_negative_dentries();	/* phase 2: negative -> instantiate */
 
 	/* Build a small tree.
 	 *   /a(1) /a/b(2) /a/b/c(3) /a/x(4) /d(5) /d/e(6)
