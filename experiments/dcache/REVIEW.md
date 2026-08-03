@@ -705,12 +705,39 @@ items here are the ones that actually fired in this experiment):
   is contention in the ordinary sense; the counters say there is no competitor
   left to contend with.
 
-  Next, and it is now firmly a liburcu question: why that guard never validates
-  when nothing else is mutating the list.  The two candidates the counters
-  cannot separate are a neighbour left permanently MARKED-but-linked, and a
-  stale guard surviving the `conflict()/end()/begin()` retry protocol — the
-  header notes the `-EAGAIN` path "HAS already appended a {v -> v} validate",
-  which is exactly the kind of thing that would.
+  ⭐ **DEL-OUTCOME COUNTER ADDED to separate the candidates** (`del ok / peer /
+  FAIL(still-linked) / RELINK-AFTER-FAIL`).  It **falsified** the hypothesis it
+  was built for: `lru_del_claimed` returns 1 unconditionally even when the list
+  del failed, so a rotate could re-insert a node that was never unlinked —
+  doubly linking it, which would make its neighbours' guards unvalidatable
+  forever.  Measured across every wedged run: `FAIL 0, RELINK-AFTER-FAIL 0`.
+  Not the cause.  (The unconditional return is still sloppy and worth fixing on
+  its own; it is simply not this.)
+
+  ⚠ **And it exposed a hole in my own instrumentation, which had produced a
+  confident wrong reading.**  `URCU_TXN_CAS_FAIL` covered only
+  `install_mw_flat()` — the path a FIRST attempt takes.  A *retrying*
+  transaction takes `install_mw_depth()`, and a lone MW edge below the
+  escalation threshold CASes inline in `desc_commit()`.  So it reported ~0
+  failures against 142M aborts and read as "the CAS is not what is failing".
+  Hooking one path out of several is worse than hooking none: it yields a number
+  that is wrong in the direction of exonerating the uncovered code.  Now fires on
+  all four loss paths (`67022589` upstream).
+
+  **Two distinct wedge modes, across runs of the identical command line:**
+
+  | run | commit aborts | `-EAGAIN` from `del_prepare` | install-CAS failures |
+  |---|--:|--:|--:|
+  | A | 13 | **337,475,430** | 13 |
+  | B | **124,943,648** | 0 | 1 |
+  | C | **25,939,515** | 0 | 0 |
+
+  Mode A is the successor-tombstone guard firing forever — a neighbour left
+  MARKED-but-linked.  Mode B is a commit that aborts ~125M times with **all four
+  CAS-loss paths instrumented and still ~0 failures**, i.e. there remains a
+  pre-install abort path inside `desc_commit()` that is neither the descriptor
+  install nor `poisoned` (0) nor `-EAGAIN` (0).  Finding it is the next step, and
+  it is a liburcu question.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:

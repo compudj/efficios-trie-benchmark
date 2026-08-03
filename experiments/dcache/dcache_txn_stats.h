@@ -55,6 +55,17 @@ struct dc_ts_row {
 					 * lost, which localises a self-conflict
 					 * (always the same index) apart from a
 					 * live competitor (spread) */
+	/*
+	 * Outcome of a list del, which is what separates the two candidate
+	 * causes of a guard that never validates:
+	 *   ok    we unlinked it -- re-adding it is correct
+	 *   peer  a peer had already unlinked it -- re-adding is correct too
+	 *   fail  NOT unlinked and STILL LINKED.  Re-adding after this links the
+	 *         node a SECOND time, and a doubly-linked node's neighbours can
+	 *         never validate their guards again -- absorbing by construction.
+	 * relink_after_fail counts exactly that mistake being made.
+	 */
+	unsigned long del_ok, del_peer, del_fail, relink_after_fail;
 	unsigned long begins;		/* urcu_txn_begin() calls that RETURNED */
 	unsigned long begin_in_lane;	/* ... of those, already holding the lane */
 	unsigned long begin_funnel_on;	/* ... of those, with domain->active set */
@@ -153,6 +164,26 @@ static inline void dc_ts_begin(enum dc_ts_site s, const struct urcu_txn *txn)
 #define DC_TS_COMMIT(site, txnp, st)	dc_ts_commit((site), (txnp), (st))
 #define DC_TS_BEGIN(site, txnp)		dc_ts_begin((site), (txnp))
 
+static inline void dc_ts_del_ret(enum dc_ts_site s, int ret)
+{
+	struct dc_ts_row *r = dc_ts_row(s);
+
+	if (ret == 1)
+		r->del_ok++;
+	else if (ret == 0)
+		r->del_peer++;
+	else
+		r->del_fail++;
+}
+
+static inline void dc_ts_relink_after_fail(enum dc_ts_site s)
+{
+	dc_ts_row(s)->relink_after_fail++;
+}
+
+#define DC_TS_DEL_RET(site, ret)	dc_ts_del_ret((site), (ret))
+#define DC_TS_RELINK_BAD(site)		dc_ts_relink_after_fail(site)
+
 /*
  * The failing install CAS, routed here from liburcu's URCU_TXN_CAS_FAIL hook.
  * Attributed to whichever site is CURRENTLY committing on this thread -- the
@@ -221,6 +252,10 @@ void dc_txn_stats_dump(void *stream)
 			a.begin_funnel_on += r->begin_funnel_on;
 			for (k = 0; k < 6; k++)
 				a.casfail[k] += r->casfail[k];
+			a.del_ok += r->del_ok;
+			a.del_peer += r->del_peer;
+			a.del_fail += r->del_fail;
+			a.relink_after_fail += r->relink_after_fail;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
 		}
@@ -232,6 +267,11 @@ void dc_txn_stats_dump(void *stream)
 		fprintf(f, "TXNSTATS %-9s begins %lu  in-lane %lu  funnel-on %lu  "
 			"poisoned %lu\n", name[i], a.begins, a.begin_in_lane,
 			a.begin_funnel_on, a.poison);
+		if (a.del_ok || a.del_peer || a.del_fail || a.relink_after_fail)
+			fprintf(f, "TXNSTATS %-9s del ok %lu  peer %lu  "
+				"FAIL(still-linked) %lu  RELINK-AFTER-FAIL %lu\n",
+				name[i], a.del_ok, a.del_peer, a.del_fail,
+				a.relink_after_fail);
 		fprintf(f, "TXNSTATS %-9s cas-fail by record idx:", name[i]);
 		for (k = 0; k < 6; k++)
 			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
@@ -245,6 +285,8 @@ void dc_txn_stats_dump(void *stream)
 #define DC_TS_COMMIT(site, txnp, st)	do { } while (0)
 #define DC_TS_BEGIN(site, txnp)		do { } while (0)
 #define DC_TS_EAGAIN(site)		do { } while (0)
+#define DC_TS_DEL_RET(site, ret)	do { } while (0)
+#define DC_TS_RELINK_BAD(site)		do { } while (0)
 
 #endif	/* DC_TXN_STATS */
 #endif	/* DCACHE_TXN_STATS_H */

@@ -417,10 +417,17 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		return 0;			/* off, or a peer is mid-change */
 	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
 		return 0;
-	if (lru_list_del(dc, &d->d_lru.link) == 1)
-		uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
-	uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
-	return 1;
+	{
+		int r = lru_list_del(dc, &d->d_lru.link);
+
+		DC_TS_DEL_RET(DC_TS_LRU_DEL, r);
+		if (r == 1)
+			uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
+		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
+		if (r < 0)
+			DC_TS_RELINK_BAD(DC_TS_LRU_DEL);
+		return 1;
+	}
 }
 
 static void lru_del(struct dcache *dc, struct dentry *d)
