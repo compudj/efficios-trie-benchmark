@@ -1310,6 +1310,17 @@ static inline unsigned int lru_node_id(void)
 	return 0;
 }
 
+/*
+ * DCACHE_REFERENCED analog: "this was used, give it a second chance".  Set by
+ * the WRITER-side resolve only (see resolve()), never by a lookup.  Test-then-set
+ * so a hot directory costs a shared load instead of an invalidation.
+ */
+static inline void lru_mark_referenced(struct dentry *d)
+{
+	if (!uatomic_load(&d->d_lru.referenced, CMM_RELAXED))
+		uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
+}
+
 /* Add at the TAIL (newest).  Called with no lock held. */
 static void lru_add(struct dcache *dc, struct dentry *d)
 {
@@ -1381,6 +1392,7 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return n;
 }
 #else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
+static inline void lru_mark_referenced(struct dentry *d) { (void) d; }
 static inline void lru_add(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_del(struct dcache *dc, struct dentry *d)
@@ -1807,6 +1819,23 @@ static struct dentry *__child_lookup(struct dcache *dc, struct dentry *parent,
 	return d;
 }
 
+/*
+ * WRITER-side path resolve.  Distinct from dc_lookup's walk, which is the
+ * lockless reader and does not come through here -- and that separation is what
+ * lets this mark LRU recency without touching the reader at all.
+ *
+ * The kernel sets DCACHE_REFERENCED on the ref-taking paths, never on the RCU
+ * walk: __d_lookup_rcu takes no reference, so it never dputs and never marks
+ * anything.  A ref-walk dgets and dputs each component, so the PREFIX it passed
+ * through is what gets marked.  This is that, exactly: the reader stays free and
+ * the writers supply the second-chance signal.
+ *
+ * TEST-THEN-SET rather than an unconditional store.  The bit lives on the
+ * dedicated LRU line, which LRU splices already bounce between cores; storing
+ * unconditionally would invalidate every ancestor's line on every write op,
+ * whereas a hot directory is already marked, so the common case is a shared-state
+ * LOAD and no invalidation.
+ */
 static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 			      uint32_t depth)
 {
@@ -1817,6 +1846,7 @@ static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 		cur = __child_lookup(dc, cur, &p->comp[i]);
 		if (!cur)
 			return NULL;
+		lru_mark_referenced(cur);
 	}
 	return cur;
 }

@@ -654,6 +654,34 @@ static void test_lru_shrinker(void)
 	CHECK(dc_lru_count(dc) == 0, "lru: list drained");
 	CHECK(dc_shrink(dc, 10) == 0, "lru: shrinking an empty list is a no-op");
 
+	/*
+	 * SECOND CHANCE.  A referenced entry survives a pass that would otherwise
+	 * have taken it, and is evicted on the NEXT one -- CLOCK, not FIFO.
+	 *
+	 * Recency is marked by the WRITER-side resolve, never by a lookup (this
+	 * port's reader takes no reference, exactly as the kernel's RCU walk does
+	 * not).  So /s is made hot by writing THROUGH it, which is what a ref-walk
+	 * would have marked in the kernel.
+	 */
+	CHECK(dc_add(dc, P("/s"), 4000) == 0, "clock: add dir /s");
+	CHECK(dc_add(dc, P("/t"), 4001) == 0, "clock: add dir /t");
+	CHECK(dc_add_file(dc, P("/s/x"), 4002) == 0, "clock: writing through /s marks it");
+	CHECK(dc_unlink(dc, P("/s/x")) == 0, "clock: /s now empty but REFERENCED");
+
+	/* /s is at the head (added first) and empty, so a FIFO would take it.
+	 * The referenced bit must buy it one pass. */
+	freed = dc_shrink(dc, 1);
+	CHECK(freed == 1, "clock: one eviction, got %ld", freed);
+	CHECK(dc_lookup(dc, P("/s"), NULL) == DC_POSITIVE,
+	      "clock: the REFERENCED entry survived its turn (second chance)");
+	expect_absent(dc, "/t");	/* the unreferenced one went instead */
+
+	/* its bit is now cleared, so the next pass takes it */
+	freed = dc_shrink(dc, 1);
+	CHECK(freed == 1, "clock: second pass evicts, got %ld", freed);
+	expect_absent(dc, "/s");
+	CHECK(dc_lru_count(dc) == 0, "clock: drained");
+
 	/* An explicit unlink must take the entry OFF the list immediately --
 	 * lazily would gate the free on reclaim instead of the grace period. */
 	CHECK(dc_add_file(dc, P("/u"), 3000) == 0, "lru: add /u");
