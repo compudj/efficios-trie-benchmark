@@ -620,17 +620,26 @@ static long shrink_all(struct dcache *dc)
 	long total = 0, n;
 	int passes = 0, expect = census_count(dc);
 
-	while ((n = dc_shrink(dc, 1)) > 0) {	/* ONE at a time: see below */
-		int now;
+	while (dc_lru_count(dc) > 0) {
+		n = dc_shrink(dc, 1);		/* ONE at a time: see below */
+		if (n > 0) {
+			int now;
 
-		total += n;
-		expect -= (int) n;
-		now = census_count(dc);
-		CHECK(now == expect,
-		      "lru: pass %d freed %ld but the census lost %d (a populated "
-		      "directory was evicted, orphaning its subtree)",
-		      passes + 1, n, expect + (int) n - now);
-		if (++passes > 256) {		/* must converge */
+			total += n;
+			expect -= (int) n;
+			now = census_count(dc);
+			CHECK(now == expect,
+			      "lru: pass %d freed %ld but the census lost %d (a "
+			      "populated directory was evicted, orphaning its "
+			      "subtree)",
+			      passes + 1, n, expect + (int) n - now);
+		}
+		/* A pass may legitimately free NOTHING and still make progress:
+		 * a second chance clears a referenced bit, and an in-use entry
+		 * leaves the list (LRU_REMOVED).  So loop on the POPULATION, not
+		 * on the return value -- stopping at the first zero-pass would
+		 * quit while the list still had evictable entries in it. */
+		if (++passes > 512) {
 			CHECK(0, "lru: shrink did not converge (%ld freed)", total);
 			break;
 		}
@@ -715,8 +724,13 @@ static void test_lru_shrinker(void)
 		free(c.e);
 	}
 
-	/* Now drain: the leaves go, and the directory follows once it is EMPTY.
-	 * That is the rule working, not failing -- "never while populated". */
+	/*
+	 * Drain.  /l goes too, and legitimately: adding children marked it
+	 * referenced, so the first pass rotated it to the tail BEHIND its own
+	 * leaves -- by the time it reaches the head they are gone and it is
+	 * empty.  The in-use case (LRU_REMOVED) is therefore NOT exercised here,
+	 * which is exactly why the two-level "pop:" case below exists.
+	 */
 	freed = shrink_all(dc);
 	CHECK(freed == 26, "lru: full drain freed %ld, expected 26", freed);
 	expect_absent(dc, "/l");
@@ -798,7 +812,23 @@ static void test_lru_shrinker(void)
 	      "pop: /p survives while it still has a child");
 	expect_absent(dc, "/p/q");
 
-	CHECK(shrink_all(dc) == 1, "pop: the now-empty /p follows");
+	/*
+	 * LRU_REMOVED, not rotate.  /p was in use when the shrinker reached it,
+	 * so the kernel's isolate takes it OFF the list rather than cycling it --
+	 * and an entry off the list is not a candidate, however hard we shrink.
+	 * It is not lost either: retain_dentry re-adds it on the next touch,
+	 * which is what makes dropping safe.  (Rotating instead would keep
+	 * un-evictable entries circulating and burning scan budget forever.)
+	 */
+	CHECK(dc_lru_count(dc) == 0, "pop: /p was REMOVED from the list, not rotated");
+	CHECK(shrink_all(dc) == 0, "pop: an entry off the list cannot be evicted");
+	CHECK(dc_lookup(dc, P("/p"), NULL) == DC_POSITIVE, "pop: /p still there");
+
+	/* touch it -- retain_dentry re-arms it -- and now it evicts */
+	CHECK(dc_add_file(dc, P("/p/z"), 5003) == 0, "pop: write through /p re-arms it");
+	CHECK(dc_unlink(dc, P("/p/z")) == 0, "pop: drop the child again");
+	CHECK(dc_lru_count(dc) == 1, "pop: /p is back on the list");
+	CHECK(shrink_all(dc) == 1, "pop: and now the empty /p evicts");
 	expect_absent(dc, "/p");
 
 	/* An explicit unlink must take the entry OFF the list immediately --

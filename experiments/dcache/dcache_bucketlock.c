@@ -1373,14 +1373,35 @@ static unsigned int lru_nshards(void)
 }
 
 /*
- * DCACHE_REFERENCED analog: "this was used, give it a second chance".  Set by
- * the WRITER-side resolve only (see resolve()), never by a lookup.  Test-then-set
- * so a hot directory costs a shared load instead of an invalidation.
+ * retain_dentry (fs/dcache.c), the kernel's last-dput action:
+ *
+ *	not on the LRU -> d_lru_add() at the tail
+ *	already on it  -> d_flags |= DCACHE_REFERENCED, and do NOT move it
+ *
+ * Not moving an already-listed dentry is the load-bearing half: recency becomes
+ * a per-object bit rather than a shared list-head write, which is the only
+ * reason one list per shard survives a busy cache.
+ *
+ * The re-add half matters just as much, and an earlier cut of this missed it.
+ * It is what lets the shrinker answer LRU_REMOVED for an in-use entry the way
+ * the kernel does -- an entry taken off the list is not lost, it is waiting for
+ * its next touch.  Without a re-arm the only safe answer is to rotate, which
+ * keeps un-evictable entries circulating and burning scan budget forever.
+ *
+ * Called from the WRITER-side resolve only; dc_lookup does not come through
+ * there, so the reader pays nothing.  Test-then-set on the bit so a hot
+ * directory costs a shared-state load and no invalidation.
  */
-static inline void lru_mark_referenced(struct dentry *d)
+static void lru_add(struct dcache *dc, struct dentry *d);
+
+static inline void lru_retain(struct dcache *dc, struct dentry *d)
 {
-	if (!uatomic_load(&d->d_lru.referenced, CMM_RELAXED))
-		uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
+	if (caa_likely(uatomic_load(&d->d_lru.shard, CMM_RELAXED))) {
+		if (!uatomic_load(&d->d_lru.referenced, CMM_RELAXED))
+			uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
+		return;
+	}
+	lru_add(dc, d);				/* re-arm after an LRU_REMOVED */
 }
 
 /* Add at the TAIL (newest).  Called with no lock held. */
@@ -1454,7 +1475,8 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return n;
 }
 #else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
-static inline void lru_mark_referenced(struct dentry *d) { (void) d; }
+static inline void lru_retain(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
 static inline void lru_add(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_del(struct dcache *dc, struct dentry *d)
@@ -1924,7 +1946,7 @@ static struct dentry *resolve(struct dcache *dc, const struct dc_path *p,
 		cur = __child_lookup(dc, cur, &p->comp[i]);
 		if (!cur)
 			return NULL;
-		lru_mark_referenced(cur);
+		lru_retain(dc, cur);
 	}
 	return cur;
 }
@@ -3822,11 +3844,21 @@ long dc_shrink(struct dcache *dc, long nr)
 			if (victim->d_lru.referenced) {
 				victim->d_lru.referenced = 0;	/* second chance */
 				rot = 1;
-			} else if (!children_empty(victim)) {
-				rot = 1;			/* populated */
 			}
 			if (rot) {
-				lru_rotate_locked(sh, victim, i);
+				lru_rotate_locked(sh, victim, i);	/* LRU_ROTATE */
+				lru_unlock(sh);
+				rcu_read_unlock();
+				continue;
+			}
+			if (!children_empty(victim)) {
+				/* IN USE -> LRU_REMOVED, as the kernel does: a
+				 * cached child pins its parent, so it is not a
+				 * candidate at all.  Safe to drop rather than
+				 * rotate because lru_retain re-arms it on the
+				 * next touch -- and dropping is what stops
+				 * un-evictable entries circulating forever. */
+				lru_unlink_locked(sh, victim);
 				lru_unlock(sh);
 				rcu_read_unlock();
 				continue;
