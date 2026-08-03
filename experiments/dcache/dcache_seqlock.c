@@ -235,6 +235,25 @@ static inline int d_is_positive(const struct dentry *d)
  * a weak reference (absent => 0 => logical id); mirrors the txn engine so the
  * bench treats both identically.  See bench_dcache.c.
  */
+/* phase 3 LRU not implemented on this engine yet */
+const int dc_lru_supported = 0;
+
+
+/* Phase 3 stubs: dc_lru_supported is 0, so a harness must not call these to do
+ * anything.  They answer honestly rather than aborting, so engine-agnostic code
+ * can call them unconditionally and observe that nothing is evictable here. */
+long dc_shrink(struct dcache *dc, long nr)
+{
+	(void) dc; (void) nr;
+	return 0;
+}
+
+unsigned long dc_lru_count(struct dcache *dc)
+{
+	(void) dc;
+	return 0;
+}
+
 /* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
 const int dc_delete_dir_supported = 1;
 

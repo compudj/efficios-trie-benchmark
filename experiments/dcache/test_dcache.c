@@ -569,6 +569,91 @@ static void test_delete_to_negative(void)
 	printf("  ok: d_delete -> negative (phase 2 remainder)\n");
 }
 
+/*
+ * Phase 3: the LRU and its CLOCK shrinker.
+ */
+static void test_lru_shrinker(void)
+{
+	struct dcache *dc = dc_create(1024);
+	unsigned long n0;
+	long freed;
+	int i;
+	char buf[32];
+
+	if (!dc_lru_supported) {
+		CHECK(dc_shrink(dc, 100) == 0, "lru: stub shrink evicts nothing");
+		CHECK(dc_lru_count(dc) == 0, "lru: stub count is zero");
+		dc_destroy(dc);
+		printf("  skip: LRU not implemented on this engine\n");
+		return;
+	}
+
+	CHECK(dc_add(dc, P("/l"), 1000) == 0, "lru: add /l");
+	for (i = 0; i < 40; i++) {
+		snprintf(buf, sizeof(buf), "/l/f%d", i);
+		CHECK(dc_add_file(dc, P(buf), 2000 + i) == 0, "lru: add leaf");
+	}
+	n0 = dc_lru_count(dc);
+	CHECK(n0 == 41, "lru: population is 41, got %lu", n0);
+
+	/* NON-VACUITY: eviction must actually destroy names.  A shrinker that
+	 * silently did nothing would pass every "still correct" assertion. */
+	freed = dc_shrink(dc, 10);
+	CHECK(freed == 10, "lru: shrink(10) freed %ld", freed);
+	CHECK(dc_lru_count(dc) == n0 - 10, "lru: population dropped by 10");
+	{
+		int gone = 0;
+
+		for (i = 0; i < 40; i++) {
+			snprintf(buf, sizeof(buf), "/l/f%d", i);
+			if (dc_lookup(dc, P(buf), NULL) == DC_ABSENT)
+				gone++;
+		}
+		CHECK(gone == 10, "lru: exactly 10 leaves absent, got %d", gone);
+	}
+
+	/* THE POPULATED-DIRECTORY RULE.  /l still has children, so it must never
+	 * be evicted no matter how hard we shrink -- otherwise the survivors
+	 * would be orphaned and the census would show it. */
+	freed = dc_shrink(dc, 1000);
+	CHECK(dc_lookup(dc, P("/l"), NULL) == DC_POSITIVE,
+	      "lru: a populated directory is never evicted");
+	CHECK(dc_lru_count(dc) >= 1, "lru: /l survives on the list");
+
+	/* Everything reachable must still BE reachable: whatever survived is
+	 * still walkable from the root through /l. */
+	{
+		struct collector c = { 0 };
+		int j;
+
+		dc_walk(dc, collect_cb, &c);
+		for (j = 0; j < c.n; j++)
+			CHECK(strncmp(c.e[j].path, "/l", 2) == 0,
+			      "lru: stray path '%s' after eviction", c.e[j].path);
+		free(c.e);
+	}
+
+	/* Drained: only the directory is left, and it is now empty, so one more
+	 * pass can take it too. */
+	CHECK(dc_lru_count(dc) == 1, "lru: only /l left, got %lu",
+	      dc_lru_count(dc));
+	freed = dc_shrink(dc, 10);
+	CHECK(freed == 1, "lru: the now-empty directory evicts, freed %ld", freed);
+	expect_absent(dc, "/l");
+	CHECK(dc_lru_count(dc) == 0, "lru: list drained");
+	CHECK(dc_shrink(dc, 10) == 0, "lru: shrinking an empty list is a no-op");
+
+	/* An explicit unlink must take the entry OFF the list immediately --
+	 * lazily would gate the free on reclaim instead of the grace period. */
+	CHECK(dc_add_file(dc, P("/u"), 3000) == 0, "lru: add /u");
+	CHECK(dc_lru_count(dc) == 1, "lru: /u on the list");
+	CHECK(dc_unlink(dc, P("/u")) == 0, "lru: unlink /u");
+	CHECK(dc_lru_count(dc) == 0, "lru: unlink removed it immediately");
+
+	dc_destroy(dc);
+	printf("  ok: LRU + CLOCK shrinker\n");
+}
+
 int main(void)
 {
 	struct dcache *dc;
@@ -582,6 +667,7 @@ int main(void)
 	test_negative_dentries();	/* phase 2: negative -> instantiate */
 	test_delete_to_negative();	/* phase 2: positive -> negative in place */
 	test_recreate_over_moved_dir();	/* same name, old location, fold in flight */
+	test_lru_shrinker();		/* phase 3: LRU + CLOCK shrinker */
 
 	/* Build a small tree.
 	 *   /a(1) /a/b(2) /a/b/c(3) /a/x(4) /d(5) /d/e(6)

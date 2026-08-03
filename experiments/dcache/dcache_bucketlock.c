@@ -310,6 +310,19 @@ struct dentry {
 	unsigned char d_isdir;
 
 	/*
+	 * ---- PHASE 3: LRU (cold, writer/shrinker only) -------------------------
+	 * Deliberately down here, off the reader's 1-CL hot line: a lookup in this
+	 * port takes no reference and so never touches the LRU at all, exactly as
+	 * the kernel's RCU walk does not (design/dcache-lru-txn.md section 2).
+	 * Plain stores under the owning shard's lock -- no reader consumes these
+	 * links, so there is nothing for an SW commit to make atomic.
+	 */
+	struct dentry *d_lru_prev;		/* NULL when not on a shard */
+	struct dentry *d_lru_next;
+	unsigned char d_lru_shard;		/* which shard owns it, +1; 0 = off */
+	unsigned char d_referenced;		/* DCACHE_REFERENCED analog: second chance */
+
+	/*
 	 * Per-entry walk-causality generation (the DC_PER_NODE_GEN reader).  Lives
 	 * on the address-stable content host -- durable across renames AND folds
 	 * (folds free shells from the TOP down; the tail host never moves, see
@@ -1047,7 +1060,35 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 # define DC_RENAME_CONFLICT_HINT(txn) ((void) (txn))
 #endif
 
+/*
+ * PHASE 3: a sharded LRU, the mainline-shaped arm.
+ *
+ * The kernel shards by (NUMA node x memcg) and takes that shard's spinlock for
+ * every list mutation.  Sharding is what keeps producer-vs-producer off one
+ * lock; the remaining contention is producer-vs-shrinker, which mainline bounds
+ * (batch-isolate under the lock, process outside it) rather than eliminating.
+ * This arm reproduces that shape.  The MCAS-bidir alternative -- which removes
+ * producer/consumer contention outright at the price of a descriptor on every
+ * enqueue and unlink -- is the second arm, and design/dcache-lru-txn.md section 7
+ * says which wins is decided by RECLAIM CADENCE, not by readers: bursty reclaim
+ * favours the lock, continuous eviction favours MCAS.
+ *
+ * Insert at TAIL, evict from HEAD (oldest first), rotate to tail on second
+ * chance -- the kernel's order.
+ */
+#define DC_LRU_SHARDS	16		/* power of two */
+
+struct dc_lru_shard {
+	unsigned long lock;		/* test-and-set; see fold_lock */
+	struct dentry *head;		/* oldest -- the shrinker's end */
+	struct dentry *tail;		/* newest -- the enqueue end */
+	unsigned long count;
+	/* keep shards off each other's cachelines */
+	char pad[64 - (2 * sizeof(unsigned long) + 2 * sizeof(void *)) % 64];
+};
+
 struct dcache {
+	struct dc_lru_shard lru[DC_LRU_SHARDS];
 	struct urcu_txn_sw_hlist_head *buckets;
 	unsigned long mask;			/* nbuckets - 1 (power of two) */
 	struct dentry *root;
@@ -1134,6 +1175,9 @@ const char *dc_engine_name(void)
  * table instead of id==value; the dc_walk census (which reads the real cold
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
+/* phase 3: sharded-lock LRU + CLOCK shrinker */
+const int dc_lru_supported = 1;
+
 /* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
 const int dc_delete_dir_supported = 1;
 
@@ -1180,6 +1224,104 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	d->d_seq = NULL;		/* per-node gen (DC_PER_NODE_GEN); even */
 #endif
 	return d;
+}
+
+/* ---- PHASE 3: the sharded LRU ------------------------------------------- */
+
+static inline void lru_lock(struct dc_lru_shard *sh)
+{
+	while (uatomic_cmpxchg(&sh->lock, 0UL, 1UL) != 0UL)
+		caa_cpu_relax();
+	cmm_smp_mb();
+}
+
+static inline void lru_unlock(struct dc_lru_shard *sh)
+{
+	uatomic_store(&sh->lock, 0UL, CMM_RELEASE);
+}
+
+/*
+ * Pick a shard.  The kernel keys on the NUMA node of the allocating CPU; here
+ * the dentry ADDRESS is the same kind of proxy -- stable for the node's life
+ * (required: the node must go back to the shard that holds it) and spread by the
+ * allocator.  Deliberately NOT the current CPU: a node enqueued on one CPU and
+ * unlinked on another must resolve to the SAME shard, or the unlink would splice
+ * it out of a list it is not on.
+ */
+static inline unsigned int lru_shard_of(const struct dentry *d)
+{
+	return (unsigned int) (((uintptr_t) d >> 6) & (DC_LRU_SHARDS - 1));
+}
+
+/* Add at the TAIL (newest).  Called with no lock held. */
+static void lru_add(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx = lru_shard_of(d);
+	struct dc_lru_shard *sh = &dc->lru[idx];
+
+	lru_lock(sh);
+	d->d_lru_prev = sh->tail;
+	d->d_lru_next = NULL;
+	if (sh->tail)
+		sh->tail->d_lru_next = d;
+	else
+		sh->head = d;
+	sh->tail = d;
+	sh->count++;
+	d->d_lru_shard = (unsigned char) (idx + 1);
+	lru_unlock(sh);
+}
+
+/* Splice out, wherever it sits.  Caller holds @sh. */
+static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
+{
+	if (d->d_lru_prev)
+		d->d_lru_prev->d_lru_next = d->d_lru_next;
+	else
+		sh->head = d->d_lru_next;
+	if (d->d_lru_next)
+		d->d_lru_next->d_lru_prev = d->d_lru_prev;
+	else
+		sh->tail = d->d_lru_prev;
+	d->d_lru_prev = d->d_lru_next = NULL;
+	d->d_lru_shard = 0;
+	sh->count--;
+}
+
+/*
+ * IMMEDIATE physical removal, from an arbitrary position.  This is the operation
+ * that decides the whole design (design/dcache-lru-txn.md section 6): the
+ * tempting alternative -- mark it dead and let the shrinker reap it -- fails
+ * under unlink churn with no memory pressure, because the node's call_rcu free
+ * cannot fire while the list still points at it.  That turns "freeable after one
+ * grace period" into "freeable whenever reclaim wanders by", i.e. unbounded live
+ * memory exactly where a dcache is busiest.  A Harris-style logical mark does not
+ * rescue it either: Harris needs every traverser to help unlink, and this list
+ * has exactly one traverser.
+ */
+static void lru_del(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx;
+	struct dc_lru_shard *sh;
+
+	idx = uatomic_load(&d->d_lru_shard, CMM_RELAXED);
+	if (!idx)
+		return;				/* not on any shard */
+	sh = &dc->lru[idx - 1];
+	lru_lock(sh);
+	if (d->d_lru_shard)			/* re-check under the lock */
+		lru_unlink_locked(sh, d);
+	lru_unlock(sh);
+}
+
+unsigned long dc_lru_count(struct dcache *dc)
+{
+	unsigned long n = 0;
+	unsigned int i;
+
+	for (i = 0; i < DC_LRU_SHARDS; i++)
+		n += uatomic_load(&dc->lru[i].count, CMM_RELAXED);
+	return n;
 }
 
 struct dcache *dc_create(unsigned int nbuckets)
@@ -1692,6 +1834,11 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
 	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
+	/* PHASE 3: on the LRU at the TAIL (newest), AFTER publishing and outside
+	 * the bucket locks -- the LRU has no reader, so it need not be atomic with
+	 * the index edit, and taking a shard lock under a bucket lock would add an
+	 * ordering edge between two lock classes for nothing. */
+	lru_add(dc, d);
 	return 0;
 }
 
@@ -1965,6 +2112,14 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		bl_unlock2(bucket, &parent->d_child_head);
 		break;				/* removed from both indexes */
 	}
+	/* PHASE 3: off the LRU IMMEDIATELY, never lazily.  The node's call_rcu
+	 * free cannot fire while a shard still points at it, so deferring this to
+	 * the shrinker would gate reclaim on memory pressure instead of on the
+	 * grace period -- unbounded live memory under churn without pressure.
+	 * See design/dcache-lru-txn.md section 6. */
+	lru_del(dc, host);
+	if (top != host)
+		lru_del(dc, top);
 	rcu_read_unlock();
 	if (settled)				/* host has no fold queued: free it */
 		call_rcu(&top->d_rcu, dentry_free_cb);
@@ -3374,6 +3529,148 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 		walk_rec(host, path, fn, arg);
 		path->ndepth--;
 	}
+}
+
+/*
+ * Evict one SETTLED dentry: remove it from both indexes and RCU-defer the free,
+ * which is exactly dc_unlink's core taking the dentry instead of a path.
+ *
+ * It takes the dentry rather than reconstructing a path on purpose.  A host's
+ * OWN d_iname is stale whenever a shell is stacked above it -- the current name
+ * lives on the top -- so building a path from a victim would name it wrongly
+ * mid-rename.  Settled nodes have no such gap: a settled node IS its own top, so
+ * its name and parent are current and the bucket is computable directly.
+ *
+ * Anything mid-transition is therefore SKIPPED rather than handled.  That is a
+ * real policy choice and a cheap one: renames are transient, so the node is a
+ * candidate again on the next pass, and mainline does the same thing whenever it
+ * cannot get d_lock (LRU_SKIP).  Returns 0, or -EAGAIN to skip.
+ */
+static int lru_evict_settled(struct dcache *dc, struct dentry *d)
+{
+	struct dentry *parent;
+	struct urcu_txn_sw_hlist_head *bucket;
+	int marked = 0;
+
+	if (uatomic_load(&d->d_back, CMM_RELAXED) ||
+	    uatomic_load(&d->d_fwd, CMM_RELAXED))
+		return -EAGAIN;			/* on a transition chain */
+	parent = parent_of_rcu(d);
+	if (!parent || parent == d)
+		return -EAGAIN;			/* the root anchors the tree */
+	bucket = bucket_of(dc, parent, d->d_iname.hash);
+
+	bl_lock2(bucket, &parent->d_child_head);
+	/* RE-VERIFY under the lock, the same way dc_unlink does: still hashed,
+	 * still childless, still settled.  A rename or an unlink can have landed
+	 * between the isolate and this acquire. */
+	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
+	if (marked || !children_empty(d) ||
+	    uatomic_load(&d->d_back, CMM_RELAXED)) {
+		bl_unlock2(bucket, &parent->d_child_head);
+		return -EAGAIN;
+	}
+	bl_hlist_del_locked(&d->d_hash);
+	bl_hlist_del_locked(&d->d_sib);
+	bl_unlock2(bucket, &parent->d_child_head);
+	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
+	return 0;
+}
+
+/* Move @d to the tail of @sh (second chance).  Caller holds @sh. */
+static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
+			      unsigned int idx)
+{
+	lru_unlink_locked(sh, d);
+	d->d_lru_prev = sh->tail;
+	d->d_lru_next = NULL;
+	if (sh->tail)
+		sh->tail->d_lru_next = d;
+	else
+		sh->head = d;
+	sh->tail = d;
+	sh->count++;
+	d->d_lru_shard = (unsigned char) (idx + 1);
+}
+
+/*
+ * PHASE 3: the shrinker -- a CLOCK / second-chance pass, the kernel's
+ * dentry_lru_isolate policy:
+ *
+ *   REFERENCED set  -> clear the bit and ROTATE to the tail (second chance)
+ *   has children    -> rotate; it is not a candidate WHILE populated
+ *   mid-rename      -> rotate; try again once the fold settles it
+ *   otherwise       -> EVICT
+ *
+ * "Has children" stands in for the kernel's "in use": a cached child pins its
+ * parent's refcount there, so a populated directory is never a candidate at all.
+ * Stating it directly is not an optimisation -- evicting a populated directory
+ * would orphan a live subtree, and the conservation census would be right to
+ * call that corruption.  Mainline answers LRU_REMOVED for the in-use case
+ * because a later last-put re-adds it; this port has no last-put, so removing it
+ * would make it permanently un-evictable.  It rotates instead, and every
+ * rotation is paid for out of a budget fixed at the start of the pass, so a
+ * shard full of skips terminates rather than spinning.
+ *
+ * The victim is unlinked with the shard lock DROPPED: the unlink takes bucket
+ * locks, and holding a shard lock across it would both invert against a
+ * concurrent enqueue and stall the hot enqueue path for the length of an
+ * unlink.  Isolate under the lock, release, then unlink -- mainline's
+ * batch-isolate shape at batch size one.
+ */
+long dc_shrink(struct dcache *dc, long nr)
+{
+	long freed = 0;
+	unsigned int i;
+
+	if (nr <= 0)
+		return 0;
+
+	for (i = 0; i < DC_LRU_SHARDS && freed < nr; i++) {
+		struct dc_lru_shard *sh = &dc->lru[i];
+		unsigned long scanned = 0, budget;
+
+		budget = uatomic_load(&sh->count, CMM_RELAXED);
+		while (freed < nr && scanned++ < budget) {
+			struct dentry *victim;
+			int rot;
+
+			rcu_read_lock();
+			lru_lock(sh);
+			victim = sh->head;
+			if (!victim) {
+				lru_unlock(sh);
+				rcu_read_unlock();
+				break;
+			}
+			rot = 0;
+			if (victim->d_referenced) {
+				victim->d_referenced = 0;	/* second chance */
+				rot = 1;
+			} else if (!children_empty(victim)) {
+				rot = 1;			/* populated */
+			}
+			if (rot) {
+				lru_rotate_locked(sh, victim, i);
+				lru_unlock(sh);
+				rcu_read_unlock();
+				continue;
+			}
+			lru_unlink_locked(sh, victim);	/* ISOLATE */
+			lru_unlock(sh);
+			if (lru_evict_settled(dc, victim) == 0) {
+				freed++;
+			} else {
+				/* not evictable right now -- put it BACK, or it
+				 * would be silently un-evictable forever */
+				lru_lock(sh);
+				lru_rotate_locked(sh, victim, i);
+				lru_unlock(sh);
+			}
+			rcu_read_unlock();
+		}
+	}
+	return freed;
 }
 
 void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg)

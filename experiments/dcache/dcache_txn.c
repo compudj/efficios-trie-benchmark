@@ -521,6 +521,25 @@ const char *dc_engine_name(void)
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
 /* rmdir-to-negative: see dcache.h.  lock-free engine: nothing spans the check and the flip */
+/* phase 3 LRU not implemented on this engine yet */
+const int dc_lru_supported = 0;
+
+
+/* Phase 3 stubs: dc_lru_supported is 0, so a harness must not call these to do
+ * anything.  They answer honestly rather than aborting, so engine-agnostic code
+ * can call them unconditionally and observe that nothing is evictable here. */
+long dc_shrink(struct dcache *dc, long nr)
+{
+	(void) dc; (void) nr;
+	return 0;
+}
+
+unsigned long dc_lru_count(struct dcache *dc)
+{
+	(void) dc;
+	return 0;
+}
+
 #ifdef DC_IPARENT_TXN
 const int dc_delete_dir_supported = 1;	/* guard/write pair, no lock: see
 					 * dc_set_negative_txn */

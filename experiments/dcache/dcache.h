@@ -353,6 +353,50 @@ int dc_delete(struct dcache *dc, const struct dc_path *path);
 extern const int dc_delete_dir_supported;
 
 /*
+ * PHASE 3 -- the LRU and its shrinker.
+ *
+ * A real dcache is BOUNDED: entries are evicted under memory pressure, and the
+ * kernel picks victims from a per-(NUMA node x memcg) `struct list_lru` with a
+ * CLOCK / second-chance policy.  Three properties of that design are load-bearing
+ * and are reproduced here (see design/dcache-lru-txn.md for the derivation):
+ *
+ *   1. THE ORDER IS FUZZY, ON PURPOSE.  dentry_lru_isolate is a clock: in-use ->
+ *      remove, REFERENCED -> clear the bit and rotate to the tail (second
+ *      chance), otherwise evict.  A precise LRU is doubly disqualified -- it
+ *      would write a shared list head on every access AND need reader-atomicity
+ *      on the list.
+ *   2. A LOOKUP TOUCHES THE LRU ZERO TIMES.  The kernel's RCU walk takes no
+ *      reference, so it never dputs and never reaches the list; recency is a
+ *      per-object bit set on the ref-taking paths.  This port is pure RCU walk,
+ *      so the reader stays exactly as it was -- no new load, no new store, and
+ *      the LRU fields sit off the 1-CL hot line.
+ *   3. THE LRU WANTS NO SW TRANSACTION.  The SW txn's one product is a
+ *      reader-atomic multi-word flip, and the LRU has no lockless reader to
+ *      consume it -- only the shrinker walks the links.  So the links are plain
+ *      stores under the shard lock.  (That is an argument against SW here, NOT
+ *      against MW: an arbitrary mid-list splice is a genuine multi-writer
+ *      problem, which is the second arm this phase is built to compare.)
+ *
+ * dc_shrink evicts up to @nr entries and returns how many it actually freed.
+ * dc_lru_count reports the current population.  Eviction is a real unlink --
+ * the same RCU-deferred reclaim path dc_unlink uses (interface seam (b)) -- so
+ * an evicted name is ABSENT afterwards, not negative.
+ *
+ * ⚠ A NON-EMPTY DIRECTORY IS NEVER EVICTED.  In the kernel a child pins its
+ * parent (the parent's refcount is non-zero while children are cached), so a
+ * populated directory is never a candidate; here the shrinker skips it
+ * explicitly.  Without that, eviction would orphan a live subtree -- and the
+ * conservation census would be right to call it corruption.
+ *
+ * ⚠ dc_shrink DESTROYS NAMES BY DESIGN, so any harness with a conservation gate
+ * must account for what it evicted.  It is never called implicitly: nothing
+ * shrinks unless the caller asks.
+ */
+extern const int dc_lru_supported;
+long dc_shrink(struct dcache *dc, long nr);
+unsigned long dc_lru_count(struct dcache *dc);
+
+/*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam
  * (b)).  0 on success, -ENOENT, -ENOTEMPTY (still has children).
  */
