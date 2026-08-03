@@ -543,6 +543,33 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 	}
 }
 
+/*
+ * LRU_ROTATE as a single MOVE, not a del followed by an add.
+ *
+ * The node never leaves the list, so no tombstone is set, no window exists in
+ * which it is unlinked, and no traverser standing on it can be re-pointed by a
+ * later re-insert.  The lock arm always had this property -- lru_rotate_locked
+ * is unlink+link under one lock -- and decomposing it into two independent
+ * commits is what cost the MCAS arm that guarantee.
+ *
+ * The node stays CLAIMED for the whole move (it is already ON, and we do not
+ * pass through OFF), so a concurrent lru_add/lru_del cannot interleave: both
+ * require a state transition through the shard word, and a move never publishes
+ * one.  Returns 1 if it moved, 0 if it was already the tail or a peer removed
+ * it, -1 on failure.
+ */
+static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
+{
+	struct dc_lru_shard *sh = &dc->lru[idx];
+	int r;
+
+	r = urcu_txn_list_move_tail_rcu(&d->d_lru.link, &sh->list,
+					&dc->lru_domain);
+	if (r == -ENOENT)
+		return 0;			/* a peer deleted it */
+	return r == 0 ? 1 : -1;
+}
+
 static void lru_del(struct dcache *dc, struct dentry *d)
 {
 	(void) lru_del_claimed(dc, d);

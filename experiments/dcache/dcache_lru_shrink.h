@@ -52,8 +52,10 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			victim = lru_dentry(n);
 			if (victim->d_lru.referenced) {
 				victim->d_lru.referenced = 0;	/* LRU_ROTATE */
-				if (lru_del_claimed(dc, victim))
-					lru_add_at(dc, victim, i);	/* THIS shard */
+				/* ONE move, not del + add: the node never leaves
+				 * the list, so no traverser can be standing on
+				 * a node that is about to be re-inserted. */
+				(void) lru_move_tail(dc, victim, i);
 				rcu_read_unlock();
 				continue;
 			}

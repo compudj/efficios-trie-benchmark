@@ -984,7 +984,24 @@ items here are the ones that actually fired in this experiment):
   differentiator and the measurements stand — but an instrumented build that
   changes transaction semantics is not the control it was being used as.
 
-  ⚠ This supersedes the shell/fold sketch below, which solved the wrong problem:
+  ✅ **IMPLEMENTED AND TESTED** — `urcu_txn_list_move_tail_prepare()` upstream,
+  wired into the MCAS shrinker's rotate.  Correctness holds: 394 checks, and all
+  gates including `check-lru-arms` (11 configurations).
+
+  ⛔ **It does NOT fix the wedge** — still collapses, 3/3.  So the
+  del+add decomposition, though genuinely the wrong operation, was not what was
+  biting.  **Keep it anyway**: it is one commit instead of two, sets no
+  tombstone, opens no unlinked window, and removes a real correctness hazard on
+  its own terms.  A fix justified by its own semantics rather than by a
+  measurement it did not deliver.
+
+  ⚠ Note the rotate is not the last del+add pair: `lru_retain()`'s re-arm after
+  an `LRU_REMOVED` still adds a previously-removed node.  That one is a genuine
+  re-add (the node really did leave the list), so a move cannot express it — it
+  is the case the shell/fold sketch below would actually be for.
+
+  ⚠ This supersedes the shell/fold sketch below AS A ROTATE FIX, which solved the
+  wrong problem:
   the shell exists to let a node be re-added while stale traversers hold it, and
   a move means it is never removed, so nothing needs re-adding.  Keeping the
   sketch only because the reasoning is reusable if a genuine remove-then-re-add
