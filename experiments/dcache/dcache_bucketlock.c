@@ -1189,13 +1189,32 @@ struct dcache {
 	unsigned long mask;			/* nbuckets - 1 (power of two) */
 	struct dentry *root;
 	/*
-	 * Escalation domain (fair-mutex fallback lane).  VESTIGIAL in the default
-	 * pure-SW build (the SW commit takes no domain -- it cannot contention-abort,
-	 * so it has no lane), but LIVE under DC_CHAIN_SWMW: the mixed shell ops carry
-	 * MW records that can abort, so they run the full begin/commit/end retry loop
-	 * against this domain and re-inherit the fair-mutex escalation discipline.
+	 * Escalation domain (fair-mutex fallback lane) for the NAMESPACE INDEX.
+	 * Vestigial in the default pure-SW build (the SW commit takes no domain --
+	 * it cannot contention-abort, so it has no lane), but LIVE under
+	 * DC_CHAIN_SWMW: the mixed shell ops carry MW records that can abort, so
+	 * they run the full begin/commit/end retry loop against this domain and
+	 * re-inherit the fair-mutex escalation discipline.
 	 */
 	dc_domain_t domain;
+#if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU)
+	/*
+	 * A SEPARATE domain for the LRU, and the separation is load-bearing.
+	 *
+	 * rcu-txn-list.h says a domain should be shared by lists "that form ONE
+	 * logical structure" -- and the LRU is not part of the namespace index.
+	 * They share no slots, and one has no business funnelling the other
+	 * through a fair mutex.  Sharing dc->domain would do exactly that under
+	 * DC_CHAIN_SWMW, where the shell ops are also MW and can escalate: an
+	 * escalation raised by a rename would capture the LRU's commits too.
+	 *
+	 * That failure mode is not hypothetical here.  f9b6901a fixed a bug where
+	 * every lane holder re-asserted domain->active, so ONE escalation captured
+	 * the whole domain -- worth 2.65x at 192 writers.  Widening a domain to
+	 * cover unrelated structures is the same mistake with extra steps.
+	 */
+	dc_domain_t lru_domain;
+#endif
 
 	/*
 	 * Walk-causality generation (rename_lock's job, NOT d_seq's -- see
@@ -1457,7 +1476,7 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 	    != DC_LRU_OFF)
 		return;				/* someone else owns the change */
 	if (urcu_txn_list_add_tail_rcu(&d->d_lru.link, &sh->list,
-				       &dc->domain) != 0) {
+				       &dc->lru_domain) != 0) {
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		return;				/* -ENOMEM: simply not listed */
 	}
@@ -1482,7 +1501,7 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		return 0;			/* off, or a peer is mid-change */
 	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
 		return 0;
-	if (urcu_txn_list_del_rcu(&d->d_lru.link, &dc->domain) == 1)
+	if (urcu_txn_list_del_rcu(&d->d_lru.link, &dc->lru_domain) == 1)
 		uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
 	uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 	return 1;
@@ -1644,6 +1663,9 @@ struct dcache *dc_create(unsigned int nbuckets)
 	/* One escalation domain type now (the canonical urcu_txn_domain); LIVE only
 	 * for a DC_CHAIN_MIXED build's shell ops, vestigial otherwise. */
 	urcu_txn_domain_init(&dc->domain);
+#if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU)
+	urcu_txn_domain_init(&dc->lru_domain);	/* NOT shared with the index */
+#endif
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1, 1); /* root: dir, positive */
