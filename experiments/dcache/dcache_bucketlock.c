@@ -58,6 +58,9 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>			/* generic rcu_* names => QSBR flavor */
 #include <urcu-call-rcu.h>
+#ifndef DC_NO_LRU
+#include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
+#endif
 #include <urcu/rcu-txn.h>		/* the canonical (mixed SW/MW) front-end + URCU_TXN_TAG */
 #include <urcu/rcu-txn-hlist.h>		/* URCU_TXN_HLIST_TAG / _MARK / is_marked (reused) */
 #include <urcu/rcu-txn-sw.h>		/* bucket lock: single-writer flip-proxy commit */
@@ -309,18 +312,6 @@ struct dentry {
 	 */
 	unsigned char d_isdir;
 
-	/*
-	 * ---- PHASE 3: LRU (cold, writer/shrinker only) -------------------------
-	 * Deliberately down here, off the reader's 1-CL hot line: a lookup in this
-	 * port takes no reference and so never touches the LRU at all, exactly as
-	 * the kernel's RCU walk does not (design/dcache-lru-txn.md section 2).
-	 * Plain stores under the owning shard's lock -- no reader consumes these
-	 * links, so there is nothing for an SW commit to make atomic.
-	 */
-	struct dentry *d_lru_prev;		/* NULL when not on a shard */
-	struct dentry *d_lru_next;
-	unsigned char d_lru_shard;		/* which shard owns it, +1; 0 = off */
-	unsigned char d_referenced;		/* DCACHE_REFERENCED analog: second chance */
 
 	/*
 	 * Per-entry walk-causality generation (the DC_PER_NODE_GEN reader).  Lives
@@ -395,6 +386,42 @@ struct dentry {
 		uint64_t       d_id;	/* host: stable identity (SPLIT: cold) */
 		struct dentry *d_host;	/* shell: skip pointer to the tail host */
 	};
+#endif
+
+#ifndef DC_NO_LRU
+	/*
+	 * ---- PHASE 3: LRU, ON ITS OWN CACHELINE --------------------------------
+	 *
+	 * Off CL0 because a lookup never touches the LRU (this port takes no
+	 * reference, exactly as the kernel's RCU walk does not).  But "not CL0"
+	 * was not enough, and the first cut got it wrong.
+	 *
+	 * The reason is the INTRUSIVE LIST: splicing a node out writes its two
+	 * NEIGHBOURS' link fields, so every add / unlink / rotate dirties a line
+	 * belonging to two ARBITRARY OTHER dentries -- whichever happened to be
+	 * enqueued near it in time, which under churn are nodes other cores are
+	 * actively using.  The shard lock does not help: it serializes the
+	 * operation, not the coherence traffic.
+	 *
+	 * So these links must not share a line with anything another core touches
+	 * for a different reason -- and BOTH existing cold lines fail that test:
+	 *   CL1 is the fold-lock line, whose stated contract is "ONLY fold-side
+	 *       and read-only words, never a field another core reads concurrently
+	 *       with a fold" -- and it holds d_fwd, which chain-following READERS
+	 *       resolve;
+	 *   CL2 is the structural-reader line -- d_child_head / d_sib for readdir,
+	 *       and d_host, which host_of_rcu resolves on every shelled LOOKUP.
+	 *
+	 * Hence a dedicated line.  It costs sizeof(dentry) 192 -> 256, which is
+	 * the LRU's own honest price, and is why -DDC_NO_LRU exists: the A/B
+	 * control that MEASURES that price instead of asserting it is small.
+	 */
+	struct {
+		struct dentry *prev;		/* NULL when not on a shard */
+		struct dentry *next;
+		unsigned int   shard;		/* owning shard +1; 0 = off */
+		unsigned char  referenced;	/* DCACHE_REFERENCED analog */
+	} d_lru __attribute__((aligned(64)));
 #endif
 };
 
@@ -1076,7 +1103,7 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
  * Insert at TAIL, evict from HEAD (oldest first), rotate to tail on second
  * chance -- the kernel's order.
  */
-#define DC_LRU_SHARDS	16		/* power of two */
+#define DC_LRU_SHARDS	64		/* >= nr_node_ids on anything we run on */
 
 struct dc_lru_shard {
 	unsigned long lock;		/* test-and-set; see fold_lock */
@@ -1175,8 +1202,12 @@ const char *dc_engine_name(void)
  * table instead of id==value; the dc_walk census (which reads the real cold
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
-/* phase 3: sharded-lock LRU + CLOCK shrinker */
+/* phase 3: sharded-lock LRU + CLOCK shrinker (per-NUMA-node shards) */
+#ifdef DC_NO_LRU
+const int dc_lru_supported = 0;
+#else
 const int dc_lru_supported = 1;
+#endif
 
 /* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
 const int dc_delete_dir_supported = 1;
@@ -1226,6 +1257,7 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	return d;
 }
 
+#ifndef DC_NO_LRU
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
 
 static inline void lru_lock(struct dc_lru_shard *sh)
@@ -1241,50 +1273,75 @@ static inline void lru_unlock(struct dc_lru_shard *sh)
 }
 
 /*
- * Pick a shard.  The kernel keys on the NUMA node of the allocating CPU; here
- * the dentry ADDRESS is the same kind of proxy -- stable for the node's life
- * (required: the node must go back to the shard that holds it) and spread by the
- * allocator.  Deliberately NOT the current CPU: a node enqueued on one CPU and
- * unlinked on another must resolve to the SAME shard, or the unlink would splice
- * it out of a list it is not on.
+ * Pick a shard: the NUMA NODE, exactly the axis the kernel shards on
+ * (`lru->node[nid]`, one list + one lock per node).
+ *
+ * Read from the RSEQ ABI page -- rseq_current_node_id() is a plain load of a
+ * field the kernel maintains in thread-local memory, so it costs a load and no
+ * syscall, no vDSO call, and no libnuma.
+ *
+ * WHICH node, though, is worth stating, because the kernel and this differ in
+ * derivation and agree in effect.  The kernel takes the node of the OBJECT'S
+ * MEMORY (`list_lru_add_obj` -> `page_to_nid(virt_to_page(item))`) -- the list
+ * links live inside the dentry, so it wants the shard whose lock and head are
+ * near that memory.  This takes the node of the ENQUEUEING THREAD, which under
+ * a first-touch allocator is the node that dentry's memory is on, since the same
+ * thread allocated it moments earlier.  Same shard, one load instead of a page
+ * lookup.
+ *
+ * The node is captured ONCE, at enqueue, and stored in d_lru.shard -- a dentry
+ * unlinked from a different node must splice out of the list it is actually on,
+ * not the caller's.  The kernel gets that property for free by recomputing from
+ * the object; we get it by remembering.
+ *
+ * Without rseq node ids (old kernel, or rseq unavailable) everything lands on
+ * shard 0.  That is honest rather than degraded-but-plausible: we genuinely do
+ * not know the node, and pretending otherwise -- sharding by CPU, say -- would
+ * silently make this arm FINER-grained than the kernel's and flatter it in
+ * exactly the comparison it exists to inform.
  */
-static inline unsigned int lru_shard_of(const struct dentry *d)
+static inline unsigned int lru_node_id(void)
 {
-	return (unsigned int) (((uintptr_t) d >> 6) & (DC_LRU_SHARDS - 1));
+	if (caa_likely(rseq_node_id_available())) {
+		unsigned int nid = rseq_current_node_id();
+
+		return nid < DC_LRU_SHARDS ? nid : nid % DC_LRU_SHARDS;
+	}
+	return 0;
 }
 
 /* Add at the TAIL (newest).  Called with no lock held. */
 static void lru_add(struct dcache *dc, struct dentry *d)
 {
-	unsigned int idx = lru_shard_of(d);
+	unsigned int idx = lru_node_id();
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
 	lru_lock(sh);
-	d->d_lru_prev = sh->tail;
-	d->d_lru_next = NULL;
+	d->d_lru.prev = sh->tail;
+	d->d_lru.next = NULL;
 	if (sh->tail)
-		sh->tail->d_lru_next = d;
+		sh->tail->d_lru.next = d;
 	else
 		sh->head = d;
 	sh->tail = d;
 	sh->count++;
-	d->d_lru_shard = (unsigned char) (idx + 1);
+	d->d_lru.shard = (unsigned char) (idx + 1);
 	lru_unlock(sh);
 }
 
 /* Splice out, wherever it sits.  Caller holds @sh. */
 static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
 {
-	if (d->d_lru_prev)
-		d->d_lru_prev->d_lru_next = d->d_lru_next;
+	if (d->d_lru.prev)
+		d->d_lru.prev->d_lru.next = d->d_lru.next;
 	else
-		sh->head = d->d_lru_next;
-	if (d->d_lru_next)
-		d->d_lru_next->d_lru_prev = d->d_lru_prev;
+		sh->head = d->d_lru.next;
+	if (d->d_lru.next)
+		d->d_lru.next->d_lru.prev = d->d_lru.prev;
 	else
-		sh->tail = d->d_lru_prev;
-	d->d_lru_prev = d->d_lru_next = NULL;
-	d->d_lru_shard = 0;
+		sh->tail = d->d_lru.prev;
+	d->d_lru.prev = d->d_lru.next = NULL;
+	d->d_lru.shard = 0;
 	sh->count--;
 }
 
@@ -1304,12 +1361,12 @@ static void lru_del(struct dcache *dc, struct dentry *d)
 	unsigned int idx;
 	struct dc_lru_shard *sh;
 
-	idx = uatomic_load(&d->d_lru_shard, CMM_RELAXED);
+	idx = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
 	if (!idx)
 		return;				/* not on any shard */
 	sh = &dc->lru[idx - 1];
 	lru_lock(sh);
-	if (d->d_lru_shard)			/* re-check under the lock */
+	if (d->d_lru.shard)			/* re-check under the lock */
 		lru_unlink_locked(sh, d);
 	lru_unlock(sh);
 }
@@ -1323,6 +1380,15 @@ unsigned long dc_lru_count(struct dcache *dc)
 		n += uatomic_load(&dc->lru[i].count, CMM_RELAXED);
 	return n;
 }
+#else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
+static inline void lru_add(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+static inline void lru_del(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
+long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+#endif	/* DC_NO_LRU */
+
 
 struct dcache *dc_create(unsigned int nbuckets)
 {
@@ -3531,6 +3597,7 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 	}
 }
 
+#ifndef DC_NO_LRU
 /*
  * Evict one SETTLED dentry: remove it from both indexes and RCU-defer the free,
  * which is exactly dc_unlink's core taking the dentry instead of a path.
@@ -3582,15 +3649,15 @@ static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
 			      unsigned int idx)
 {
 	lru_unlink_locked(sh, d);
-	d->d_lru_prev = sh->tail;
-	d->d_lru_next = NULL;
+	d->d_lru.prev = sh->tail;
+	d->d_lru.next = NULL;
 	if (sh->tail)
-		sh->tail->d_lru_next = d;
+		sh->tail->d_lru.next = d;
 	else
 		sh->head = d;
 	sh->tail = d;
 	sh->count++;
-	d->d_lru_shard = (unsigned char) (idx + 1);
+	d->d_lru.shard = (unsigned char) (idx + 1);
 }
 
 /*
@@ -3644,8 +3711,8 @@ long dc_shrink(struct dcache *dc, long nr)
 				break;
 			}
 			rot = 0;
-			if (victim->d_referenced) {
-				victim->d_referenced = 0;	/* second chance */
+			if (victim->d_lru.referenced) {
+				victim->d_lru.referenced = 0;	/* second chance */
 				rot = 1;
 			} else if (!children_empty(victim)) {
 				rot = 1;			/* populated */
@@ -3672,6 +3739,8 @@ long dc_shrink(struct dcache *dc, long nr)
 	}
 	return freed;
 }
+#endif	/* DC_NO_LRU */
+
 
 void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg)
 {

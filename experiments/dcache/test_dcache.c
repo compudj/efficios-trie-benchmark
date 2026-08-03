@@ -612,33 +612,44 @@ static void test_lru_shrinker(void)
 		CHECK(gone == 10, "lru: exactly 10 leaves absent, got %d", gone);
 	}
 
-	/* THE POPULATED-DIRECTORY RULE.  /l still has children, so it must never
-	 * be evicted no matter how hard we shrink -- otherwise the survivors
-	 * would be orphaned and the census would show it. */
-	freed = dc_shrink(dc, 1000);
+	/*
+	 * THE POPULATED-DIRECTORY RULE.  While /l still has children it must
+	 * never be evicted -- the survivors would be orphaned, and worse, a
+	 * lookup of one would dereference a freed parent.  So shrink a BOUNDED
+	 * amount (leaving children behind) and check both that /l is there and
+	 * that the census is exactly the survivors, reachable through it.
+	 *
+	 * Note the earlier draft of this asserted "/l survives dc_shrink(1000)",
+	 * which passed only because 16 address-keyed shards kept any one pass
+	 * short.  Sharded per NUMA NODE a single-threaded test uses ONE shard, so
+	 * a big pass drains the leaves and then legitimately takes the directory
+	 * once it is empty.  The assertion was measuring the shard count, not the
+	 * rule.
+	 */
+	freed = dc_shrink(dc, 5);
+	CHECK(freed == 5, "lru: bounded shrink freed %ld", freed);
 	CHECK(dc_lookup(dc, P("/l"), NULL) == DC_POSITIVE,
 	      "lru: a populated directory is never evicted");
-	CHECK(dc_lru_count(dc) >= 1, "lru: /l survives on the list");
-
-	/* Everything reachable must still BE reachable: whatever survived is
-	 * still walkable from the root through /l. */
 	{
 		struct collector c = { 0 };
-		int j;
+		int j, leaves = 0;
 
 		dc_walk(dc, collect_cb, &c);
-		for (j = 0; j < c.n; j++)
+		CHECK(c.n == 26, "lru: census has %d entries, expected 26", c.n);
+		for (j = 0; j < c.n; j++) {
 			CHECK(strncmp(c.e[j].path, "/l", 2) == 0,
 			      "lru: stray path '%s' after eviction", c.e[j].path);
+			if (strlen(c.e[j].path) > 2)
+				leaves++;
+		}
+		CHECK(leaves == 25, "lru: %d leaves reachable, expected 25", leaves);
 		free(c.e);
 	}
 
-	/* Drained: only the directory is left, and it is now empty, so one more
-	 * pass can take it too. */
-	CHECK(dc_lru_count(dc) == 1, "lru: only /l left, got %lu",
-	      dc_lru_count(dc));
-	freed = dc_shrink(dc, 10);
-	CHECK(freed == 1, "lru: the now-empty directory evicts, freed %ld", freed);
+	/* Now drain: the leaves go, and the directory follows once it is EMPTY.
+	 * That is the rule working, not failing -- "never while populated". */
+	freed = dc_shrink(dc, 1000);
+	CHECK(freed == 26, "lru: full drain freed %ld, expected 26", freed);
 	expect_absent(dc, "/l");
 	CHECK(dc_lru_count(dc) == 0, "lru: list drained");
 	CHECK(dc_shrink(dc, 10) == 0, "lru: shrinking an empty list is a no-op");

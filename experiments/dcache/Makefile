@@ -51,7 +51,11 @@ CC       ?= gcc
 CFLAGS   ?= -O2 -g -pthread -Wall -Wextra -march=native
 CPPFLAGS := -I$(URCU_TXN_INC) -I. $(SLAB_CPP)
 LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) $(SLAB_LD)
-LDLIBS   := -lurcu-qsbr -lurcu-common $(SLAB_LIB) -lpthread
+# Phase 3's LRU shards by NUMA node, read from the rseq ABI page
+# (rseq_current_node_id) -- a plain load, no syscall and no libnuma.  Linked
+# unconditionally because every engine now carries the LRU or its stub; build
+# with -DDC_NO_LRU to drop both the field and this dependency.
+LDLIBS   := -lurcu-qsbr -lurcu-common $(SLAB_LIB) -lrseq -lpthread
 
 # Rebuild when the LIBRARY changes, not only when our sources do.  Without this
 # every binary here silently survives a liburcu rebuild: the prerequisites are
