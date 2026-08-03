@@ -134,6 +134,16 @@ repro-fold: repro_fold.c dcache_txn.c $(HDRS) | check-lib
 	  repro_fold.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./repro_fold
 
+# The fold-TRANSFER vs d_delete lost-update race (phase 2).  Runs on BOTH txn
+# engines: the window is the fold's identity handover, which both implement.
+repro-delete-fold: repro_delete_fold.c dcache_txn.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -DDC_TEST_HOOKS -o repro_delete_fold_mark \
+	  repro_delete_fold.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./repro_delete_fold_mark
+	$(CC) $(CFLAGS) $(HCPP) -DDC_TEST_HOOKS -o repro_delete_fold_bl \
+	  repro_delete_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_delete_fold_bl
+
 repro-asan: repro_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(ASANFLAGS) \
 	  $(HCPP) -DDC_TEST_HOOKS -o repro_dcache_asan \

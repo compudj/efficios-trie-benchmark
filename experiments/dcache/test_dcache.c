@@ -356,6 +356,92 @@ static void test_negative_dentries(void)
 	printf("  ok: negative dentries + d_instantiate\n");
 }
 
+/*
+ * Phase 2 remainder: d_delete leaves a NEGATIVE behind instead of unhashing.
+ * The state change now runs on a live, already-indexed node -- the shape the
+ * txn engines' write-once-identity assumption forbids -- in BOTH directions.
+ */
+static void test_delete_to_negative(void)
+{
+	struct dcache *dc = dc_create(1024);
+	uint64_t got = ~0ULL;
+
+	CHECK(dc_add(dc, P("/d"), 800) == 0, "del: add dir /d");
+	CHECK(dc_add_file(dc, P("/d/f"), 801) == 0, "del: add file /d/f");
+	expect_positive(dc, "/d/f", 801);
+
+	/* d_delete: the NAME survives, the object does not */
+	CHECK(dc_delete(dc, P("/d/f")) == 0, "del: delete /d/f");
+	expect_negative(dc, "/d/f");
+	CHECK(dc_lookup(dc, P("/d/f"), &got) == DC_NEGATIVE, "del: still negative");
+
+	/* NON-VACUITY: it must be distinguishable from BOTH neighbours -- an
+	 * engine that reported everything negative, or that had actually
+	 * unhashed the dentry, would pass one of these and fail the other. */
+	CHECK(dc_lookup(dc, P("/d"), &got) == DC_POSITIVE && got == 800,
+	      "del: sibling dir still positive");
+	expect_absent(dc, "/d/neverwas");
+
+	/* idempotence and the error surface */
+	CHECK(dc_delete(dc, P("/d/f")) == -ENOENT, "del: delete an already-negative");
+	CHECK(dc_delete(dc, P("/d/nothere")) == -ENOENT, "del: delete an absent name");
+	CHECK(dc_delete(dc, P("/d")) == -EISDIR, "del: delete a directory -EISDIR");
+	CHECK(dc_delete(dc, P("/")) == -EISDIR, "del: delete the root -EISDIR");
+
+	/* THE INVARIANT the files-only restriction buys: a negative cannot gain
+	 * a child, so a walk through one finds nothing.  If dc_delete ever
+	 * accepts directories this is the assertion that must be revisited. */
+	CHECK(dc_add_file(dc, P("/d/f/under"), 802) == -ENOTDIR,
+	      "del: no child under a negative");
+	expect_absent(dc, "/d/f/under");
+
+	/* round trip: the dentry kept its address and its place, so
+	 * instantiating the same name brings it back -- with the NEW id, which
+	 * is what proves the id was republished and not merely never lost */
+	CHECK(dc_instantiate(dc, P("/d/f"), 803) == 0, "del: re-instantiate");
+	expect_positive(dc, "/d/f", 803);
+	CHECK(dc_delete(dc, P("/d/f")) == 0, "del: delete again");
+	expect_negative(dc, "/d/f");
+
+	/*
+	 * DELETE A RENAMED FILE.  The rename stacks a shell, so the top and the
+	 * content host are different nodes; dc_delete must land on the HOST.
+	 * As in the instantiate case this only tests the TRANSFER once the fold
+	 * has collapsed the chain -- before that the reader consults the host
+	 * directly and would be right either way.
+	 */
+	CHECK(dc_add_file(dc, P("/d/g"), 804) == 0, "del: add file /d/g");
+	CHECK(dc_rename(dc, P("/d/g"), P("/d/h")) == 0, "del: rename it");
+	CHECK(dc_delete(dc, P("/d/h")) == 0, "del: delete the renamed file");
+	expect_negative(dc, "/d/h");
+	dc_quiescent();
+	synchronize_rcu();
+	rcu_barrier();
+	synchronize_rcu();
+	rcu_barrier();
+	expect_negative(dc, "/d/h");	/* survived the fold's TRANSFER */
+
+	/* and the reverse order: delete first, THEN rename the negative */
+	CHECK(dc_add_file(dc, P("/d/i"), 805) == 0, "del: add file /d/i");
+	CHECK(dc_delete(dc, P("/d/i")) == 0, "del: delete /d/i");
+	CHECK(dc_rename(dc, P("/d/i"), P("/d/j")) == 0, "del: rename the negative");
+	expect_absent(dc, "/d/i");
+	expect_negative(dc, "/d/j");
+	dc_quiescent();
+	synchronize_rcu();
+	rcu_barrier();
+	synchronize_rcu();
+	rcu_barrier();
+	expect_negative(dc, "/d/j");	/* survived the fold's TRANSFER */
+
+	/* a negative still unlinks -- the name goes fully absent */
+	CHECK(dc_unlink(dc, P("/d/j")) == 0, "del: unlink a negative");
+	expect_absent(dc, "/d/j");
+
+	dc_destroy(dc);
+	printf("  ok: d_delete -> negative (phase 2 remainder)\n");
+}
+
 int main(void)
 {
 	struct dcache *dc;
@@ -367,6 +453,7 @@ int main(void)
 
 	test_midtransition();		/* mid-transition unlink + exchange edges */
 	test_negative_dentries();	/* phase 2: negative -> instantiate */
+	test_delete_to_negative();	/* phase 2: positive -> negative in place */
 
 	/* Build a small tree.
 	 *   /a(1) /a/b(2) /a/b/c(3) /a/x(4) /d(5) /d/e(6)

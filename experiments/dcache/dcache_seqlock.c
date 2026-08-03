@@ -915,6 +915,75 @@ unlock:
 	return ret;
 }
 
+/*
+ * Phase 2: d_delete with a surviving reference -- make the dentry NEGATIVE in
+ * place rather than unhashing it.  The inverse of dc_instantiate, and in this
+ * engine it is the same three lines inside the same bracket: d_seq is what
+ * makes a state change on a live, hashed dentry coherent to a lockless reader,
+ * so there is nothing to add.  That is the comparison this operation exists to
+ * draw -- the txn engines must publish it through a commit because they deleted
+ * the counter that does this here for free.
+ *
+ * FILES ONLY (-EISDIR).  The restriction is not needed for THIS engine's safety
+ * -- the bucket lock and the parent's dir lock would serialize a concurrent add
+ * against the check -- but the invariant "every negative is a file" has to hold
+ * ENGINE-WIDE or the harness could not assert it across the matrix, and in the
+ * txn engines it is the only race-free way to get it (see dcache.h).  So the
+ * baseline is deliberately restricted to what its partners can also promise.
+ *
+ * d_id is likewise left stale, which this engine alone need not do: the bracket
+ * makes clearing it atomic with the state.  The txn engines cannot -- a
+ * single-slot commit publishes the state and nothing else -- so the census
+ * skips negatives everywhere (walk_rec) and every engine behaves the same.
+ */
+int dc_delete(struct dcache *dc, const struct dc_path *path)
+{
+	struct dentry *parent, *d;
+	const struct qstr *name;
+	struct dc_bucket *b;
+	int ret = 0;
+
+	if (path->ndepth == 0)
+		return -EISDIR;			/* the root is a directory */
+
+	rcu_read_lock();
+	parent = resolve_dentry_rcu(dc, path, path->ndepth - 1);
+	if (!parent) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	name = &path->comp[path->ndepth - 1];
+	b = bucket_of(dc, parent, name->hash);
+	dir_wlock(parent);
+	bl_lock(b);
+	d = __child_lookup(dc, parent, name);
+	if (!d) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	if (d->d_isdir) {			/* write-once */
+		ret = -EISDIR;
+		goto unlock;
+	}
+	if (!DC_IS_POSITIVE(d)) {		/* already caches an absence */
+		ret = -ENOENT;
+		goto unlock;
+	}
+	write_seqcount_begin(&d->d_seq);
+#if defined(DC_HOT1CL_SPLIT)
+	CMM_STORE_SHARED(d->d_parent, (struct dentry *)
+			 ((uintptr_t) d->d_parent | DC_TAG_NEG));
+#else
+	CMM_STORE_SHARED(d->d_inode, 0);
+#endif
+	write_seqcount_end(&d->d_seq);
+unlock:
+	bl_unlock(b);
+	dir_wunlock(parent);
+	rcu_read_unlock();
+	return ret;
+}
+
 static void dentry_free_cb(struct rcu_head *rh)
 {
 	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
@@ -1189,7 +1258,12 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 {
 	struct dentry *c;
 
-	if (path->ndepth > 0 || DC_DPARENT(d) != d)	/* skip emitting root */
+	/* Skip the root, and skip NEGATIVES: the census counts OBJECTS, and a
+	 * negative dentry holds a name without one -- its d_id is stale by
+	 * construction (kept stale here to match the txn engines, which cannot
+	 * clear it atomically with the state).  Reporting it would make a
+	 * conservation gate read a cached absence as a surviving object. */
+	if ((path->ndepth > 0 || DC_DPARENT(d) != d) && DC_IS_POSITIVE(d))
 		fn(d->d_id, path, arg);
 
 	for (c = d->d_children; c; c = c->d_sib) {

@@ -251,14 +251,47 @@ int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id);
  * bit into every shell.  Costs the reader one host-line load at the TERMINAL
  * component (never per hop).
  *
- * Unlink still REMOVES rather than leaving a negative behind.  The kernel does
- * leave one, and it is a larger source of negatives than failed lookups are --
- * but dc_unlink's "no walk-causality bump is owed" proof rests on unlink being a
- * REMOVE of a terminal, and a negative that survives the call is a live
- * reachable node changing state.  Deferred deliberately; see REVIEW.md.
+ * dc_delete is the inverse: the kernel's d_delete when the dentry still has
+ * users, which makes it NEGATIVE in place instead of unhashing it.  This is the
+ * larger source of negatives in a real dcache -- bigger than failed lookups --
+ * and unlike dc_add_negative it puts a live, reachable, already-indexed node
+ * through a state change on a COMMON operation.  -ENOENT if absent or already
+ * negative, -EISDIR on a directory.
+ *
+ * dc_delete is FILES ONLY, and that is load-bearing rather than a simplifying
+ * omission.  A negative must have no children and must not be able to GAIN any,
+ * or a reader walking through it would find something beneath a name that does
+ * not exist.  A children_empty check here would not establish that in the txn
+ * engines: a concurrent dc_add commits to a different slot, so the two do not
+ * conflict and the child can land after the check.  Enforcing it would cost
+ * dc_add a read-set entry on the parent's state word -- a hot path taxed to
+ * protect a rare call.  Files get it free and race-free: the type is write-once
+ * at allocation and dc_add already rejects a child under a file with -ENOTDIR,
+ * so EVERY negative is a file by construction.  It is also the faithful scope,
+ * unlink(2) being the non-directory call; rmdir-to-negative would need the
+ * atomic check and is deliberately out.
+ *
+ * WHAT dc_delete COST THE no-bump PROOF -- the reason it was not a rider on
+ * phase 2.  dc_unlink owes no walk-causality bump because "unlink REMOVES, and
+ * the removed node is EMPTY, hence a TERMINAL".  Neither clause survives here:
+ * the node lives on, hashed, and a reader can hold it as an interior waypoint.
+ * The proof still holds, but only once restated on the property the two
+ * operations actually share -- THE NODE'S LOCATION DOES NOT CHANGE.  A bump is
+ * owed when a reader's stale prefix can be combined with a node's NEW location
+ * to name a path that never existed, which needs a RELOCATION.  A late reader
+ * that finds something under a node still sitting where it always sat is
+ * reporting a real path at a real time.  So the general rule is relocation, and
+ * dc_unlink's terminal argument is a corollary of it (remove being relocation
+ * to "nowhere"), not the other way round.
+ *
+ * The census (dc_walk) skips negatives: it counts OBJECTS, and a negative holds
+ * a name without one.  Its id is stale by construction -- dc_delete cannot clear
+ * it without racing a reader in one direction or the other -- so a conservation
+ * gate must not read a cached absence as a surviving object.
  */
 int dc_add_negative(struct dcache *dc, const struct dc_path *path);
 int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id);
+int dc_delete(struct dcache *dc, const struct dc_path *path);
 
 /*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam

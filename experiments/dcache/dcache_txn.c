@@ -80,6 +80,20 @@ void (*dc_test_walk_hook)(int depth);
  * builds.
  */
 void (*dc_test_fold_hook)(void);
+/*
+ * Test-only rendezvous fired INSIDE the fold's TRANSFER, between the read of the
+ * host's d_iparent and the cmpxchg that writes it back.  That window is the one
+ * a concurrent d_delete / d_instantiate can be lost in if the write-back is not
+ * atomic, so a repro pauses the fold here and performs the state change from
+ * another thread.  NULL and never compiled into normal builds.
+ */
+void (*dc_test_transfer_hook)(void);
+#define DC_TEST_TRANSFER_HOOK()	do {					\
+		if (dc_test_transfer_hook)				\
+			dc_test_transfer_hook();			\
+	} while (0)
+#else
+#define DC_TEST_TRANSFER_HOOK()	do { } while (0)
 #endif
 
 /*
@@ -317,7 +331,14 @@ static inline uintptr_t iparent_raw(const struct dentry *d)
 	return (uintptr_t) urcu_txn_read((void **) &nc->d_iparent,
 					  DC_IPARENT_TAG);
 #else
-	return (uintptr_t) d->d_iparent;
+	struct dentry *nc = (struct dentry *) (uintptr_t) d;
+
+	/* RELAXED ATOMIC, not a plain load.  The fold's TRANSFER cmpxchgs this
+	 * word (dc_transfer_iparent) while readers sample it for pos/neg, so a
+	 * plain load here IS a data race -- TSAN says so, and it is UB even
+	 * though x86 emits the identical instruction.  No ordering is claimed:
+	 * the walk-causality bracket carries that, not this load. */
+	return (uintptr_t) uatomic_load(&nc->d_iparent, CMM_RELAXED);
 #endif
 }
 
@@ -1110,32 +1131,92 @@ int dc_add_negative(struct dcache *dc, const struct dc_path *path)
 }
 
 /*
- * Phase 2: d_instantiate -- the dentry keeps its address, its bucket, its child
- * list and its chain position; only its inode-ness changes.
+ * Phase 2: flip the content HOST between positive and negative in place.  Both
+ * d_instantiate (negative -> positive, @id is the new inode) and d_delete
+ * (positive -> negative, @id ignored) are this one word change; the dentry
+ * keeps its address, its bucket, its children and its chain position.
  *
  * This is the one shape the txn engines' simplification did NOT already cover.
  * The seqlock baseline brackets it in the per-dentry d_seq it still has, which
  * is exactly what that seqcount is for.  These engines deleted d_seq and paid
- * for it by treating pos/neg as write-once-per-identity, so an in-place store
- * here would be precisely the mutation that assumption forbids -- a live,
- * reachable node changing kind under a reader that samples the word plainly.
+ * for it by treating pos/neg as write-once-per-identity, so a plain store here
+ * is precisely the mutation that assumption forbids.
  *
- * So publish it the way this engine publishes everything else: a single-slot
- * COMMIT on the transacted d_iparent of the content HOST.  A reader resolving
- * that slot sees the old value or the new one, never a tear -- the transaction
- * standing in for the seqcount it replaced.  The write set is one slot, so this
- * cannot abort against anything except a concurrent writer of the SAME slot,
- * which is a rename folding into this host or another instantiate.
+ * WHAT REPLACES d_seq IS AN ATOMIC RMW, NOT A TRANSACTION, and getting that
+ * wrong is the interesting part of phase 2.  The obvious move -- publish the
+ * flip as a single-slot commit on d_iparent -- does not work, for a reason the
+ * library states outright: urcu_txn_store_sw() "parks it with a plain store
+ * that never fails", an SW-only commit never contention-aborts, and SW is a
+ * PROMISE OF EXCLUSION that must hold across every writer of the slot.  The
+ * fold's TRANSFER is another writer of exactly this word (it pulls the outgoing
+ * top's parent down into the host), running on a call_rcu worker, so the
+ * promise is false and two plain stores race: the fold reads the host positive,
+ * this publishes NEGATIVE, the fold writes back the bit it read, and the delete
+ * is silently gone.
  *
- * @id is stored before the commit: it is cold, read only by validation builds
- * (DC_SPLIT_KEEPID), and a reader that sees the node positive must already see
- * the id that came with it.
+ * d0e7955 saw this coming and said so -- the fold's in-place identity write was
+ * "benign today only because rename preserves inode-ness ... but it is UB and a
+ * latent correctness bug once phase-2 negative dentries land."  It landed.
+ *
+ * store_mw() would be correct, but it installs a descriptor that every reader
+ * must resolve, and the global and per-node arms deliberately leave d_iparent
+ * untransacted (d0e7955 rejected paying resolving reads on the hottest field).
+ * A cmpxchg is correct on EVERY arm and costs the reader nothing: the loop
+ * re-reads and re-decides if the fold moved the parent bits underneath it, and
+ * the reader's load stays exactly as plain as it was.  The CAS is against the
+ * RAW word rather than iparent_raw()'s resolved value, which is sound because
+ * after this change NO transacted writer targets d_iparent, so it never holds
+ * a proxy.
+ *
+ * @id is stored before the flip: it is cold, read only by validation builds
+ * (DC_SPLIT_KEEPID) and the census, and a reader that sees the node positive
+ * must already see the id that came with it.
  */
+static int dc_set_negative(struct dentry *host, int negative, uint64_t id)
+{
+#ifdef DC_HOT1CL
+	for (;;) {
+		uintptr_t raw = (uintptr_t) uatomic_load(&host->d_iparent,
+							 CMM_RELAXED);
+		uintptr_t want;
+
+		if (!!(raw & DC_TAG_NEG) == !!negative)
+			return negative ? -ENOENT : -EEXIST;
+		if (!negative) {
+			host->d_id = id;
+			cmm_smp_wmb();		/* id before positive */
+		}
+		want = negative ? (raw | DC_TAG_NEG) : (raw & ~DC_TAG_NEG);
+		if ((uintptr_t) uatomic_cmpxchg(&host->d_iparent,
+						(struct dentry *) raw,
+						(struct dentry *) want) == raw)
+			break;
+		/* lost the word to the fold's TRANSFER (new parent bits) or to
+		 * another state change: re-read and re-decide */
+	}
+	host->d_inode = negative ? 0 : 1;	/* cold bookkeeping; the tag rules */
+	return 0;
+#else
+	/* Legacy 3-CL layout: pos/neg is its OWN word (d_inode), which the fold
+	 * never touches -- so this arm has no competing writer and one aligned
+	 * store to a plainly-sampled word is enough.  Old-or-new, never a tear.
+	 * It keeps d_seq too, so it is the arm closest to the baseline: it
+	 * never needed anything here. */
+	if ((!DC_IS_POSITIVE(host)) == (!!negative))
+		return negative ? -ENOENT : -EEXIST;
+	if (!negative) {
+		host->d_id = id;
+		cmm_smp_wmb();
+	}
+	CMM_STORE_SHARED(host->d_inode, negative ? 0 : 1);
+	return 0;
+#endif
+}
+
 int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
-	struct urcu_txn txn;
 	int ret = 0;
 
 	if (path->ndepth == 0)
@@ -1149,82 +1230,98 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 	}
 	name = &path->comp[path->ndepth - 1];
 
-	urcu_txn_init(&txn, &dc->domain);
-	for (;;) {
-		enum urcu_txn_status st;
-#ifdef DC_HOT1CL
-		uintptr_t raw;
-#endif
-
-		urcu_txn_begin(&txn);
-		top = find_top_rcu(dc, parent, name);
-		if (!top) {
-			urcu_txn_abandon(&txn);
-			urcu_txn_end(&txn);
-			ret = -ENOENT;
-			goto out;
-		}
-		host = host_of_rcu(top);
-#ifdef DC_HOT1CL
-		raw = iparent_raw(host);
-		if (!(raw & DC_TAG_NEG)) {	/* already has an inode */
-#else
-		if (DC_IS_POSITIVE(host)) {	/* already has an inode */
-#endif
-			urcu_txn_abandon(&txn);
-			urcu_txn_end(&txn);
-			ret = -EEXIST;
-			goto out;
-		}
-		host->d_id = id;		/* cold; ordered before the publish */
-#ifndef DC_HOT1CL
-		/* Legacy 3-CL layout: pos/neg is its own word (d_inode) rather
-		 * than a tag in d_iparent, and no reader resolves it through a
-		 * txn slot -- so there is nothing to commit and the flip is one
-		 * aligned store to a plainly-sampled word.  Old-or-new, never a
-		 * tear.  This layout keeps d_seq too, so it is the arm closest
-		 * to the baseline: it never needed the transaction here. */
-		CMM_STORE_SHARED(host->d_inode, 1);
-#else
-		host->d_inode = 1;		/* cold under HOT1CL: the tag rules */
-#endif
-#if !defined(DC_HOT1CL)
-		/* nothing further to publish */
-#elif defined(DC_IPARENT_TXN)
-		/* The slot is transacted (the fold publishes identity through
-		 * it), so the flip rides the same commit discipline and a
-		 * concurrent reader resolves old-or-new, never a tear. */
-		if (urcu_txn_store_sw(&txn, (void **) &host->d_iparent,
-				      (void *) raw,
-				      (void *) (raw & ~DC_TAG_NEG),
-				      DC_IPARENT_TAG)) {
-			urcu_txn_abandon(&txn);
-			urcu_txn_end(&txn);
-			ret = -ENOMEM;
-			goto out;
-		}
-#else
-		/* Arms that do NOT transact d_iparent (global / per-node) carry
-		 * their walk causality in d_seq or the mark, and the fold stores
-		 * identity in place here rather than publishing it.  There is no
-		 * slot to commit, so the flip is a single release store to a word
-		 * the reader samples plainly: it observes the old state or the
-		 * new one, and both are valid linearizations of a lookup racing a
-		 * create.  What it must NOT do is tear, and a single aligned
-		 * pointer-width store does not. */
-		CMM_STORE_SHARED(host->d_iparent, (struct dentry *)
-				 (raw & ~DC_TAG_NEG));
-#endif
-		st = urcu_txn_commit(&txn);
-		urcu_txn_end(&txn);
-		if (st == URCU_TXN_STATUS_ABORT)
-			continue;		/* same slot raced: re-read, retry */
-		if (st < 0) {
-			ret = -ENOMEM;
-			goto out;
-		}
-		break;
+	top = find_top_rcu(dc, parent, name);
+	if (!top) {
+		ret = -ENOENT;
+		goto out;
 	}
+	host = host_of_rcu(top);
+	ret = dc_set_negative(host, 0, id);
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
+/*
+ * Phase 2: d_delete with a surviving reference -- the kernel's "if the dentry
+ * still has users, make it negative instead of unhashing it".  The exact
+ * INVERSE of dc_instantiate, published the same way, and together they are the
+ * state-change-in-place pair this engine did not previously have.
+ *
+ * It matters separately from dc_unlink because unlink-to-negative is the LARGER
+ * source of negative dentries in a real dcache, and because it puts a live,
+ * reachable node through a state change on a COMMON operation rather than on a
+ * lookup miss.
+ *
+ * WALK CAUSALITY: still no bump -- but NOT for the reason dc_unlink gives, and
+ * the difference is the interesting part.  dc_unlink argues "unlink REMOVES,
+ * and the removed node is EMPTY, hence a TERMINAL a reader can only straddle at
+ * the leaf".  Neither clause holds here: the node survives, hashed, in both
+ * indexes, and a reader can hold it as an interior waypoint.
+ *
+ * What actually carries both proofs is weaker than "removed", and is the
+ * property the two operations share: THE NODE'S LOCATION DOES NOT CHANGE.  A
+ * bump is owed when a reader's stale PREFIX can be combined with a node's NEW
+ * location to name a path that never existed -- which needs a relocation.
+ * dc_delete leaves the host at the same (parent, name) it already had, so a
+ * reader holding it mid-walk holds it exactly where it still is; anything it
+ * subsequently finds beneath it is a real path at that time.  That is a LATE
+ * reader, not a phantom, and late is a valid linearization.  Remove is the
+ * degenerate case of the same rule, with the new location being "nowhere" --
+ * so the honest statement of the rule is RELOCATION, not removal, and
+ * dc_unlink's proof is a corollary rather than the general case.
+ *
+ * FILES ONLY (-EISDIR on a directory), and that restriction is load-bearing
+ * rather than a simplification.  The invariant a negative must hold is that it
+ * has no children and CANNOT GAIN ANY: a reader walking through a negative must
+ * find nothing beneath it.  Checking children_empty here would not establish
+ * that -- a concurrent dc_add could commit a child after the check and before
+ * this commit, since the two touch different slots and so do not conflict.
+ * Enforcing it would cost dc_add a read-set entry on the parent's state word,
+ * on a hot path, to protect a rare operation.  Restricting to files gets it for
+ * free and race-free instead: d_isdir is write-once at allocation and dc_add
+ * already rejects a child under a file with -ENOTDIR.  So EVERY negative in
+ * this engine is a file, by construction, at no cost to the common path.  It is
+ * also the faithful scope -- unlink(2) is the non-directory call.  rmdir-to-
+ * negative would need the atomic check above and is deliberately not here.
+ */
+int dc_delete(struct dcache *dc, const struct dc_path *path)
+{
+	struct dentry *parent, *top, *host;
+	const struct qstr *name;
+	int ret = 0;
+
+	if (path->ndepth == 0)
+		return -EISDIR;			/* the root is a directory */
+
+	rcu_read_lock();
+	parent = resolve(dc, path, path->ndepth - 1);
+	if (!parent) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	name = &path->comp[path->ndepth - 1];
+
+	top = find_top_rcu(dc, parent, name);
+	if (!top) {
+		ret = -ENOENT;
+		goto out;
+	}
+	host = host_of_rcu(top);
+	if (host->d_isdir) {			/* write-once: no race to lose */
+		ret = -EISDIR;
+		goto out;
+	}
+	/*
+	 * d_id is deliberately NOT cleared.  Clearing it after the flip would
+	 * race a reader that latched the node positive and then read the id;
+	 * clearing it before would expose 0 to a reader that still sees it
+	 * positive.  Neither is needed: no reader reads a negative's id, and
+	 * dc_instantiate rewrites it before republishing.  The census skips
+	 * negatives for the same reason (walk_rec) -- it counts OBJECTS, and a
+	 * negative holds a name, not an object.
+	 */
+	ret = dc_set_negative(host, 1, 0);
 out:
 	rcu_read_unlock();
 	return ret;
@@ -1656,15 +1753,19 @@ static void fold(struct dcache *dc, struct dentry *n)
 
 		if (back == NULL) {
 			/* TRANSFER: @n is the top; pull identity down into m.
-			 * These are plain in-place stores to a node (m) that
-			 * concurrent readers CAN reach (as the content host, via
-			 * the d_host skip pointer) -- but no reader reads a host's
-			 * d_iparent/d_iname: matching and pos/neg are taken off the
-			 * write-once TOP (dc_lookup), and readdir reads the top's
-			 * d_iname + host's d_id.  So this write races no reader. */
+			 * m is reachable by concurrent readers (as the content
+			 * host, via the d_host skip pointer).  The d_iname copy
+			 * still races no reader -- no reader reads a host's name;
+			 * matching uses the write-once TOP and readdir reads the
+			 * top's d_iname + host's d_id -- and the name guard
+			 * (-DDC_DEBUG_NAME_GUARD) is what holds that invariant.
+			 * d_iparent is a different story since phase 2: readers
+			 * take pos/neg off the host, and d_delete WRITES it from
+			 * another thread, so the handover below is an atomic RMW. */
 			struct dentry *m = fwd;
 #if   defined(DC_HOT1CL)
-			/* Adopt n's PARENT; keep m's own host/shell bit (m may
+			/*
+			 * Adopt n's PARENT; keep m's own host/shell bit (m may
 			 * still be a middle relay of the remaining chain) AND its
 			 * own pos/neg.
 			 *
@@ -1672,13 +1773,55 @@ static void fold(struct dcache *dc, struct dentry *n)
 			 * the HOST authoritative for it: the fold walks identity
 			 * DOWN toward the host, so adopting n's bit here would let
 			 * a name-carrying node overwrite the content node's own
-			 * state -- and d_instantiate commits to the host, so the
-			 * top's copy is exactly the one that can be stale. */
-			m->d_iparent = (struct dentry *) (
-				((uintptr_t) n->d_iparent
-					& ~(DC_TAG_SHELL | DC_TAG_NEG)) |
-				((uintptr_t) m->d_iparent
-					& (DC_TAG_SHELL | DC_TAG_NEG)));
+			 * state -- and d_delete/d_instantiate write the host, so
+			 * the top's copy is exactly the one that can be stale.
+			 *
+			 * ATOMIC read-modify-write, and this is load-bearing.
+			 * Until phase 2 the fold was the ONLY writer of a host's
+			 * d_iparent, so a plain store was safe -- d0e7955 says so
+			 * in as many words, and predicted its own expiry: "benign
+			 * today only because rename preserves inode-ness ... but
+			 * it is UB and a latent correctness bug once phase-2
+			 * negative dentries land."  It landed.  d_delete and
+			 * d_instantiate now write this same word from another
+			 * thread, so a plain read-then-store LOSES one: the fold
+			 * reads m positive, a concurrent d_delete publishes
+			 * NEGATIVE, the fold stores back the positive bit it read
+			 * and the delete is gone with no error anywhere.
+			 *
+			 * A transaction does NOT fix it, which is the part worth
+			 * recording.  urcu_txn_store_sw() "parks it with a plain
+			 * store that never fails" and an SW-only commit never
+			 * contention-aborts -- SW is a PROMISE of exclusion, and
+			 * the fold breaks that promise.  store_mw() would work,
+			 * but only where the slot is transacted: it installs a
+			 * descriptor, so every reader must resolve it, and the
+			 * global and per-node arms deliberately do not (d0e7955
+			 * rejected transacting the hottest field to fix one cold
+			 * read).  A cmpxchg is correct on EVERY arm and costs the
+			 * reader nothing -- it is the same plain load it already
+			 * did.  The three writers of this word therefore all use
+			 * atomics on it and no update can be lost.
+			 */
+			{
+				uintptr_t nam = (uintptr_t) n->d_iparent &
+					~(DC_TAG_SHELL | DC_TAG_NEG);
+				uintptr_t own, want;
+
+				for (;;) {
+					own = (uintptr_t) uatomic_load(
+						&m->d_iparent, CMM_RELAXED);
+					DC_TEST_TRANSFER_HOOK();
+					want = nam | (own & (DC_TAG_SHELL |
+							     DC_TAG_NEG));
+					if ((uintptr_t) uatomic_cmpxchg(
+							&m->d_iparent,
+							(struct dentry *) own,
+							(struct dentry *) want)
+					    == own)
+						break;
+				}
+			}
 #else
 			m->d_iparent = n->d_iparent;	/* pre-publish: m unindexed */
 #endif
@@ -2032,7 +2175,12 @@ static void walk_rec(struct dentry *d, struct dc_path *path, dc_visit_fn fn,
 {
 	struct urcu_txn_hlist_node *n;
 
-	if (path->ndepth > 0 || parent_of_rcu(d) != d)
+	/* Skip NEGATIVES: the census counts OBJECTS, and a negative dentry holds
+	 * a name without one -- its d_id is stale by construction (dc_delete
+	 * cannot clear it without racing a reader; dc_add_negative never set
+	 * it).  Reporting it would make a conservation gate read a cached
+	 * absence as a surviving object. */
+	if ((path->ndepth > 0 || parent_of_rcu(d) != d) && DC_IS_POSITIVE(d))
 		fn(d->d_id, path, arg);
 
 	for (n = urcu_txn_hlist_first_rcu(&d->d_child_head); n;
