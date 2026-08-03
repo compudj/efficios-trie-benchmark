@@ -385,8 +385,42 @@ static void test_delete_to_negative(void)
 	/* idempotence and the error surface */
 	CHECK(dc_delete(dc, P("/d/f")) == -ENOENT, "del: delete an already-negative");
 	CHECK(dc_delete(dc, P("/d/nothere")) == -ENOENT, "del: delete an absent name");
-	CHECK(dc_delete(dc, P("/d")) == -EISDIR, "del: delete a directory -EISDIR");
 	CHECK(dc_delete(dc, P("/")) == -EISDIR, "del: delete the root -EISDIR");
+
+	/*
+	 * rmdir-to-negative is an ENGINE CAPABILITY, so assert the REAL behaviour
+	 * on both sides rather than accepting either -- an "either is fine" test
+	 * would pass on an engine that silently did nothing.
+	 */
+	CHECK(dc_add(dc, P("/d/sub"), 810) == 0, "del: add dir /d/sub");
+	if (dc_delete_dir_supported) {
+		CHECK(dc_add_file(dc, P("/d/sub/kid"), 811) == 0, "del: add kid");
+		CHECK(dc_delete(dc, P("/d/sub")) == -ENOTEMPTY,
+		      "del: rmdir a NON-empty directory -ENOTEMPTY");
+		CHECK(dc_unlink(dc, P("/d/sub/kid")) == 0, "del: drop the kid");
+
+		CHECK(dc_delete(dc, P("/d/sub")) == 0, "del: rmdir-to-negative");
+		expect_negative(dc, "/d/sub");
+
+		/* THE INVARIANT: a negative directory must not gain a child. */
+		CHECK(dc_add_file(dc, P("/d/sub/kid"), 812) == -ENOENT,
+		      "del: no child under a negative DIRECTORY");
+		expect_absent(dc, "/d/sub/kid");
+
+		/* and it comes back, still a directory, when re-instantiated */
+		CHECK(dc_instantiate(dc, P("/d/sub"), 813) == 0,
+		      "del: re-instantiate the directory");
+		expect_positive(dc, "/d/sub", 813);
+		CHECK(dc_add_file(dc, P("/d/sub/kid"), 814) == 0,
+		      "del: a positive directory takes children again");
+		expect_positive(dc, "/d/sub/kid", 814);
+		CHECK(dc_unlink(dc, P("/d/sub/kid")) == 0, "del: tidy");
+	} else {
+		CHECK(dc_delete(dc, P("/d/sub")) == -ENOTSUP,
+		      "del: engine declines rmdir-to-negative");
+		expect_positive(dc, "/d/sub", 810);	/* and did NOT do it */
+	}
+	CHECK(dc_unlink(dc, P("/d/sub")) == 0, "del: unlink /d/sub");
 
 	/* THE INVARIANT the files-only restriction buys: a negative cannot gain
 	 * a child, so a walk through one finds nothing.  If dc_delete ever

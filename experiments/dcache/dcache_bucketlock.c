@@ -1134,6 +1134,9 @@ const char *dc_engine_name(void)
  * table instead of id==value; the dc_walk census (which reads the real cold
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
+/* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
+const int dc_delete_dir_supported = 1;
+
 #if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
 const int dc_lookup_id_is_address = 1;
 #else
@@ -1665,6 +1668,27 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	 * churn workload; harden with a re-check under the lock if ever needed).
 	 */
 	bl_lock2(bucket, &parent->d_child_head);
+	/*
+	 * RE-CHECK the parent under the lock: a concurrent dc_delete of an empty
+	 * DIRECTORY makes it negative, and a negative must never gain a child --
+	 * a walk through it has to find nothing beneath a name that is not there.
+	 * dc_delete holds this same d_child_head while it checks children_empty
+	 * and flips the state, so this test under this lock is what makes the two
+	 * atomic with respect to each other.
+	 *
+	 * The cost is ONE PREDICTED LOAD-AND-BRANCH inside a critical section the
+	 * add already entered -- no new lock, no read-set entry, nothing on the
+	 * reader.  That is the whole price of rmdir-to-negative on this engine,
+	 * and it is only this cheap because the lock the fold and the add already
+	 * share happens to be the one the invariant needs.  (A FILE parent needs
+	 * none of this: d_isdir is write-once, so -ENOTDIR above already answers
+	 * and every negative file is unreachable as a parent by construction.)
+	 */
+	if (!DC_IS_POSITIVE(parent)) {
+		bl_unlock2(bucket, &parent->d_child_head);
+		free(d);			/* never published */
+		return -ENOENT;
+	}
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
 	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
@@ -1760,10 +1784,11 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
 	struct urcu_txn_sw_hlist_head *bucket;
+	struct dentry *isdir_locked = NULL;	/* host whose child head we hold */
 	int ret = 0;
 
 	if (path->ndepth == 0)
-		return -EISDIR;			/* the root is a directory */;
+		return -EISDIR;			/* the root cannot be removed */
 
 	rcu_read_lock();
 	parent = resolve(dc, path, path->ndepth - 1);
@@ -1792,17 +1817,49 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		 * lock the right bucket and then edit the wrong host.  Same
 		 * re-verify dc_unlink does, for the same reason.
 		 */
-		bl_lock(bucket);
+		if (isdir_locked)
+			bl_lock2(bucket, &isdir_locked->d_child_head);
+		else
+			bl_lock(bucket);
 		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next),
 					&marked);
 		if (marked) {
-			bl_unlock(bucket);
+			if (isdir_locked)
+				bl_unlock2(bucket,
+					   &isdir_locked->d_child_head);
+			else
+				bl_unlock(bucket);
+			isdir_locked = NULL;
 			continue;		/* re-find the current top */
 		}
 		host = host_of_rcu(top);	/* O(1); the chain tail */
-		if (host->d_isdir) {		/* write-once: no race to lose */
+		if (host->d_isdir && host != isdir_locked) {
+			/*
+			 * A DIRECTORY needs its OWN child-list head locked too,
+			 * and that is the whole cost of rmdir-to-negative here:
+			 * a negative must not be able to GAIN a child, and for a
+			 * file d_isdir gives that free (dc_add answers -ENOTDIR),
+			 * but a directory can legitimately take one.  So
+			 * children_empty has to still hold at the flip -- which
+			 * means excluding dc_add, which locks its parent's
+			 * d_child_head.  That is the head below, so THE LOCK IS
+			 * ALREADY IN THE RIGHT PLACE and dc_add pays nothing.
+			 *
+			 * Re-acquire both address-ordered rather than grabbing
+			 * the child head with the bucket already in hand: both
+			 * are bucket-head-class locks and that class is
+			 * address-ordered (bl_lock2), so taking them out of
+			 * order would deadlock against a dc_add that wants the
+			 * same pair.  Cheap, because it only happens for
+			 * directories and only on the first pass.
+			 */
 			bl_unlock(bucket);
-			ret = -EISDIR;
+			isdir_locked = host;
+			continue;
+		}
+		if (host->d_isdir && !children_empty(host)) {
+			bl_unlock2(bucket, &host->d_child_head);
+			ret = -ENOTEMPTY;
 			goto out;
 		}
 		/* d_id deliberately NOT cleared: clearing it either side of
@@ -1810,7 +1867,10 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		 * reader reads a negative's id, and dc_instantiate rewrites
 		 * it before republishing.  The census skips negatives. */
 		ret = dc_set_negative(host, 1, 0);
-		bl_unlock(bucket);
+		if (host->d_isdir)
+			bl_unlock2(bucket, &host->d_child_head);
+		else
+			bl_unlock(bucket);
 		break;
 	}
 out:

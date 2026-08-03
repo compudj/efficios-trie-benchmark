@@ -300,6 +300,42 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id);
 int dc_delete(struct dcache *dc, const struct dc_path *path);
 
 /*
+ * Can dc_delete turn an empty DIRECTORY negative (rmdir-to-negative), or only a
+ * file?  1 on the engines that can; 0 means dc_delete answers -ENOTSUP for a
+ * directory.  This is a genuine engine difference, not a stub, and it is the
+ * cleanest measurement rmdir-to-negative produced:
+ *
+ * A negative must not be able to GAIN a child.  For a FILE that is free on every
+ * engine -- d_isdir is write-once and dc_add already answers -ENOTDIR.  A
+ * DIRECTORY can legitimately take one, so children_empty has to still hold at
+ * the instant the state flips, which means excluding a concurrent dc_add.
+ *
+ *   dcache_seqlock     FREE.  dc_add takes its parent's dir lock, so dc_delete
+ *                      takes the VICTIM's -- which is that same lock.  Exactly
+ *                      why the kernel's rmdir holds the victim's i_rwsem.
+ *   dcache_bucketlock  FREE.  dc_add takes its parent's d_child_head bit-lock,
+ *                      so dc_delete takes the victim's -- the same head, and one
+ *                      it can pair with the bucket it already holds.
+ *   dcache_txn         NOT FREE, hence 0.  It is lock-free by design: nothing it
+ *                      already holds spans the check and the flip.  The flip is a
+ *                      cmpxchg rather than a commit (the fold writes that word
+ *                      non-transactionally), so it cannot simply join a guarded
+ *                      transaction, and making it one would force d_iparent to be
+ *                      MW-transacted on EVERY arm -- resolving reads on the
+ *                      hottest field, which d0e7955 rejected.  The alternative is
+ *                      a per-parent lock (d_moving exists) taken by dc_add, i.e.
+ *                      a cmpxchg added to the hot add path.  Either way the
+ *                      lock-free engine pays for what the lock-bearing ones get
+ *                      for nothing, so the choice is left explicit rather than
+ *                      taken silently.
+ *
+ * That asymmetry is the point: the feature is free exactly where a lock already
+ * covers the child list, which is the kernel's own arrangement -- and it is one
+ * more thing the hybrid winner inherits by ending on the bucket lock.
+ */
+extern const int dc_delete_dir_supported;
+
+/*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam
  * (b)).  0 on success, -ENOENT, -ENOTEMPTY (still has children).
  */

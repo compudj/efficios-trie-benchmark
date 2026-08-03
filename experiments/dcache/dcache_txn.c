@@ -500,6 +500,9 @@ const char *dc_engine_name(void)
  * table instead of id==value; the dc_walk census (which reads the real cold
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
+/* rmdir-to-negative: see dcache.h.  lock-free engine: nothing spans the check and the flip */
+const int dc_delete_dir_supported = 0;
+
 #if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
 const int dc_lookup_id_is_address = 1;
 #else
@@ -1308,8 +1311,23 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		goto out;
 	}
 	host = host_of_rcu(top);
-	if (host->d_isdir) {			/* write-once: no race to lose */
-		ret = -EISDIR;
+	if (host->d_isdir) {
+		/*
+		 * rmdir-to-negative is NOT implemented on this engine, and the
+		 * reason is structural rather than an omission (dc_delete_dir_
+		 * supported == 0, see dcache.h).  A negative directory could
+		 * gain a child, so children_empty must still hold at the flip
+		 * -- and nothing this lock-free engine already holds spans the
+		 * check and the flip.  The flip is a cmpxchg, not a commit,
+		 * because the fold writes this same word non-transactionally,
+		 * so it cannot just join a guarded transaction; making it one
+		 * would force d_iparent MW-transacted on every arm and put a
+		 * resolving read on the hottest field.  The alternative is a
+		 * per-parent lock in dc_add.  Both are real costs the seqlock
+		 * and bucketlock engines do not pay, so the choice is left to
+		 * be made deliberately.
+		 */
+		ret = -ENOTSUP;
 		goto out;
 	}
 	/*

@@ -235,6 +235,9 @@ static inline int d_is_positive(const struct dentry *d)
  * a weak reference (absent => 0 => logical id); mirrors the txn engine so the
  * bench treats both identically.  See bench_dcache.c.
  */
+/* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
+const int dc_delete_dir_supported = 1;
+
 #if defined(DC_HOT1CL_SPLIT) && !defined(DC_SPLIT_KEEPID)
 const int dc_lookup_id_is_address = 1;
 #else
@@ -813,6 +816,18 @@ static int dc_add_typed_state(struct dcache *dc, const struct dc_path *path,
 	 */
 	dir_wlock(parent);
 	bl_lock(b);
+	/*
+	 * RE-CHECK the parent under the lock: a concurrent dc_delete of an empty
+	 * DIRECTORY makes it negative, and a negative must never gain a child.
+	 * dc_delete holds this same dir lock (the victim's own) while it checks
+	 * d_children and flips the state, so this test under this lock is what
+	 * makes the two atomic.  One predicted load-and-branch inside a critical
+	 * section the add already entered -- no new lock.
+	 */
+	if (!DC_IS_POSITIVE(parent)) {
+		ret = -ENOENT;
+		goto unlock;
+	}
 	if (__child_lookup(dc, parent, name)) {
 		ret = -EEXIST;
 		goto unlock;
@@ -938,13 +953,13 @@ unlock:
  */
 int dc_delete(struct dcache *dc, const struct dc_path *path)
 {
-	struct dentry *parent, *d;
+	struct dentry *parent, *d, *peek;
 	const struct qstr *name;
 	struct dc_bucket *b;
-	int ret = 0;
+	int isdir, ret = 0;
 
 	if (path->ndepth == 0)
-		return -EISDIR;			/* the root is a directory */
+		return -EISDIR;			/* the root cannot be removed */
 
 	rcu_read_lock();
 	parent = resolve_dentry_rcu(dc, path, path->ndepth - 1);
@@ -954,19 +969,53 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 	}
 	name = &path->comp[path->ndepth - 1];
 	b = bucket_of(dc, parent, name->hash);
-	dir_wlock(parent);
-	bl_lock(b);
-	d = __child_lookup(dc, parent, name);
+
+	for (;;) {
+		/*
+		 * PEEK the victim locklessly to learn its TYPE, because the type
+		 * decides which locks to take and the locks are address-ordered
+		 * (dirs_wlock2) -- so the pair has to be acquired together, not
+		 * escalated once we are already holding one.  d_isdir is
+		 * write-once, so the peek cannot be stale about the type; what
+		 * it CAN be stale about is which node holds the name, which the
+		 * re-find under the lock catches.
+		 */
+		peek = resolve_dentry_rcu(dc, path, path->ndepth);
+		isdir = peek && peek->d_isdir;
+
+		if (isdir)
+			dirs_wlock2(parent, peek);
+		else
+			dir_wlock(parent);
+		bl_lock(b);
+		d = __child_lookup(dc, parent, name);
+		if (isdir && d != peek) {	/* raced: re-peek and re-lock */
+			bl_unlock(b);
+			dirs_wunlock2(parent, peek);
+			continue;
+		}
+		break;
+	}
+
 	if (!d) {
 		ret = -ENOENT;
 		goto unlock;
 	}
-	if (d->d_isdir) {			/* write-once */
-		ret = -EISDIR;
-		goto unlock;
-	}
 	if (!DC_IS_POSITIVE(d)) {		/* already caches an absence */
 		ret = -ENOENT;
+		goto unlock;
+	}
+	/*
+	 * A DIRECTORY must be EMPTY, and must stay empty across the flip -- a
+	 * negative that could gain a child would let a walk find something
+	 * beneath a name that is not there.  Holding the VICTIM's own dir lock
+	 * is what makes that stick, because dc_add takes its parent's dir lock,
+	 * and the victim is that parent.  Exactly why the kernel's rmdir holds
+	 * the victim's i_rwsem.  A FILE needs none of it: d_isdir is write-once
+	 * and dc_add answers -ENOTDIR under one.
+	 */
+	if (d->d_isdir && d->d_children) {
+		ret = -ENOTEMPTY;
 		goto unlock;
 	}
 	write_seqcount_begin(&d->d_seq);
@@ -979,7 +1028,10 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 	write_seqcount_end(&d->d_seq);
 unlock:
 	bl_unlock(b);
-	dir_wunlock(parent);
+	if (isdir)
+		dirs_wunlock2(parent, peek);
+	else
+		dir_wunlock(parent);
 	rcu_read_unlock();
 	return ret;
 }
