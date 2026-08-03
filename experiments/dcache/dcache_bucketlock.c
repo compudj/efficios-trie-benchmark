@@ -97,6 +97,8 @@
  * included above); no extra include is needed for a DC_CHAIN_MIXED build. */
 
 #include "dcache.h"
+#define DC_TXN_STATS_IMPL
+#include "dcache_txn_stats.h"
 
 /*
  * ---- engine selector: pure single-writer SW vs mixed SW/MW -----------------
@@ -1224,6 +1226,13 @@ const char *dc_engine_name(void)
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
 /* phase 3: sharded-lock LRU + CLOCK shrinker (per-NUMA-node shards) */
+#ifdef DC_TXN_STATS
+const int dc_txn_stats_supported = 1;
+#else
+const int dc_txn_stats_supported = 0;
+void dc_txn_stats_dump(void *stream) { (void) stream; }
+#endif
+
 #ifdef DC_NO_LRU
 const int dc_lru_supported = 0;
 #else
@@ -2370,6 +2379,7 @@ static int stack_shell(struct dcache *dc,
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent);
 		st = urcu_txn_sw_commit(&txn);	/* atomic index flip; no ABORT under the lock */
+		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
 		if (st == URCU_TXN_STATUS_OK)
 			/* DEMOTE: plain store under the chain lock -- atomic-to-fold with
 			 * top's index removal above, both held under this lock. */
@@ -2502,6 +2512,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 		bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
 		bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
 		st = urcu_txn_sw_commit(&txn);		/* no ABORT under the lock */
+		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
 		if (st == URCU_TXN_STATUS_OK) {
 			uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
 		} else {
@@ -2664,6 +2675,7 @@ static int stack_shell(struct dcache *dc,
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent);
 		st = urcu_txn_commit_sw(&txn);	/* pure-SW: index + demote, one commit */
+		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
 		if (cross_parent)
@@ -2737,6 +2749,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			(void) urcu_txn_store_mw(&txn, (void **) &fwd->d_back,
 						      n, back, DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
+			DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 			urcu_txn_end(&txn);
 			if (st == URCU_TXN_STATUS_ABORT) {
 				DC_DBG_FOLD_ABORT();
@@ -2802,6 +2815,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 			(void) urcu_txn_store_mw(&txn, (void **) &m->d_back,
 						      n, NULL, DC_FWD_TAG);
 			st = urcu_txn_commit(&txn);
+			DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 			bl_unlock_n(heads, 2);
 			urcu_txn_end(&txn);
 			if (st == URCU_TXN_STATUS_ABORT) {
@@ -2838,6 +2852,7 @@ reclaim:
 		(void) urcu_txn_store_mw(&txn, (void **) &m->d_back, n, NULL,
 					      DC_FWD_TAG);	/* promote m (harmless if host) */
 		st = urcu_txn_commit(&txn);
+		DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 		urcu_txn_end(&txn);
 		if (st == URCU_TXN_STATUS_ABORT) {
 			DC_DBG_FOLD_ABORT();
@@ -2960,6 +2975,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 				bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
 				bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
 				st = urcu_txn_commit_sw(&txn);
+				DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 				urcu_txn_end(&txn);
 				if (st == URCU_TXN_STATUS_OK)
 					uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
@@ -3229,6 +3245,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 						  parent_of_rcu(hostb), pa, DC_PARENT_TAG);
 		}
 		st = urcu_txn_sw_commit(&txn);	/* atomic swap; no ABORT under the locks */
+		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
 		if (st == URCU_TXN_STATUS_OK) {
 			/* demotes: plain stores under the two chain locks */
 			uatomic_store(&topa->d_back, sa, CMM_RELEASE);
@@ -3454,6 +3471,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 						      DC_PARENT_TAG);
 		}
 		st = urcu_txn_commit_sw(&txn);	/* atomic swap: pure store_sw */
+		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
 		if (cross) {

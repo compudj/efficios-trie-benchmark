@@ -68,6 +68,7 @@
 #include <urcu/rcu-txn-hlist.h>
 
 #include "dcache.h"
+#include "dcache_txn_stats.h"
 
 #ifdef DC_TEST_HOOKS
 /*
@@ -560,6 +561,13 @@ const char *dc_engine_name(void)
  * d_id) remains the conservation gate.  See bench_dcache.c.
  */
 /* rmdir-to-negative: see dcache.h.  lock-free engine: nothing spans the check and the flip */
+#ifdef DC_TXN_STATS
+const int dc_txn_stats_supported = 1;
+#else
+const int dc_txn_stats_supported = 0;
+void dc_txn_stats_dump(void *stream) { (void) stream; }
+#endif
+
 /* phase 3: the shared LRU (dcache_lru.h); lock arm by default, -DDC_LRU_MCAS */
 #ifdef DC_NO_LRU
 const int dc_lru_supported = 0;

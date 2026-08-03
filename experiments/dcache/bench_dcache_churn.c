@@ -63,6 +63,8 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -598,6 +600,24 @@ static void usage(const char *p)
 	exit(2);
 }
 
+/*
+ * Dump the transaction counters from a SIGNAL and leave immediately.
+ *
+ * The configuration this instrumentation exists to explain does not finish, so
+ * the end-of-run dump never happens for it.  SIGTERM/SIGALRM gives a snapshot of
+ * a run that is CURRENTLY wedged, which is the only way to see the counters in
+ * the state that matters.  _exit() rather than exit(): the process is wedged, so
+ * anything that waits (atexit, rcu_barrier, joins) would wedge with it.
+ */
+static void stats_signal(int sig)
+{
+	(void) sig;
+	if (dc_txn_stats_supported)
+		dc_txn_stats_dump(stdout);
+	fflush(stdout);
+	_exit(3);
+}
+
 int main(int argc, char **argv)
 {
 	struct warg *wa, *ra;
@@ -686,6 +706,8 @@ int main(int argc, char **argv)
 
 	for (i = 0; i < nwriters; i++)
 		pthread_create(&wt[i], NULL, writer_fn, &wa[i]);
+	signal(SIGTERM, stats_signal);
+	signal(SIGALRM, stats_signal);
 	for (i = 0; i < nreaders; i++)
 		pthread_create(&rt[i], NULL, reader_fn, &ra[i]);
 	if (evict_cap && !evict_continuous)
@@ -883,7 +905,9 @@ int main(int argc, char **argv)
 		printf("CONSERVATION FAILED: %d anomalies -- run is CORRUPT, "
 		       "ignore the numbers above\n", anomaly);
 	else
-		printf("CHECK   conservation: OK (state, census and ids agree)\n");
+		if (dc_txn_stats_supported)
+		dc_txn_stats_dump(stdout);
+	printf("CHECK   conservation: OK (state, census and ids agree)\n");
 	printf("RESULT: %s\n", anomaly ? "FAIL" : "PASS");
 
 	rcu_unregister_thread();

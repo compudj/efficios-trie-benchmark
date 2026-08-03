@@ -415,6 +415,17 @@ unsigned long dc_lru_count(struct dcache *dc);
 const char *dc_lru_arm(void);
 
 /*
+ * -DDC_TXN_STATS: per-call-site transaction counters (attempts / contention
+ * aborts / fallback-lane entries / aging depth).  Built to answer WHICH commit
+ * site starves first, because escalation is domain-wide -- once any site
+ * escalates, every site's begin() pays for it, so only per-site attribution
+ * separates the initiator from the victims.  Off by default; see
+ * dcache_txn_stats.h.  dc_txn_stats_supported is 0 in a normal build.
+ */
+extern const int dc_txn_stats_supported;
+void dc_txn_stats_dump(void *stream);
+
+/*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam
  * (b)).  0 on success, -ENOENT, -ENOTEMPTY (still has children).
  */

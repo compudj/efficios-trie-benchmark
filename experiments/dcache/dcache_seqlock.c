@@ -56,6 +56,7 @@
 #endif
 
 #include "dcache.h"
+#include "dcache_txn_stats.h"
 #include "seqcount.h"
 
 /*
@@ -296,6 +297,13 @@ static inline int d_is_positive(const struct dentry *d)
  * bench treats both identically.  See bench_dcache.c.
  */
 /* phase 3: struct list_lru, per NUMA node -- the kernel's own shape */
+#ifdef DC_TXN_STATS
+const int dc_txn_stats_supported = 1;
+#else
+const int dc_txn_stats_supported = 0;
+void dc_txn_stats_dump(void *stream) { (void) stream; }
+#endif
+
 #ifdef DC_NO_LRU
 const int dc_lru_supported = 0;
 #else

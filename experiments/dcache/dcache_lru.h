@@ -275,6 +275,86 @@ static int lru_shards_init(struct dcache *dc)
 #ifdef DC_LRU_MCAS
 /* ======================= THE MCAS ARM (lock-free) ======================= */
 
+/*
+ * Thin wrappers around the list mutators, so that under -DDC_TXN_STATS the
+ * transaction handle is OURS and its in_fallback / retry state is observable.
+ * urcu_txn_list_*_rcu() owns its handle internally, which is exactly the state
+ * the escalation question needs -- so the instrumented build re-implements the
+ * same convenience bracket with the _prepare form.  The uninstrumented build
+ * calls the library's own, unchanged.
+ */
+#ifdef DC_TXN_STATS
+static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
+			     struct urcu_txn_list_head *head)
+{
+	struct urcu_txn txn;
+
+	urcu_txn_init(&txn, &dc->lru_domain);
+	for (;;) {
+		enum urcu_txn_status st;
+		int p;
+
+		urcu_txn_begin(&txn);
+		p = urcu_txn_list_insert_before_prepare(&txn, n, &head->node);
+		if (p) {
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			if (p == -ENOMEM)
+				return -1;
+			continue;
+		}
+		st = urcu_txn_commit(&txn);
+		DC_TS_COMMIT(DC_TS_LRU_ADD, &txn, st);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		return st < 0 ? -1 : 0;
+	}
+}
+
+static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
+{
+	struct urcu_txn txn;
+
+	urcu_txn_init(&txn, &dc->lru_domain);
+	for (;;) {
+		enum urcu_txn_status st;
+		int p;
+
+		urcu_txn_begin(&txn);
+		p = urcu_txn_list_del_prepare(&txn, n);
+		if (p) {
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			if (p == -ENOENT)
+				return 0;	/* a peer removed it */
+			if (p == -ENOMEM)
+				return -1;
+			DC_TS_EAGAIN(DC_TS_LRU_DEL);
+			continue;		/* -EAGAIN: successor mid-delete */
+		}
+		st = urcu_txn_commit(&txn);
+		DC_TS_COMMIT(DC_TS_LRU_DEL, &txn, st);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		return st == URCU_TXN_STATUS_OK ? 1 : -1;
+	}
+}
+#else
+static inline int lru_list_add_tail(struct dcache *dc,
+				    struct urcu_txn_list_node *n,
+				    struct urcu_txn_list_head *head)
+{
+	return urcu_txn_list_add_tail_rcu(n, head, &dc->lru_domain);
+}
+
+static inline int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
+{
+	return urcu_txn_list_del_rcu(n, &dc->lru_domain);
+}
+#endif
+
 /* dentry <-> list node */
 static inline struct dentry *lru_dentry(struct urcu_txn_list_node *n)
 {
@@ -293,8 +373,7 @@ static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_BUSY)
 	    != DC_LRU_OFF)
 		return;				/* someone else owns the change */
-	if (urcu_txn_list_add_tail_rcu(&d->d_lru.link, &sh->list,
-				       &dc->lru_domain) != 0) {
+	if (lru_list_add_tail(dc, &d->d_lru.link, &sh->list) != 0) {
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		return;				/* -ENOMEM: simply not listed */
 	}
@@ -336,7 +415,7 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		return 0;			/* off, or a peer is mid-change */
 	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
 		return 0;
-	if (urcu_txn_list_del_rcu(&d->d_lru.link, &dc->lru_domain) == 1)
+	if (lru_list_del(dc, &d->d_lru.link) == 1)
 		uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
 	uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 	return 1;

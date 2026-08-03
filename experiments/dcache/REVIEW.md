@@ -631,10 +631,35 @@ items here are the ones that actually fired in this experiment):
   | LRU on a separate domain from the index | forcing both onto `&dc->domain`: still wedges |
   | shrinker not reporting quiescent states | `dc_quiescent()` after every single eviction: still wedges |
 
-  Next step is INSTRUMENTATION, not another hypothesis: per-call-site abort and
-  escalation counts (`URCU_TXN_CACHE_STATS` and friends) to find which commit
-  actually starves first.  Five guesses have now cost more than measuring would
-  have.
+  ⭐⭐ **INSTRUMENTED (`-DDC_TXN_STATS`), and it answered on the first run** —
+  after five guesses had not.  Snapshot taken by signalling a *currently wedged*
+  process (`kill -ALRM`), since the run never reaches its own dump:
+
+  | site | attempts | aborts | escalated | published | maxretry | poison |
+  |---|--:|--:|--:|--:|--:|--:|
+  | `lru_add` | 61,683 | 3,981 | **0** | 0 | 3 | 0 |
+  | `lru_del` | 161,247,900 | 161,190,238 | 161,189,563 | 161,189,563 | **161,189,627** | **0** |
+
+  Healthy arm for contrast (`--evict continuous`, same build): 362k commits,
+  **zero** aborts, zero escalations.
+
+  What that says, and none of it was guessable:
+  - **`lru_del` livelocks.**  `maxretry` ≈ attempts means ONE handle retrying
+    161M times and never completing — not many transactions each retrying a few.
+  - **Not poison** (0) — the descriptor is well-formed, so it is not a
+    mis-computed expected-old.  **Not `-EAGAIN`** (22) — not the
+    successor-mid-delete retry path either.  These are genuine *contention*
+    aborts.
+  - ⭐ **Escalation is not helping it.**  The victim escalates and publishes
+    `domain->active` on essentially every attempt, yet its competitor `lru_add`
+    shows **0 escalations** — the fast path never enters the lane, so holding
+    the lane never confers exclusivity and the victim can be invalidated
+    indefinitely by transactions that never queue behind it.
+
+  So the question moves off the dcache entirely and onto the escalation
+  qualification rule (`urcu_txn__self_qualifies` / the `domain->active` funnel):
+  why a publishing escalation does not pull the competing writer in.  Next
+  measurement: instrument the funnel decision itself, not the dcache.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:

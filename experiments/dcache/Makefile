@@ -738,6 +738,17 @@ check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./stress_dcache_pernode_asan 4 4 8 16 15000
 
+# Transaction instrumentation smoke: the -DDC_TXN_STATS build must still be
+# correct, not just compile -- it re-implements the LRU list mutators with the
+# _prepare form so the handle is ours to inspect.
+check-txnstats: test_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_TXN_STATS $(HCPP) -o test_dcache_txnstats \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txnstats
+	$(CC) $(CFLAGS) -DDC_LRU_MCAS -DDC_TXN_STATS $(HCPP) -o test_dcache_txnstats_mcas \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_txnstats_mcas
+
 # PHASE 3 LRU SHARD-AXIS arms.  Per-node is the kernel's own granularity and the
 # default; per-CPU and mm_cid are the userspace refinements this compares against.
 # Correctness must hold on all three -- a shard axis is not allowed to change what
