@@ -585,16 +585,40 @@ items here are the ones that actually fired in this experiment):
   concurrent delete publishes NEGATIVE, the fold writes back the bit it read,
   and **the delete is gone with both callers returning success**.
 
-  The fix is a cmpxchg on both sides.  Not `store_mw` (it installs a descriptor
-  every reader must resolve, and the global/per-node arms deliberately leave
-  `d_iparent` untransacted), and **not the bucket lock** even though the fold
-  holds it across the handover: `dc_delete` never takes it, `-DDC_CHAIN_SWMW`
-  has no fold lock at all, and `dcache_txn.c` is lock-free by design.  Measured,
-  not argued — the bucketlock mutant loses the delete identically.
+  **The two engines close it differently, and that split is the interesting
+  result.**  `dcache_txn.c` is lock-free by design, so it leaves the fold and
+  the state change concurrent and makes each an **atomic RMW**.  Not `store_mw`
+  (it installs a descriptor every reader must resolve, and the global/per-node
+  arms deliberately leave `d_iparent` untransacted).
 
-  `repro_delete_fold.c` pins it deterministically on both engines through a new
-  `dc_test_transfer_hook` fired between the fold's read and its write-back, and
-  is mutation-verified: restoring the plain RMW reports *"/d/g reads POSITIVE
+  `dcache_bucketlock.c` **excludes them with the bucket lock it already holds**:
+  the fold takes the named top's bucket head across its handover in all three
+  chain variants, so `dc_delete`/`dc_instantiate` take the same bucket — plus
+  the re-verify `dc_unlink` already does, since a concurrent transfer can make a
+  *different* node the top of that *same* bucket between the find and the
+  acquire — and the fold keeps a plain store.
+
+  ⛔ **The FOLD lock is not the answer, and "bucket then fold lock if shelled"
+  is a deadlock.**  The hierarchy is `{fold locks < bucket-head locks}`, chosen
+  so that *"no bucket is ever held while waiting on a fold lock"*, and the fold
+  acquires `fold_lock(host)` **before** its buckets — so reaching for it with a
+  bucket in hand is ABBA.  It is also unnecessary: the TRANSFER writes the top's
+  immediate SUCCESSOR while `dc_delete` writes the chain TAIL, and those coincide
+  only when the chain is `top→host`, where both hold the same bucket.  SPLICE and
+  RECLAIM never touch the word.
+
+  ⭐ **Writer-writer exclusion does not make the store plain.**  Both engines
+  keep a relaxed atomic store, because readers sample this word for pos/neg
+  while holding no lock — a different race from the lost update, and the one
+  TSAN caught.
+
+  `repro_delete_fold.c` pins it on both engines through a new
+  `dc_test_transfer_hook` fired between the fold's read and its write-back.  Its
+  rendezvous is **timed, and the timeout is load-bearing**: the all-MW engine
+  lets the deleter COMPLETE inside the window while the bucket-lock engine makes
+  it BLOCK, so waiting unconditionally would deadlock the second design rather
+  than test it.  Mutation-verified per engine — restoring the plain RMW (txn) or
+  dropping the bucket lock (bucketlock) makes each report *"/d/g reads POSITIVE
   (id 42) -- the d_delete was LOST"*.
 
   ⚠ **TSAN then found the other half, which no gate had run**: phase 2 made
