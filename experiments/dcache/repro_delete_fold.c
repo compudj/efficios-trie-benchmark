@@ -28,10 +28,31 @@
  * A transaction does not fix it and was the first thing tried: store_sw()
  * "parks it with a plain store that never fails" and an SW-only commit never
  * contention-aborts, because SW asserts exclusion across EVERY writer of the
- * slot -- which the fold breaks.  The fix is a cmpxchg on both sides.
+ * slot -- which the fold breaks.
  *
- * Final state after the fold drains: /d/f was deleted and never re-instantiated,
+ * THE TWO ENGINES CLOSE IT DIFFERENTLY, and this repro holds both to the same
+ * assertion:
+ *
+ *   dcache_txn (all-MW)  is lock-free by design, so it leaves the fold and the
+ *                        state change CONCURRENT and makes each an atomic RMW.
+ *                        The deleter runs to completion inside the window.
+ *   dcache_bucketlock    EXCLUDES them: the fold already holds the named top's
+ *                        bucket head across its handover, so d_delete takes the
+ *                        same lock (and re-verifies the top under it, as
+ *                        dc_unlink does) and the fold keeps a plain store.  The
+ *                        deleter BLOCKS inside the window.
+ *
+ * The fold lock is deliberately NOT what bucketlock uses: the hierarchy is
+ * {fold locks < bucket-head locks}, and the fold takes fold_lock(host) before
+ * its buckets, so reaching for it with a bucket in hand would be ABBA.  It is
+ * also unnecessary -- the TRANSFER writes the top's immediate SUCCESSOR while
+ * d_delete writes the chain TAIL, and those coincide only when the chain is
+ * top->host, where both hold the same bucket.
+ *
+ * Final state after the fold drains: /d/g was deleted and never re-instantiated,
  * so it MUST read NEGATIVE.  Broken engine: POSITIVE, carrying the old id.
+ * Mutation-verified both ways -- restoring the plain RMW (txn) or dropping the
+ * bucket lock (bucketlock) makes each report the loss.
  *
  * Build/run: make repro-delete-fold.  Exit 0 = state preserved; 1 = lost.
  */
@@ -41,10 +62,12 @@
 
 #include <pthread.h>
 #include <semaphore.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include <urcu-qsbr.h>
 
@@ -58,6 +81,7 @@ static struct dcache *g_dc;
 static sem_t g_in_transfer;	/* fold -> main: read done, write pending */
 static sem_t g_deleted;		/* main -> fold: state change published */
 static int   g_hook_fired;	/* one-shot */
+static int   g_rendezvous;	/* did the delete complete INSIDE the window? */
 
 /* See repro_fold.c: parking while RCU-online stalls every grace period. */
 static void sem_wait_quiescent(sem_t *s)
@@ -72,6 +96,44 @@ static void sem_wait_quiescent(sem_t *s)
 }
 
 /*
+ * TIMED variant, and the timeout is load-bearing rather than defensive.
+ *
+ * The two correct designs close this window in DIFFERENT ways, and the repro has
+ * to accept both.  The all-MW engine leaves the fold and the state change
+ * concurrent and makes each an atomic RMW, so the deleter runs to completion
+ * inside the window and posts -- the rendezvous completes and we proceed
+ * immediately.  The bucket-lock engine EXCLUDES them: the fold holds the named
+ * top's bucket head across its handover, so the deleter blocks on that lock and
+ * can never post while we are parked here.  Waiting unconditionally would
+ * deadlock the second design rather than test it.
+ *
+ * So: time out, proceed, and let the delete land after the lock is dropped.  The
+ * final assertion is the same either way -- the state change must survive.  A
+ * BROKEN engine (plain read-modify-write, no lock) is still caught
+ * deterministically, because there the deleter completes and posts at once.
+ */
+static int sem_timedwait_quiescent(sem_t *s, int ms)
+{
+	unsigned long was_online = rcu_read_ongoing();
+	struct timespec ts;
+	int r;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += (long) ms * 1000000L;
+	ts.tv_sec += ts.tv_nsec / 1000000000L;
+	ts.tv_nsec %= 1000000000L;
+
+	if (was_online)
+		rcu_thread_offline();
+	do {
+		r = sem_timedwait(s, &ts);
+	} while (r != 0 && errno == EINTR);
+	if (was_online)
+		rcu_thread_online();
+	return r;			/* 0 = peer posted; -1 = timed out */
+}
+
+/*
  * Runs on the call_rcu fold worker, INSIDE the TRANSFER, between the read of
  * the host's d_iparent and the write-back.  One-shot: later folds (including
  * the retry a correct cmpxchg performs) must not re-park, or the run deadlocks.
@@ -81,7 +143,7 @@ static void transfer_hook(void)
 	if (!g_hook_fired) {
 		g_hook_fired = 1;
 		sem_post(&g_in_transfer);
-		sem_wait_quiescent(&g_deleted);
+		g_rendezvous = (sem_timedwait_quiescent(&g_deleted, 250) == 0);
 	}
 }
 
@@ -171,6 +233,10 @@ int main(void)
 			"so the race window was never opened\n");
 		return 2;
 	}
+
+	printf("  window: the delete %s inside the TRANSFER\n",
+	       g_rendezvous ? "COMPLETED (engines that leave the two concurrent)"
+			    : "BLOCKED  (engines that exclude them by lock)");
 
 	res = dc_lookup(g_dc, path_of(&a, "/d/g"), &id);
 	if (res != DC_NEGATIVE) {

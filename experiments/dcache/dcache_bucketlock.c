@@ -917,21 +917,31 @@ static inline int node_is_positive(const struct dentry *d)
  * The cmpxchg costs the reader nothing: its load stays plain.
  */
 #ifdef DC_HOT1CL
-/* TRANSFER: adopt @n's parent into @m, preserving @m's own shell and pos/neg. */
+/*
+ * TRANSFER: adopt @n's parent into @m, preserving @m's own shell and pos/neg.
+ *
+ * CALLED WITH @n's BUCKET HEAD LOCKED, which is what makes the read-modify-write
+ * safe against the other writer of this word.  It is not a cmpxchg because it
+ * does not need to be: dc_delete/dc_instantiate take the same bucket lock, so
+ * the two cannot interleave.  See dc_set_negative() for why that single lock
+ * covers every case.
+ *
+ * The STORE is still a relaxed atomic, for the reader rather than the writer:
+ * readers sample this word plainly for pos/neg (host_is_positive), so a plain
+ * store here would be a data race against them -- which is exactly what TSAN
+ * caught when phase 2 first reintroduced that read.  Same instruction on x86.
+ */
 static inline void dc_transfer_iparent(struct dentry *m, struct dentry *n)
 {
 	uintptr_t nam = (uintptr_t) n->d_iparent & ~(DC_TAG_SHELL | DC_TAG_NEG);
-	uintptr_t own, want;
+	uintptr_t own;
 
-	for (;;) {
-		own = (uintptr_t) uatomic_load(&m->d_iparent, CMM_RELAXED);
-		DC_TEST_TRANSFER_HOOK();
-		want = nam | (own & (DC_TAG_SHELL | DC_TAG_NEG));
-		if ((uintptr_t) uatomic_cmpxchg(&m->d_iparent,
-						(struct dentry *) own,
-						(struct dentry *) want) == own)
-			return;
-	}
+	own = (uintptr_t) uatomic_load(&m->d_iparent, CMM_RELAXED);
+	DC_TEST_TRANSFER_HOOK();
+	uatomic_store(&m->d_iparent,
+		      (struct dentry *) (nam | (own & (DC_TAG_SHELL |
+						       DC_TAG_NEG))),
+		      CMM_RELAXED);
 }
 #endif
 
@@ -941,29 +951,44 @@ static inline void dc_transfer_iparent(struct dentry *m, struct dentry *n)
  * The dentry keeps its address, bucket, children and chain position.  @id is
  * stored before the flip -- a reader that sees the node positive must already
  * see the id that came with it.
+ *
+ * CALLER HOLDS THE NAMED TOP'S BUCKET HEAD LOCK, and has re-verified under it
+ * that the top is still hashed.  That one lock is the whole exclusion argument,
+ * so this is a plain read-modify-write rather than a cmpxchg:
+ *
+ *   - The only other writer of a reachable host's d_iparent is the fold's
+ *     TRANSFER, which holds the same bucket lock across its handover.
+ *   - The TRANSFER writes @n->d_fwd, the TOP'S IMMEDIATE SUCCESSOR; this writes
+ *     host_of_rcu(top), the CHAIN TAIL.  Those are the same node only when the
+ *     chain is exactly top->host -- and then the fold's bucket, derived from
+ *     that same top, is the bucket held here.
+ *   - The fold's other two arms never touch this word: SPLICE and RECLAIM move
+ *     chain pointers (d_fwd/d_back) only.
+ *
+ * The FOLD LOCK is deliberately NOT taken.  It is unnecessary by the argument
+ * above, and taking it here would be a deadlock rather than an over-precaution:
+ * the documented hierarchy is {fold locks < bucket-head locks} precisely so that
+ * "no bucket is ever held while waiting on a fold lock", and the fold acquires
+ * fold_lock(host) BEFORE its buckets.  Grabbing the fold lock with a bucket in
+ * hand inverts that.
+ *
+ * The STORE stays a relaxed atomic: readers sample this word plainly for pos/neg
+ * and take no lock, so writer-writer exclusion does not make a plain store legal.
  */
 static int dc_set_negative(struct dentry *host, int negative, uint64_t id)
 {
 #ifdef DC_HOT1CL
-	for (;;) {
-		uintptr_t raw = (uintptr_t) uatomic_load(&host->d_iparent,
-							 CMM_RELAXED);
-		uintptr_t want;
+	uintptr_t raw = (uintptr_t) uatomic_load(&host->d_iparent, CMM_RELAXED);
 
-		if (!!(raw & DC_TAG_NEG) == !!negative)
-			return negative ? -ENOENT : -EEXIST;
-		if (!negative) {
-			host->d_id = id;
-			cmm_smp_wmb();		/* id before positive */
-		}
-		want = negative ? (raw | DC_TAG_NEG) : (raw & ~DC_TAG_NEG);
-		if ((uintptr_t) uatomic_cmpxchg(&host->d_iparent,
-						(struct dentry *) raw,
-						(struct dentry *) want) == raw)
-			break;
-		/* lost the word to the fold's TRANSFER (new parent bits) or to
-		 * another state change: re-read and re-decide */
+	if (!!(raw & DC_TAG_NEG) == !!negative)
+		return negative ? -ENOENT : -EEXIST;
+	if (!negative) {
+		host->d_id = id;
+		cmm_smp_wmb();			/* id before positive */
 	}
+	uatomic_store(&host->d_iparent, (struct dentry *)
+		      (negative ? (raw | DC_TAG_NEG) : (raw & ~DC_TAG_NEG)),
+		      CMM_RELAXED);
 	host->d_inode = negative ? 0 : 1;	/* cold bookkeeping; the tag rules */
 	return 0;
 #else
@@ -1680,10 +1705,11 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 {
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
+	struct urcu_txn_sw_hlist_head *bucket;
 	int ret = 0;
 
 	if (path->ndepth == 0)
-		return -EEXIST;			/* the root is always positive */
+		return -EEXIST;			/* the root is always positive */;
 
 	rcu_read_lock();
 	parent = resolve(dc, path, path->ndepth - 1);
@@ -1692,14 +1718,38 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 		return -ENOENT;
 	}
 	name = &path->comp[path->ndepth - 1];
+	bucket = bucket_of(dc, parent, name->hash);
 
-	top = find_top_rcu(dc, parent, name);
-	if (!top) {
-		ret = -ENOENT;
-		goto out;
+	for (;;) {
+		int marked = 0;
+
+		top = find_top_rcu(dc, parent, name);
+		if (!top) {
+			ret = -ENOENT;
+			goto out;
+		}
+		/*
+		 * Take the NAMED TOP'S bucket -- the same head the fold's
+		 * TRANSFER holds across its identity handover -- then RE-VERIFY
+		 * the top under it.  A concurrent fold can transfer between the
+		 * find and the acquire, which leaves the old top unhashed and
+		 * makes a different node the top (of this same bucket, since a
+		 * transfer preserves the name), so an unverified acquire would
+		 * lock the right bucket and then edit the wrong host.  Same
+		 * re-verify dc_unlink does, for the same reason.
+		 */
+		bl_lock(bucket);
+		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next),
+					&marked);
+		if (marked) {
+			bl_unlock(bucket);
+			continue;		/* re-find the current top */
+		}
+		host = host_of_rcu(top);	/* O(1); the chain tail */
+		ret = dc_set_negative(host, 0, id);
+		bl_unlock(bucket);
+		break;
 	}
-	host = host_of_rcu(top);
-	ret = dc_set_negative(host, 0, id);
 out:
 	rcu_read_unlock();
 	return ret;
@@ -1709,10 +1759,11 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 {
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
+	struct urcu_txn_sw_hlist_head *bucket;
 	int ret = 0;
 
 	if (path->ndepth == 0)
-		return -EISDIR;			/* the root is a directory */
+		return -EISDIR;			/* the root is a directory */;
 
 	rcu_read_lock();
 	parent = resolve(dc, path, path->ndepth - 1);
@@ -1721,22 +1772,47 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 		return -ENOENT;
 	}
 	name = &path->comp[path->ndepth - 1];
+	bucket = bucket_of(dc, parent, name->hash);
 
-	top = find_top_rcu(dc, parent, name);
-	if (!top) {
-		ret = -ENOENT;
-		goto out;
+	for (;;) {
+		int marked = 0;
+
+		top = find_top_rcu(dc, parent, name);
+		if (!top) {
+			ret = -ENOENT;
+			goto out;
+		}
+		/*
+		 * Take the NAMED TOP'S bucket -- the same head the fold's
+		 * TRANSFER holds across its identity handover -- then RE-VERIFY
+		 * the top under it.  A concurrent fold can transfer between the
+		 * find and the acquire, which leaves the old top unhashed and
+		 * makes a different node the top (of this same bucket, since a
+		 * transfer preserves the name), so an unverified acquire would
+		 * lock the right bucket and then edit the wrong host.  Same
+		 * re-verify dc_unlink does, for the same reason.
+		 */
+		bl_lock(bucket);
+		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next),
+					&marked);
+		if (marked) {
+			bl_unlock(bucket);
+			continue;		/* re-find the current top */
+		}
+		host = host_of_rcu(top);	/* O(1); the chain tail */
+		if (host->d_isdir) {		/* write-once: no race to lose */
+			bl_unlock(bucket);
+			ret = -EISDIR;
+			goto out;
+		}
+		/* d_id deliberately NOT cleared: clearing it either side of
+		 * the flip races a reader that sampled the other side, no
+		 * reader reads a negative's id, and dc_instantiate rewrites
+		 * it before republishing.  The census skips negatives. */
+		ret = dc_set_negative(host, 1, 0);
+		bl_unlock(bucket);
+		break;
 	}
-	host = host_of_rcu(top);
-	if (host->d_isdir) {			/* write-once: no race to lose */
-		ret = -EISDIR;
-		goto out;
-	}
-	/* d_id deliberately NOT cleared: clearing it either side of the flip
-	 * races a reader that sampled the other side, no reader reads a
-	 * negative's id, and dc_instantiate rewrites it before republishing.
-	 * The census skips negatives (walk_rec). */
-	ret = dc_set_negative(host, 1, 0);
 out:
 	rcu_read_unlock();
 	return ret;
