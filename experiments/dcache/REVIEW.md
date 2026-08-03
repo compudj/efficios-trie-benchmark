@@ -532,9 +532,35 @@ items here are the ones that actually fired in this experiment):
   reaches does not return a clean null — it returns the *cost* of the disabled
   mechanism, which is worse than uninformative because it looks like evidence
   against it.  Rule §4.3 wearing a different hat.
-- **Phase 2 (negative dentries)**: `stack_shell` must copy pos/neg into the
-  shell (today every node is born positive, so top==host coincidentally);
-  this is a recorded dependency of the `d_iparent`-race fix.
+- **Phase 2 (negative dentries)** — *landed, and it priced the thesis.*
+  `dc_add_negative` + `dc_instantiate` across all three engines.  The recorded
+  item (`stack_shell` must copy pos/neg into the shell) was retired rather than
+  done: inode-ness is now authoritative on the content HOST, so a rename cannot
+  disturb it and no shell -- including the exchange's two -- has to carry it.
+
+  **The two engine families answer it differently, and that difference is the
+  thesis being tested.**  The seqlock baseline brackets the transition in the
+  per-dentry `d_seq` it still has, which is exactly what that seqcount is for.
+  The txn engines deleted `d_seq` and paid for it by treating pos/neg as
+  write-once-per-identity -- so `d_instantiate`, a live reachable node changing
+  kind, is precisely the shape that assumption forbids.  They publish it as a
+  single-slot COMMIT on the transacted `d_iparent` instead, the transaction
+  standing in for the seqcount they removed.
+
+  So the honest form of the headline: **`d_seq` dissolves for the operations
+  phase 1 implements**, all of which change the namespace; a state change IN
+  PLACE needs the transaction to stand in for it.  It cost no bytes
+  (`sizeof(dentry)` still 168, name still 48) and nothing per hop -- with no
+  rename in flight the top IS the host, so the reader's match word is already
+  the one carrying the state.
+- ⚠ **Phase 2 remainder: unlink does not leave a negative behind.**  The kernel's
+  `unlink()` on a still-referenced dentry makes it negative, and that is a larger
+  source of negatives than failed lookups.  It is deferred because `dc_unlink`'s
+  "no walk-causality bump is owed" proof rests on unlink being a REMOVE of a
+  terminal -- "the removed node is always a TERMINAL, never an interior
+  waypoint" -- and a negative that survives the call is a live, reachable node
+  changing state.  Adding it re-opens that proof on the COMMON operation, so it
+  wants doing deliberately, not as a rider.
 - **Phase 3 (LRU/shrinker)**: `design/dcache-lru-txn.md`; the mixed SW/MW
   commit is the enabler (SW-owned index + MW-shared LRU head in one commit).
 - **Standing hazard** — *closed, now machine-checked*.  The fold TRANSFER's

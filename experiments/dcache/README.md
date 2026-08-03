@@ -293,8 +293,13 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
    reclaim (real `call_rcu` free), so phase 2/3 reuse the same reclaim path
    instead of forcing a redesign. Phasing:
    - **Phase 1** (now): RCU-core — tree + hash + rename/exchange + walk.
-   - **Phase 2**: negative dentries (payload state + `d_instantiate` transition;
-     doesn't touch the rename mechanism).
+   - **Phase 2** ✅: negative dentries + `d_instantiate`.  It DOES touch the
+     rename mechanism, contrary to the note this line used to carry: inode-ness
+     is authoritative on the content host, so the fold's TRANSFER preserves it
+     rather than adopting the top's.  See REVIEW.md section 6 -- it is where the
+     "`d_seq` dissolves" claim gets priced, because the baseline brackets the
+     transition in a seqcount it still has and the txn engines must publish it
+     through a commit instead.
    - **Phase 3**: LRU + shrinker (makes lifetime/refcount first-class; the
      shrinker is "just another unlink mutator" over the S1 reclaim primitive).
 2. **Baseline** — **faithful `rename_lock` seqcount + per-dentry `d_seq` port**.
