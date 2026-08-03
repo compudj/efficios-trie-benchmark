@@ -885,8 +885,42 @@ items here are the ones that actually fired in this experiment):
   `lru_del` retrying forever on a `prev->next` CAS that loses to a MARKED value,
   with `same-as-old` 0, while every competitor is parked in the lane it holds.
 
-  ⚠⚠ **Nine hypotheses, nine refuted — and the pattern in HOW they failed is the
-  real output of this investigation.**  Almost every one died not to better
+  ⭐⭐ **THE STRONGEST REMAINING LEAD — stale RCU traversers, and it is the only
+  idea that explains the LOCK-vs-MCAS asymmetry** (the earliest and most solid
+  fact we had, and the one every hypothesis above failed to use).
+
+  RCU list deletion deliberately leaves the removed node's `next` pointing into
+  the list, so a traverser already standing on it can finish its walk.  The
+  rotate is `del` immediately followed by `add_tail` **on the same node with no
+  grace period in between**, and `insert_before_prepare`'s plain
+  `newp->next = pos` then rewrites the very pointer such a traverser is about to
+  follow — teleporting it to wherever the node was re-inserted.
+
+  Why that is arm-specific, exactly:
+  - **shard lock** — the rotate runs UNDER the lock, and every traversal takes
+    that same lock, so no traverser can be inside the list at that moment.
+    Immediate re-insertion is safe by exclusion.
+  - **MCAS** — there is no lock; traversal is a lockless
+    `urcu_txn_list_next_rcu()`, run by every writer under `--evict continuous`
+    and by the shrinker under `--evict bursty`.  A traverser CAN be standing on
+    the node.
+
+  It also fits the rest: needs a separate high-frequency evictor (more overlap),
+  stochastic onset (needs the window hit), absorbing (a latched stale
+  predecessor can never satisfy `prev->next : elem -> next`), and the MARKED
+  value the losing CAS sees (that stale predecessor is itself deleted, hence
+  marked).
+
+  ⚠ **Tested by disabling the rotate — still collapses, but the test was
+  INCOMPLETE, so this is untested rather than refuted.**  The rotate is only one
+  of TWO paths that re-insert a previously-removed node with no intervening
+  grace period; the other is `lru_retain()`'s "re-arm after an LRU_REMOVED"
+  (`dcache_lru.h`), which the experiment left in place.  A real test has to close
+  both — or, better, insert a grace period between removal and re-insertion and
+  see the wedge go.
+
+  ⚠⚠ **Ten hypotheses, nine refuted and one untested — and the pattern in HOW
+  they failed is the real output of this investigation.**  Almost every one died not to better
   reasoning but to a probe that was itself wrong: one installer hooked out of
   four; a stale build header; a counter conflating prepare failures with commit
   aborts; a counter read after `end()` had cleared it; a tag tested on an
