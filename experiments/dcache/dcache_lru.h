@@ -278,6 +278,12 @@ static int lru_shards_init(struct dcache *dc)
 #ifdef DC_LRU_MCAS
 /* ======================= THE MCAS ARM (lock-free) ======================= */
 
+static inline struct urcu_txn_list_node *urcu_txn_list_node_ptr(void *v)
+{
+	return (struct urcu_txn_list_node *) ((uintptr_t) v & ~3UL);
+}
+
+
 /*
  * Thin wrappers around the list mutators, so that under -DDC_TXN_STATS the
  * transaction handle is OURS and its in_fallback / retry state is observable.
@@ -314,6 +320,51 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 			continue;
 		return st < 0 ? -1 : 0;
 	}
+}
+
+/*
+ * POST-COMMIT AUDIT of a del, to catch the TRANSITION rather than the aftermath.
+ *
+ * A del applies three edges in ONE commit -- mark the victim's next, unlink it
+ * forward from its predecessor, unlink it backward from its successor -- so a
+ * successful commit must leave all three applied.  A marked-but-still-linked
+ * node means the mark landed and the forward unlink did not, which by MCAS
+ * atomicity should be impossible; walking the list only ever showed us that
+ * state long after the fact.  This checks it at the instant the commit reports
+ * OK, while we still know which three slots were supposed to change.
+ *
+ * Reads are RESOLVED (a slot may legitimately hold a parked descriptor) --
+ * comparing raw values here is exactly the mistake that made the first list
+ * validator report proxies as marks.  Only VIOLATIONS are logged; a quiet run
+ * costs three resolved loads per del.
+ */
+static void lru_del_audit(struct urcu_txn_list_node *n,
+			  struct urcu_txn_list_node *prev,
+			  struct urcu_txn_list_node *next)
+{
+	void *nn_raw = uatomic_load(&n->next, CMM_RELAXED);
+	void *pn = urcu_txn_list_resolve(uatomic_load(&prev->next, CMM_RELAXED));
+	/*
+	 * The MARK must be tested on the RAW value.  urcu_txn_list_resolve()
+	 * returns the LOGICAL pointer and strips it, so resolving first reports
+	 * every successful del as unmarked -- 33k false positives on the first
+	 * run of this audit.  Skip the test entirely if the slot holds a parked
+	 * descriptor (bit 0), which is the mirror-image mistake: testing the mark
+	 * on an unresolved proxy is what made the list validator report proxies
+	 * as marks.  Raw for the mark, resolved for the pointer, and neither for
+	 * a value that is mid-commit.
+	 */
+	int in_flight = ((uintptr_t) nn_raw & 0x1UL) != 0;
+	int bad_mark = !in_flight && !urcu_txn_list_is_marked(nn_raw);
+	int bad_fwd = (urcu_txn_list_node_ptr(pn) == n);
+
+	if (caa_unlikely(bad_mark || bad_fwd)) {
+		DC_TS_DELAUDIT(DC_TS_LRU_DEL, bad_mark, bad_fwd);
+		uatomic_store(&dc_ts_last_slot, (void *) &prev->next, CMM_RELAXED);
+		uatomic_store(&dc_ts_last_old, (void *) n, CMM_RELAXED);
+		uatomic_store(&dc_ts_last_seen, pn, CMM_RELAXED);
+	}
+	(void) next;
 }
 
 static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
@@ -358,9 +409,19 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 			DC_TS_EAGAIN(DC_TS_LRU_DEL);
 			continue;		/* -EAGAIN: successor mid-delete */
 		}
-		st = urcu_txn_commit(&txn);
-		DC_TS_COMMIT(DC_TS_LRU_DEL, &txn, st);
-		urcu_txn_end(&txn);
+		{
+			struct urcu_txn_list_node *pv, *nx;
+
+			pv = urcu_txn_list_node_ptr(urcu_txn_list_resolve(
+				uatomic_load(&n->prev, CMM_RELAXED)));
+			nx = urcu_txn_list_node_ptr(urcu_txn_list_resolve(
+				uatomic_load(&n->next, CMM_RELAXED)));
+			st = urcu_txn_commit(&txn);
+			DC_TS_COMMIT(DC_TS_LRU_DEL, &txn, st);
+			urcu_txn_end(&txn);
+			if (st == URCU_TXN_STATUS_OK && pv && nx)
+				lru_del_audit(n, pv, nx);
+		}
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
 		return st == URCU_TXN_STATUS_OK ? 1 : -1;

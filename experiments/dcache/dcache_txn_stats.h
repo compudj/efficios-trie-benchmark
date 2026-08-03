@@ -78,6 +78,8 @@ struct dc_ts_row {
 	 *   other   a plain, different pointer -- the slot moved on.
 	 */
 	unsigned long seen_same, seen_marked, seen_proxy, seen_other;
+	unsigned long audit_no_mark;	/* commit OK but the victim is NOT marked */
+	unsigned long audit_still_linked;/* commit OK but prev->next STILL names it */
 	unsigned long stale_unmarked;	/* memory says MARKED, prepare proceeded */
 	unsigned long marked_seen;	/* memory says MARKED, prepare agreed */
 	unsigned long poison_set;	/* two records on one slot that do not
@@ -211,6 +213,17 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got)
 	uatomic_store(&dc_ts_last_seen, got, CMM_RELAXED);
 }
 
+static inline void dc_ts_delaudit(enum dc_ts_site s, int no_mark, int linked)
+{
+	struct dc_ts_row *r = dc_ts_row(s);
+
+	if (no_mark)
+		r->audit_no_mark++;
+	if (linked)
+		r->audit_still_linked++;
+}
+
+#define DC_TS_DELAUDIT(site, nm, lk)	dc_ts_delaudit((site), (nm), (lk))
 #define DC_TS_STALE(site)	(dc_ts_row(site)->stale_unmarked++)
 #define DC_TS_MARKEDSEEN(site)	(dc_ts_row(site)->marked_seen++)
 #define DC_TS_DEL_RET(site, ret)	dc_ts_del_ret((site), (ret))
@@ -319,6 +332,8 @@ void dc_txn_stats_dump(void *stream)
 			a.seen_other += r->seen_other;
 			a.poison_set += r->poison_set;
 			a.stale_unmarked += r->stale_unmarked;
+			a.audit_no_mark += r->audit_no_mark;
+			a.audit_still_linked += r->audit_still_linked;
 			a.marked_seen += r->marked_seen;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
@@ -340,6 +355,10 @@ void dc_txn_stats_dump(void *stream)
 		for (k = 0; k < 6; k++)
 			fprintf(f, " [%lu]=%lu", k, a.casfail[k]);
 		fprintf(f, "\n");
+		if (a.audit_no_mark || a.audit_still_linked)
+			fprintf(f, "TXNSTATS %-9s POST-COMMIT AUDIT: not-marked %lu  "
+				"STILL-LINKED %lu\n", name[i], a.audit_no_mark,
+				a.audit_still_linked);
 		if (a.stale_unmarked || a.marked_seen)
 			fprintf(f, "TXNSTATS %-9s raw-MARKED: prepare-agreed %lu  "
 				"PREPARE-PROCEEDED(stale) %lu\n", name[i],
@@ -365,6 +384,7 @@ void dc_txn_stats_dump(void *stream)
 #define DC_TS_RELINK_BAD(site)		do { } while (0)
 #define DC_TS_STALE(site)		do { } while (0)
 #define DC_TS_MARKEDSEEN(site)		do { } while (0)
+#define DC_TS_DELAUDIT(site, nm, lk)	do { } while (0)
 
 #endif	/* DC_TXN_STATS */
 #endif	/* DCACHE_TXN_STATS_H */

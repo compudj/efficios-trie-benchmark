@@ -828,11 +828,41 @@ items here are the ones that actually fired in this experiment):
   flight.  Fixed to classify the two apart and stop at a proxy rather than follow
   it; the numbers above are post-fix.
 
-  Where that leaves it: a del applies its mark and both unlinks in ONE commit, so
-  a marked-but-linked node should be unreachable — yet it is reachable, and the
-  counter drifts with it.  The next step is to catch the transition rather than
-  the aftermath: log every `del` commit's outcome together with the three slots
-  it wrote, and find the one whose mark landed while its forward unlink did not.
+  ⛔ **AND THE CORRUPTION CONCLUSION DOES NOT SURVIVE EITHER.**  A post-commit
+  audit now checks every successful `del` against the three slots it was supposed
+  to change, at the instant it reports OK.  Result: **zero violations** — the
+  mark always lands and the forward unlink always happens.  `del` is atomic and
+  correct.
+
+  Which means the marked-but-linked nodes the walker sees are almost certainly a
+  **legitimate transient**, not corruption: `urcu_txn_settle()` writes its
+  records back **one at a time**, so between the record that marks `elem->next`
+  and the record that repoints `prev->next` the node genuinely IS marked and
+  still linked.  A snapshot taken mid-settle sees exactly that.  The
+  count-vs-walked discrepancies have the same explanation.
+
+  ⚠ **This audit was ALSO wrong on its first run**, in the mirror-image way to
+  the list validator: it resolved the slot before testing the mark, and
+  `urcu_txn_list_resolve()` returns the LOGICAL pointer with the mark stripped —
+  33,359 false "not marked" reports.  **Raw for the mark, resolved for the
+  pointer, and neither for a value mid-commit.**  Between them these two probes
+  got the tag handling wrong in both possible directions.
+
+  **What is actually established**, and all that is:
+  - the wedge is real, absorbing, MCAS-only, and needs a separate high-frequency
+    evictor thread;
+  - the spinning transaction is `lru_del`, holding the escalation lane, with
+    every competitor correctly parked behind it;
+  - it loses to a **MARKED** value — `same-as-old` 0 rules out ABA;
+  - it is **not** poison, not a same-slot merge, not a stale read of the
+    victim's own next, not `settle`, and **not a broken `del`**.
+
+  Everything about the aftermath has now been measured and come back clean, so
+  the next probe should be on the OTHER side: the insert path.  `newp->next = pos`
+  in `insert_before_prepare` is a PLAIN store executed at prepare time, before
+  the commit — so an insert that later aborts has already cleared a mark on a
+  node that is still logically deleted.  Whether that is reachable here is the
+  one hypothesis left standing, and it is testable the same way.
 
   ⚠ **Process note, having been wrong four times here:** three of the four bad
   readings came from *incomplete instrumentation*, not bad reasoning — one
