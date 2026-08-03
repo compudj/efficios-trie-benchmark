@@ -415,6 +415,18 @@ static void test_delete_to_negative(void)
 		      "del: a positive directory takes children again");
 		expect_positive(dc, "/d/sub/kid", 814);
 		CHECK(dc_unlink(dc, P("/d/sub/kid")) == 0, "del: tidy");
+
+		/* dc_add is NOT the only way to gain a child: a RENAME INTO the
+		 * directory is the other one, and it must be refused too. */
+		CHECK(dc_delete(dc, P("/d/sub")) == 0, "del: rmdir again");
+		expect_negative(dc, "/d/sub");
+		CHECK(dc_add_file(dc, P("/d/mv"), 815) == 0, "del: add /d/mv");
+		CHECK(dc_rename(dc, P("/d/mv"), P("/d/sub/mv")) == -ENOENT,
+		      "del: no rename INTO a negative directory");
+		expect_absent(dc, "/d/sub/mv");
+		expect_positive(dc, "/d/mv", 815);
+		CHECK(dc_unlink(dc, P("/d/mv")) == 0, "del: tidy mv");
+		CHECK(dc_instantiate(dc, P("/d/sub"), 813) == 0, "del: restore");
 	} else {
 		CHECK(dc_delete(dc, P("/d/sub")) == -ENOTSUP,
 		      "del: engine declines rmdir-to-negative");

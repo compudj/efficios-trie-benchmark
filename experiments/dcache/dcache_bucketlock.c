@@ -2208,6 +2208,23 @@ static int stack_shell(struct dcache *dc,
 				uatomic_and(&host->d_moving, ~1UL);
 			continue;		/* re-find the current top */
 		}
+		/*
+		 * A NEGATIVE destination directory must not gain a child, and a
+		 * rename INTO it is the SECOND way that can happen -- dc_add is
+		 * the first, and guarding only dc_add left this hole.  Checked
+		 * here, under new_parent->d_child_head: the head dc_delete holds
+		 * while it verifies children_empty and flips the state, which is
+		 * what makes the two atomic.  Not a retry -- the parent stays
+		 * negative until someone instantiates it.
+		 */
+		if (!DC_IS_POSITIVE(new_parent)) {
+			bl_unlock_n(heads, 4);
+			fold_unlock(host);
+			if (cross_parent)
+				uatomic_and(&host->d_moving, ~1UL);
+			ret = -ENOENT;
+			goto out_free;
+		}
 
 		urcu_txn_sw_init(&txn);
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
@@ -2491,6 +2508,17 @@ static int stack_shell(struct dcache *dc,
 			urcu_txn_conflict(&txn);
 			urcu_txn_end(&txn);
 			continue;		/* re-find the current top */
+		}
+		/* See the other stack_shell: a negative destination directory
+		 * must refuse a rename INTO it, checked under its child head. */
+		if (!DC_IS_POSITIVE(new_parent)) {
+			bl_unlock_n(heads, 4);
+			if (cross_parent)
+				uatomic_and(&host->d_moving, ~1UL);
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -ENOENT;
+			goto out_free;
 		}
 
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
@@ -2847,6 +2875,14 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	to_name = &to->comp[to->ndepth - 1];
 	if (__child_lookup(dc, to_parent, to_name))
 		return -EEXIST;
+	/*
+	 * dc_add is NOT the only way a directory gains a child -- a rename INTO
+	 * it is the other, and a NEGATIVE directory must refuse both (see
+	 * dc_delete).  Advisory here; stack_shell re-checks under the destination
+	 * child head lock, which is where it is made atomic against dc_delete.
+	 */
+	if (!DC_IS_POSITIVE(to_parent))
+		return -ENOENT;
 
 	rcu_read_lock();
 	cross = parent_of_rcu(victim) != to_parent;

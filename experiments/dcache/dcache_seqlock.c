@@ -1088,7 +1088,7 @@ unlock:
  * is one even->odd->even transition to lockless walkers, and bumps the victim's
  * own d_seq so a walker mid-compare on it retries.
  */
-static void __d_move(struct dcache *dc, struct dentry *victim,
+static int __d_move(struct dcache *dc, struct dentry *victim,
 		     struct dentry *new_parent, const struct qstr *new_name)
 {
 	struct dentry *old_parent = DC_DPARENT(victim);
@@ -1104,6 +1104,19 @@ static void __d_move(struct dcache *dc, struct dentry *victim,
 	 * the del + add is atomic against a concurrent add/unlink on either chain.
 	 */
 	dirs_wlock2(old_parent, new_parent);
+	/*
+	 * A NEGATIVE destination directory must not gain a child, and a rename
+	 * INTO it is the SECOND way that can happen -- dc_add is the first, and
+	 * guarding only dc_add left this hole.  Checked under new_parent's OWN
+	 * dir lock, which is the lock dc_delete holds while it verifies
+	 * d_children and flips the state; that is what makes the two atomic.
+	 * Only cross-parent can hit it: a negative directory has no children, so
+	 * a same-dir rename under one has nothing to rename.
+	 */
+	if (old_parent != new_parent && !DC_IS_POSITIVE(new_parent)) {
+		dirs_wunlock2(old_parent, new_parent);
+		return -ENOENT;
+	}
 	bl_lock2(ob, nb);
 	write_seqcount_begin(&victim->d_seq);
 	hlist_del_rcu(&victim->d_hash);			/* leave old bucket */
@@ -1127,6 +1140,7 @@ static void __d_move(struct dcache *dc, struct dentry *victim,
 	write_seqcount_end(&victim->d_seq);
 	bl_unlock2(ob, nb);
 	dirs_wunlock2(old_parent, new_parent);
+	return 0;
 }
 
 int dc_rename(struct dcache *dc, const struct dc_path *from,
@@ -1162,6 +1176,11 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	if (cross)
 		pthread_mutex_lock(&dc->vfs_rename_mutex);
 	to_name = &to->comp[to->ndepth - 1];
+	if (!DC_IS_POSITIVE(to_parent)) {
+		/* advisory; __d_move re-checks under to_parent's dir lock */
+		ret = -ENOENT;
+		goto out_unlock;
+	}
 	if (__child_lookup(dc, to_parent, to_name)) {
 		ret = -EEXIST;			/* phase 1: no replace */
 		goto out_unlock;
@@ -1179,7 +1198,7 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	 * its target slot), the same ownership resolve's returned nodes rely on.
 	 */
 	write_seqlock(&dc->rename_lock);
-	__d_move(dc, victim, to_parent, to_name);
+	ret = __d_move(dc, victim, to_parent, to_name);
 	write_sequnlock(&dc->rename_lock);
 out_unlock:
 	if (cross)
