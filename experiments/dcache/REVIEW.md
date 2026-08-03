@@ -732,12 +732,40 @@ items here are the ones that actually fired in this experiment):
   | B | **124,943,648** | 0 | 1 |
   | C | **25,939,515** | 0 | 0 |
 
-  Mode A is the successor-tombstone guard firing forever — a neighbour left
-  MARKED-but-linked.  Mode B is a commit that aborts ~125M times with **all four
-  CAS-loss paths instrumented and still ~0 failures**, i.e. there remains a
-  pre-install abort path inside `desc_commit()` that is neither the descriptor
-  install nor `poisoned` (0) nor `-EAGAIN` (0).  Finding it is the next step, and
-  it is a liburcu question.
+  ⛔ **The "pre-install abort path" does not exist — that table mixed two
+  builds.**  Runs B and C used the binary from *before* the header copy was
+  fixed, so their "≈0 CAS failures" measured a hook that was not there.  Rebuilt
+  and re-measured, aborts and CAS failures match 1:1:
+
+  | run | aborts | `-EAGAIN` | failing record index |
+  |---|--:|--:|---|
+  | 1 | 25,430,784 | 0 | **[3] = 25,430,777** |
+  | 2 | 1 | 299,653,846 | — |
+  | 3 | 124,462,389 | 0 | **[0] = 124,462,385** |
+  | 4 | 6 | 298,772,519 | — |
+
+  So there are two failure modes, both now fully attributed:
+
+  - **Mode A** — the successor-tombstone guard firing forever (`-EAGAIN` ~300M):
+    a neighbour left MARKED-but-linked.
+  - **Mode B** — **one single record loses its install CAS ~100% of the time.**
+    Which index varies by run (0 or 3) because records are slot-address-sorted
+    once `retry != 0`, so the position is an allocation artifact; the shape —
+    *one* record, essentially every attempt — is not.
+
+  ⭐ The remaining question is now narrow and concrete: **why one record's
+  expected-old never matches when every competitor is parked.**  `del_prepare`
+  rebuilds its record set each attempt, so a stale expected-old would have to be
+  surviving inside `urcu_txn_load()`'s RYW view rather than in the caller.  That
+  is one experiment, not a hypothesis: log the failing record's `old` against
+  what the slot actually holds — the `URCU_TXN_CAS_FAIL` hook already passes
+  both, and only the dcache-side sink discards them.
+
+  ⚠ **Process note, having been wrong four times here:** three of the four bad
+  readings came from *incomplete instrumentation*, not bad reasoning — one
+  installer hooked out of four, a stale header, a counter conflating prepare
+  failures with commit aborts, a counter read after `end()` cleared it.  Before
+  trusting a zero in this subsystem, verify the counter can be made non-zero.
 
   <!-- superseded first attempt kept below for the reasoning, not the verdict -->
   The chain that was proposed, and is at most half the story:
