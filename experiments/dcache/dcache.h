@@ -397,6 +397,17 @@ long dc_shrink(struct dcache *dc, long nr);
 unsigned long dc_lru_count(struct dcache *dc);
 
 /*
+ * Which axis the LRU shards on -- "pernode" (default, what the kernel does),
+ * "percpu", or "mm_cid" (rseq's dense per-process concurrency id).  A build arm,
+ * because the trade is real and measurable: finer sharding trivially wins the
+ * enqueue microbenchmark, and what it costs is eviction QUALITY -- N independent
+ * clocks make the global order only as good as the shard balance -- plus a shard
+ * array sized by the machine rather than by the workload.  Per-node keeps one
+ * clock per node, which is why the kernel can still call the result an LRU.
+ */
+const char *dc_lru_arm(void);
+
+/*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam
  * (b)).  0 on success, -ENOENT, -ENOTEMPTY (still has children).
  */

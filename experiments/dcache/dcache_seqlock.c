@@ -254,6 +254,8 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return 0;
 }
 
+const char *dc_lru_arm(void) { return "none"; }
+
 /* rmdir-to-negative: see dcache.h.  free here -- the lock dc_add takes is the one the invariant needs */
 const int dc_delete_dir_supported = 1;
 

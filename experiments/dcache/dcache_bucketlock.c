@@ -1103,7 +1103,35 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
  * Insert at TAIL, evict from HEAD (oldest first), rotate to tail on second
  * chance -- the kernel's order.
  */
-#define DC_LRU_SHARDS	64		/* >= nr_node_ids on anything we run on */
+/*
+ * WHICH AXIS TO SHARD ON is a real question with a measurable answer, so it is a
+ * build arm rather than a decision baked in:
+ *
+ *   default          per NUMA NODE   -- what the kernel does (lru->node[nid]),
+ *                                       and so the faithful arm.  Coarse: every
+ *                                       CPU on a node shares one lock and one
+ *                                       pair of head/tail cachelines.
+ *   -DDC_LRU_PERCPU  per CPU         -- the obvious userspace refinement.  Kills
+ *                                       producer-vs-producer outright, at the
+ *                                       price of a shard array sized by the
+ *                                       MACHINE and an LRU order that is now
+ *                                       fuzzy across CPUs as well as in time.
+ *   -DDC_LRU_MM_CID  per mm_cid      -- rseq's dense per-process concurrency id.
+ *                                       Same isolation as per-CPU while the
+ *                                       shard array is sized by how many threads
+ *                                       are ACTUALLY running, not by how many
+ *                                       CPUs exist, so the shard heads stay in
+ *                                       cache instead of scattering.
+ *
+ * The comparison is the point.  Finer sharding trivially wins the enqueue
+ * microbenchmark; what it costs is eviction QUALITY -- N independent clocks mean
+ * the global order is only as good as the shard balance -- and shard-array
+ * footprint.  Per-node keeps one clock per node, which is why the kernel can
+ * still call the result an LRU.
+ */
+#if defined(DC_LRU_PERCPU) && defined(DC_LRU_MM_CID)
+# error "pick one LRU shard axis"
+#endif
 
 struct dc_lru_shard {
 	unsigned long lock;		/* test-and-set; see fold_lock */
@@ -1115,7 +1143,8 @@ struct dc_lru_shard {
 };
 
 struct dcache {
-	struct dc_lru_shard lru[DC_LRU_SHARDS];
+	struct dc_lru_shard *lru;		/* nlru shards; see lru_shard_index */
+	unsigned int nlru;
 	struct urcu_txn_sw_hlist_head *buckets;
 	unsigned long mask;			/* nbuckets - 1 (power of two) */
 	struct dentry *root;
@@ -1300,14 +1329,47 @@ static inline void lru_unlock(struct dc_lru_shard *sh)
  * silently make this arm FINER-grained than the kernel's and flatter it in
  * exactly the comparison it exists to inform.
  */
-static inline unsigned int lru_node_id(void)
+static inline unsigned int lru_shard_index(const struct dcache *dc)
 {
-	if (caa_likely(rseq_node_id_available())) {
-		unsigned int nid = rseq_current_node_id();
+	unsigned int id;
 
-		return nid < DC_LRU_SHARDS ? nid : nid % DC_LRU_SHARDS;
-	}
-	return 0;
+#if defined(DC_LRU_PERCPU)
+	int raw = rseq_current_cpu_raw();
+
+	id = raw < 0 ? 0u : (unsigned int) raw;
+#elif defined(DC_LRU_MM_CID)
+	id = rseq_mm_cid_available() ? rseq_current_mm_cid() : 0u;
+#else
+	id = rseq_node_id_available() ? rseq_current_node_id() : 0u;
+#endif
+	return id < dc->nlru ? id : id % dc->nlru;
+}
+
+const char *dc_lru_arm(void)
+{
+#if defined(DC_LRU_PERCPU)
+	return "percpu";
+#elif defined(DC_LRU_MM_CID)
+	return "mm_cid";
+#else
+	return "pernode";
+#endif
+}
+
+/* How many shards this arm wants. */
+static unsigned int lru_nshards(void)
+{
+#if defined(DC_LRU_PERCPU)
+	int n = rseq_get_max_nr_cpus();
+
+	return n > 0 ? (unsigned int) n : 1u;
+#elif defined(DC_LRU_MM_CID)
+	int n = rseq_get_max_nr_cpus();		/* mm_cid <= nr_cpus, and dense */
+
+	return n > 0 ? (unsigned int) n : 1u;
+#else
+	return 64u;				/* >= nr_node_ids anywhere we run */
+#endif
 }
 
 /*
@@ -1324,7 +1386,7 @@ static inline void lru_mark_referenced(struct dentry *d)
 /* Add at the TAIL (newest).  Called with no lock held. */
 static void lru_add(struct dcache *dc, struct dentry *d)
 {
-	unsigned int idx = lru_node_id();
+	unsigned int idx = lru_shard_index(dc);
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
 	lru_lock(sh);
@@ -1387,7 +1449,7 @@ unsigned long dc_lru_count(struct dcache *dc)
 	unsigned long n = 0;
 	unsigned int i;
 
-	for (i = 0; i < DC_LRU_SHARDS; i++)
+	for (i = 0; i < dc->nlru; i++)
 		n += uatomic_load(&dc->lru[i].count, CMM_RELAXED);
 	return n;
 }
@@ -1420,6 +1482,19 @@ struct dcache *dc_create(unsigned int nbuckets)
 	for (i = 0; i < n; i++)
 		urcu_txn_sw_hlist_init(&dc->buckets[i]);
 	dc->mask = n - 1;
+#ifndef DC_NO_LRU
+	/* PHASE 3: the LRU shards.  Cacheline-aligned so shards do not share a
+	 * line with each other -- the whole point of sharding is defeated if two
+	 * shards' head/tail/count words sit together. */
+	dc->nlru = lru_nshards();
+	if (posix_memalign((void **) &dc->lru, 64,
+			   (size_t) dc->nlru * sizeof(*dc->lru)) != 0) {
+		free(dc->buckets);
+		free(dc);
+		return NULL;
+	}
+	memset(dc->lru, 0, (size_t) dc->nlru * sizeof(*dc->lru));
+#endif
 	/* One escalation domain type now (the canonical urcu_txn_domain); LIVE only
 	 * for a DC_CHAIN_MIXED build's shell ops, vestigial otherwise. */
 	urcu_txn_domain_init(&dc->domain);
@@ -1460,6 +1535,9 @@ void dc_destroy(struct dcache *dc)
 	rcu_barrier();				/* run the frees they queued */
 	free_subtree(dc->root);
 	free(dc->buckets);
+#ifndef DC_NO_LRU
+	free(dc->lru);
+#endif
 	free(dc);
 }
 
@@ -3723,7 +3801,7 @@ long dc_shrink(struct dcache *dc, long nr)
 	if (nr <= 0)
 		return 0;
 
-	for (i = 0; i < DC_LRU_SHARDS && freed < nr; i++) {
+	for (i = 0; i < dc->nlru && freed < nr; i++) {
 		struct dc_lru_shard *sh = &dc->lru[i];
 		unsigned long scanned = 0, budget;
 

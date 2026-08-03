@@ -540,6 +540,8 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return 0;
 }
 
+const char *dc_lru_arm(void) { return "none"; }
+
 #ifdef DC_IPARENT_TXN
 const int dc_delete_dir_supported = 1;	/* guard/write pair, no lock: see
 					 * dc_set_negative_txn */

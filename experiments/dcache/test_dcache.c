@@ -570,6 +570,75 @@ static void test_delete_to_negative(void)
 }
 
 /*
+ * Shrink until nothing more can be freed, and return the total.
+ *
+ * A single dc_shrink() call is NOT a full drain, and must not be assumed to be:
+ * each shard gets a budget fixed at the start of ITS pass, and every rotation
+ * (second chance, or a directory still populated) spends budget without freeing.
+ * So an entry can legitimately need two or three passes.  Sharding makes that
+ * visible -- with one shard per node a single-threaded test uses one shard and a
+ * big call looks like a drain, while per-CPU spreads the same entries over many
+ * shards and it plainly is not.  Loop instead of encoding either shape.
+ */
+static int census_count(struct dcache *dc)
+{
+	struct collector c = { 0 };
+	int n;
+
+	dc_walk(dc, collect_cb, &c);
+	n = c.n;
+	free(c.e);
+	return n;
+}
+
+/*
+ * Shrink to exhaustion, CONSERVATION-GATED after every pass.
+ *
+ * The gate is what makes the populated-directory rule testable at all, and it
+ * took a vacuous test to notice.  Checking "is /l still there" cannot catch an
+ * eviction that should not have happened: evicting a populated directory
+ * ORPHANS its children -- they stay in the hash but leave the tree -- and a path
+ * lookup of one then resolves THROUGH the missing parent and reports ABSENT, the
+ * same answer a correct eviction gives.  The census walks from the root, so it
+ * cannot see them either.  Nothing downstream distinguishes the two.
+ *
+ * What does distinguish them is the ARITHMETIC.  A correct pass removes exactly
+ * the entries it freed; evicting a populated directory removes the directory AND
+ * everything under it while reporting one.  So assert the census lost exactly
+ * what the shrinker claims to have freed, every pass.  Same conservation
+ * discipline the rest of this harness uses on renames.
+ *
+ * ONE EVICTION PER PASS, and that is load-bearing too.  Freeing in batches hides
+ * the very thing the gate is for: a pass that wrongly evicts a populated
+ * directory goes on to free its orphaned children in the SAME pass, so the
+ * arithmetic balances again by the time the pass ends and nothing looks wrong.
+ * Stepping one at a time is what makes the discrepancy observable -- freed 1,
+ * census lost 26.
+ */
+static long shrink_all(struct dcache *dc)
+{
+	long total = 0, n;
+	int passes = 0, expect = census_count(dc);
+
+	while ((n = dc_shrink(dc, 1)) > 0) {	/* ONE at a time: see below */
+		int now;
+
+		total += n;
+		expect -= (int) n;
+		now = census_count(dc);
+		CHECK(now == expect,
+		      "lru: pass %d freed %ld but the census lost %d (a populated "
+		      "directory was evicted, orphaning its subtree)",
+		      passes + 1, n, expect + (int) n - now);
+		if (++passes > 256) {		/* must converge */
+			CHECK(0, "lru: shrink did not converge (%ld freed)", total);
+			break;
+		}
+	}
+	return total;
+}
+
+/*
  * Phase 3: the LRU and its CLOCK shrinker.
  */
 static void test_lru_shrinker(void)
@@ -648,7 +717,7 @@ static void test_lru_shrinker(void)
 
 	/* Now drain: the leaves go, and the directory follows once it is EMPTY.
 	 * That is the rule working, not failing -- "never while populated". */
-	freed = dc_shrink(dc, 1000);
+	freed = shrink_all(dc);
 	CHECK(freed == 26, "lru: full drain freed %ld, expected 26", freed);
 	expect_absent(dc, "/l");
 	CHECK(dc_lru_count(dc) == 0, "lru: list drained");
@@ -668,19 +737,69 @@ static void test_lru_shrinker(void)
 	CHECK(dc_add_file(dc, P("/s/x"), 4002) == 0, "clock: writing through /s marks it");
 	CHECK(dc_unlink(dc, P("/s/x")) == 0, "clock: /s now empty but REFERENCED");
 
-	/* /s is at the head (added first) and empty, so a FIFO would take it.
-	 * The referenced bit must buy it one pass. */
-	freed = dc_shrink(dc, 1);
-	CHECK(freed == 1, "clock: one eviction, got %ld", freed);
-	CHECK(dc_lookup(dc, P("/s"), NULL) == DC_POSITIVE,
-	      "clock: the REFERENCED entry survived its turn (second chance)");
-	expect_absent(dc, "/t");	/* the unreferenced one went instead */
+	/*
+	 * Both are empty, so FIFO would take /s first (it was added first).  The
+	 * referenced bit must make it go LAST instead.
+	 *
+	 * Asserted as an ORDER, not as a pass count.  Which pass frees what
+	 * depends on how the two landed across shards -- if /t's shard is visited
+	 * first it is freed immediately and /s is not even examined; if /s's is
+	 * first it is rotated and /t freed in the same pass.  Both are correct
+	 * CLOCK behaviour and the earlier draft encoded only the second, so the
+	 * per-CPU arm failed it.  What must hold on every arm is that the
+	 * unreferenced entry dies first.
+	 */
+	{
+		int s_gone = -1, t_gone = -1, pass;
 
-	/* its bit is now cleared, so the next pass takes it */
-	freed = dc_shrink(dc, 1);
-	CHECK(freed == 1, "clock: second pass evicts, got %ld", freed);
-	expect_absent(dc, "/s");
+		for (pass = 1; pass <= 8 && (s_gone < 0 || t_gone < 0); pass++) {
+			dc_shrink(dc, 1);
+			if (s_gone < 0 && dc_lookup(dc, P("/s"), NULL) == DC_ABSENT)
+				s_gone = pass;
+			if (t_gone < 0 && dc_lookup(dc, P("/t"), NULL) == DC_ABSENT)
+				t_gone = pass;
+		}
+		CHECK(t_gone > 0, "clock: /t never evicted");
+		CHECK(s_gone > 0, "clock: /s never evicted");
+		CHECK(t_gone < s_gone,
+		      "clock: the REFERENCED entry must die LAST (/t pass %d, /s pass %d)",
+		      t_gone, s_gone);
+	}
 	CHECK(dc_lru_count(dc) == 0, "clock: drained");
+
+	/*
+	 * A POPULATED DIRECTORY REACHING THE HEAD.  The bulk case above never
+	 * exercises the rule: adding children marks the parent referenced, so the
+	 * first pass rotates it to the tail, BEHIND its own leaves -- by the time
+	 * it comes round again it is empty and legitimately evictable.  Both
+	 * populated-directory checks can be deleted and that test still passes.
+	 *
+	 * Two levels reach the state.  Evict the single grandchild first, and the
+	 * middle directory is left empty while the TOP one is still populated and
+	 * has had its referenced bit cleared -- so the top reaches the head with a
+	 * child under it, which is precisely the case the rule exists for.
+	 */
+	CHECK(dc_add(dc, P("/p"), 5000) == 0, "pop: add /p");
+	CHECK(dc_add(dc, P("/p/q"), 5001) == 0, "pop: add dir /p/q");
+	CHECK(dc_add_file(dc, P("/p/q/x"), 5002) == 0, "pop: add /p/q/x");
+	CHECK(dc_lru_count(dc) == 3, "pop: three on the list");
+
+	/* clears both directories' referenced bits and takes the grandchild */
+	CHECK(dc_shrink(dc, 1) == 1, "pop: the grandchild goes first");
+	expect_absent(dc, "/p/q/x");
+	CHECK(census_count(dc) == 2, "pop: /p and /p/q remain");
+
+	/* /p is now head, unreferenced, and STILL POPULATED */
+	CHECK(dc_shrink(dc, 1) == 1, "pop: one more eviction");
+	CHECK(census_count(dc) == 1,
+	      "pop: freed 1 but the census lost more -- a POPULATED directory was "
+	      "evicted, orphaning its subtree");
+	CHECK(dc_lookup(dc, P("/p"), NULL) == DC_POSITIVE,
+	      "pop: /p survives while it still has a child");
+	expect_absent(dc, "/p/q");
+
+	CHECK(shrink_all(dc) == 1, "pop: the now-empty /p follows");
+	expect_absent(dc, "/p");
 
 	/* An explicit unlink must take the entry OFF the list immediately --
 	 * lazily would gate the free on reclaim instead of the grace period. */
