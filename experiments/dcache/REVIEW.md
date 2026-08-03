@@ -543,9 +543,16 @@ items here are the ones that actually fired in this experiment):
   per-dentry `d_seq` it still has, which is exactly what that seqcount is for.
   The txn engines deleted `d_seq` and paid for it by treating pos/neg as
   write-once-per-identity -- so `d_instantiate`, a live reachable node changing
-  kind, is precisely the shape that assumption forbids.  They publish it as a
-  single-slot COMMIT on the transacted `d_iparent` instead, the transaction
-  standing in for the seqcount they removed.
+  kind, is precisely the shape that assumption forbids.
+
+  ⚠ **What replaces `d_seq` is an ATOMIC RMW, not a transaction** -- and the
+  first answer here was wrong in a way worth keeping on the record.  Phase 2
+  published the flip as a single-slot `urcu_txn_store_sw()` commit and claimed
+  "the transaction stands in for the seqcount".  It does not: `store_sw` *"parks
+  it with a plain store that never fails"*, an SW-only commit never
+  contention-aborts, and **SW is a promise of EXCLUSION across every writer of
+  the slot** -- which the fold's TRANSFER, another writer of that same word,
+  breaks.  See the lost-update item below.
 
   So the honest form of the headline: **`d_seq` dissolves for the operations
   phase 1 implements**, all of which change the namespace; a state change IN
@@ -553,14 +560,58 @@ items here are the ones that actually fired in this experiment):
   (`sizeof(dentry)` still 168, name still 48) and nothing per hop -- with no
   rename in flight the top IS the host, so the reader's match word is already
   the one carrying the state.
-- ⚠ **Phase 2 remainder: unlink does not leave a negative behind.**  The kernel's
-  `unlink()` on a still-referenced dentry makes it negative, and that is a larger
-  source of negatives than failed lookups.  It is deferred because `dc_unlink`'s
-  "no walk-causality bump is owed" proof rests on unlink being a REMOVE of a
-  terminal -- "the removed node is always a TERMINAL, never an interior
-  waypoint" -- and a negative that survives the call is a live, reachable node
-  changing state.  Adding it re-opens that proof on the COMMON operation, so it
-  wants doing deliberately, not as a rider.
+- **Phase 2 remainder (`dc_delete`)** — *landed, and it restated the no-bump
+  proof rather than breaking it.*  `dc_unlink`'s proof says "unlink REMOVES, and
+  the removed node is EMPTY, hence a TERMINAL a reader can only straddle at the
+  leaf".  Neither clause survives a delete that leaves the node hashed.  The
+  proof still holds once restated on the property the two operations share --
+  **the node's LOCATION does not change**.  A bump is owed when a reader's stale
+  prefix can be combined with a node's NEW location to name a path that never
+  existed, and that needs a RELOCATION; a late reader finding something under a
+  node still sitting where it always sat is reporting a real path at a real
+  time.  So the general rule is relocation, and the terminal argument is a
+  corollary.  FILES ONLY: a negative must not be able to gain a child, a
+  `children_empty` check cannot establish that against a concurrent `dc_add`
+  (different slot, no conflict), and `d_isdir` is write-once so `-ENOTDIR`
+  already gives it free.
+
+- ⛔⭐⭐ **THE LOST STATE CHANGE — phase 2's own prediction, come true.**
+  `d0e7955` left the fold's in-place identity write plain, said exactly why that
+  was safe, and dated its own expiry: *"benign today only because rename
+  preserves inode-ness ... but it is UB and a latent correctness bug once
+  phase-2 negative dentries land."*  It landed.  `d_delete`/`d_instantiate`
+  write a live host's `d_iparent` from another thread, so two plain
+  read-modify-writes share one word: the fold reads the host positive, a
+  concurrent delete publishes NEGATIVE, the fold writes back the bit it read,
+  and **the delete is gone with both callers returning success**.
+
+  The fix is a cmpxchg on both sides.  Not `store_mw` (it installs a descriptor
+  every reader must resolve, and the global/per-node arms deliberately leave
+  `d_iparent` untransacted), and **not the bucket lock** even though the fold
+  holds it across the handover: `dc_delete` never takes it, `-DDC_CHAIN_SWMW`
+  has no fold lock at all, and `dcache_txn.c` is lock-free by design.  Measured,
+  not argued — the bucketlock mutant loses the delete identically.
+
+  `repro_delete_fold.c` pins it deterministically on both engines through a new
+  `dc_test_transfer_hook` fired between the fold's read and its write-back, and
+  is mutation-verified: restoring the plain RMW reports *"/d/g reads POSITIVE
+  (id 42) -- the d_delete was LOST"*.
+
+  ⚠ **TSAN then found the other half, which no gate had run**: phase 2 made
+  `host_is_positive` re-read the host's `d_iparent` — the read `d0e7955` had
+  *removed* — so the reader's plain load raced the fold's write.  `iparent_raw`
+  is now a relaxed atomic load.  The rule this pays for: **when a fix works by
+  removing a read, adding that read back is a change to the fix, not a use of
+  it** — and the gate that would have caught it (TSAN) was not in the phase-2
+  gate set.
+
+- ⚠ **The gate matrix must cover the BUILD matrix.**  Phase 2 broke both txn
+  `_nosplit` arms (legacy 3-CL: pos/neg is its own `d_inode` word, no
+  `d_iparent` tags) and no gate noticed, because all seven gate configurations
+  build the DEFAULT split layout while the benchmark matrix also builds
+  `_nosplit` and `_hot1cl`.  A tag-encoded feature is exactly what that axis
+  breaks.  `make check-layouts` now runs the tests — not just the compiler — on
+  the arms the benchmarks build.
 - **Phase 3 (LRU/shrinker)**: `design/dcache-lru-txn.md`; the mixed SW/MW
   commit is the enabler (SW-owned index + MW-shared LRU head in one commit).
 - **Standing hazard** — *closed, now machine-checked*.  The fold TRANSFER's

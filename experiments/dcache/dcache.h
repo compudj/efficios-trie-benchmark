@@ -241,9 +241,15 @@ int dc_add_file(struct dcache *dc, const struct dc_path *path, uint64_t id);
  * inline name), and paid for that by declaring pos/neg a write-once-per-identity
  * property so the reader could test it off the already-loaded d_iparent.
  * Instantiate is a node changing kind while live and reachable, which is the one
- * shape that assumption forbids.  So the txn engines publish the state through a
- * single-slot COMMIT on the transacted d_iparent instead -- the transaction being
- * this engine's replacement for the seqcount it removed.
+ * shape that assumption forbids.
+ *
+ * WHAT REPLACES d_seq IS AN ATOMIC RMW, NOT A TRANSACTION.  Publishing the flip
+ * as a single-slot commit was tried first and is WRONG: urcu_txn_store_sw()
+ * "parks it with a plain store that never fails", an SW-only commit never
+ * contention-aborts, and SW asserts exclusion across EVERY writer of the slot --
+ * which the fold's TRANSFER, another writer of that same word, breaks.  The two
+ * plain read-modify-writes lose an update (see repro_delete_fold.c).  Both
+ * writers use a cmpxchg on the word instead; the reader's load stays plain.
  *
  * The state is authoritative on the content HOST, not on the named top: an inode
  * is content, a rename replaces the name and must not disturb it, and keeping it
