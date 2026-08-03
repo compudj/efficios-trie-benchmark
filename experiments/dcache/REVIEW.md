@@ -570,10 +570,45 @@ items here are the ones that actually fired in this experiment):
   existed, and that needs a RELOCATION; a late reader finding something under a
   node still sitting where it always sat is reporting a real path at a real
   time.  So the general rule is relocation, and the terminal argument is a
-  corollary.  FILES ONLY: a negative must not be able to gain a child, a
-  `children_empty` check cannot establish that against a concurrent `dc_add`
-  (different slot, no conflict), and `d_isdir` is write-once so `-ENOTDIR`
-  already gives it free.
+  corollary.  Files first; **rmdir-to-negative followed**, and it produced the cleanest
+  cost measurement of phase 2 (below).
+
+- ⭐⭐ **rmdir-to-negative: free where a lock already covers the child list,
+  and only there.**  The invariant a negative must hold is that it cannot GAIN a
+  child.  For a FILE that is free on every engine (`d_isdir` is write-once, so
+  `dc_add` already answers `-ENOTDIR`).  A directory can legitimately take one,
+  so `children_empty` must still hold at the instant the state flips — which
+  means excluding a concurrent `dc_add`.  Exposed as a capability
+  (`dc_delete_dir_supported`) because the engines genuinely differ:
+
+  | engine | cost | why |
+  |---|---|---|
+  | `seqlock` | **free** | `dc_add` takes its parent's dir lock; `dc_delete` takes the VICTIM's — the same lock.  Exactly why the kernel's `rmdir` holds the victim's `i_rwsem`. |
+  | `bucketlock` | **free** | `dc_add` takes its parent's `d_child_head` bit-lock; `dc_delete` takes the victim's — the same head, paired with the bucket it already holds. |
+  | `txn` (all-MW) | **`-ENOTSUP`** | lock-free by design: nothing it holds spans the check and the flip. |
+
+  On the two lock-bearing engines the whole price is **one predicted
+  load-and-branch inside a critical section `dc_add` already entered** — no new
+  lock, no read-set entry, nothing on the reader.  It is that cheap only because
+  the lock `dc_add` and the fold already share is the one the invariant needs.
+
+  The all-MW engine's options are both real costs: transact `d_iparent` MW on
+  every arm (a resolving read on the hottest field — what `d0e7955` rejected),
+  or take a per-parent lock in `dc_add` (a cmpxchg on the hot add path).  Left
+  explicit rather than chosen silently.
+
+  ⭐ **This is a second instance of the review's own headline**: the hybrid wins
+  by ending on the kernel's per-bucket lock, and the feature is free precisely
+  where that lock already sits.  The lock-free engine pays for what the
+  lock-bearing ones get for nothing — the same shape as the churn result.
+
+  ⚠ Lock ordering: `dc_delete` must acquire the bucket and the victim's child
+  head **address-ordered together** (`bl_lock2`), not escalate to the child head
+  with the bucket in hand — both are bucket-head-class locks, so escalating
+  deadlocks against a `dc_add` wanting the same pair.  seqlock has the same
+  shape and peeks the victim locklessly to learn its type before locking
+  (`d_isdir` is write-once, so the peek cannot be stale about the type; the
+  re-find under the lock catches a stale *identity*).
 
 - ⛔⭐⭐ **THE LOST STATE CHANGE — phase 2's own prediction, come true.**
   `d0e7955` left the fold's in-place identity write plain, said exactly why that
