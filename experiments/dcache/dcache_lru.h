@@ -614,8 +614,55 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 				break;			/* mid-commit: give up */
 			w = urcu_txn_list_node_ptr(raw);
 		}
-		if (!found)
+		if (!found) {
 			DC_TS_UNLINKED(DC_TS_LRU_DEL);
+			/*
+			 * ONE-SHOT STRUCTURAL DUMP of the ring the node claims to
+			 * be on.  "Not reachable" is a statement about the node;
+			 * this is a statement about the LIST, and they are
+			 * different bugs.  Walk from the sentinel counting live vs
+			 * MARKED nodes and reporting whether the walk returns to
+			 * the sentinel at all -- a walk that neither terminates
+			 * nor comes back is a cycle that does not contain the
+			 * sentinel, which is what a predecessor rescan spins on.
+			 */
+			static int dumped;
+
+			if (!uatomic_cmpxchg(&dumped, 0, 1)) {
+				struct urcu_txn_list_node *q = &csh->list.node;
+				unsigned long live = 0, marked = 0, inflight = 0;
+				int closed = 0;
+
+				for (hops = 0; hops < 100000; hops++) {
+					void *raw = uatomic_load(&q->next,
+								 CMM_RELAXED);
+
+					if ((uintptr_t) raw & 0x1UL)
+						inflight++;
+					if (urcu_txn_list_is_marked(raw))
+						marked++;
+					else
+						live++;
+					q = urcu_txn_list_node_ptr(
+						urcu_txn_list_resolve(raw));
+					if (!q)
+						break;
+					if (q == &csh->list.node) {
+						closed = 1;
+						break;
+					}
+				}
+				fprintf(stderr,
+					"RING shard=%u count=%lu walked=%lu "
+					"live=%lu marked=%lu inflight=%lu "
+					"closed=%d victim=%p\n",
+					st - DC_LRU_ON(0),
+					(unsigned long) uatomic_load(&csh->count,
+								     CMM_RELAXED),
+					hops, live, marked, inflight, closed,
+					(void *) &d->d_lru.link);
+			}
+		}
 	}
 #endif
 	{
@@ -669,6 +716,10 @@ static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 	 * "did not move" and let the caller move on, which is what the shrinker
 	 * already does for a lost del.
 	 */
+#ifdef DC_LRU_NO_MOVE
+	(void) sh; (void) st; (void) r;
+	return 0;			/* PROBE: the move path is neutralised */
+#else
 	st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
 	if (st < DC_LRU_ON(0))
 		return 0;			/* off, or a peer is mid-change */
@@ -697,6 +748,7 @@ static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 		return 0;
 	}
 	return r == 0 ? 1 : -1;
+#endif
 }
 
 /*
