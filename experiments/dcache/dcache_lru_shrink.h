@@ -15,18 +15,31 @@
  * PHASE 3, MCAS ARM: the same CLOCK policy as the lock arm, with no lock at any
  * point.  Each step reads the OLDEST node (the sentinel's successor) and then:
  *
- *   REFERENCED   -> clear the bit, del + add_tail (LRU_ROTATE)
- *   has children -> del (LRU_REMOVED; retain_dentry re-arms it later)
- *   otherwise    -> del, then kill
+ *   REFERENCED   -> clear the bit, rotate head to tail (LRU_ROTATE)
+ *   has children -> rotate (see below: this arm diverges from the kernel here)
+ *   otherwise    -> evict, then remove
  *
  * There is no isolate/drop-the-lock dance here because there is no lock to drop:
- * the del IS the isolation, and it is atomic on both edges.  That is the whole
- * difference this arm exists to price -- the shrinker never shares a lock with
- * dentry ops, at the cost of a descriptor and a multi-CAS on every enqueue and
- * every unlink.
+ * the remove IS the isolation, and it is atomic on all its edges.  That is the
+ * whole difference this arm exists to price -- the shrinker never shares a lock
+ * with dentry ops, at the cost of a descriptor and a multi-CAS on every enqueue
+ * and every unlink.
  *
- * lru_del_claimed() returning 0 means a peer changed the node's state under us
- * (an unlink, or another shrinker); the pass simply moves on.
+ * THE HEAD IS A HINT, RE-READ EVERY ITERATION, and that is what keeps the deque's
+ * no-traversal contract true: this loop never steps from one node to its
+ * successor.  It also means the rotate below rotates whatever is at the head
+ * NOW, which may no longer be @victim if a peer got in between -- acceptable for
+ * a CLOCK, whose order is fuzzy on purpose, and the referenced bit we cleared
+ * belongs to @victim either way.
+ *
+ * TWO SWEEPERS CAN REACH lru_evict_settled() FOR ONE VICTIM, because there is no
+ * claim any more.  That is safe, but it MOVES THE SERIALIZATION POINT from the
+ * LRU word to the eviction itself, so it is stated rather than discovered: both
+ * engines' lru_evict_settled re-verifies under the bucket lock (bucketlock: the
+ * hlist mark; txn: hlist_del_prepare answering -ENOENT, and two commits on the
+ * same slot where one must abort), so exactly one caller reaches call_rcu and
+ * the other answers -EAGAIN.  The loser then rotates, which is a no-op on a
+ * node the winner already removed.
  */
 static long lru_shrink_range(struct dcache *dc, long nr,
 			     unsigned int lo, unsigned int hi)
@@ -35,27 +48,24 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 	unsigned int i;
 
 	for (i = lo; i < hi && freed < nr; i++) {
-		struct dc_lru_shard *sh = &dc->lru[i];
+		struct urcu_txn_deque *q = &dc->lru[i].deque;
 		unsigned long scanned = 0, budget;
 
-		budget = uatomic_load(&sh->count, CMM_RELAXED);
+		budget = uatomic_load(&q->count, CMM_RELAXED);
 		while (freed < nr && scanned++ < budget) {
-			struct urcu_txn_list_node *n;
+			struct urcu_txn_deque_node *n;
 			struct dentry *victim;
 
 			rcu_read_lock();
-			n = urcu_txn_list_next_rcu(&sh->list.node);
-			if (n == &sh->list.node) {	/* empty */
+			n = urcu_txn_deque_head(q);
+			if (!n) {			/* empty */
 				rcu_read_unlock();
 				break;
 			}
 			victim = lru_dentry(n);
 			if (victim->d_lru.referenced) {
 				victim->d_lru.referenced = 0;	/* LRU_ROTATE */
-				/* ONE move, not del + add: the node never leaves
-				 * the list, so no traverser can be standing on
-				 * a node that is about to be re-inserted. */
-				(void) lru_move_tail(dc, victim, i);
+				(void) lru_dq_rotate(dc, q);
 				rcu_read_unlock();
 				continue;
 			}
@@ -63,28 +73,22 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				/*
 				 * IN USE.  The kernel answers LRU_REMOVED here
 				 * and lets a later retain_dentry re-add it, and
-				 * the LOCK arm does the same -- safely, because
-				 * re-adding under the lock cannot race a
-				 * traverser.
+				 * the LOCK arm does the same.
 				 *
-				 * THIS ARM MOVES IT INSTEAD, and the divergence
-				 * is forced by the mechanism rather than chosen.
-				 * A remove here is a GENUINE removal, so the
-				 * re-add that follows is a genuine insert, and
-				 * an insert rewrites `next` on a node a lockless
-				 * traverser may still be standing on -- the one
-				 * hazard a move exists to avoid.  Moving costs
-				 * the same single commit and leaves nothing to
-				 * re-arm: lru_retain()'s re-add path becomes
-				 * reachable only after an allocation failure.
-				 *
-				 * The price is that an in-use entry keeps
-				 * circulating instead of leaving the list, so it
-				 * spends scan budget -- bounded per pass, and
+				 * THIS ARM ROTATES INSTEAD.  Not because a
+				 * removal would be unsafe -- with the deque it
+				 * would be -- but because rotating costs the
+				 * same single commit and leaves nothing to
+				 * re-arm, so lru_retain()'s re-add path stays
+				 * cold.  The price is that an in-use entry keeps
+				 * circulating instead of leaving the deque, so
+				 * it spends scan budget: bounded per pass, and
 				 * the same cost the referenced-bit rotate above
-				 * already pays.
+				 * already pays.  dc_lru_inuse_is_removed tells
+				 * test_dcache.c which of the two it is looking
+				 * at.
 				 */
-				(void) lru_move_tail(dc, victim, i);
+				(void) lru_dq_rotate(dc, q);
 				rcu_read_unlock();
 				continue;
 			}
@@ -92,36 +96,41 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			/*
 			 * EVICT BEFORE UNLINKING.  lru_evict_settled() returns
 			 * -EAGAIN without having mutated anything, so it is safe
-			 * to attempt while @victim is still linked.  Claiming is
-			 * the exclusion; the list is left alone until the
-			 * eviction has actually committed.  A failed attempt
-			 * then just restores the word -- the node never leaves
-			 * the list, so there is nothing to put back, and the
-			 * same-grace-period re-add disappears by construction
-			 * rather than by timing.
+			 * to attempt while @victim is still queued, and the deque
+			 * is left alone until the eviction has actually
+			 * committed.  A failed attempt therefore has nothing to
+			 * put back: the same-grace-period re-add disappears by
+			 * construction rather than by timing, which matters
+			 * because a real grace period is not open to us here --
+			 * the shrinker holds its victim by RCU alone, so leaving
+			 * the read-side section to wait is exactly what would let
+			 * dentry_free_cb reclaim the node it means to re-add.
+			 *
+			 * The remove AFTER the eviction is also why this whole
+			 * loop must stay inside rcu_read_lock(): lru_evict_settled
+			 * has already call_rcu'd the dentry, and only the
+			 * read-side section keeps that free from landing before
+			 * the deque stops pointing at it.
+			 *
+			 * On failure, ROTATE rather than leave it at the head, or
+			 * the sweeper re-examines the same unevictable victim for
+			 * the whole budget.
 			 *
 			 * -DDC_LRU_READD_LEGACY restores the unlink-then-maybe-
-			 * re-add shape below, which is kept only as the A/B
-			 * control that reproduces the live-lock.
+			 * re-add shape below.  On the list that shape live-locked;
+			 * it is kept as the A/B control that says whether the
+			 * deque removed the cause or merely the symptom.
 			 */
-			{
-				unsigned int st = lru_claim(victim);
-
-				if (!st) {
-					rcu_read_unlock();
-					continue;	/* a peer took it */
-				}
-				if (lru_evict_settled(dc, victim) == 0) {
-					lru_unlink_claimed(dc, victim, st);
-					freed++;
-				} else {
-					lru_unclaim(victim, st);
-				}
-				rcu_read_unlock();
-				continue;
+			if (lru_evict_settled(dc, victim) == 0) {
+				lru_del(dc, victim);
+				freed++;
+			} else {
+				(void) lru_dq_rotate(dc, q);
 			}
-#endif
-			if (!lru_del_claimed(dc, victim)) {
+			rcu_read_unlock();
+			continue;
+#else
+			if (!lru_try_del(dc, victim)) {
 				rcu_read_unlock();
 				continue;	/* a peer took it */
 			}
@@ -131,18 +140,16 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			/*
 			 * PROBE: drop the SAME-GRACE-PERIOD re-add.  The unlink
 			 * above and this re-add sit in one read-side critical
-			 * section, so no grace period can separate them -- and
-			 * insert_before_prepare rewrites the node's own next and
-			 * prev with PLAIN stores, under anyone still holding it.
-			 * Leaving the victim off the list costs LRU accuracy and
-			 * nothing else; if the wedge goes away, the same-GP
-			 * re-add is implicated.
+			 * section, so no grace period can separate them.
+			 * Leaving the victim off the deque costs LRU accuracy
+			 * and nothing else.
 			 */
 #else
 			else
 				lru_add_at(dc, victim, i);	/* THIS shard */
 #endif
 			rcu_read_unlock();
+#endif	/* DC_LRU_READD_LEGACY */
 		}
 	}
 	return freed;

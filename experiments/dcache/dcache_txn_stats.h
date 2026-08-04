@@ -39,7 +39,7 @@ enum dc_ts_site {
 	DC_TS_XCHG,		/* exchange */
 	DC_TS_LRU_ADD,		/* LRU enqueue (MCAS arm) */
 	DC_TS_LRU_DEL,		/* LRU removal (MCAS arm) */
-	DC_TS_LRU_EVICT,	/* shrinker's index removal */
+	DC_TS_LRU_ROT,		/* shrinker's second-chance rotate (MCAS arm) */
 	DC_TS_NR
 };
 
@@ -325,7 +325,7 @@ void dc_txn_stats_dump(void *stream)
 	FILE *f = stream;
 	static const char *const name[DC_TS_NR] = {
 		"add", "unlink", "state", "stack", "fold", "exchange",
-		"lru_add", "lru_del", "lru_evict"
+		"lru_add", "lru_del", "lru_rotate"
 	};
 	unsigned long nthr = uatomic_load(&dc_ts_next_slot, CMM_RELAXED);
 	unsigned long t, i, k;

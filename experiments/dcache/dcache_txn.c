@@ -74,7 +74,7 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #ifndef DC_NO_LRU
 #include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
 #ifdef DC_LRU_MCAS
-#include <urcu/rcu-txn-list.h>		/* phase 3: the lock-free LRU arm */
+#include <urcu/rcu-txn-deque.h>		/* phase 3: the lock-free LRU arm */
 #endif
 #endif
 #include <urcu/rcu-txn.h>		/* AFTER the RCU flavor */
@@ -316,12 +316,17 @@ struct dentry {
 	 */
 	struct {
 #ifdef DC_LRU_MCAS
-		struct urcu_txn_list_node link;
+		/*
+		 * The deque node carries its own membership (`owner`, a pointer
+		 * to the shard's deque), so there is NO shard word here: the
+		 * word and the links could disagree, the pointer cannot.
+		 */
+		struct urcu_txn_deque_node dnode;
 #else
 		struct dentry *prev;
 		struct dentry *next;
-#endif
 		unsigned int   shard;
+#endif
 		unsigned char  referenced;
 	} d_lru __attribute__((aligned(64)));
 #endif

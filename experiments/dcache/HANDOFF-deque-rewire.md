@@ -1,125 +1,129 @@
-# Handoff — move the MCAS LRU onto the deque
+# Handoff — the LRU-onto-deque rewire is DONE; one defect is open
 
-2026-08-04. Written at the end of the session that built the deque. Everything
-below is committed and gated unless marked otherwise.
+2026-08-04. Supersedes the pre-rewire version of this file. Everything below is
+committed.
 
-## The decision
+## What landed
 
-**The MCAS LRU moves to `rcu-txn-deque.h`. `rcu-txn-list.h` is no longer
-relevant to the LRU.** Do not port the membership seqcount to the list on the
-LRU's account.
+The MCAS LRU now runs on `<urcu/rcu-txn-deque.h>`. `rcu-txn-list.h` is no longer
+involved in the LRU at all.
 
-Two list fixes stay because they are independently correct for any other user:
+- `d_lru` on the MCAS arm is `struct urcu_txn_deque_node dnode` and **nothing
+  else**: `shard` is gone (it survives only on the lock arm). Membership is
+  `urcu_txn_deque_owner()`.
+- The claim protocol is deleted — `lru_claim` / `lru_unclaim` /
+  `lru_del_claimed` / `lru_unlink_claimed`, `DC_LRU_BUSY`, and `DC_LRU_OFF` /
+  `DC_LRU_ON` on the MCAS arm. `DC_LRU_OFF`/`DC_LRU_ON` are `#ifndef
+  DC_LRU_MCAS` so a surviving use fails to compile rather than quietly
+  reintroducing a second membership record.
+- `lru_move_tail` is gone; the sweeper's second chance is
+  `urcu_txn_deque_rotate_head()`.
+- `dc->lru[i]` is a `struct urcu_txn_deque`; its own approximate `count` is the
+  only counter, so there is nothing left to drift against it.
+- Evict-first is kept. `dc:claim` / `dc:wedge` tracepoints are gone (they
+  instrumented a protocol that no longer exists); `dc:commit` stays.
+- `DC_TS_LRU_EVICT` was dead; it is now `DC_TS_LRU_ROT` and counts rotates.
 
-- `750572af` — `del_prepare` load-validates its derivation read of `&elem->prev`.
-- `b69b4a53` — all five convenience brackets leaked the escalation lane on their
-  `-ENOENT` terminal bail (no `urcu_txn_abandon()` before `end()`), which the
-  contract says holds the domain's lane forever.
+**The decision the old handoff asked to make first**, now stated in
+`dcache_lru_shrink.h`: with no claim, two sweepers can both reach
+`lru_evict_settled()` for one victim. Safe — bucketlock re-verifies the hlist
+mark under `bl_lock2`, txn's `hlist_del_prepare` answers `-ENOENT` and two
+commits on one slot cannot both win — but it **moves the serialization point
+from the LRU word to the eviction**.
 
-## Why the list is the wrong structure here
+Gates green: `make check`, `check-bucketlock`, `check-lru-arms` (9 PASS + 2 ASan
+stress), 390/394 checks, 0 failures.
 
-A move and RCU traversal cannot coexist: a traverser standing on a relocated
-node follows its new `next` and silently skips or repeats a span, and no barrier
-or grace period repairs that — grace periods govern reclamation, not logical
-position. `rcu-txn-list.h` offers both and says nothing.
+## The open defect — READ THIS BEFORE TOUCHING THE LRU
 
-This port has **no LRU read-side traversal at all**: the only read of an LRU link
-outside the mutators is `dcache_lru_shrink.h:47`, one hop off the sentinel,
-re-read every iteration. `dc_lookup` never touches it. So the LRU wants a
-structure whose contract forbids traversal and therefore may offer relocation.
+`deque-design.md` predicted the `DC_LRU_READD_LEGACY` control could be deleted
+once the deque landed. **That prediction is refuted.** The shape is still
+expressible (remove, then push) and it still collapses 0/5.
 
-That also means the rationale written for `lru_move_tail` — protecting "a
-lockless traverser standing on the node" — was **vacuous**. There is no such
-traverser.
+The residual is a **different failure from the list's**, and confusing the two is
+exactly the trap this project fell into before:
 
-## State of the deque
+| | list (old) | deque (now) |
+|---|---|---|
+| lane holder | stuck on a CAS that can never land | **moving** (3 gdb samples 2s apart: `remove_prepare` → `urcu_txn_end` → `urcu_txn_sort_recs`) |
+| other writers | parked | parked in `cds_fair_mutex_park` |
+| call_rcu worker | in `synchronize_rcu()` | in `synchronize_rcu()` |
 
-`include/urcu/rcu-txn-deque.h` in `userspace-rcu-txn`, plus `test_deque.c` here.
+So the starvation half (escalation lane + park-while-online under QSBR) survives,
+and that half is a **liburcu** matter, not this file's.
 
-- PASS at 2, 4, 8, 16, 32 writers, all three operation mixes, checking the
-  `owner <=> reachable` biconditional and both edges at every step.
-- Audited: no plain store in any mutator; every read is either `load_validate`
-  or covered by a write of the same slot. See `91feec07` for the table.
-- `owner` (a pointer to the deque) carries membership, identity and exclusion in
-  the same commit as the edges. No claim protocol, no BUSY state, no deletion
-  mark.
-- ⚠ The per-node `seq` (ABA guard, `05b24b48`) is **UNPROVEN**: compiled out via
-  `-DURCU_TXN_DEQUE_NO_SEQ_GUARD` the test still passes 3/3 at 16 writers. It is
-  committed on argument, not evidence. Keep the macro so that stays measurable.
+But it arrives with a structural violation the deque's contract forbids:
+`dc_lru_validate` reports a shard whose ring reaches a node with `owner == NULL`
+(`first-bad=2`, `walked=9 count=13`). Only three writers touch a node's `next` —
+push (which also sets `owner`), rotate, and remove's `&prev->next : n -> next` —
+so a remove installed an edge naming a node that had **already departed**, i.e.
+its `next` read was stale despite `load_validate` and the per-node `seq` guard.
 
-## The rewire
+The default arm is clean on the same measurement: 3 trials, ~10M `lru_del` each,
+**0 escalations, maxretry 3, 0 disowned nodes in any shard**. So this is not
+"the deque is broken"; it is "the remove-then-push shape reaches a state the
+deque test does not cover".
 
-1. `d_lru` loses `shard` **entirely**: `struct urcu_txn_deque_node dnode`
-   replaces `urcu_txn_list_node link` + `unsigned int shard`. Membership becomes
-   `urcu_txn_deque_owner()`.
-   ⛔ Do NOT cache membership in a second word. That re-creates the
-   two-states-no-commit-covers defect the whole exercise exists to remove; the
-   header says so at the accessor.
-2. Delete the claim protocol: `lru_claim` / `lru_unclaim` / `lru_del_claimed` /
-   `lru_unlink_claimed` and `DC_LRU_OFF|BUSY|ON`. The commit is the exclusion,
-   and `push` answers `-EEXIST` where the claim used to fail.
-3. `dc->lru[i]` becomes a `struct urcu_txn_deque`. `lru_shard_index()` still
-   selects which one. `count` becomes caller-maintained and explicitly
-   approximate.
-4. Shrinker: peek is `urcu_txn_deque_head()`, second chance is
-   `urcu_txn_deque_rotate_head()`. Note it only ever rotates the HEAD, which is
-   exactly the narrowed primitive the deque offers — the general-move hazard
-   never arises.
-5. Keep evict-first (`c404d80`): peek → try evict → `remove()` on success,
-   `rotate_head()` on failure. No claim needed; the loser gets `-ENOENT`.
+**Where to start**: `test_deque.c` hammers **one** deque over a **static** node
+array. The dcache has many shards (a node can migrate between deques) and frees
+nodes via `call_rcu` (memory is reused). Those are the two uncovered axes. Also
+re-run the `-DURCU_TXN_DEQUE_NO_SEQ_GUARD` mutation test here — the guard was
+committed on argument and is still unproven, and this workload is the first that
+might actually exercise it.
 
-**Decide before starting**: with no claim, two sweepers can both reach
-`lru_evict_settled()` for the same victim. That is safe today because its
-bucket-lock re-verify makes one fail — but it moves the serialization point from
-the LRU word to the eviction. State it in the design rather than discovering it.
+⚠ `disowned` is an **amplified** count, not a defect count: a removed node keeps
+stale links by design, so one bad edge sends the walk off the live ring for as
+many hops as those links chain. `first-bad` is the localiser.
 
 ## Measured facts — do not re-derive
 
-- Default MCAS arm is healthy: 4/4 complete, ~1.39–1.42 Mchurn/s under
-  `--evict bursty`. Transacting the node's links changes nothing there.
-- `DC_LRU_READD_LEGACY` still collapses 4/4. It is the kept control.
-- The legacy arm has **two stacked failures**, which is why single fixes kept
-  appearing not to work:
-  1. a retry wedge — suppressed by transacting the re-added node's links
-     (`-DDC_LRU_TXN_LINKS`: WEDGE dumps 1 without the flag, 0 with);
-  2. starvation — writers park behind a shrinker that KEEPS the escalation lane,
-     because `urcu_txn_end()` deliberately retains an escalated handle's lane
-     while the last commit returned ABORT. A caller that aborts often never
-     yields and FIFO fairness never applies.
-- At the wedge: the failing record is `&prev->next : elem -> next`, `want`=elem,
-  `seen`=MARKED — so `prev` is a DELETED node, and `pv->next` names someone else,
-  so the staleness predates its removal.
-- Aborts are **in-lane** (`in-lane ~= aborts`), so nothing is racing the holder;
-  a serialized commit that still fails has an expected-old that is not in memory.
-- The single escalation lane is BY DESIGN and shared with the bucket
-  transactions. Do not "fix" it with per-shard domains.
+`--writers 8 --readers 8 --evict bursty --evict-cap 32`, bucketlock engine:
 
-## Claims retracted this session — do not resurrect
+| arm | completion | Mchurn/s |
+|---|---|---|
+| deque, evict-first (default) | 5/5 | 2.50 2.53 2.54 2.51 2.50 |
+| deque, `-DDC_LRU_READD_LEGACY` | 0/5 (timeout 25-30s) | — |
 
-Each was argued convincingly and refuted by measurement:
+⚠ Those Mchurn/s are **not** comparable to the pre-rewire 1.39-1.42 figure: the
+command line behind that number was never recorded. A list-vs-deque throughput
+claim needs both arms re-run under one command line, and nobody has done that.
 
-- the stale-prev *forward rescan* (`prev_repair`) — reverted; its termination
-  test walks from a hint that may itself be off-ring. The stale-prev *disease*
-  was real; the medicine was `load_validate`.
-- "a corrupt ring / cycle without the sentinel" — the ring dump shows
-  `closed=1 marked=0 count==walked` every time.
-- the six-edge `move_tail` as the cause — `DC_LRU_NO_MOVE`, 6/6 still collapse.
-- word-OFF-while-linked — the claim-site assertion never fires.
-- "plain stores exonerated" — I counted a TIMEOUT as THE WEDGE. They differ.
+## Two upstream fixes that stay (independent of the LRU)
+
+- `750572af` — `urcu_txn_list_del_prepare` load-validates its derivation read of
+  `&elem->prev`.
+- `b69b4a53` — all five list convenience brackets leaked the escalation lane on
+  their `-ENOENT` terminal bail (no `urcu_txn_abandon()` before `end()`).
+
+⭐ The general rule behind both: **an operation that READS a slot it does not
+WRITE must validate that read.** `insert_before`/`move_tail` write the slot they
+derive from, so they need nothing; `del`/`remove` do not.
+
+## Claims retracted before the rewire — do not resurrect
+
+- the stale-prev *forward rescan* (`prev_repair`) — its termination test walks
+  from a hint that may itself be off-ring.
+- "a corrupt ring / cycle without the sentinel" on the list — `closed=1
+  marked=0 count==walked` every time.
+- the six-edge `move_tail` as the cause — `DC_LRU_NO_MOVE`, 6/6 still collapsed.
+- word-OFF-while-linked — the claim-site assertion never fired.
+- "plain stores exonerated" — a TIMEOUT was counted as THE WEDGE. They differ.
 - "the slab lfstack pop is spinning" — one gdb sample of a thread passing
-  through; four samples show it moving.
+  through; four samples showed it moving.
 - "the deque reproduces the dcache wedge at engine level" — same symptom,
   different cause.
 
 ## Method rules earned the hard way
 
-- **Grep for the actual violation marker, not the exit status.** A timeout is
-  not the wedge.
+- **Grep for the actual violation marker, not the exit status.** A timeout is not
+  the wedge.
 - **One gdb sample is not a spin.** Take three, two seconds apart, and check
-  whether frames move.
-- **Verify a probe is live before trusting its zero.** A counter that prints
-  every N stays silent when the failure arrives before N — print on the FIRST
-  call and run a with/without control (`probe ran 1 vs 0`). Bitten 3x.
+  whether frames move. (That is what separated the two failures above.)
+- **Run the control under the same methodology.** The disowned-node finding is
+  only meaningful because the default arm was SIGTERM'd mid-run through the same
+  walk and came back clean.
+- **Verify a probe is live before trusting its zero.** Print on the FIRST call
+  and run a with/without control. Bitten 3x.
 - **Mutation-test every new guard.** If removing it changes nothing, the test
   does not exercise it; say so instead of claiming a fix.
 - **The bench compiles against a COPY** of the urcu headers in
@@ -127,24 +131,22 @@ Each was argued convincingly and refuted by measurement:
   `md5sum` both after every edit. Cost two measurement rounds.
 - `sleep` is blocked in the agent's bash tool; a bare `for` loop is
   instantaneous. Use `python3 -c "import time; time.sleep(N)"`.
-- **An operation that reads a slot it does not write must validate that read.**
-  That is the general shape behind `750572af`: `del`/`remove` read `&elem->prev`
-  and never write it; `insert_before`/`move_tail` write the slot they derive
-  from and so need nothing.
 
 ## Build recipes
 
-    # deque test
+    # deque test (engine level)
     gcc -O2 -g -pthread -march=native -DNWRITERS=16 \
         -I$U/include -I. -o t test_deque.c \
         -L$U/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread
 
-    # the collapse control
-    ... -DDC_LRU_MCAS -DDC_TXN_STATS -DDC_LRU_READD_LEGACY [-DDC_LRU_TXN_LINKS]
+    # the dcache arms (bucketlock engine)
+    CPP="-I../../urcu-txn-build/include -I. -DDC_SPLIT_KEEPID"
+    cc -O2 -g -pthread -march=native $CPP -DDC_MARK_GEN -DDC_LRU_MCAS \
+       [-DDC_TXN_STATS] [-DDC_LRU_READD_LEGACY] \
+       -o churn bench_dcache_churn.c dcache_bucketlock.c \
+       -L../../urcu-txn-build/src/.libs -Wl,-rpath,../../urcu-txn-build/src/.libs \
+       -lurcu-qsbr -lurcu-common -lrseq -lpthread
 
-    # LTTng flight recorder (see the skill; 64K x 4 keeps the ring L2-resident)
-    lttng create dcwedge --snapshot
-    lttng enable-channel --userspace --subbuf-size=64K --num-subbuf=4 ch
-    lttng enable-event --userspace --channel ch 'dc:*'
-
-Gates: `make check`, `check-bucketlock`, `check-lru-arms` — all green at handoff.
+    # counters + the ring dump out of a wedged process
+    ./churn --writers 8 --readers 8 --duration 1000 --evict bursty --evict-cap 32 &
+    kill -TERM $!     # the stats handler dumps TXNSTATS + LRUCHK and _exit(3)s

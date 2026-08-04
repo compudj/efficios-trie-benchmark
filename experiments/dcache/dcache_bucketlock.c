@@ -74,7 +74,7 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #ifndef DC_NO_LRU
 #include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
 #ifdef DC_LRU_MCAS
-#include <urcu/rcu-txn-list.h>		/* phase 3: the lock-free LRU arm */
+#include <urcu/rcu-txn-deque.h>		/* phase 3: the lock-free LRU arm */
 #endif
 #endif
 #include <urcu/rcu-txn.h>		/* the canonical (mixed SW/MW) front-end + URCU_TXN_TAG */
@@ -436,16 +436,19 @@ struct dentry {
 	 */
 	struct {
 #ifdef DC_LRU_MCAS
-		struct urcu_txn_list_node link;	/* transacted bidir edges */
+		/*
+		 * Transacted edges AND transacted membership: `owner` points at
+		 * the shard's deque and is written by the same commit that moves
+		 * the edges, so there is NO shard word on this arm.  A word and
+		 * the links can disagree; a pointer inside the commit cannot.
+		 */
+		struct urcu_txn_deque_node dnode;
 #else
 		struct dentry *prev;		/* NULL when not on a shard */
 		struct dentry *next;
+		unsigned int   shard;		/* DC_LRU_OFF / DC_LRU_ON(i) */
 #endif
-		unsigned int   shard;		/* see DC_LRU_OFF / DC_LRU_BUSY */
 		unsigned char  referenced;	/* DCACHE_REFERENCED analog */
-#ifdef DC_ENABLE_TRACING
-		unsigned char  last_site;	/* diagnostic: last writer of .shard */
-#endif
 	} d_lru __attribute__((aligned(64)));
 #endif
 };

@@ -80,6 +80,11 @@ That gives the invariant the list could not hold:
 `prev` therefore stops being a hint. Nothing can leave a node naming a departed
 predecessor, so no `prev_repair`, no forward rescan, no stale-hint live-lock.
 
+> ⚠ **That last paragraph is NOT yet established under the dcache's workload.**
+> The rewire found a live ring reaching a node with `owner == NULL` — see "What
+> the rewire measured" below. The invariant holds in `test_deque.c` (one deque,
+> static nodes) and fails somewhere the dcache goes and the test does not.
+
 ### Structure
 
 ```c
@@ -156,7 +161,7 @@ This is the subtle inversion and belongs in the header's first paragraph.
 | `lru_move_tail` mutating without owning the node | no claim protocol; the commit is the exclusion |
 | `lru_del` discarding the BUSY answer | no BUSY state exists |
 | same-GP re-add clobbering edges via plain stores | no plain stores; and evict-first keeps the node queued |
-| stale `prev` naming a departed node | every edge CAS'd against prior state |
+| ~~stale link naming a departed node~~ | ⛔ **NOT FIXED** — reproduced on the deque under `-DDC_LRU_READD_LEGACY`; see below |
 | `next == sent` aliasing in a general move | rotate is head-only |
 
 ## Costs, stated honestly
@@ -178,8 +183,12 @@ This is the subtle inversion and belongs in the header's first paragraph.
   belongs.
 - The lock arm is unchanged: under exclusion, unlink+link is atomic and none of
   this applies. It stays the honest A/B control.
-- The `DC_LRU_READD_LEGACY` control can go once the deque lands, since the shape
-  it reproduces will no longer be expressible.
+- ~~The `DC_LRU_READD_LEGACY` control can go once the deque lands, since the shape
+  it reproduces will no longer be expressible.~~ **REFUTED BY MEASUREMENT.** The
+  deque landed and the shape is still expressible (remove, then push), and it
+  still collapses 5/5. The control has therefore earned its keep: it is now a
+  *deque*-level reproducer, not a list-level one. See "What the rewire measured"
+  below.
 
 ## Open question, and it is not about the deque
 
@@ -194,3 +203,48 @@ before the deque's API is frozen — if the sweeper ever gets a hand, `rotate`
 becomes dead weight and the hand needs its own contract (most likely: the hand is
 a *node reference* whose removal transaction is responsible for advancing it,
 which is expressible here precisely because `owner` is transacted).
+
+## What the rewire measured
+
+2026-08-04, bucketlock engine, `--writers 8 --readers 8 --evict bursty
+--evict-cap 32`, uninstrumented 1s runs.
+
+| arm | completion | Mchurn/s |
+|---|---|---|
+| deque, evict-first (default) | **5/5** | 2.50 2.53 2.54 2.51 2.50 |
+| deque, `-DDC_LRU_READD_LEGACY` | **0/5** (all timed out at 25-30s) | — |
+
+Instrumented (`-DDC_TXN_STATS`), SIGTERM mid-run, `lru_del` row:
+
+| arm | attempts | aborts | escalated | maxretry | disowned nodes |
+|---|---|---|---|---|---|
+| default (3 trials, ~10M dels each) | 9.5-10.5M | 3.0-64k | **0** | **3** | **0 in every shard** |
+| legacy | 57-60M | 57-60M | 57-60M | **57M in ONE call** | a departed node spliced into a live ring |
+
+So the deque did *not* remove the legacy arm's collapse, and the residual is a
+**different failure from the list's**, which matters because the two were
+confused before:
+
+- On the list, the lane holder was stuck on a CAS that could never land. Here it
+  is **moving** — three gdb samples two seconds apart show it in
+  `remove_prepare`, then `urcu_txn_end`, then `urcu_txn_sort_recs` — while every
+  other worker is parked in `cds_fair_mutex_park` and the call_rcu worker is
+  inside `urcu_qsbr_synchronize_rcu()`. That is the escalation-lane starvation
+  plus the park-while-online QSBR stall, which is a liburcu matter, not this
+  file's.
+- But it comes with a **structural violation the deque's own contract forbids**:
+  `dc_lru_validate` reports a shard whose ring reaches a node with `owner ==
+  NULL` (`first-bad=2`, `walked=9 count=13`). Only three writers touch a node's
+  `next`: push (which also sets `owner`), rotate, and remove's
+  `&prev->next : n -> next`. So a remove installed an edge naming a node that had
+  already departed — i.e. its `next` read was stale despite `load_validate` and
+  the per-node `seq` guard.
+
+⚠ Read `disowned` as amplified, not as a defect count: a removed node keeps stale
+links by design, so one bad edge sends the walk off the live ring for as many
+hops as those stale links happen to chain. `first-bad` is the localiser.
+
+`test_deque.c` does not cover this: it hammers **one** deque over a **static**
+node array, whereas the dcache has many shards (a node can migrate) and frees
+nodes through `call_rcu` (memory is reused). Those are the two uncovered axes and
+where the next attempt should start.
