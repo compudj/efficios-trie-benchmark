@@ -84,6 +84,27 @@
 #define DC_LRU_BUSY	1u		/* a transition is in flight */
 #define DC_LRU_ON(i)	((i) + 2u)	/* on shard i */
 
+/*
+ * LTTng scaffolding (-DDC_ENABLE_TRACING).  See dcache_tp.h for why these three
+ * events and no others.  Inert -- not even a branch -- in every other build.
+ */
+#ifdef DC_ENABLE_TRACING
+#include "dcache_tp.h"
+#define DC_TP_CLAIM(n, o, s, w, site) \
+	lttng_ust_tracepoint(dc, claim, (n), (o), (s), (w), (site))
+#define DC_TP_COMMIT(n, a, b, op, st) \
+	lttng_ust_tracepoint(dc, commit, (n), (a), (b), (op), (st))
+#define DC_TP_WEDGE(n, nn, np, pv, pvn, nx, nxp, sh) \
+	lttng_ust_tracepoint(dc, wedge, (n), (nn), (np), (pv), (pvn), (nx), \
+			     (nxp), (sh))
+#define DC_TP_SITE(d, s)	((d)->d_lru.last_site = (unsigned char) (s))
+#else
+#define DC_TP_CLAIM(n, o, s, w, site)			do { } while (0)
+#define DC_TP_COMMIT(n, a, b, op, st)			do { } while (0)
+#define DC_TP_WEDGE(n, nn, np, pv, pvn, nx, nxp, sh)	do { } while (0)
+#define DC_TP_SITE(d, s)				do { } while (0)
+#endif
+
 struct dc_lru_shard {
 #ifdef DC_LRU_MCAS
 	/*
@@ -435,11 +456,62 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 {
 	struct urcu_txn txn;
 
+	unsigned long tries = 0;
+
 	urcu_txn_init(&txn, &dc->lru_domain);
 	for (;;) {
 		enum urcu_txn_status st;
 		int p;
 
+#ifdef DC_TXN_STATS
+		/*
+		 * ONE-SHOT SLOT DUMP at the live-lock.  The wedged state is
+		 * STABLE for whole seconds -- a debugger can be attached to it --
+		 * so a single fprintf here cannot perturb the window the way it
+		 * would for a sub-microsecond race.  Print what the retry is
+		 * actually up against: the three nodes the commit derives, and
+		 * whether &prev->next STILL NAMES @n.  Record 1 is
+		 * &prev->next : n -> next, and it is the one losing 33.6M times,
+		 * so this either shows the slot holding @n (the expected-old is
+		 * right and the commit is at fault) or holding something else
+		 * (the derivation is at fault).  It is the difference the
+		 * counters cannot express.
+		 */
+		if (++tries == 200000) {
+			void *nn = uatomic_load(&n->next, CMM_RELAXED);
+			void *np = uatomic_load(&n->prev, CMM_RELAXED);
+			struct urcu_txn_list_node *pv =
+				urcu_txn_list_node_ptr(urcu_txn_list_resolve(np));
+			struct urcu_txn_list_node *nx =
+				urcu_txn_list_node_ptr(urcu_txn_list_resolve(nn));
+			void *pvn = pv ? uatomic_load(&pv->next, CMM_RELAXED) : NULL;
+			void *nxp = nx ? uatomic_load(&nx->prev, CMM_RELAXED) : NULL;
+
+			DC_TP_WEDGE(n, nn, np, pv, pvn, nx, nxp,
+				    uatomic_load(&caa_container_of(n,
+							struct dentry,
+							d_lru.link)->d_lru.shard,
+						 CMM_RELAXED));
+			fprintf(stderr,
+				"WEDGE n=%p next=%p prev=%p | pv=%p pv->next=%p "
+				"(names_n=%d) | nx=%p nx->prev=%p (names_n=%d)\n",
+				(void *) n, nn, np, (void *) pv, pvn,
+				pv && urcu_txn_list_node_ptr(
+					urcu_txn_list_resolve(pvn)) == n,
+				(void *) nx, nxp,
+				nx && urcu_txn_list_node_ptr(
+					urcu_txn_list_resolve(nxp)) == n);
+#ifdef DC_ENABLE_TRACING
+			/*
+			 * Persist the rolling buffer and stop the world, so
+			 * nothing overwrites the window that produced this node.
+			 */
+			if (system("lttng snapshot record 1>&2") == -1)
+				perror("lttng snapshot");
+			abort();
+#endif
+		}
+#endif
 		urcu_txn_begin(&txn);
 		DC_TS_BEGIN(DC_TS_LRU_DEL, &txn);
 		/*
@@ -539,17 +611,67 @@ static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 {
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
-	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_BUSY)
-	    != DC_LRU_OFF)
-		return;				/* someone else owns the change */
+	{
+		unsigned int seen = uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF,
+						    DC_LRU_BUSY);
+
+		DC_TP_CLAIM(&d->d_lru.link, DC_LRU_OFF, seen, DC_LRU_BUSY, 1);
+		DC_TP_SITE(d, 1);
+		if (seen != DC_LRU_OFF)
+			return;			/* someone else owns the change */
+#ifdef DC_ENABLE_TRACING
+		/*
+		 * THE VIOLATION, caught where it happens rather than 35ms later
+		 * where it wedges.  We now own the node because the word said
+		 * OFF -- so the node had BETTER be off the list.  A node that
+		 * left the list did so through del_prepare, which MARKS its
+		 * next; a node that was never added has a NULL next.  Anything
+		 * else is a LINKED node about to have its edges overwritten by
+		 * insert_before_prepare's plain, un-CAS'd prepare-time stores,
+		 * which is how a live predecessor stops naming its successor
+		 * while nothing marks the orphan.  last_site names the code that
+		 * last wrote the word, which is the culprit's signature.
+		 */
+		{
+			void *raw = uatomic_load(&d->d_lru.link.next,
+						 CMM_RELAXED);
+
+			if (raw && !urcu_txn_list_is_marked(raw)) {
+				DC_TP_WEDGE(&d->d_lru.link, raw,
+					    uatomic_load(&d->d_lru.link.prev,
+							 CMM_RELAXED),
+					    NULL, NULL, NULL, NULL,
+					    d->d_lru.last_site);
+				fprintf(stderr,
+					"CLAIMED-A-LINKED-NODE n=%p next=%p "
+					"prev=%p last_site=%u\n",
+					(void *) &d->d_lru.link, raw,
+					uatomic_load(&d->d_lru.link.prev,
+						     CMM_RELAXED),
+					d->d_lru.last_site);
+				if (system("lttng snapshot record 1>&2") == -1)
+					perror("lttng snapshot");
+				abort();
+			}
+		}
+#endif
+	}
 	MLOCK(sh);
 	if (lru_list_add_tail(dc, &d->d_lru.link, &sh->list) != 0) {
 		MUNLOCK(sh);
+		DC_TP_CLAIM(&d->d_lru.link, DC_LRU_BUSY, DC_LRU_BUSY,
+			    DC_LRU_OFF, 7);
+		DC_TP_SITE(d, 7);
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		return;				/* -ENOMEM: simply not listed */
 	}
 	MUNLOCK(sh);
 	uatomic_inc(&sh->count);
+	DC_TP_COMMIT(&d->d_lru.link,
+		     uatomic_load(&d->d_lru.link.prev, CMM_RELAXED),
+		     uatomic_load(&d->d_lru.link.next, CMM_RELAXED), 1, 0);
+	DC_TP_CLAIM(&d->d_lru.link, DC_LRU_BUSY, DC_LRU_BUSY, DC_LRU_ON(idx), 2);
+		DC_TP_SITE(d, 2);
 	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELEASE);
 }
 
@@ -585,8 +707,15 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 
 	if (st < DC_LRU_ON(0))
 		return 0;			/* off, or a peer is mid-change */
-	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
-		return 0;
+	{
+		unsigned int seen = uatomic_cmpxchg(&d->d_lru.shard, st,
+						    DC_LRU_BUSY);
+
+		DC_TP_CLAIM(&d->d_lru.link, st, seen, DC_LRU_BUSY, 3);
+		DC_TP_SITE(d, 3);
+		if (seen != st)
+			return 0;
+	}
 #ifdef DC_TXN_STATS
 	/*
 	 * Is the node we just claimed actually REACHABLE in the shard it says it
@@ -672,6 +801,13 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		if (r == 1)
 			uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
 		MUNLOCK(&dc->lru[st - DC_LRU_ON(0)]);
+		DC_TP_COMMIT(&d->d_lru.link,
+			     uatomic_load(&d->d_lru.link.prev, CMM_RELAXED),
+			     uatomic_load(&d->d_lru.link.next, CMM_RELAXED),
+			     2, r);
+		DC_TP_CLAIM(&d->d_lru.link, DC_LRU_BUSY, DC_LRU_BUSY,
+			    DC_LRU_OFF, 4);
+		DC_TP_SITE(d, 4);
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		if (r < 0)
 			DC_TS_RELINK_BAD(DC_TS_LRU_DEL);
@@ -723,15 +859,25 @@ static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 	st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
 	if (st < DC_LRU_ON(0))
 		return 0;			/* off, or a peer is mid-change */
-	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
-		return 0;
+	{
+		unsigned int seen = uatomic_cmpxchg(&d->d_lru.shard, st,
+						    DC_LRU_BUSY);
+
+		DC_TP_CLAIM(&d->d_lru.link, st, seen, DC_LRU_BUSY, 5);
+		DC_TP_SITE(d, 5);
+		if (seen != st)
+			return 0;
+	}
 
 	MLOCK(sh);
 	r = urcu_txn_list_move_tail_rcu(&d->d_lru.link, &sh->list,
 					&dc->lru_domain);
 	MUNLOCK(sh);
-	if (r != -ENOENT)			/* still linked: restore the claim */
+	if (r != -ENOENT) {			/* still linked: restore the claim */
+		DC_TP_CLAIM(&d->d_lru.link, DC_LRU_BUSY, DC_LRU_BUSY, st, 8);
+		DC_TP_SITE(d, 8);
 		uatomic_store(&d->d_lru.shard, st, CMM_RELEASE);
+	}
 	if (r == -ENOENT) {
 		/*
 		 * A peer deleted it: the node is NOT on the list any more, so
@@ -744,6 +890,9 @@ static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 		 * Measured as CLAIMED-BUT-NOT-LINKED under -DDC_TXN_STATS.
 		 */
 		uatomic_dec(&sh->count);
+		DC_TP_CLAIM(&d->d_lru.link, DC_LRU_BUSY, DC_LRU_BUSY,
+			    DC_LRU_OFF, 6);
+		DC_TP_SITE(d, 6);
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		return 0;
 	}

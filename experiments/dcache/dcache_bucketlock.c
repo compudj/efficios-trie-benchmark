@@ -443,6 +443,9 @@ struct dentry {
 #endif
 		unsigned int   shard;		/* see DC_LRU_OFF / DC_LRU_BUSY */
 		unsigned char  referenced;	/* DCACHE_REFERENCED analog */
+#ifdef DC_ENABLE_TRACING
+		unsigned char  last_site;	/* diagnostic: last writer of .shard */
+#endif
 	} d_lru __attribute__((aligned(64)));
 #endif
 };
