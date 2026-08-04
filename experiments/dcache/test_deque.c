@@ -56,6 +56,7 @@ static unsigned long		g_ops;
 static unsigned long		g_pushed, g_removed, g_rotated, g_exists, g_noent;
 
 struct warg {
+	unsigned long idx;
 	unsigned long seed;
 	unsigned long pushed, removed, rotated, exists, noent;
 };
@@ -75,7 +76,15 @@ static void *writer_fn(void *arg)
 	rcu_thread_online();
 	while (!g_stop) {
 		unsigned long r = xrand(&w->seed);
+#ifdef OPS_DISJOINT
+		/* Each writer owns a private slice, so the only shared slots
+		 * left are the sentinel's.  Distinguishes owner-slot
+		 * contention from sentinel contention. */
+		struct item *it = &g_items[w->idx * (NNODES / NWRITERS)
+					   + (r % (NNODES / NWRITERS))];
+#else
 		struct item *it = &g_items[r % NNODES];
+#endif
 		int op = (int) ((r >> 16) % 8), ret;
 
 		/*
@@ -91,6 +100,12 @@ static void *writer_fn(void *arg)
 #endif
 #ifdef OPS_ONLY_ROTATE
 		op = 6;
+#endif
+#ifdef OPS_ONLY_PUSH
+		op = 0;
+#endif
+#ifdef OPS_ONLY_REMOVE
+		op = 3;
 #endif
 		rcu_read_lock();
 		if (op < 3) {
@@ -233,6 +248,7 @@ int main(void)
 
 	for (i = 0; i < NWRITERS; i++) {
 		memset(&wa[i], 0, sizeof(wa[i]));
+		wa[i].idx = i;
 		wa[i].seed = 0x9e3779b97f4a7c15UL ^ (i + 1) * 0x1234567UL;
 		if (pthread_create(&th[i], NULL, writer_fn, &wa[i]))
 			return 2;
@@ -251,7 +267,12 @@ int main(void)
 	       g_pushed, g_exists, g_removed, g_noent, g_rotated);
 
 	/* A run that never contended proves nothing about the invariant. */
+#if defined(OPS_ONLY_PUSH) || defined(OPS_ONLY_REMOVE) || \
+    defined(OPS_ONLY_ROTATE) || defined(OPS_NO_ROTATE)
+	if (0) {
+#else
 	if (g_exists == 0 || g_noent == 0 || g_rotated == 0) {
+#endif
 		fprintf(stderr,
 			"VACUOUS: the run did not exercise contention "
 			"(EEXIST %lu, ENOENT %lu, rotate %lu)\n",
