@@ -372,6 +372,15 @@ static int lru_insert_tail_prepare(struct urcu_txn *txn,
 	nn = urcu_txn_load(txn, (void **) &n->next, URCU_TXN_TAG);
 	np = urcu_txn_load(txn, (void **) &n->prev, URCU_TXN_TAG);
 
+	{	/* VERIFY THE PROBE IS LIVE.  A negative result from a probe that
+		 * never ran is worth nothing, and this file has already shipped
+		 * two inert ones. */
+		static unsigned long calls;
+
+		if (uatomic_add_return(&calls, 1) == 1)
+			fprintf(stderr, "[TXN_LINKS live: %lu inserts]\n",
+				uatomic_load(&calls, CMM_RELAXED));
+	}
 	ret = urcu_txn_store_mw(txn, (void **) &n->next, nn, sent,
 				URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->prev, np, oldtail,
