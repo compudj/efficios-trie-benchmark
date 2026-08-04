@@ -284,7 +284,9 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 	 * traverser may still hold; keeping the path rare is what keeps that
 	 * exposure rare.  See lru_move_tail().
 	 */
-	lru_add(dc, d);
+#ifndef DC_LRU_NO_READD
+	lru_add(dc, d);		/* see the probe in dcache_lru_shrink.h */
+#endif
 }
 
 
@@ -901,6 +903,40 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 			DC_TS_RELINK_BAD(DC_TS_LRU_DEL);
 		return 1;
 	}
+}
+
+/*
+ * CLAIM / UNCLAIM / UNLINK, split out of lru_del_claimed() so the shrinker can
+ * order them differently: claim, try the eviction, and unlink ONLY if it
+ * succeeded.  See the DC_LRU_EVICT_FIRST arm in dcache_lru_shrink.h -- the
+ * point is that a node we might put back is never taken off the list at all,
+ * which is the only way to avoid a re-add in the unlink's own grace period.
+ * Waiting for a real grace period is not open to us: the shrinker holds its
+ * victim by RCU alone, so leaving the read-side critical section to wait is
+ * what lets dentry_free_cb reclaim the node we meant to re-add.
+ */
+static unsigned int lru_claim(struct dentry *d)
+{
+	unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+
+	if (st < DC_LRU_ON(0))
+		return 0;			/* off, or a peer is mid-change */
+	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
+		return 0;
+	return st;
+}
+
+static void lru_unclaim(struct dentry *d, unsigned int st)
+{
+	uatomic_store(&d->d_lru.shard, st, CMM_RELEASE);
+}
+
+static void lru_unlink_claimed(struct dcache *dc, struct dentry *d,
+			       unsigned int st)
+{
+	if (lru_list_del(dc, &d->d_lru.link) == 1)
+		uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
+	uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 }
 
 /*

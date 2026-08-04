@@ -88,14 +88,60 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				rcu_read_unlock();
 				continue;
 			}
+#ifndef DC_LRU_READD_LEGACY
+			/*
+			 * EVICT BEFORE UNLINKING.  lru_evict_settled() returns
+			 * -EAGAIN without having mutated anything, so it is safe
+			 * to attempt while @victim is still linked.  Claiming is
+			 * the exclusion; the list is left alone until the
+			 * eviction has actually committed.  A failed attempt
+			 * then just restores the word -- the node never leaves
+			 * the list, so there is nothing to put back, and the
+			 * same-grace-period re-add disappears by construction
+			 * rather than by timing.
+			 *
+			 * -DDC_LRU_READD_LEGACY restores the unlink-then-maybe-
+			 * re-add shape below, which is kept only as the A/B
+			 * control that reproduces the live-lock.
+			 */
+			{
+				unsigned int st = lru_claim(victim);
+
+				if (!st) {
+					rcu_read_unlock();
+					continue;	/* a peer took it */
+				}
+				if (lru_evict_settled(dc, victim) == 0) {
+					lru_unlink_claimed(dc, victim, st);
+					freed++;
+				} else {
+					lru_unclaim(victim, st);
+				}
+				rcu_read_unlock();
+				continue;
+			}
+#endif
 			if (!lru_del_claimed(dc, victim)) {
 				rcu_read_unlock();
 				continue;	/* a peer took it */
 			}
 			if (lru_evict_settled(dc, victim) == 0)
 				freed++;
+#ifdef DC_LRU_NO_READD
+			/*
+			 * PROBE: drop the SAME-GRACE-PERIOD re-add.  The unlink
+			 * above and this re-add sit in one read-side critical
+			 * section, so no grace period can separate them -- and
+			 * insert_before_prepare rewrites the node's own next and
+			 * prev with PLAIN stores, under anyone still holding it.
+			 * Leaving the victim off the list costs LRU accuracy and
+			 * nothing else; if the wedge goes away, the same-GP
+			 * re-add is implicated.
+			 */
+#else
 			else
 				lru_add_at(dc, victim, i);	/* THIS shard */
+#endif
 			rcu_read_unlock();
 		}
 	}
