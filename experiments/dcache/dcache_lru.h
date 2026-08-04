@@ -605,6 +605,39 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 			void *pvn = pv ? uatomic_load(&pv->next, CMM_RELAXED) : NULL;
 			void *nxp = nx ? uatomic_load(&nx->prev, CMM_RELAXED) : NULL;
 
+			/*
+			 * WHICH SLOT is the failing record?  in-lane aborts
+			 * mean nothing is racing, so a CAS that still will not
+			 * land has an expected-old that is not in that slot --
+			 * and naming the slot decides between "the mark store
+			 * on &elem->next sees the node already marked" (a stale
+			 * read the transaction's own load did not see) and
+			 * "&next->prev holds a marked value", which the list
+			 * never writes and would mean that memory is no longer
+			 * a live prev slot at all.
+			 */
+			{
+				void *ls = uatomic_load(&dc_ts_last_slot,
+							CMM_RELAXED);
+				const char *which =
+					ls == (void *) &n->next   ? "&elem->next (the MARK store)" :
+					(pv && ls == (void *) &pv->next) ? "&prev->next" :
+					(nx && ls == (void *) &nx->prev) ? "&next->prev" :
+					"NONE OF THE THREE";
+
+				fprintf(stderr,
+					"  failing slot=%p -> %s\n"
+					"    want=%p seen=%p  (marked seen=%d)\n"
+					"    &elem->next=%p &prev->next=%p &next->prev=%p\n",
+					ls, which,
+					uatomic_load(&dc_ts_last_old, CMM_RELAXED),
+					uatomic_load(&dc_ts_last_seen, CMM_RELAXED),
+					((uintptr_t) uatomic_load(&dc_ts_last_seen,
+								  CMM_RELAXED) & 0x2UL) != 0,
+					(void *) &n->next,
+					pv ? (void *) &pv->next : NULL,
+					nx ? (void *) &nx->prev : NULL);
+			}
 			DC_TP_WEDGE(n, nn, np, pv, pvn, nx, nxp,
 				    uatomic_load(&caa_container_of(n,
 							struct dentry,
