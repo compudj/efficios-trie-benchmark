@@ -68,6 +68,80 @@ static unsigned long xrand(unsigned long *s)
 }
 
 /*
+ * COMMIT LOG.  Record what each SUCCESSFUL commit derived, so the corruption
+ * can be replayed against the operations that built it rather than guessed at.
+ * Ring buffer, one atomic index; dumped filtered to the three addresses the
+ * discriminator names.
+ */
+#define HIST_N	(1u << 16)
+struct hev { unsigned long seq; int op; void *n, *a, *b; };
+static struct hev g_hist[HIST_N];
+static unsigned long g_hseq;
+
+static void hist_log(int op, void *n, void *a, void *b)
+{
+	unsigned long i = uatomic_add_return(&g_hseq, 1) - 1;
+	struct hev *e = &g_hist[i & (HIST_N - 1)];
+
+	e->op = op; e->n = n; e->a = a; e->b = b;
+	cmm_smp_wmb();
+	e->seq = i;
+}
+
+static void hist_dump(void *x, void *y, void *z)
+{
+	unsigned long now = uatomic_load(&g_hseq, CMM_RELAXED), i;
+	unsigned long lo = now > HIST_N ? now - HIST_N : 0;
+	static const char *opn[] = { "?", "PUSH", "REMOVE" };
+
+	fprintf(stderr, "-- commit log touching %p / %p / %p --\n", x, y, z);
+	for (i = lo; i < now; i++) {
+		struct hev *e = &g_hist[i & (HIST_N - 1)];
+
+		if (e->seq != i)
+			continue;
+		if (e->n != x && e->n != y && e->n != z &&
+		    e->a != x && e->a != y && e->a != z &&
+		    e->b != x && e->b != y && e->b != z)
+			continue;
+		fprintf(stderr, "  #%lu %-6s n=%p prev=%p next=%p\n",
+			e->seq, opn[e->op], e->n, e->a, e->b);
+	}
+}
+
+/*
+ * PUSH with the same hand-opened bracket, so its derived edges are logged too.
+ */
+static int push_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
+{
+	struct urcu_txn txn;
+
+	urcu_txn_init(&txn, &g_domain);
+	for (;;) {
+		enum urcu_txn_status st;
+		int prep;
+		void *ot;
+
+		urcu_txn_begin(&txn);
+		prep = urcu_txn_deque_push_tail_prepare(&txn, d, n);
+		if (prep) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			return prep;
+		}
+		ot = (void *) urcu_txn_deque_resolve(uatomic_load(
+				(void **) &d->sentinel.prev, CMM_RELAXED));
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		if (st == URCU_TXN_STATUS_OK)
+			hist_log(1, n, ot, &d->sentinel);
+		return st == URCU_TXN_STATUS_OK ? 0 : -ENOMEM;
+	}
+}
+
+/*
  * THE DISCRIMINATOR.  At the livelock one thread retries forever inside the
  * escalation lane while its only competitor is parked -- so nothing can be
  * racing it, and a CAS that still will not land has an expected-old that
@@ -134,6 +208,7 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 				 urcu_txn_deque_owner(n) == d)
 				? "STRUCTURE IS CORRECT -> the ENGINE is failing"
 				: "STRUCTURE IS CORRUPT -> the DEQUE is failing");
+			hist_dump(n, pv, nx);
 			abort();
 		}
 
@@ -144,8 +219,17 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 			urcu_txn_end(&txn);
 			return prep;
 		}
-		st = urcu_txn_commit(&txn);
-		urcu_txn_end(&txn);
+		{
+			void *pv = (void *) urcu_txn_deque_resolve(
+				uatomic_load((void **) &n->prev, CMM_RELAXED));
+			void *nx = (void *) urcu_txn_deque_resolve(
+				uatomic_load((void **) &n->next, CMM_RELAXED));
+
+			st = urcu_txn_commit(&txn);
+			urcu_txn_end(&txn);
+			if (st == URCU_TXN_STATUS_OK)
+				hist_log(2, n, pv, nx);
+		}
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
 		return st == URCU_TXN_STATUS_OK ? 0 : -ENOMEM;
@@ -194,8 +278,7 @@ static void *writer_fn(void *arg)
 #endif
 		rcu_read_lock();
 		if (op < 3) {
-			ret = urcu_txn_deque_push_tail(&g_dq, &it->dn,
-						       &g_domain);
+			ret = push_dbg(&g_dq, &it->dn);
 			if (ret == 0)
 				w->pushed++;
 			else if (ret == -EEXIST)
