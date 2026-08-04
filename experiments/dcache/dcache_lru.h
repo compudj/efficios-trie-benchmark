@@ -338,6 +338,51 @@ static inline struct urcu_txn_list_node *urcu_txn_list_node_ptr(void *v)
  * same convenience bracket with the _prepare form.  The uninstrumented build
  * calls the library's own, unchanged.
  */
+/*
+ * PROBE (-DDC_LRU_TXN_LINKS): the tail insert with the NODE'S OWN LINKS
+ * TRANSACTED instead of plain-stored.
+ *
+ * urcu_txn_list_insert_before_prepare() writes newp->next and newp->prev as
+ * plain stores at prepare time -- un-CAS'd, and not undone on abort.  That is
+ * the last un-transacted write in this arm, and the one mechanism a validate
+ * record cannot fully cover: a validate catches a plain store that CHANGES a
+ * slot it is watching, but nothing puts the plain store itself under conflict
+ * detection.  Make every edge a store_mw and re-run the legacy re-add path.
+ * If it stops collapsing the plain stores are the cause; if it does not, they
+ * are exonerated and the search moves elsewhere.
+ */
+static int lru_insert_tail_prepare(struct urcu_txn *txn,
+				   struct urcu_txn_list_node *n,
+				   struct urcu_txn_list_head *head)
+{
+	struct urcu_txn_list_node *sent = &head->node, *oldtail;
+	void *pn, *nn, *np;
+	int ret;
+
+	oldtail = urcu_txn_list_unmark(
+		urcu_txn_load(txn, (void **) &sent->prev, URCU_TXN_TAG));
+	/* Skip the guard on an empty list: &oldtail->next is then the same slot
+	 * the forward store below already writes. */
+	pn = (oldtail != sent)
+		? urcu_txn_load_validate(txn, (void **) &sent->next,
+					 URCU_TXN_TAG)
+		: urcu_txn_load(txn, (void **) &sent->next, URCU_TXN_TAG);
+	if (urcu_txn_list_is_marked(pn))
+		return -ENOENT;
+	nn = urcu_txn_load(txn, (void **) &n->next, URCU_TXN_TAG);
+	np = urcu_txn_load(txn, (void **) &n->prev, URCU_TXN_TAG);
+
+	ret = urcu_txn_store_mw(txn, (void **) &n->next, nn, sent,
+				URCU_TXN_TAG);
+	ret |= urcu_txn_store_mw(txn, (void **) &n->prev, np, oldtail,
+				 URCU_TXN_TAG);
+	ret |= urcu_txn_store_mw(txn, (void **) &oldtail->next, sent, n,
+				 URCU_TXN_TAG);
+	ret |= urcu_txn_store_mw(txn, (void **) &sent->prev, oldtail, n,
+				 URCU_TXN_TAG);
+	return ret ? -ENOMEM : 0;
+}
+
 #ifdef DC_TXN_STATS
 static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 			     struct urcu_txn_list_head *head)
@@ -423,7 +468,11 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 		 * and that CAS can never match.
 		 */
 		pre = uatomic_load(&n->next, CMM_RELAXED);
+#ifdef DC_LRU_TXN_LINKS
+		p = lru_insert_tail_prepare(&txn, n, head);
+#else
 		p = urcu_txn_list_insert_before_prepare(&txn, n, &head->node);
+#endif
 		if (p) {
 			urcu_txn_conflict(&txn);
 			urcu_txn_end(&txn);
