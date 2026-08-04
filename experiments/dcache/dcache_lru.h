@@ -104,6 +104,19 @@ struct dc_lru_shard {
 	 */
 	struct urcu_txn_list_head list;
 	unsigned long count;			/* atomic; no lock to protect it */
+#ifdef DC_LRU_MCAS_LOCKED
+	/*
+	 * DIAGNOSTIC ARM (-DDC_LRU_MCAS_LOCKED): a shard lock on TOP of the MCAS
+	 * list, serializing every list MUTATION while leaving reads lockless.
+	 *
+	 * It is a bisection, not a design: if the wedge survives with all
+	 * mutations serialized, then it is not a race between mutators at all
+	 * and the MCAS mutation path is broken even single-writer.  If it stops,
+	 * the fault is concurrency between mutators, and the search collapses to
+	 * that.  Either answer halves the remaining space.
+	 */
+	unsigned long mlock;
+#endif
 	char pad[64 - (sizeof(unsigned long) +
 		       sizeof(struct urcu_txn_list_head)) % 64];
 #else
@@ -481,6 +494,25 @@ static inline int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 #endif
 
 /* dentry <-> list node */
+#ifdef DC_LRU_MCAS_LOCKED
+static inline void mlock_acquire(struct dc_lru_shard *sh)
+{
+	while (uatomic_cmpxchg(&sh->mlock, 0UL, 1UL) != 0UL)
+		caa_cpu_relax();
+	cmm_smp_mb();
+}
+
+static inline void mlock_release(struct dc_lru_shard *sh)
+{
+	uatomic_store(&sh->mlock, 0UL, CMM_RELEASE);
+}
+#define MLOCK(sh)	mlock_acquire(sh)
+#define MUNLOCK(sh)	mlock_release(sh)
+#else
+#define MLOCK(sh)	do { } while (0)
+#define MUNLOCK(sh)	do { } while (0)
+#endif
+
 static inline struct dentry *lru_dentry(struct urcu_txn_list_node *n)
 {
 	return caa_container_of(n, struct dentry, d_lru.link);
@@ -498,10 +530,13 @@ static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_BUSY)
 	    != DC_LRU_OFF)
 		return;				/* someone else owns the change */
+	MLOCK(sh);
 	if (lru_list_add_tail(dc, &d->d_lru.link, &sh->list) != 0) {
+		MUNLOCK(sh);
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		return;				/* -ENOMEM: simply not listed */
 	}
+	MUNLOCK(sh);
 	uatomic_inc(&sh->count);
 	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELEASE);
 }
@@ -546,6 +581,7 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		DC_TS_DEL_RET(DC_TS_LRU_DEL, r);
 		if (r == 1)
 			uatomic_dec(&dc->lru[st - DC_LRU_ON(0)].count);
+		MUNLOCK(&dc->lru[st - DC_LRU_ON(0)]);
 		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
 		if (r < 0)
 			DC_TS_RELINK_BAD(DC_TS_LRU_DEL);
@@ -575,8 +611,10 @@ static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 	struct dc_lru_shard *sh = &dc->lru[idx];
 	int r;
 
+	MLOCK(sh);
 	r = urcu_txn_list_move_tail_rcu(&d->d_lru.link, &sh->list,
 					&dc->lru_domain);
+	MUNLOCK(sh);
 	if (r == -ENOENT)
 		return 0;			/* a peer deleted it */
 	return r == 0 ? 1 : -1;

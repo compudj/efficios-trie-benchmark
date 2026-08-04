@@ -1015,6 +1015,31 @@ items here are the ones that actually fired in this experiment):
   pairs gone from the MCAS arm.  So the whole re-insert-after-remove family is
   now eliminated as the cause, not just the rotate.
 
+  ⭐⭐ **AND A SHARD LOCK OVER EVERY MCAS MUTATION DOES NOT FIX IT EITHER**
+  (`-DDC_LRU_MCAS_LOCKED`, a bisection arm: the shard lock reinstated on TOP of
+  the transacted list, serializing all mutations while leaving reads lockless).
+  **5/5 collapse.**  Correctness holds (390 checks) and `--evict continuous`
+  completes, so the arm works.
+
+  That is the sharpest cut yet, because it removes an entire class rather than
+  one mechanism: **the wedge is NOT a race between mutators.**  With the lock
+  held there is exactly one mutator on a shard at a time, its transaction runs
+  to completion inside the lock, and `lru_del` still retries forever against a
+  list nobody else is touching.
+
+  What that leaves, and it is a much smaller set:
+  - a stale read INSIDE the failing transaction's own view (its expected-old
+    never matches a slot no one else is changing);
+  - state left behind by an EARLIER failed transaction — a leaked proxy or a
+    half-settled record — which every later attempt then trips over;
+  - or something outside the list entirely that only correlates with it.
+
+  ⚠ Note the corollary: the lock arm and the locked-MCAS arm now differ ONLY in
+  which machinery performs the list edit, with identical serialization — and one
+  wedges while the other does not.  That is as clean a control as this
+  investigation has had, and it points squarely at the transaction machinery
+  rather than at how the dcache drives it.
+
   ⚠ This supersedes the shell/fold sketch below AS A ROTATE FIX, which solved the
   wrong problem:
   the shell exists to let a node be re-added while stale traversers hold it, and
