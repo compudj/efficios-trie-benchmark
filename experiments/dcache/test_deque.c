@@ -73,19 +73,40 @@ static unsigned long xrand(unsigned long *s)
  * Ring buffer, one atomic index; dumped filtered to the three addresses the
  * discriminator names.
  */
-#define HIST_N	(1u << 16)
-struct hev { unsigned long seq; int op; void *n, *a, *b; };
+#define HIST_N	(1u << 21)
+struct hev { unsigned long seq; int op; int st; void *n, *a, *b; };
 static struct hev g_hist[HIST_N];
 static unsigned long g_hseq;
 
-static void hist_log(int op, void *n, void *a, void *b)
+/*
+ * Log EVERY outcome, not just OK.  The previous version recorded successes
+ * only, which left two explanations standing for a node that is queued with no
+ * push behind it: a commit that reported OK without applying all its slots, or
+ * simply a missing log entry.  Recording the bails and the failed commits
+ * separates them -- in particular a push answering -EEXIST after the node's
+ * last remove proves owner was still set, i.e. that remove's commit reported OK
+ * without applying &n->owner.
+ */
+static void hist_log(int op, int st, void *n, void *a, void *b)
 {
 	unsigned long i = uatomic_add_return(&g_hseq, 1) - 1;
 	struct hev *e = &g_hist[i & (HIST_N - 1)];
 
-	e->op = op; e->n = n; e->a = a; e->b = b;
+	e->op = op; e->st = st; e->n = n; e->a = a; e->b = b;
 	cmm_smp_wmb();
 	e->seq = i;
+}
+
+static const char *stn(int v)
+{
+	switch (v) {
+	case 0:		return "OK";
+	case -EEXIST:	return "EEXIST";
+	case -ENOENT:	return "ENOENT";
+	case -EAGAIN:	return "EAGAIN";
+	case 1:		return "ABORT";
+	default:	return "ERR";
+	}
 }
 
 static void hist_dump(void *x, void *y, void *z)
@@ -104,8 +125,8 @@ static void hist_dump(void *x, void *y, void *z)
 		    e->a != x && e->a != y && e->a != z &&
 		    e->b != x && e->b != y && e->b != z)
 			continue;
-		fprintf(stderr, "  #%lu %-6s n=%p prev=%p next=%p\n",
-			e->seq, opn[e->op], e->n, e->a, e->b);
+		fprintf(stderr, "  #%lu %-6s %-8s n=%p prev=%p next=%p\n",
+			e->seq, opn[e->op], stn(e->st), e->n, e->a, e->b);
 	}
 }
 
@@ -125,6 +146,7 @@ static int push_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_deque_push_tail_prepare(&txn, d, n);
 		if (prep) {
+			hist_log(1, prep, n, NULL, NULL);
 			urcu_txn_abandon(&txn);
 			urcu_txn_end(&txn);
 			return prep;
@@ -133,10 +155,11 @@ static int push_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 				(void **) &d->sentinel.prev, CMM_RELAXED));
 		st = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
+		hist_log(1, st == URCU_TXN_STATUS_OK ? 0 :
+			 (st == URCU_TXN_STATUS_ABORT ? 1 : -5), n, ot,
+			 &d->sentinel);
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
-		if (st == URCU_TXN_STATUS_OK)
-			hist_log(1, n, ot, &d->sentinel);
 		return st == URCU_TXN_STATUS_OK ? 0 : -ENOMEM;
 	}
 }
@@ -215,6 +238,7 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_deque_remove_prepare(&txn, d, n);
 		if (prep) {
+			hist_log(2, prep, n, NULL, NULL);
 			urcu_txn_abandon(&txn);
 			urcu_txn_end(&txn);
 			return prep;
@@ -227,8 +251,9 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 
 			st = urcu_txn_commit(&txn);
 			urcu_txn_end(&txn);
-			if (st == URCU_TXN_STATUS_OK)
-				hist_log(2, n, pv, nx);
+			hist_log(2, st == URCU_TXN_STATUS_OK ? 0 :
+				 (st == URCU_TXN_STATUS_ABORT ? 1 : -5),
+				 n, pv, nx);
 		}
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
