@@ -386,6 +386,19 @@ static int verify(void)
 		fail = 1;
 	}
 
+	/* 1b. seq must stay EVEN: bit 0 is the engine's descriptor proxy tag on
+	 * every transacted slot, so an odd value means either a leaked proxy or
+	 * a bump by 1 somewhere. */
+	for (i = 0; i < NNODES; i++) {
+		if (g_items[i].dn.seq & 1UL) {
+			fprintf(stderr,
+				"FAIL: node %lu seq=%lu is ODD -- bit 0 is the "
+				"proxy tag and must stay clear\n",
+				i, g_items[i].dn.seq);
+			fail = 1;
+		}
+	}
+
 	/* 2. THE BICONDITIONAL, over every node -- owner set <=> reachable */
 	for (i = 0; i < NNODES; i++) {
 		int has_owner = g_items[i].dn.owner != NULL;
@@ -410,8 +423,15 @@ static int verify(void)
 		fprintf(stderr, "FAIL: %lu owned vs %lu walked\n", owned, walked);
 		fail = 1;
 	}
-	printf("  ring: %lu nodes, closed, both edges agree, owner<=>reachable\n",
-	       walked);
+	{
+		unsigned long tot = 0;
+
+		for (i = 0; i < NNODES; i++)
+			tot += g_items[i].dn.seq;
+		printf("  ring: %lu nodes, closed, both edges agree, "
+		       "owner<=>reachable; seq total %lu (all even)\n",
+		       walked, tot);
+	}
 	free(seen);
 	return fail;
 }
