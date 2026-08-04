@@ -67,6 +67,91 @@ static unsigned long xrand(unsigned long *s)
 	return *s;
 }
 
+/*
+ * THE DISCRIMINATOR.  At the livelock one thread retries forever inside the
+ * escalation lane while its only competitor is parked -- so nothing can be
+ * racing it, and a CAS that still will not land has an expected-old that
+ * memory does not hold.  Two possibilities, and they point at opposite code:
+ *
+ *   the structure is CORRECT here (owner == d, prev->next == n,
+ *   next->prev == n)  =>  every expected-old the prepare records IS what
+ *   memory holds, and the commit is failing anyway   =>  ENGINE
+ *
+ *   the structure is CORRUPT  =>  the deque's own prepares built it wrong
+ *   =>  DEQUE
+ *
+ * So open the bracket by hand, count the retries, and dump the three edges the
+ * prepare derives against what memory actually holds.
+ */
+static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
+{
+	struct urcu_txn txn;
+	unsigned long tries = 0;
+
+	urcu_txn_init(&txn, &g_domain);
+	for (;;) {
+		enum urcu_txn_status st;
+		int prep;
+
+		if (++tries == 100000) {
+			struct urcu_txn_deque_node *pv, *nx, *w;
+			unsigned long hop = 0;
+			int reach = 0;
+
+			pv = urcu_txn_deque_resolve(
+				uatomic_load((void **) &n->prev, CMM_RELAXED));
+			nx = urcu_txn_deque_resolve(
+				uatomic_load((void **) &n->next, CMM_RELAXED));
+			w = urcu_txn_deque_resolve(uatomic_load(
+				(void **) &d->sentinel.next, CMM_RELAXED));
+			while (w && w != &d->sentinel && hop++ < 4096) {
+				if (w == n) { reach = 1; break; }
+				w = urcu_txn_deque_resolve(uatomic_load(
+					(void **) &w->next, CMM_RELAXED));
+			}
+			fprintf(stderr,
+				"LIVELOCK n=%p owner=%p(want %p) reachable=%d\n"
+				"   n->prev=%p  pv->next=%p  names_n=%d\n"
+				"   n->next=%p  nx->prev=%p  names_n=%d\n"
+				"   => %s\n",
+				(void *) n, (void *) urcu_txn_deque_owner(n),
+				(void *) d, reach,
+				(void *) pv,
+				pv ? (void *) uatomic_load((void **) &pv->next,
+							   CMM_RELAXED) : NULL,
+				pv && urcu_txn_deque_resolve(uatomic_load(
+					(void **) &pv->next, CMM_RELAXED)) == n,
+				(void *) nx,
+				nx ? (void *) uatomic_load((void **) &nx->prev,
+							   CMM_RELAXED) : NULL,
+				nx && urcu_txn_deque_resolve(uatomic_load(
+					(void **) &nx->prev, CMM_RELAXED)) == n,
+				(pv && nx &&
+				 urcu_txn_deque_resolve(uatomic_load(
+					(void **) &pv->next, CMM_RELAXED)) == n &&
+				 urcu_txn_deque_resolve(uatomic_load(
+					(void **) &nx->prev, CMM_RELAXED)) == n &&
+				 urcu_txn_deque_owner(n) == d)
+				? "STRUCTURE IS CORRECT -> the ENGINE is failing"
+				: "STRUCTURE IS CORRUPT -> the DEQUE is failing");
+			abort();
+		}
+
+		urcu_txn_begin(&txn);
+		prep = urcu_txn_deque_remove_prepare(&txn, d, n);
+		if (prep) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			return prep;
+		}
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		return st == URCU_TXN_STATUS_OK ? 0 : -ENOMEM;
+	}
+}
+
 static void *writer_fn(void *arg)
 {
 	struct warg *w = arg;
@@ -116,7 +201,7 @@ static void *writer_fn(void *arg)
 			else if (ret == -EEXIST)
 				w->exists++;
 		} else if (op < 6) {
-			ret = urcu_txn_deque_remove(&g_dq, &it->dn, &g_domain);
+			ret = remove_dbg(&g_dq, &it->dn);
 			if (ret == 0)
 				w->removed++;
 			else if (ret == -ENOENT)
