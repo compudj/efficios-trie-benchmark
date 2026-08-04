@@ -1,4 +1,7 @@
-# Handoff — the LRU-onto-deque rewire is DONE; one defect is open
+# Handoff — the LRU-onto-deque rewire is DONE; a PORT-WIDE defect is open
+
+> ⚠ Read the **2026-08-04 (later)** section at the end FIRST: it supersedes two
+> conclusions in the middle of this file.
 
 2026-08-04. Supersedes the pre-rewire version of this file. Everything below is
 committed.
@@ -78,9 +81,15 @@ was uninterpretable. Split into `DC_LRU_NO_SHRINK_READD` /
 It is the **shrinker's own put-back**: it removes the victim, holds it by RCU
 alone, a concurrent `dc_unlink` finds the node already off (so its `lru_del` does
 nothing) and `call_rcu`s it, and the sweeper then pushes a dentry pending free
-back onto a deque. That is precisely the window **evict-first closes**, which is
-why the default arm is clean. The legacy shape is not merely slower — it is
-unsafe for this caller, whatever structure the LRU is built on.
+back onto a deque. That is precisely the window **evict-first closes**. The
+legacy shape is not merely slower — it is unsafe for this caller, whatever
+structure the LRU is built on.
+
+⚠ **"which is why the default arm is clean" — SUPERSEDED.** That was measured
+under `--evict bursty` only. Under `--evict continuous` the default arm fires
+too, through a SECOND pusher (`lru_retain`'s re-arm) that this 2x2 could not see
+because bursty's window is too narrow. And the LOCK arm fires under BOTH
+cadences. See the 2026-08-04 (later) section at the end of this file.
 
 The remaining half of the legacy collapse (lane holder moving, everyone parked,
 call_rcu worker in `synchronize_rcu()`) is escalation-lane starvation plus the
@@ -242,3 +251,80 @@ derive from, so they need nothing; `del`/`remove` do not.
     # counters + the ring dump out of a wedged process
     ./churn --writers 8 --readers 8 --duration 1000 --evict bursty --evict-cap 32 &
     kill -TERM $!     # the stats handler dumps TXNSTATS + LRUCHK and _exit(3)s
+
+---
+
+## 2026-08-04 (later): re-measured, and the picture is WIDER than "the deque"
+
+Question asked: is the MCAS deque still collapsing? Direct answer: **not under
+the cadence I had been testing, and I had only been testing one.**
+
+`--evict bursty`, bucketlock engine, MCAS deque, 5 trials per point:
+
+| writers | 8 | 16 | 32 | 48 | 96 | 192 |
+|---|---|---|---|---|---|---|
+| complete | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| Mchurn/s | 2.44-2.60 | 3.40-3.61 | 3.98-4.19 | 3.41-3.61 | 1.81-1.89 | 0.98-1.02 |
+
+30/30 complete, and `-DDC_LRU_FREE_ASSERT` fires **0** times at 8/32/96/192.
+
+Then I ran the OTHER cadence, and the whole framing changed:
+
+| engine / LRU arm | `--evict bursty` | `--evict continuous` |
+|---|---|---|
+| bucketlock, MCAS deque | clean 30/30, 0 hits | **FREE-WHILE-QUEUED** |
+| bucketlock, LOCK | **FREE-WHILE-QUEUED 3/3** | **FREE-WHILE-QUEUED** |
+| txn, MCAS deque | — | **hangs 3/3** (escalation lane) |
+| txn, LOCK | — | 2/3 ok, 1 SEGV, 0 hits |
+
+### ⛔ So it is a PORT-wide defect, not the deque's, and not even MCAS's
+
+**The LOCK arm — the honest A/B control — is the worst affected**: it frees
+linked dentries under BOTH cadences. Verified with a second, independent
+witness, not just the state word: the free callback walks the shard chain under
+that shard's lock and reports `chain-reachable=1`, with `prev=(nil)`, i.e. the
+victim is the shard HEAD.
+
+One root cause, two entry points. Nothing prevents a dentry from being
+**(re-)added to the LRU after it has been evicted/unlinked and handed to
+call_rcu**. Mainline is protected by the refcount — `dentry_lru_isolate` holds
+one — and this port deliberately has no refcount (readers take none) and never
+replaced that protection on the LRU side.
+
+    pusher 1  lru_retain's re-arm          both arms; the ONLY one on the
+                                           MCAS default arm.  Disabling it
+                                           (-DDC_LRU_NO_RETAIN_READD) takes the
+                                           MCAS arm to 9/9 clean under
+                                           continuous.
+    pusher 2  the shrinker's put-back      lock arm ALWAYS (unlink, try evict,
+              after a failed evict         link_tail on failure); MCAS legacy
+                                           arm.  Disabling pusher 1 does NOT
+                                           help the lock arm -- 3/3 still.
+
+### What this corrects
+
+- "evict-first fixes it" (`c404d80`, and this file's earlier revision) is
+  **incomplete**. Evict-first closes pusher 2 on the MCAS arm; pusher 1 is
+  untouched and only shows under continuous eviction.
+- "the default arm is clean" was true **for bursty only**, and I did not say so.
+
+### Not corruption: the txn + MCAS + continuous hang
+
+3 gdb samples 2s apart: 47 of 48 writers in `cds_fair_mutex_park` every time,
+the 48th moving (`urcu_slab_alloc` -> `sysmalloc` -> `pthread_mutex_lock`), no
+assert. That is the known escalation-lane starvation, not a structural failure.
+
+### Next decision (NOT taken -- it is a design call)
+
+Both pushers need the same thing: a way to know a dentry is still alive before
+adding it to the LRU. Candidates, cheapest first:
+
+1. **Drop `lru_retain`'s re-arm on the MCAS arm.** The shrinker there ROTATES
+   in-use entries, so the header already says this path is "reachable only after
+   an allocation failure" -- it is nearly dead code that costs a real bug.
+   Measured cost: none visible; measured benefit: 9/9 clean under continuous.
+2. **Gate every push on "still hashed"**, the port's stand-in for a refcount.
+   Fixes both pushers and the lock arm, but the check has to be atomic with the
+   push or it is just a narrower race.
+3. **Give the shrinker a real reference.** Faithful to mainline, and the biggest
+   change.

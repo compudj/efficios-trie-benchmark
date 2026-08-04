@@ -2043,31 +2043,71 @@ static void dentry_free_cb(struct rcu_head *rh)
 {
 	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
 
-#if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU) && defined(DC_LRU_FREE_ASSERT)
+#if !defined(DC_NO_LRU) && defined(DC_LRU_FREE_ASSERT)
 	/*
-	 * PROBE (-DDC_LRU_FREE_ASSERT): is this dentry still on a deque at the
+	 * PROBE (-DDC_LRU_FREE_ASSERT): is this dentry still on the LRU at the
 	 * instant its memory is released?
 	 *
 	 * If it is, free() hands the storage back and the next dentry to land on
-	 * it is memset to zero -- owner NULL, links NULL -- while the neighbours
-	 * that were pointing at the old node STILL NAME IT.  That is precisely
-	 * the "live ring reaches a node with owner == NULL" the churn bench
-	 * reports, and it would be a caller bug, not a deque bug.
+	 * it is memset to zero, while the neighbours that were pointing at the
+	 * old node STILL NAME IT.  On the MCAS arm that shows up downstream as
+	 * "a live ring reaches a node with owner == NULL"; on the lock arm it
+	 * corrupts the shard's head/tail chain the same way.
 	 *
 	 * The free callback is the only place that can decide it: everywhere
 	 * else the answer is a race.
+	 *
+	 * ⚠ BOTH ARMS, deliberately.  Asking it only of the MCAS arm invites the
+	 * conclusion that the mechanism is at fault, when the question is
+	 * whether the PORT lets a dying dentry be re-added -- which is a
+	 * property of retain_dentry's policy, not of the structure underneath.
 	 */
 	{
+#ifdef DC_LRU_MCAS
 		struct urcu_txn_deque *q = urcu_txn_deque_owner(&d->d_lru.dnode);
+		int queued = q != NULL;
+		void *a = uatomic_load((void **) &d->d_lru.dnode.next, CMM_RELAXED);
+		void *b = uatomic_load((void **) &d->d_lru.dnode.prev, CMM_RELAXED);
+#else
+		unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+		void *q = (void *) (uintptr_t) st;
+		int queued = st >= DC_LRU_ON(0);
+		void *a = uatomic_load(&d->d_lru.next, CMM_RELAXED);
+		void *b = uatomic_load(&d->d_lru.prev, CMM_RELAXED);
+#endif
 
-		if (caa_unlikely(q != NULL)) {
+		if (caa_unlikely(queued)) {
+			int reachable = -1;
+#ifndef DC_LRU_MCAS
+			/*
+			 * SECOND, INDEPENDENT WITNESS on the lock arm: the state
+			 * word says "linked", but the word is exactly the thing
+			 * that could be stale.  Walk the shard it names, under
+			 * that shard's lock, and report whether the chain really
+			 * reaches @d.  One probe is not a finding, and this claim
+			 * -- that the LOCK arm, the honest A/B control, frees
+			 * linked dentries -- is too consequential to rest on a
+			 * word.
+			 */
+			if (dc_lru_validate_dc) {
+				struct dc_lru_shard *sh =
+					&dc_lru_validate_dc->lru[st - DC_LRU_ON(0)];
+				struct dentry *w;
+				unsigned long hop = 0;
+
+				lru_lock(sh);
+				reachable = 0;
+				for (w = sh->head; w && hop++ < 100000;
+				     w = w->d_lru.next) {
+					if (w == d) { reachable = 1; break; }
+				}
+				lru_unlock(sh);
+			}
+#endif
 			fprintf(stderr,
-				"FREE-WHILE-QUEUED d=%p owner=%p next=%p prev=%p\n",
-				(void *) d, (void *) q,
-				uatomic_load((void **) &d->d_lru.dnode.next,
-					     CMM_RELAXED),
-				uatomic_load((void **) &d->d_lru.dnode.prev,
-					     CMM_RELAXED));
+				"FREE-WHILE-QUEUED d=%p owner=%p next=%p prev=%p "
+				"chain-reachable=%d\n",
+				(void *) d, (void *) q, a, b, reachable);
 			abort();
 		}
 	}
