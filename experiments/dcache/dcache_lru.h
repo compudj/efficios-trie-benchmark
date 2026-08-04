@@ -22,6 +22,15 @@
  *                       dc_domain_t lru_domain; }   (domain: MCAS arm only)
  *   int children_empty(struct dentry *);
  *   int lru_evict_settled(struct dcache *, struct dentry *);  -- 0 on success
+ *   int lru_alive_validate(struct urcu_txn *, struct dentry *);  (MCAS arm)
+ *       -- 0 if @d is still hashed, -ENOENT if it has been unhashed.  This is
+ *          mainline retain_dentry's FIRST test (d_unhashed), which this port
+ *          omitted; see lru_push_prepare().  An engine whose liveness bit lives
+ *          in a slot the MCAS engine exclusively owns should RECORD A VALIDATE
+ *          so the answer joins the commit's conflict set; one whose bit is
+ *          written by a plain store under some other lock MUST NOT, and says so.
+ *   int lru_alive_hint(struct dentry *);   (LOCK arm)
+ *       -- the same question with no transaction to put it in.
  *
  * The design (design/dcache-lru-txn.md), in one paragraph: the order is FUZZY on
  * purpose (CLOCK / second chance), a lookup touches the list ZERO times because
@@ -403,19 +412,24 @@ static inline struct dentry *lru_dentry(struct urcu_txn_deque_node *n)
 }
 
 /*
- * The three mutators.  Under -DDC_TXN_STATS the convenience brackets in the
- * header are re-implemented here so that the transaction HANDLE is ours and its
- * in_fallback / retry state is observable -- that is the state the escalation
- * question needs.  The uninstrumented build calls the header's own, unchanged.
+ * The three mutators, each with its own hand-opened bracket rather than the
+ * header's convenience form.  TWO reasons, and the second is the load-bearing
+ * one now:
  *
- * ⚠ The instrumented bracket must mirror the header's TERMINAL BAIL exactly.
- * An escalated handle KEEPS its lane across end() so that a re-attempt does not
- * go to the back of the FIFO, so a path that does NOT re-attempt must
- * urcu_txn_abandon() first or the domain's lane is held forever and every other
- * writer parks behind it.  push_tail answers -EEXIST on every duplicate, which
- * is a hot path here, so this is not a corner case (b69b4a53).
+ *   under -DDC_TXN_STATS the transaction HANDLE is ours, so its in_fallback /
+ *   retry state is observable -- the state the escalation question needs;
+ *
+ *   the push must COMPOSE a liveness guard with the deque's own prepare, and a
+ *   convenience bracket cannot express "these two records commit together".
+ *   See lru_push_prepare().
+ *
+ * ⚠ The bracket must mirror the header's TERMINAL BAIL exactly.  An escalated
+ * handle KEEPS its lane across end() so that a re-attempt does not go to the
+ * back of the FIFO, so a path that does NOT re-attempt must urcu_txn_abandon()
+ * first or the domain's lane is held forever and every other writer parks
+ * behind it.  push_tail answers -EEXIST on every duplicate, which is a hot path
+ * here, so this is not a corner case (b69b4a53).
  */
-#ifdef DC_TXN_STATS
 #define LRU_DQ_BRACKET(site, dcp, call)					\
 	struct urcu_txn txn;						\
 	int prep;							\
@@ -446,11 +460,45 @@ static inline struct dentry *lru_dentry(struct urcu_txn_deque_node *n)
 		return st == URCU_TXN_STATUS_OK ? 0 : -ENOMEM;		\
 	}
 
+/*
+ * PUSH, COMPOSED WITH A LIVENESS GUARD -- retain_dentry's FIRST test, which this
+ * port omitted.
+ *
+ * Mainline's retain_dentry (fs/dcache.c) opens with
+ *
+ *	// Unreachable? Nobody would be able to look it up, no point retaining
+ *	if (unlikely(d_unhashed(dentry)))
+ *		return false;
+ *
+ * and only then considers the LRU.  We went straight to the enqueue, so a
+ * dentry that had just been unhashed and handed to call_rcu could be pushed
+ * back on -- and then freed while a deque still named it.  Note this is NOT the
+ * refcount's job upstream: d_unhashed is tested before any count is consulted.
+ *
+ * ⚠ A BARE CHECK IS ONLY A NARROWER RACE.  The unhash can land between the test
+ * and the commit.  Mainline closes that with d_lock; here the guard has to be
+ * part of the SAME COMMIT as the edges, which is what lru_alive_validate() is
+ * for -- an engine that can transact its liveness slot records a conflict-set
+ * entry, so a concurrent unhash aborts this push instead of racing it.
+ *
+ * Returns -ENOENT when @d is already unhashed, which the caller treats as "do
+ * not re-arm", not as an error.
+ */
+static int lru_push_prepare(struct urcu_txn *txn, struct urcu_txn_deque *q,
+			    struct dentry *d)
+{
+	int ret = lru_alive_validate(txn, d);
+
+	if (ret)
+		return ret;			/* -ENOENT: unhashed, drop it */
+	return urcu_txn_deque_push_tail_prepare(txn, q, &d->d_lru.dnode);
+}
+
 static int lru_dq_push(struct dcache *dc, struct urcu_txn_deque *q,
-		       struct urcu_txn_deque_node *n)
+		       struct dentry *d)
 {
 	LRU_DQ_BRACKET(DC_TS_LRU_ADD, dc,
-		urcu_txn_deque_push_tail_prepare(&txn, q, n))
+		lru_push_prepare(&txn, q, d))
 }
 
 static int lru_dq_remove(struct dcache *dc, struct urcu_txn_deque *q,
@@ -465,24 +513,6 @@ static int lru_dq_rotate(struct dcache *dc, struct urcu_txn_deque *q)
 	LRU_DQ_BRACKET(DC_TS_LRU_ROT, dc,
 		urcu_txn_deque_rotate_head_prepare(&txn, q))
 }
-#else
-static inline int lru_dq_push(struct dcache *dc, struct urcu_txn_deque *q,
-			      struct urcu_txn_deque_node *n)
-{
-	return urcu_txn_deque_push_tail(q, n, &dc->lru_domain);
-}
-
-static inline int lru_dq_remove(struct dcache *dc, struct urcu_txn_deque *q,
-				struct urcu_txn_deque_node *n)
-{
-	return urcu_txn_deque_remove(q, n, &dc->lru_domain);
-}
-
-static inline int lru_dq_rotate(struct dcache *dc, struct urcu_txn_deque *q)
-{
-	return urcu_txn_deque_rotate_head(q, &dc->lru_domain);
-}
-#endif
 
 /*
  * Enqueue at the TAIL of shard @idx.
@@ -491,6 +521,10 @@ static inline int lru_dq_rotate(struct dcache *dc, struct urcu_txn_deque *q)
  * dentry that is already queued -- anywhere, including on another shard --
  * answers -EEXIST and nothing is written.  That is the whole reason lru_retain
  * may branch on a stale hint.
+ *
+ * -ENOENT means @d was already unhashed, so it must NOT be listed: enqueueing a
+ * dentry that is on its way to call_rcu is what let one be freed while a deque
+ * still named it.  Silently correct, like -EEXIST, and not an error.
  */
 static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 {
@@ -498,7 +532,7 @@ static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 	int r;
 
 	rcu_read_lock();
-	r = lru_dq_push(dc, q, &d->d_lru.dnode);
+	r = lru_dq_push(dc, q, d);
 	/* The trace reads the node's own links, so it belongs INSIDE the read
 	 * section: once out of it a peer's unlink can retire @d. */
 	if (r == 0)
@@ -509,8 +543,9 @@ static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx)
 	rcu_read_unlock();
 	if (r == 0)
 		uatomic_inc(&q->count);
-	/* -EEXIST: already queued, nothing to do.  -ENOMEM: simply not listed;
-	 * lru_retain re-arms it on the next touch. */
+	/* -EEXIST: already queued, nothing to do.  -ENOENT: unhashed, must not
+	 * be listed.  -ENOMEM: simply not listed; lru_retain re-arms it on the
+	 * next touch. */
 }
 
 /*
@@ -746,13 +781,30 @@ static inline void lru_unlock(struct dc_lru_shard *sh)
 	uatomic_store(&sh->lock, 0UL, CMM_RELEASE);
 }
 
-/* Add at the TAIL (newest).  Called with no lock held. */
+/*
+ * Add at the TAIL (newest).  Called with no lock held.
+ *
+ * The liveness test is re-done UNDER THE SHARD LOCK, not just at entry, and it
+ * is still only a narrowing: the shard lock does not exclude the unhash (that
+ * is the bucket lock / the index transaction), so a dentry can be unhashed
+ * between the test and the link.  Mainline gets atomicity here from d_lock,
+ * which serialises retain_dentry's d_lru_add against __dentry_kill's unhash +
+ * d_lru_del; this arm has no per-dentry lock and so cannot close it this way.
+ * Recorded rather than papered over -- -DDC_LRU_FREE_ASSERT measures what is
+ * left.
+ */
 static void lru_add(struct dcache *dc, struct dentry *d)
 {
 	unsigned int idx = lru_shard_index(dc);
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
+	if (!lru_alive_hint(d))
+		return;			/* unhashed: never re-arm a dying dentry */
 	lru_lock(sh);
+	if (!lru_alive_hint(d)) {
+		lru_unlock(sh);
+		return;
+	}
 	d->d_lru.prev = sh->tail;
 	d->d_lru.next = NULL;
 	if (sh->tail)

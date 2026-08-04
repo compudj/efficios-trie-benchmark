@@ -1307,6 +1307,50 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	return d;
 }
 
+#ifndef DC_NO_LRU
+/*
+ * LIVENESS FOR THE LRU -- mainline retain_dentry's first test (d_unhashed),
+ * which this port omitted.  See lru_push_prepare() in dcache_lru.h.
+ *
+ * ⛔ AND ON THIS ENGINE IT CANNOT BE TRANSACTED, which is the whole reason the
+ * two engines differ here.  &d->d_hash.next is NOT an MCAS-managed slot: it is
+ * written by bl_hlist_del_locked() with a PLAIN __atomic_store_n under the
+ * bucket lock.  Recording an MCAS guard on it would plant a proxy that the
+ * bucket-lock writer's plain store then overwrites -- and this transaction's
+ * settle would afterwards store the pre-mark value back over that writer's
+ * mark, RESURRECTING a node the index has already deleted.  A guard that
+ * corrupts the thing it guards is worse than no guard.
+ *
+ * So this is a plain resolved read and records nothing: it NARROWS the window
+ * (the unhash can still land between the read and the commit) rather than
+ * closing it, and saying so is the point of having two spellings.
+ *
+ * Closing it here needs the bucket lock -- the analogue of mainline's d_lock,
+ * and the same lock lru_evict_settled() takes to unhash -- on the enqueue path.
+ * That is a real cost on a hot path and a separate decision; measure the
+ * residual with -DDC_LRU_FREE_ASSERT before paying it.
+ */
+#ifdef DC_LRU_MCAS
+static int lru_alive_validate(struct urcu_txn *txn, struct dentry *d)
+{
+	int marked = 0;
+
+	(void) txn;
+	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
+	return marked ? -ENOENT : 0;
+}
+
+#else
+static int lru_alive_hint(struct dentry *d)
+{
+	int marked = 0;
+
+	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
+	return !marked;
+}
+#endif
+#endif	/* DC_NO_LRU */
+
 #include "dcache_lru.h"		/* PHASE 3: the shared LRU (see the header) */
 
 

@@ -328,3 +328,100 @@ adding it to the LRU. Candidates, cheapest first:
    push or it is just a narrower race.
 3. **Give the shrinker a real reference.** Faithful to mainline, and the biggest
    change.
+
+
+---
+
+## 2026-08-04 (later still): fix 1 LANDED, fix 2 ATTEMPTED AND REVERTED
+
+### Fix 1 — the missing `d_unhashed` guard — works, on the MCAS arm
+
+`lru_retain` never performed mainline `retain_dentry`'s FIRST test:
+
+    // Unreachable? Nobody would be able to look it up, no point retaining
+    if (unlikely(d_unhashed(dentry)))
+            return false;
+
+Note this is **not the refcount's job** upstream — `d_unhashed` is tested before
+any count is consulted. The port simply omitted it.
+
+Added as an engine-supplied predicate, composed into the LRU push
+(`lru_push_prepare`), because a bare check is only a narrower race:
+
+| engine | how | atomic? |
+|---|---|---|
+| txn | `urcu_txn_load_validate(&d->d_hash.next)` | **yes** — the guard joins the push's conflict set, so a concurrent unhash aborts the push |
+| bucketlock | plain resolved read | **no** — and it must not be transacted, see below |
+
+⛔ **Why bucketlock cannot transact it.** `&d->d_hash.next` is not an
+MCAS-managed slot there: `bl_hlist_del_locked()` writes it with a plain
+`__atomic_store_n` under the bucket lock. An MCAS guard would plant a proxy that
+the plain store overwrites, and this transaction's settle would then write the
+pre-mark value back *over that writer's mark*, resurrecting a node the index has
+already deleted. A guard that corrupts what it guards is worse than none.
+Closing it there needs the bucket lock on the enqueue path — the analogue of
+mainline's `d_lock` — which is a real cost on a hot path and a separate call.
+
+Measured, `--writers 48 --readers 48 --duration 3000`, 5 trials, FREE-WHILE-QUEUED:
+
+| arm | cadence | before | after |
+|---|---|---|---|
+| bucketlock MCAS deque | bursty | 0 | **0** |
+| bucketlock MCAS deque | continuous | 3/3 | **0/5** |
+| txn MCAS deque | bursty | 0 | **0** |
+| bucketlock LOCK | bursty | 3/3 | 5/5 (unchanged) |
+| bucketlock LOCK | continuous | 3/3 | 5/5 (unchanged) |
+
+So fix 1 closes pusher 1 on the MCAS arm and leaves the LOCK arm exactly where it
+was — which is the honest outcome, because the lock arm's problem is pusher 2.
+
+### Fix 2 — evict-first on the LOCK arm — REVERTED, and the reason is the point
+
+I proposed mainline's shrink-list handoff and then substituted something cheaper:
+stop isolating, evict while the victim is still linked, unlink only on success —
+i.e. port the MCAS arm's evict-first. Measurement killed it:
+
+| arm | cadence | before | with fix 2 |
+|---|---|---|---|
+| bucketlock LOCK | bursty | 3/3 hits | 4/5 hits (no better) |
+| bucketlock LOCK | continuous | 3/3 hits | 5/5 hits (no better) |
+| txn LOCK | continuous | 3/3 ok | **5/5 SEGV** |
+
+The SEGV is inside `urcu_txn_install_mw_depth` with a dangling `r->slot`, from
+`lru_evict_settled`'s own commit — the victim was freed underneath the eviction.
+
+**Why evict-first is not transferable to the lock arm.** On the MCAS arm it is
+safe because `urcu_txn_deque_remove()`'s `&n->owner : d -> NULL` record makes
+exactly ONE sweeper win; the deque supplies ownership. The lock arm had its
+ownership from ISOLATION — unlink under the shard lock meant no other sweeper
+could see the victim — and evict-first removes precisely that, with nothing to
+replace it. Many sweepers then evict the same victim concurrently.
+
+That is what mainline's shrink list is actually for: `d_lru_shrink_move` gives
+the sweeper *ownership* (a private list) while keeping the dentry non-ownerless
+(`DCACHE_LRU_LIST` stays set), and `__dentry_kill` honours it by leaving
+`can_free = false`. Isolation and ownership are the same act there. I treated
+"never ownerless" as the whole invariant and dropped ownership to get it.
+
+⚠ Also fixed en route and worth keeping even though the change is reverted: the
+membership re-check after dropping the shard lock must be `shard == DC_LRU_ON(i)`,
+not `shard >= DC_LRU_ON(0)`. The victim can be removed and re-added ON A
+DIFFERENT SHARD while the lock is dropped, since `lru_retain` enqueues on the
+CALLER's shard.
+
+### So the lock arm is still open
+
+It needs real ownership, not a cheaper invariant. Options, in the order I would
+try them:
+
+1. **The full shrink-list handoff.** Faithful. Needs a `DC_LRU_SHRINK(i)` state
+   and, critically, the `can_free` transfer — `dc_unlink` must not `call_rcu` a
+   dentry the shrinker owns. That spans `dc_unlink` in both engines.
+2. **Keep isolation, add the liveness guard to the put-back.** Re-check "still
+   hashed" under the shard lock before `lru_link_tail_locked`. Cheap, but only
+   narrows — same class as bucketlock's fix 1.
+3. **A per-dentry lock**, i.e. re-import `d_lock`. Closes it exactly as mainline
+   does and costs a word plus an acquire on the enqueue path.
+
+Note (1) is the only one that actually closes it, and it is the one mainline
+chose.

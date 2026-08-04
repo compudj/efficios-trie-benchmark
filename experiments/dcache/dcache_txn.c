@@ -1204,6 +1204,54 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	ret = 0;
 	return ret;
 }
+
+/*
+ * LIVENESS FOR THE LRU -- mainline retain_dentry's first test, transacted.
+ *
+ * &d->d_hash.next is an MCAS-managed slot on this engine: urcu_txn_hlist_del
+ * MARKS it inside the commit that unhashes @d.  So a load_validate here puts
+ * "still hashed" into the LRU push's conflict set, and the two possible
+ * interleavings both come out right:
+ *
+ *   unhash commits FIRST  -> our guard's re-check fails, the push aborts, the
+ *                            retry reads the mark and answers -ENOENT;
+ *   our push commits FIRST -> lru_evict_settled's caller runs lru_del() AFTER
+ *                            its unhash commit, so it finds the node we just
+ *                            pushed and takes it off before call_rcu can fire.
+ *
+ * There is no third order: the guard is installed atomically with the edges.
+ *
+ * Cross-DOMAIN (the LRU commits on lru_domain, the unhash on dc->domain) is
+ * fine -- a domain only owns the escalation lane, while conflict detection is
+ * per-slot.  The cost is that our guard can abort an unlink's commit, which
+ * that unlink simply retries.
+ */
+#ifdef DC_LRU_MCAS
+static int lru_alive_validate(struct urcu_txn *txn, struct dentry *d)
+{
+	void *raw = urcu_txn_load_validate(txn, (void **) &d->d_hash.next,
+					   URCU_TXN_HLIST_TAG);
+
+	return urcu_txn_hlist_is_marked(raw) ? -ENOENT : 0;
+}
+
+/*
+ * The same question with no transaction to put it in -- the LOCK arm's only
+ * option, and a HINT: the unhash can land between this and the enqueue.  Not
+ * spelled via top_unhashed_rcu(), which exists only under DC_LOCALIZED_GEN.
+ */
+#else
+static int lru_alive_hint(struct dentry *d)
+{
+	void *raw = (void *) rcu_dereference(d->d_hash.next);
+
+	if (caa_unlikely((uintptr_t) raw &
+			 (URCU_TXN_HLIST_TAG | URCU_TXN_HLIST_MARK)))
+		return !urcu_txn_hlist_is_marked(
+				urcu_txn_resolve(raw, URCU_TXN_HLIST_TAG));
+	return 1;			/* clean unmarked next: still hashed */
+}
+#endif
 #endif
 
 #include "dcache_lru.h"			/* PHASE 3: the shared LRU */
