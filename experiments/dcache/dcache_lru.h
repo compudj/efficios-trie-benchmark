@@ -313,9 +313,21 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 	 * routinely lands here -- it is reachable only after an allocation
 	 * failure left the node off the deque, or when the hint was stale, and
 	 * in the latter case push_tail answers -EEXIST and nothing happens.
+	 *
+	 * ⚠ TWO SEPARATE PROBES, because there are TWO re-adds and one macro used
+	 * to gate both -- which made every result from it uninterpretable:
+	 *
+	 *   -DDC_LRU_NO_RETAIN_READD   kills THIS one (a third party re-arming a
+	 *                              dentry the shrinker is mid-eviction on);
+	 *   -DDC_LRU_NO_SHRINK_READD   kills the shrinker's own put-back, in
+	 *                              dcache_lru_shrink.h;
+	 *   -DDC_LRU_NO_READD          kills BOTH (the historical spelling; keep
+	 *                              it only for reproducing old results).
 	 */
-#ifndef DC_LRU_NO_READD
-	lru_add(dc, d);		/* see the probe in dcache_lru_shrink.h */
+#if !defined(DC_LRU_NO_READD) && !defined(DC_LRU_NO_RETAIN_READD)
+	lru_add(dc, d);
+#else
+	(void) dc;
 #endif
 }
 

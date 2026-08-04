@@ -34,7 +34,71 @@ from the LRU word to the eviction**.
 Gates green: `make check`, `check-bucketlock`, `check-lru-arms` (9 PASS + 2 ASan
 stress), 390/394 checks, 0 failures.
 
-## The open defect — READ THIS BEFORE TOUCHING THE LRU
+## RESOLVED: the legacy arm's collapse is a CALLER bug
+
+⛔ An earlier revision of this file called it "a structural violation the deque's
+contract forbids". **That was wrong.** The five-minute witness that settled it:
+`-DDC_LRU_FREE_ASSERT` checks, in `dentry_free_cb`, whether the dentry is still
+queued when its storage is released.
+
+    default (evict-first)     FREE-WHILE-QUEUED  0 / 5
+    -DDC_LRU_READD_LEGACY     FREE-WHILE-QUEUED  3 / 3
+
+A dentry is freed while a deque still points at it; the storage is reused, the
+next dentry memsets it (`owner` NULL, links NULL), and the neighbours still name
+it. THAT is the "ring reaches an owner==NULL node" — a consequence, not a cause.
+
+Which re-add? `DC_LRU_NO_READD` gated two sites at once, so every result from it
+was uninterpretable. Split into `DC_LRU_NO_SHRINK_READD` /
+`DC_LRU_NO_RETAIN_READD`:
+
+| shrinker put-back | lru_retain re-arm | hits |
+|---|---|---|
+| ON | ON | 3/3 |
+| **OFF** | ON | **0/3** |
+| ON | **OFF** | 3/3 |
+
+It is the **shrinker's own put-back**: it removes the victim, holds it by RCU
+alone, a concurrent `dc_unlink` finds the node already off (so its `lru_del` does
+nothing) and `call_rcu`s it, and the sweeper then pushes a dentry pending free
+back onto a deque. That is precisely the window **evict-first closes**, which is
+why the default arm is clean. The legacy shape is not merely slower — it is
+unsafe for this caller, whatever structure the LRU is built on.
+
+The remaining half of the legacy collapse (lane holder moving, everyone parked,
+call_rcu worker in `synchronize_rcu()`) is escalation-lane starvation plus the
+park-while-online QSBR stall, which is a **liburcu** matter. Still open, still
+not this file's.
+
+## The deque is tested along both axes now
+
+`test_deque.c` covers many deques (migration, `owner` naming the right one,
+remove deriving from a hint) and reuse (retire + re-init in place, resetting
+`seq`). `make check-deque`: 8 arms, all PASS — 2/8/32 writers × 4 deques, 1 deque
+(single-ring regression), 16 deques, `NO_SEQ_GUARD` mutation, ASan, harness
+self-check.
+
+Three things worth keeping from building it:
+
+- **The harness was wrong first**, and in the instructive way: its retire waited
+  for a grace period BEFORE removing the node but not AFTER. A rotator holding
+  the node as the head then read `h->next` out of storage the retirer had just
+  zeroed — a NULL deref inside `rotate_head_prepare` that looked exactly like a
+  deque defect. Reuse needs the GP *after* the node is off; `call_rcu` gives the
+  dcache that for free. 7/8 SEGV before, 16/16 after.
+- **The audit masked it** (8/8 PASS with it on). It is opt-in now
+  (`-DRETIRE_AUDIT`) and one arm runs it. A probe that widens every window is not
+  a control.
+- **⚠ The `seq` guard is STILL UNPROVEN.** Reuse was the hypothesis that would
+  make it load-bearing; compiled out at 32 writers with reuse on, the test still
+  passes. And reuse *resets* `seq` to zero, so its stated premise ("never
+  decreases") does not survive recycled storage: it is monotone per membership,
+  not per address. Worth a header caveat, not yet written.
+- **⛔ TSAN cannot gate the deque test.** It cannot model a QSBR grace period, so
+  every reclaim-vs-reader pair reads as a race: 27 reports with the reuse op,
+  **38 with it compiled out**. No TSAN arm, deliberately.
+
+## The former open defect — kept for the reasoning, superseded above
 
 `deque-design.md` predicted the `DC_LRU_READD_LEGACY` control could be deleted
 once the deque landed. **That prediction is refuted.** The shape is still

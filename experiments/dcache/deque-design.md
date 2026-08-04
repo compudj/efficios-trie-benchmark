@@ -80,10 +80,10 @@ That gives the invariant the list could not hold:
 `prev` therefore stops being a hint. Nothing can leave a node naming a departed
 predecessor, so no `prev_repair`, no forward rescan, no stale-hint live-lock.
 
-> ⚠ **That last paragraph is NOT yet established under the dcache's workload.**
-> The rewire found a live ring reaching a node with `owner == NULL` — see "What
-> the rewire measured" below. The invariant holds in `test_deque.c` (one deque,
-> static nodes) and fails somewhere the dcache goes and the test does not.
+> The rewire briefly appeared to refute that paragraph — a live ring reaching a
+> node with `owner == NULL`. It did not: the node had been **freed while queued**
+> by the caller, and the zeroes were the reused storage. `test_deque.c` now
+> covers many deques and reuse and the invariant holds. See "⛔ CORRECTION".
 
 ### Structure
 
@@ -161,7 +161,7 @@ This is the subtle inversion and belongs in the header's first paragraph.
 | `lru_move_tail` mutating without owning the node | no claim protocol; the commit is the exclusion |
 | `lru_del` discarding the BUSY answer | no BUSY state exists |
 | same-GP re-add clobbering edges via plain stores | no plain stores; and evict-first keeps the node queued |
-| ~~stale link naming a departed node~~ | ⛔ **NOT FIXED** — reproduced on the deque under `-DDC_LRU_READD_LEGACY`; see below |
+| stale link naming a departed node | every edge CAS'd against prior state — and the one apparent counter-example was a dentry freed while queued, see "⛔ CORRECTION" |
 | `next == sent` aliasing in a general move | rotate is head-only |
 
 ## Costs, stated honestly
@@ -186,9 +186,9 @@ This is the subtle inversion and belongs in the header's first paragraph.
 - ~~The `DC_LRU_READD_LEGACY` control can go once the deque lands, since the shape
   it reproduces will no longer be expressible.~~ **REFUTED BY MEASUREMENT.** The
   deque landed and the shape is still expressible (remove, then push), and it
-  still collapses 5/5. The control has therefore earned its keep: it is now a
-  *deque*-level reproducer, not a list-level one. See "What the rewire measured"
-  below.
+  still collapses 5/5. The control has earned its keep — but as a reproducer for
+  a **caller** bug, not a deque one: it frees a dentry while a deque still points
+  at it. See "⛔ CORRECTION" below.
 
 ## Open question, and it is not about the deque
 
@@ -232,19 +232,85 @@ confused before:
   inside `urcu_qsbr_synchronize_rcu()`. That is the escalation-lane starvation
   plus the park-while-online QSBR stall, which is a liburcu matter, not this
   file's.
-- But it comes with a **structural violation the deque's own contract forbids**:
-  `dc_lru_validate` reports a shard whose ring reaches a node with `owner ==
-  NULL` (`first-bad=2`, `walked=9 count=13`). Only three writers touch a node's
-  `next`: push (which also sets `owner`), rotate, and remove's
-  `&prev->next : n -> next`. So a remove installed an edge naming a node that had
-  already departed — i.e. its `next` read was stale despite `load_validate` and
-  the per-node `seq` guard.
+- It also comes with a ring that reaches a node with `owner == NULL`
+  (`dc_lru_validate`: `first-bad=2`, `walked=9 count=13`).
 
 ⚠ Read `disowned` as amplified, not as a defect count: a removed node keeps stale
 links by design, so one bad edge sends the walk off the live ring for as many
 hops as those stale links happen to chain. `first-bad` is the localiser.
 
-`test_deque.c` does not cover this: it hammers **one** deque over a **static**
-node array, whereas the dcache has many shards (a node can migrate) and frees
-nodes through `call_rcu` (memory is reused). Those are the two uncovered axes and
-where the next attempt should start.
+## ⛔ CORRECTION: that ring state is NOT a deque defect
+
+Written first as "a remove installed an edge naming an already-departed node,
+i.e. a stale read despite `load_validate` and the seq guard". **That was wrong,
+and it is the third time this file's history has blamed the structure for a
+caller's bug.** The witness that settled it took five minutes and should have
+come first.
+
+`-DDC_LRU_FREE_ASSERT` makes `dentry_free_cb` check whether the dentry is still
+queued at the instant its storage is released:
+
+| arm | FREE-WHILE-QUEUED |
+|---|---|
+| default (evict-first) | **0 / 5** |
+| `-DDC_LRU_READD_LEGACY` | **3 / 3** |
+
+So a dentry is freed while a deque still points at it. `free()` hands the storage
+back, the next dentry to land on it is memset — `owner` NULL, links NULL — and
+the neighbours still name it. That *is* the "live ring reaches an `owner == NULL`
+node", arriving as a consequence rather than a cause.
+
+Which of the two re-adds does it? `DC_LRU_NO_READD` used to gate both sites at
+once, which made every result from it uninterpretable; split into
+`DC_LRU_NO_SHRINK_READD` and `DC_LRU_NO_RETAIN_READD`, the answer is unambiguous:
+
+| shrinker put-back | `lru_retain` re-arm | FREE-WHILE-QUEUED |
+|---|---|---|
+| ON | ON | 3/3 |
+| **OFF** | ON | **0/3** |
+| ON | **OFF** | 3/3 |
+| OFF | OFF | 0/3 |
+
+It is the **shrinker's own put-back**. The window: the sweeper removes the victim
+from the deque, and while it holds it by RCU alone a concurrent `dc_unlink` runs
+— finds the node already off the deque, so its `lru_del` does nothing — and
+`call_rcu`s the dentry. The sweeper's eviction then fails, and it pushes a dentry
+that is already pending free back onto a deque.
+
+That is exactly the window **evict-first exists to close**, and closing it is why
+the default arm is clean: the victim is never taken off, so `dc_unlink`'s
+`lru_del` always finds it and the sweeper never re-adds. The legacy arm is
+therefore not merely slower — it is *unsafe for this caller*, independently of
+which structure the LRU is built on.
+
+## The deque, tested along both axes
+
+`test_deque.c` now covers what the dcache does and it did not: **many deques**
+(nodes migrate; `owner` must name the right one; remove derives its deque from a
+hint) and **reuse** (a node is retired and re-initialised in place, resetting
+`seq` — the one event that breaks the ABA guard's monotonicity premise).
+
+`make check-deque`, eight arms, all PASS: 2/8/32 writers × 4 deques, 1 deque
+(the single-ring regression), 16 deques, the `NO_SEQ_GUARD` mutation, ASan, and a
+harness self-check. So **the deque holds on both axes**, which retires the
+suspicion above rather than leaving it hanging.
+
+Three things that fell out and are worth keeping:
+
+- **The harness was wrong first.** Its retire waited for a grace period *before*
+  removing the node but not *after*, so a rotator that had already read the node
+  as the head could read `h->next` out of storage the retirer had just zeroed —
+  a NULL deref inside `rotate_head_prepare` that looked precisely like a deque
+  defect. Reuse needs the grace period *after* the node is off, which is what
+  `call_rcu` gives the dcache for free. 7/8 SEGV before the fix, 16/16 after.
+- **The audit masked it.** An O(NNODES) self-check between the removal and the
+  re-init made it pass 8/8. It is now opt-in (`-DRETIRE_AUDIT`) and one gate arm
+  runs it, because a probe that widens every window is not a control.
+- **The `seq` guard is still unproven.** Reuse was the hypothesis that would make
+  it load-bearing; compiled out at 32 writers with reuse on, the test still
+  passes. Worse, reuse *resets* `seq` to zero, so the guard's stated premise —
+  "never decreases" — does not survive recycled storage at all. The guard is
+  monotone per membership, not per address.
+- **TSAN cannot gate this.** It cannot model a QSBR grace period, so every
+  reclaim-vs-reader pair reads as a race: 27 reports with the reuse op, **38 with
+  it compiled out** (the MCAS descriptor slab alone). No TSAN arm, deliberately.

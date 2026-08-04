@@ -136,13 +136,17 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			}
 			if (lru_evict_settled(dc, victim) == 0)
 				freed++;
-#ifdef DC_LRU_NO_READD
+#if defined(DC_LRU_NO_READD) || defined(DC_LRU_NO_SHRINK_READD)
 			/*
-			 * PROBE: drop the SAME-GRACE-PERIOD re-add.  The unlink
-			 * above and this re-add sit in one read-side critical
-			 * section, so no grace period can separate them.
-			 * Leaving the victim off the deque costs LRU accuracy
-			 * and nothing else.
+			 * PROBE (-DDC_LRU_NO_SHRINK_READD): drop the SAME-GRACE-
+			 * PERIOD re-add.  The unlink above and this re-add sit in
+			 * one read-side critical section, so no grace period can
+			 * separate them.  Leaving the victim off the deque costs
+			 * LRU accuracy and nothing else.
+			 *
+			 * ⚠ -DDC_LRU_NO_READD kills lru_retain's re-arm TOO, so
+			 * it cannot tell the two re-adds apart.  Use the split
+			 * spellings; see lru_retain().
 			 */
 #else
 			else

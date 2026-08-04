@@ -80,7 +80,7 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
-	check-filetype repro-samedir churn check-churn clean check-lib
+	check-filetype repro-samedir churn check-churn check-deque clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -789,6 +789,58 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 	$(CC) $(ASANFLAGS) -DDC_LRU_MCAS $(HCPP) -o stress_lru_mcas_asan \
 	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./stress_lru_mcas_asan 4 4 8 16 15000
+
+# ---- the deque itself, below the dcache -----------------------------------
+#
+# test_deque checks the biconditional urcu-txn-deque exists to hold -- owner ==
+# d <=> reachable in d's ring -- over the whole node array, after hammering
+# push / remove / rotate / retire-and-reuse concurrently.
+#
+# The arms are the AXES, not repetitions: NDEQUES=1 is the single-ring shape the
+# first version of this test had (kept as the regression), 4 and 16 add
+# MIGRATION between rings, and the reuse op adds a node whose storage is
+# recycled -- which resets `seq` and so is the one event that breaks the ABA
+# guard's monotonicity premise.
+#
+# NO_SEQ_GUARD is a MUTATION TEST, and it is here to keep an uncomfortable fact
+# measurable rather than forgotten: the guard has never been shown to be
+# load-bearing.  If this arm ever starts failing, the guard has earned its
+# place; while it passes, the honest statement is that it is unproven.
+#
+# ⛔ NO TSAN ARM, deliberately.  TSAN cannot model a QSBR grace period, so every
+# reclaim-vs-reader pair reads as a race: the MCAS descriptor slab alone
+# produces ~38 reports here with the reuse op COMPILED OUT, i.e. more than with
+# it in.  A TSAN gate would therefore be noise, not coverage.  See
+# deque-design.md.
+check-deque: test_deque.c $(URCU_DEP) | check-lib
+	@for w in 2 8 32; do \
+	  echo "--- test_deque: $$w writers, 4 deques ---"; \
+	  $(CC) $(CFLAGS) -DNWRITERS=$$w $(CPPFLAGS) -o test_deque \
+	    test_deque.c $(LDFLAGS) $(LDLIBS) || exit 1; \
+	  ./test_deque || exit 1; \
+	done
+	@echo "--- test_deque: 1 deque (single-ring regression) ---"
+	$(CC) $(CFLAGS) -DNWRITERS=8 -DNDEQUES=1 $(CPPFLAGS) -o test_deque_1dq \
+	  test_deque.c $(LDFLAGS) $(LDLIBS)
+	./test_deque_1dq
+	@echo "--- test_deque: 16 deques (many shards, heavy migration) ---"
+	$(CC) $(CFLAGS) -DNWRITERS=8 -DNDEQUES=16 $(CPPFLAGS) -o test_deque_16dq \
+	  test_deque.c $(LDFLAGS) $(LDLIBS)
+	./test_deque_16dq
+	@echo "--- test_deque: MUTATION -- seq ABA guard compiled out ---"
+	$(CC) $(CFLAGS) -DNWRITERS=32 -DURCU_TXN_DEQUE_NO_SEQ_GUARD $(CPPFLAGS) \
+	  -o test_deque_noseq test_deque.c $(LDFLAGS) $(LDLIBS)
+	@./test_deque_noseq && \
+	  echo "  NOTE: passes without the seq guard -- the guard remains UNPROVEN" \
+	  || { echo "  the seq guard is LOAD-BEARING -- record this"; exit 1; }
+	@echo "--- test_deque: ASan ---"
+	$(CC) $(ASANFLAGS) -DNWRITERS=8 $(CPPFLAGS) -o test_deque_asan \
+	  test_deque.c $(LDFLAGS) $(LDLIBS)
+	./test_deque_asan
+	@echo "--- test_deque: harness self-check (-DRETIRE_AUDIT) ---"
+	$(CC) $(CFLAGS) -DNWRITERS=8 -DRETIRE_AUDIT $(CPPFLAGS) -o test_deque_audit \
+	  test_deque.c $(LDFLAGS) $(LDLIBS)
+	./test_deque_audit
 
 # LAYOUT arms.  The gates above sweep the causality arms and the chain
 # strategies, but they all build the DEFAULT 1-CL split layout -- while the

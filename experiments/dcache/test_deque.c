@@ -12,8 +12,33 @@
  * forward chain skipped while the backward chain kept it, a shard word saying
  * ON for a node no walk could find, a predecessor naming a departed node.  So
  * the test does not check "it did not crash" -- it checks exactly that
- * biconditional, over the full node array, after hammering the three
- * operations concurrently.
+ * biconditional, over the full node array, after hammering the operations
+ * concurrently.
+ *
+ * ---- THE TWO AXES ADDED AFTER THE dcache REWIRE ---------------------------
+ *
+ * The first version hammered ONE deque over a STATIC node array, and the dcache
+ * promptly reached a state it could not have produced.  Two things the dcache
+ * does and that version did not:
+ *
+ *   MANY DEQUES.  dc->lru[] is an array of shards and a dentry MIGRATES between
+ *   them -- the producer pushes on its own shard, the sweeper re-adds on the
+ *   shard being swept.  So `owner` has to distinguish deques, not merely
+ *   "queued or not", and a remove has to survive deriving its deque from a
+ *   HINT that a migration can invalidate (which is exactly what lru_del does).
+ *
+ *   REUSE.  A dentry is freed via call_rcu and its storage handed to a new one,
+ *   which memsets the node -- so `seq` GOES BACK TO ZERO.  That matters because
+ *   seq is the ABA guard and its whole premise is that it never decreases.
+ *   Reuse is the one event that breaks the premise, and nothing exercised it.
+ *   Modelled here without an allocator: retire a node, wait a grace period,
+ *   re-init it in place.  Same memory, same seq reset, no UB in the checker.
+ *
+ * ⚠ WHAT THIS TEST CANNOT CATCH, stated because a session already mistook one
+ * for the other: a caller that pushes a node it no longer owns.  That is legal
+ * at this interface -- push cannot know the caller has already handed the
+ * storage to call_rcu -- and it is what the dcache's DC_LRU_READD_LEGACY arm
+ * does.  Its witness lives in the caller (-DDC_LRU_FREE_ASSERT), not here.
  *
  * Build/run: make check-deque
  */
@@ -38,33 +63,59 @@
 #ifndef NWRITERS
 #define NWRITERS	8
 #endif
+#ifndef NDEQUES
+#define NDEQUES		4
+#endif
 #ifndef DURATION_MS
 #define DURATION_MS	800
 #endif
 
+/*
+ * Per-node lifecycle, and it is the test's own discipline rather than the
+ * deque's: a node may only be pushed or removed while LIVE.  RETIRING means one
+ * writer has claimed it for reuse and is between the unpublish and the re-init,
+ * during which nobody else may touch it.
+ *
+ * That is the caller-side contract the deque assumes and does not enforce --
+ * the same one dc_unlink keeps (unhash, so nothing can find it, then reclaim)
+ * and the same one the legacy shrinker breaks.
+ */
+#define ITEM_LIVE	0UL
+#define ITEM_RETIRING	1UL
+
 struct item {
 	struct urcu_txn_deque_node dn;
 	unsigned long		   id;
+	unsigned long		   state;	/* ITEM_LIVE / ITEM_RETIRING */
+	unsigned long		   recycles;
+	unsigned long		   last_dq;	/* diagnostic: last deque pushed to */
 };
 
-static struct urcu_txn_deque	g_dq;
+static struct urcu_txn_deque	g_dq[NDEQUES];
 static struct urcu_txn_domain	g_domain;
 static struct item		g_items[NNODES];
 static volatile int		g_stop;
 static unsigned long		g_ops;
 
 static unsigned long		g_pushed, g_removed, g_rotated, g_exists, g_noent;
+static unsigned long		g_retired, g_migrated, g_hintmiss;
 
 struct warg {
 	unsigned long idx;
 	unsigned long seed;
 	unsigned long pushed, removed, rotated, exists, noent;
+	unsigned long retired, migrated, hintmiss;
 };
 
 static unsigned long xrand(unsigned long *s)
 {
 	*s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17;
 	return *s;
+}
+
+static unsigned long dq_index(const struct urcu_txn_deque *d)
+{
+	return (unsigned long) (d - &g_dq[0]);
 }
 
 /*
@@ -113,7 +164,7 @@ static void hist_dump(void *x, void *y, void *z)
 {
 	unsigned long now = uatomic_load(&g_hseq, CMM_RELAXED), i;
 	unsigned long lo = now > HIST_N ? now - HIST_N : 0;
-	static const char *opn[] = { "?", "PUSH", "REMOVE" };
+	static const char *opn[] = { "?", "PUSH", "REMOVE", "RETIRE" };
 
 	fprintf(stderr, "-- commit log touching %p / %p / %p --\n", x, y, z);
 	for (i = lo; i < now; i++) {
@@ -207,12 +258,13 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 					(void **) &w->next, CMM_RELAXED));
 			}
 			fprintf(stderr,
-				"LIVELOCK n=%p owner=%p(want %p) reachable=%d\n"
+				"LIVELOCK n=%p owner=%p(want %p, deque %lu) "
+				"reachable=%d\n"
 				"   n->prev=%p  pv->next=%p  names_n=%d\n"
 				"   n->next=%p  nx->prev=%p  names_n=%d\n"
 				"   => %s\n",
 				(void *) n, (void *) urcu_txn_deque_owner(n),
-				(void *) d, reach,
+				(void *) d, dq_index(d), reach,
 				(void *) pv,
 				pv ? (void *) uatomic_load((void **) &pv->next,
 							   CMM_RELAXED) : NULL,
@@ -261,6 +313,125 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 	}
 }
 
+/*
+ * REMOVE VIA THE OWNER HINT -- deliberately the shape dcache_lru.h's lru_del
+ * has, because that shape is what a multi-deque caller is forced into: it does
+ * not know which deque holds the node, so it reads `owner`, which is a hint,
+ * and lets remove answer authoritatively.  A migration between the two makes
+ * remove answer -ENOENT ("queued elsewhere"), which the caller must retry
+ * rather than treat as "not queued" -- counted as hintmiss so the run can prove
+ * it exercised the path.
+ */
+static int remove_by_hint(struct warg *w, struct item *it)
+{
+	struct urcu_txn_deque *q = urcu_txn_deque_owner(&it->dn);
+
+	if (!q)
+		return -ENOENT;
+	{
+		int ret = remove_dbg(q, &it->dn);
+
+		if (ret == -ENOENT &&
+		    urcu_txn_deque_owner(&it->dn) != NULL)
+			w->hintmiss++;	/* it migrated under the hint */
+		return ret;
+	}
+}
+
+/*
+ * RETIRE AND REUSE -- the axis that models call_rcu handing a node's storage to
+ * a new object.
+ *
+ * TWO GRACE PERIODS, and getting this wrong cost a debugging round, so both are
+ * spelled out:
+ *
+ *   unpublish       state LIVE -> RETIRING, so nobody NEW can select the node;
+ *   GP #1           drains peers that already read ITEM_LIVE and could still
+ *                   push -- without it a push lands after the removal loop and
+ *                   the re-init zeroes a QUEUED node's links;
+ *   remove          take it off whatever deque it is on;
+ *   GP #2           drains peers HOLDING the node as a derived pointer -- a
+ *                   sweeper that read it as the head, a mutator that derived it
+ *                   as a neighbour.  RCU keeps their pointer's MEMORY alive; it
+ *                   says nothing about its CONTENT, so re-initialising here is
+ *                   exactly the "free" they are being protected from;
+ *   re-init         seq back to zero, as a memset of reused storage does.
+ *
+ * GP #2 is the call_rcu analogue and it is the one that was missing first time.
+ * Without it, rotate_head_prepare reads `h->next` out of a node this function
+ * has already zeroed, gets NULL, and dereferences it -- which looked exactly
+ * like a deque defect and was not.  The dcache gets this right by construction:
+ * it removes from the deque, THEN call_rcu's, so the storage is reused only
+ * after a grace period that starts once the node is off.
+ */
+static void retire_and_reuse(struct warg *w, struct item *it)
+{
+	if (uatomic_cmpxchg(&it->state, ITEM_LIVE, ITEM_RETIRING) != ITEM_LIVE)
+		return;				/* a peer is retiring it */
+	synchronize_rcu();			/* GP #1: drain would-be pushers */
+	for (;;) {
+		struct urcu_txn_deque *q;
+
+		rcu_read_lock();
+		q = urcu_txn_deque_owner(&it->dn);
+		if (!q) {
+			rcu_read_unlock();
+			break;
+		}
+		(void) remove_dbg(q, &it->dn);
+		rcu_read_unlock();
+	}
+	synchronize_rcu();			/* GP #2: drain pointer holders */
+	/*
+	 * AUDIT THE HARNESS BEFORE BLAMING THE STRUCTURE.  Re-initialising a
+	 * node that is still reachable would zero a live ring's links, and the
+	 * resulting corruption would be authored here.  So prove it is off every
+	 * ring first -- and say so in the abort message, because "the test did
+	 * it" and "the deque did it" are opposite conclusions and this project
+	 * has already spent a session confusing them once.
+	 *
+	 * OPT-IN (-DRETIRE_AUDIT), and off by default ON PURPOSE: it is an
+	 * O(NNODES) walk per retire, so it widens every window and shrinks the
+	 * interleaving space the test exists to explore.  It masked the missing
+	 * second grace period completely -- 8/8 PASS with it, 7/8 SEGV without.
+	 * So the default arms run WITHOUT it and one gate arm runs WITH it, as a
+	 * check on the harness rather than on the deque.
+	 */
+#ifdef RETIRE_AUDIT
+	{
+		unsigned long k;
+
+		for (k = 0; k < NDEQUES; k++) {
+			struct urcu_txn_deque_node *w2 = urcu_txn_deque_resolve(
+				uatomic_load((void **) &g_dq[k].sentinel.next,
+					     CMM_RELAXED));
+			unsigned long hop = 0;
+
+			while (w2 && w2 != &g_dq[k].sentinel && hop++ <= NNODES) {
+				if (w2 == &it->dn) {
+					fprintf(stderr,
+						"HARNESS BUG: about to re-init "
+						"node %lu (%p) while it is still "
+						"REACHABLE in deque %lu at hop "
+						"%lu -- owner=%p\n",
+						it->id, (void *) &it->dn, k, hop,
+						(void *) urcu_txn_deque_owner(
+								&it->dn));
+					abort();
+				}
+				w2 = urcu_txn_deque_resolve(uatomic_load(
+					(void **) &w2->next, CMM_RELAXED));
+			}
+		}
+	}
+#endif
+	hist_log(3, 0, &it->dn, NULL, NULL);
+	it->recycles++;
+	urcu_txn_deque_node_init(&it->dn);	/* THE REUSE: seq back to 0 */
+	uatomic_store(&it->state, ITEM_LIVE, CMM_RELEASE);
+	w->retired++;
+}
+
 static void *writer_fn(void *arg)
 {
 	struct warg *w = arg;
@@ -279,43 +450,72 @@ static void *writer_fn(void *arg)
 #else
 		struct item *it = &g_items[r % NNODES];
 #endif
-		int op = (int) ((r >> 16) % 8), ret;
+		unsigned long dqi = (r >> 40) % NDEQUES;
+		struct urcu_txn_deque *dq = &g_dq[dqi];
+		int op = (int) ((r >> 16) % 64), ret;
 
-		/*
-		 * Mutators run under the read-side lock: remove() reads a
-		 * node's neighbours and then CASes into them, so a neighbour
-		 * freed in between would be a use-after-free.  Nothing is freed
-		 * in this test, but the discipline is the structure's contract
-		 * and the test should exercise it as callers must.
-		 */
 		uatomic_inc(&g_ops);		/* liveness witness, sampled by gdb */
 #ifdef OPS_NO_ROTATE
-		if (op >= 6) op = 0;
+		if (op >= 48 && op < 60) op = 0;
 #endif
 #ifdef OPS_ONLY_ROTATE
-		op = 6;
+		op = 48;
 #endif
 #ifdef OPS_ONLY_PUSH
 		op = 0;
 #endif
 #ifdef OPS_ONLY_REMOVE
-		op = 3;
+		op = 24;
 #endif
+#ifdef OPS_NO_REUSE
+		if (op >= 60) op = 0;
+#endif
+		/*
+		 * RETIRE runs OUTSIDE the read section: it waits for a grace
+		 * period, and a QSBR thread that blocks while inside one (or,
+		 * worse, while online and parked) holds off every grace period
+		 * in the process.
+		 */
+		if (op >= 60) {
+			retire_and_reuse(w, it);
+			if ((++n & 0xff) == 0)
+				rcu_quiescent_state();
+			continue;
+		}
+
+		/*
+		 * Mutators run under the read-side lock: remove() reads a
+		 * node's neighbours and then CASes into them, so a neighbour
+		 * reclaimed in between would be a use-after-free.  Nothing is
+		 * unmapped in this test -- reuse is modelled in place -- but
+		 * the discipline is the structure's contract and the test
+		 * should exercise it as callers must.
+		 */
 		rcu_read_lock();
-		if (op < 3) {
-			ret = push_dbg(&g_dq, &it->dn);
-			if (ret == 0)
+		if (uatomic_load(&it->state, CMM_RELAXED) != ITEM_LIVE) {
+			rcu_read_unlock();	/* claimed for reuse */
+			continue;
+		}
+		if (op < 24) {
+			ret = push_dbg(dq, &it->dn);
+			if (ret == 0) {
 				w->pushed++;
-			else if (ret == -EEXIST)
+				if (uatomic_load(&it->last_dq, CMM_RELAXED) != dqi) {
+					w->migrated++;
+					uatomic_store(&it->last_dq, dqi,
+						      CMM_RELAXED);
+				}
+			} else if (ret == -EEXIST) {
 				w->exists++;
-		} else if (op < 6) {
-			ret = remove_dbg(&g_dq, &it->dn);
+			}
+		} else if (op < 48) {
+			ret = remove_by_hint(w, it);
 			if (ret == 0)
 				w->removed++;
 			else if (ret == -ENOENT)
 				w->noent++;
 		} else {
-			if (urcu_txn_deque_rotate_head(&g_dq, &g_domain) == 0)
+			if (urcu_txn_deque_rotate_head(dq, &g_domain) == 0)
 				w->rotated++;
 		}
 		rcu_read_unlock();
@@ -331,64 +531,84 @@ static void *writer_fn(void *arg)
 /*
  * QUIESCENT verification: every writer has joined, so no commit is in flight
  * and no slot can hold a parked proxy.  Reads are plain.
+ *
+ * With NDEQUES > 1 the biconditional gets sharper, not merely wider: `owner`
+ * must name the deque the node is actually reachable in, so a node reachable in
+ * deque A while owning B is a distinct failure from one reachable nowhere, and
+ * the two are reported apart.
  */
 static int verify(void)
 {
-	struct urcu_txn_deque_node *w, *prev;
 	unsigned long walked = 0, owned = 0, i;
 	int fail = 0;
-	char *seen;
+	long *found;			/* deque index a node was walked in, or -1 */
 
-	seen = calloc(NNODES, 1);
-	if (!seen)
+	found = malloc(NNODES * sizeof(*found));
+	if (!found)
 		return 2;
+	for (i = 0; i < NNODES; i++)
+		found[i] = -1;
 
-	/* 1. walk the ring: closure, and both edges at every step */
-	prev = &g_dq.sentinel;
-	w = g_dq.sentinel.next;
-	while (w != &g_dq.sentinel) {
-		struct item *it;
+	/* 1. walk every ring: closure, and both edges at every step */
+	for (i = 0; i < NDEQUES; i++) {
+		struct urcu_txn_deque *d = &g_dq[i];
+		struct urcu_txn_deque_node *w, *prev = &d->sentinel;
+		unsigned long here = 0;
 
-		if (++walked > NNODES + 1) {
-			fprintf(stderr, "FAIL: ring does not close (walked %lu)\n",
-				walked);
-			fail = 1;
-			break;
+		w = d->sentinel.next;
+		while (w != &d->sentinel) {
+			struct item *it;
+
+			if (++here > NNODES + 1) {
+				fprintf(stderr, "FAIL: deque %lu ring does not "
+					"close (walked %lu)\n", i, here);
+				fail = 1;
+				break;
+			}
+			if (w->prev != prev) {
+				fprintf(stderr,
+					"FAIL: back edge in deque %lu: node %p "
+					"prev=%p, expected %p -- the forward and "
+					"backward chains disagree\n",
+					i, (void *) w, (void *) w->prev,
+					(void *) prev);
+				fail = 1;
+			}
+			if (w->owner != d) {
+				fprintf(stderr,
+					"FAIL: node %p is LINKED in deque %lu but "
+					"owner=%p -- membership disagrees with "
+					"the links\n", (void *) w, i,
+					(void *) w->owner);
+				fail = 1;
+			}
+			it = caa_container_of(w, struct item, dn);
+			if (it->id >= NNODES || found[it->id] >= 0) {
+				fprintf(stderr,
+					"FAIL: node id %lu bad, or reachable in "
+					"two deques (%ld and %lu)\n",
+					it->id,
+					it->id < NNODES ? found[it->id] : -1, i);
+				fail = 1;
+				break;
+			}
+			found[it->id] = (long) i;
+			prev = w;
+			w = w->next;
 		}
-		if (w->prev != prev) {
+		if (!fail && d->sentinel.prev != prev) {
 			fprintf(stderr,
-				"FAIL: back edge: node %p prev=%p, expected %p "
-				"-- the forward and backward chains disagree\n",
-				(void *) w, (void *) w->prev, (void *) prev);
+				"FAIL: deque %lu sentinel.prev=%p, last walked=%p\n",
+				i, (void *) d->sentinel.prev, (void *) prev);
 			fail = 1;
 		}
-		if (w->owner != &g_dq) {
-			fprintf(stderr,
-				"FAIL: node %p is LINKED but owner=%p -- "
-				"membership disagrees with the links\n",
-				(void *) w, (void *) w->owner);
-			fail = 1;
-		}
-		it = caa_container_of(w, struct item, dn);
-		if (it->id >= NNODES || seen[it->id]) {
-			fprintf(stderr, "FAIL: node id %lu bad or duplicated\n",
-				it->id);
-			fail = 1;
-			break;
-		}
-		seen[it->id] = 1;
-		prev = w;
-		w = w->next;
-	}
-	if (!fail && g_dq.sentinel.prev != prev) {
-		fprintf(stderr, "FAIL: sentinel.prev=%p, last walked=%p\n",
-			(void *) g_dq.sentinel.prev, (void *) prev);
-		fail = 1;
+		walked += here;
 	}
 
 	/* 1b. seq must stay EVEN: bit 0 is the engine's descriptor proxy tag on
 	 * every transacted slot, so an odd value means either a leaked proxy or
-	 * a bump by 1 somewhere. */
+	 * a bump by 1 somewhere.  Reuse resets seq to 0, which is even, so this
+	 * still holds across recycles. */
 	for (i = 0; i < NNODES; i++) {
 		if (g_items[i].dn.seq & 1UL) {
 			fprintf(stderr,
@@ -397,25 +617,40 @@ static int verify(void)
 				i, g_items[i].dn.seq);
 			fail = 1;
 		}
-	}
-
-	/* 2. THE BICONDITIONAL, over every node -- owner set <=> reachable */
-	for (i = 0; i < NNODES; i++) {
-		int has_owner = g_items[i].dn.owner != NULL;
-
-		if (has_owner)
-			owned++;
-		if (has_owner && !seen[i]) {
+		if (uatomic_load(&g_items[i].state, CMM_RELAXED) != ITEM_LIVE) {
 			fprintf(stderr,
-				"FAIL: node %lu claims owner=%p but is NOT "
-				"reachable (CLAIMED-BUT-NOT-LINKED)\n",
-				i, (void *) g_items[i].dn.owner);
+				"FAIL: node %lu left RETIRING -- a retire did "
+				"not complete\n", i);
 			fail = 1;
 		}
-		if (!has_owner && seen[i]) {
+	}
+
+	/* 2. THE BICONDITIONAL, over every node -- owner names the deque the
+	 *    node is reachable in, and nothing else. */
+	for (i = 0; i < NNODES; i++) {
+		struct urcu_txn_deque *o = g_items[i].dn.owner;
+
+		if (o)
+			owned++;
+		if (o && found[i] < 0) {
 			fprintf(stderr,
-				"FAIL: node %lu is reachable but owner is NULL "
-				"(LINKED-BUT-DISOWNED)\n", i);
+				"FAIL: node %lu claims owner=%p (deque %lu) but "
+				"is NOT reachable (CLAIMED-BUT-NOT-LINKED)\n",
+				i, (void *) o, dq_index(o));
+			fail = 1;
+		}
+		if (!o && found[i] >= 0) {
+			fprintf(stderr,
+				"FAIL: node %lu is reachable in deque %ld but "
+				"owner is NULL (LINKED-BUT-DISOWNED)\n",
+				i, found[i]);
+			fail = 1;
+		}
+		if (o && found[i] >= 0 && dq_index(o) != (unsigned long) found[i]) {
+			fprintf(stderr,
+				"FAIL: node %lu owns deque %lu but is reachable "
+				"in deque %ld (WRONG-DEQUE)\n",
+				i, dq_index(o), found[i]);
 			fail = 1;
 		}
 	}
@@ -424,15 +659,18 @@ static int verify(void)
 		fail = 1;
 	}
 	{
-		unsigned long tot = 0;
+		unsigned long tot = 0, rec = 0;
 
-		for (i = 0; i < NNODES; i++)
+		for (i = 0; i < NNODES; i++) {
 			tot += g_items[i].dn.seq;
-		printf("  ring: %lu nodes, closed, both edges agree, "
-		       "owner<=>reachable; seq total %lu (all even)\n",
-		       walked, tot);
+			rec += g_items[i].recycles;
+		}
+		printf("  %d rings: %lu nodes, closed, both edges agree, "
+		       "owner<=>reachable and names the right deque;\n"
+		       "  seq total %lu (all even) across %lu recycles\n",
+		       NDEQUES, walked, tot, rec);
 	}
-	free(seen);
+	free(found);
 	return fail;
 }
 
@@ -450,14 +688,17 @@ int main(void)
 	rcu_thread_offline();		/* main does not participate */
 
 	urcu_txn_domain_init(&g_domain);
-	urcu_txn_deque_init(&g_dq);
+	for (i = 0; i < NDEQUES; i++)
+		urcu_txn_deque_init(&g_dq[i]);
 	for (i = 0; i < NNODES; i++) {
 		urcu_txn_deque_node_init(&g_items[i].dn);
 		g_items[i].id = i;
+		g_items[i].state = ITEM_LIVE;
+		g_items[i].last_dq = (unsigned long) -1;
 	}
 
-	printf("== test_deque: %d writers, %d nodes, %d ms ==\n",
-	       NWRITERS, NNODES, DURATION_MS);
+	printf("== test_deque: %d writers, %d nodes, %d deques, %d ms ==\n",
+	       NWRITERS, NNODES, NDEQUES, DURATION_MS);
 
 	for (i = 0; i < NWRITERS; i++) {
 		memset(&wa[i], 0, sizeof(wa[i]));
@@ -474,22 +715,36 @@ int main(void)
 	for (i = 0; i < NWRITERS; i++) {
 		g_pushed += wa[i].pushed;   g_removed += wa[i].removed;
 		g_rotated += wa[i].rotated; g_exists  += wa[i].exists;
-		g_noent += wa[i].noent;
+		g_noent += wa[i].noent;     g_retired += wa[i].retired;
+		g_migrated += wa[i].migrated; g_hintmiss += wa[i].hintmiss;
 	}
-	printf("  push %lu (EEXIST %lu)  remove %lu (ENOENT %lu)  rotate %lu\n",
-	       g_pushed, g_exists, g_removed, g_noent, g_rotated);
+	printf("  push %lu (EEXIST %lu)  remove %lu (ENOENT %lu)  rotate %lu\n"
+	       "  migrate %lu  retire/reuse %lu  owner-hint miss %lu\n",
+	       g_pushed, g_exists, g_removed, g_noent, g_rotated,
+	       g_migrated, g_retired, g_hintmiss);
 
-	/* A run that never contended proves nothing about the invariant. */
+	/*
+	 * A run that never contended proves nothing about the invariant, and a
+	 * run that never migrated or never recycled proves nothing about the
+	 * two axes this file exists to cover.  Fail loudly rather than print
+	 * PASS for a test that did not run.
+	 *
+	 * hintmiss is NOT gated: it needs a migration to land inside another
+	 * writer's remove, which is genuinely rare, and demanding it would make
+	 * the gate flaky.  It is reported so a zero is visible.
+	 */
 #if defined(OPS_ONLY_PUSH) || defined(OPS_ONLY_REMOVE) || \
-    defined(OPS_ONLY_ROTATE) || defined(OPS_NO_ROTATE)
+    defined(OPS_ONLY_ROTATE) || defined(OPS_NO_ROTATE) || defined(OPS_DISJOINT)
 	if (0) {
 #else
-	if (g_exists == 0 || g_noent == 0 || g_rotated == 0) {
+	if (g_exists == 0 || g_noent == 0 || g_rotated == 0 ||
+	    g_retired == 0 || (NDEQUES > 1 && g_migrated == 0)) {
 #endif
 		fprintf(stderr,
 			"VACUOUS: the run did not exercise contention "
-			"(EEXIST %lu, ENOENT %lu, rotate %lu)\n",
-			g_exists, g_noent, g_rotated);
+			"(EEXIST %lu, ENOENT %lu, rotate %lu, retire %lu, "
+			"migrate %lu)\n",
+			g_exists, g_noent, g_rotated, g_retired, g_migrated);
 		return 2;
 	}
 

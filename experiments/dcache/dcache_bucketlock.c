@@ -2041,7 +2041,38 @@ out:
 
 static void dentry_free_cb(struct rcu_head *rh)
 {
-	free(caa_container_of(rh, struct dentry, d_rcu));
+	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
+
+#if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU) && defined(DC_LRU_FREE_ASSERT)
+	/*
+	 * PROBE (-DDC_LRU_FREE_ASSERT): is this dentry still on a deque at the
+	 * instant its memory is released?
+	 *
+	 * If it is, free() hands the storage back and the next dentry to land on
+	 * it is memset to zero -- owner NULL, links NULL -- while the neighbours
+	 * that were pointing at the old node STILL NAME IT.  That is precisely
+	 * the "live ring reaches a node with owner == NULL" the churn bench
+	 * reports, and it would be a caller bug, not a deque bug.
+	 *
+	 * The free callback is the only place that can decide it: everywhere
+	 * else the answer is a race.
+	 */
+	{
+		struct urcu_txn_deque *q = urcu_txn_deque_owner(&d->d_lru.dnode);
+
+		if (caa_unlikely(q != NULL)) {
+			fprintf(stderr,
+				"FREE-WHILE-QUEUED d=%p owner=%p next=%p prev=%p\n",
+				(void *) d, (void *) q,
+				uatomic_load((void **) &d->d_lru.dnode.next,
+					     CMM_RELAXED),
+				uatomic_load((void **) &d->d_lru.dnode.prev,
+					     CMM_RELAXED));
+			abort();
+		}
+	}
+#endif
+	free(d);
 }
 
 /*
