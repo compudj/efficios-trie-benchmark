@@ -78,6 +78,14 @@ struct dc_ts_row {
 	 *   other   a plain, different pointer -- the slot moved on.
 	 */
 	unsigned long seen_same, seen_marked, seen_proxy, seen_other;
+	/*
+	 * When the losing CAS saw a PROXY, what state is the descriptor behind
+	 * it in?  Under -DDC_LRU_MCAS_LOCKED no concurrent mutator exists, so a
+	 * proxy in a slot cannot be work in flight -- it is a LEAK, and its
+	 * status says which kind: a FAILED or SUCCEEDED descriptor still parked
+	 * means settle did not clean up after itself.
+	 */
+	unsigned long proxy_undecided, proxy_succeeded, proxy_failed;
 	unsigned long ins_cleared_mark;	/* insert ABORTED after its plain store had
 					 * already cleared the node's tombstone --
 					 * leaves it unmarked AND unlinked */
@@ -85,6 +93,10 @@ struct dc_ts_row {
 					 * does not name it */
 	unsigned long audit_no_mark;	/* commit OK but the victim is NOT marked */
 	unsigned long audit_still_linked;/* commit OK but prev->next STILL names it */
+	unsigned long claimed_unlinked;	/* shard word says ON, but the node is NOT
+					 * reachable in that shard's list */
+	unsigned long audit_back_stale;	/* commit OK but next->prev STILL names it --
+					 * the BACKWARD unlink did not take */
 	unsigned long stale_unmarked;	/* memory says MARKED, prepare proceeded */
 	unsigned long marked_seen;	/* memory says MARKED, prepare agreed */
 	unsigned long poison_set;	/* two records on one slot that do not
@@ -228,6 +240,8 @@ static inline void dc_ts_delaudit(enum dc_ts_site s, int no_mark, int linked)
 		r->audit_still_linked++;
 }
 
+#define DC_TS_UNLINKED(site)	(dc_ts_row(site)->claimed_unlinked++)
+#define DC_TS_BACKEDGE(site)	(dc_ts_row(site)->audit_back_stale++)
 #define DC_TS_INSCLEAR(site)	(dc_ts_row(site)->ins_cleared_mark++)
 #define DC_TS_INSEDGE(site)	(dc_ts_row(site)->ins_edge_bad++)
 #define DC_TS_DELAUDIT(site, nm, lk)	dc_ts_delaudit((site), (nm), (lk))
@@ -256,8 +270,19 @@ static inline void dc_ts_cas_fail(unsigned int idx, void *slot, void *old,
 		r->seen_same++;
 	else if ((uintptr_t) seen & 0x2UL)	/* list deletion MARK */
 		r->seen_marked++;
-	else if ((uintptr_t) seen & 0x1UL)	/* engine proxy tag */
+	else if ((uintptr_t) seen & 0x1UL) {	/* engine proxy tag */
+		struct urcu_txn_record *fr = urcu_txn_untag(seen, URCU_TXN_TAG);
+		unsigned long st_desc = fr && fr->desc
+			? urcu_txn_desc_status(fr->desc) : ~0UL;
+
 		r->seen_proxy++;
+		if (st_desc == URCU_TXN_DESC_UNDECIDED)
+			r->proxy_undecided++;
+		else if (st_desc == URCU_TXN_DESC_SUCCEEDED)
+			r->proxy_succeeded++;
+		else if (st_desc == URCU_TXN_DESC_FAILED)
+			r->proxy_failed++;
+	}
 	else
 		r->seen_other++;
 	uatomic_store(&dc_ts_last_slot, slot, CMM_RELAXED);
@@ -337,12 +362,17 @@ void dc_txn_stats_dump(void *stream)
 			a.seen_marked += r->seen_marked;
 			a.seen_proxy += r->seen_proxy;
 			a.seen_other += r->seen_other;
+			a.proxy_undecided += r->proxy_undecided;
+			a.proxy_succeeded += r->proxy_succeeded;
+			a.proxy_failed += r->proxy_failed;
 			a.poison_set += r->poison_set;
 			a.stale_unmarked += r->stale_unmarked;
 			a.audit_no_mark += r->audit_no_mark;
 			a.ins_cleared_mark += r->ins_cleared_mark;
 			a.ins_edge_bad += r->ins_edge_bad;
 			a.audit_still_linked += r->audit_still_linked;
+			a.audit_back_stale += r->audit_back_stale;
+			a.claimed_unlinked += r->claimed_unlinked;
 			a.marked_seen += r->marked_seen;
 			if (r->max_retry > a.max_retry)
 				a.max_retry = r->max_retry;
@@ -368,10 +398,14 @@ void dc_txn_stats_dump(void *stream)
 			fprintf(f, "TXNSTATS %-9s INSERT AUDIT: aborted-after-clearing-mark "
 				"%lu  bad-tail-edge %lu\n", name[i],
 				a.ins_cleared_mark, a.ins_edge_bad);
-		if (a.audit_no_mark || a.audit_still_linked)
+		if (a.claimed_unlinked)
+			fprintf(f, "TXNSTATS %-9s CLAIMED-BUT-NOT-LINKED: %lu\n",
+				name[i], a.claimed_unlinked);
+		if (a.audit_no_mark || a.audit_still_linked || a.audit_back_stale)
 			fprintf(f, "TXNSTATS %-9s POST-COMMIT AUDIT: not-marked %lu  "
-				"STILL-LINKED %lu\n", name[i], a.audit_no_mark,
-				a.audit_still_linked);
+				"STILL-LINKED %lu  BACK-STALE %lu\n", name[i],
+				a.audit_no_mark, a.audit_still_linked,
+				a.audit_back_stale);
 		if (a.stale_unmarked || a.marked_seen)
 			fprintf(f, "TXNSTATS %-9s raw-MARKED: prepare-agreed %lu  "
 				"PREPARE-PROCEEDED(stale) %lu\n", name[i],
@@ -384,6 +418,11 @@ void dc_txn_stats_dump(void *stream)
 				"MARKED %lu  proxy %lu  other %lu\n", name[i],
 				a.seen_same, a.seen_marked, a.seen_proxy,
 				a.seen_other);
+		if (a.seen_proxy)
+			fprintf(f, "TXNSTATS %-9s proxy descriptor state: "
+				"UNDECIDED %lu  SUCCEEDED %lu  FAILED %lu\n",
+				name[i], a.proxy_undecided, a.proxy_succeeded,
+				a.proxy_failed);
 	}
 }
 #endif	/* DC_TXN_STATS_IMPL */
@@ -400,6 +439,8 @@ void dc_txn_stats_dump(void *stream)
 #define DC_TS_DELAUDIT(site, nm, lk)	do { } while (0)
 #define DC_TS_INSCLEAR(site)		do { } while (0)
 #define DC_TS_INSEDGE(site)		do { } while (0)
+#define DC_TS_BACKEDGE(site)		do { } while (0)
+#define DC_TS_UNLINKED(site)		do { } while (0)
 
 #endif	/* DC_TXN_STATS */
 #endif	/* DCACHE_TXN_STATS_H */

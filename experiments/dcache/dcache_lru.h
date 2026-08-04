@@ -406,17 +406,29 @@ static void lru_del_audit(struct urcu_txn_list_node *n,
 	 * as marks.  Raw for the mark, resolved for the pointer, and neither for
 	 * a value that is mid-commit.
 	 */
+	void *np = urcu_txn_list_resolve(uatomic_load(&next->prev, CMM_RELAXED));
 	int in_flight = ((uintptr_t) nn_raw & 0x1UL) != 0;
 	int bad_mark = !in_flight && !urcu_txn_list_is_marked(nn_raw);
 	int bad_fwd = (urcu_txn_list_node_ptr(pn) == n);
+	/*
+	 * THE BACKWARD EDGE, which the first version of this audit never checked
+	 * -- it took `next` and then discarded it.  A del rewrites BOTH
+	 * neighbour edges; verifying only &prev->next leaves &next->prev
+	 * unaudited, and a back-pointer that does not track the forward list is
+	 * exactly what makes a later del derive a wrong `prev`, record
+	 * prev->next : elem -> next against a node that does not name elem, and
+	 * lose its CAS forever.
+	 */
+	int bad_back = (urcu_txn_list_node_ptr(np) == n);
 
-	if (caa_unlikely(bad_mark || bad_fwd)) {
+	if (caa_unlikely(bad_mark || bad_fwd || bad_back)) {
 		DC_TS_DELAUDIT(DC_TS_LRU_DEL, bad_mark, bad_fwd);
+		if (bad_back)
+			DC_TS_BACKEDGE(DC_TS_LRU_DEL);
 		uatomic_store(&dc_ts_last_slot, (void *) &prev->next, CMM_RELAXED);
 		uatomic_store(&dc_ts_last_old, (void *) n, CMM_RELAXED);
 		uatomic_store(&dc_ts_last_seen, pn, CMM_RELAXED);
 	}
-	(void) next;
 }
 
 static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
@@ -575,6 +587,37 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
 		return 0;			/* off, or a peer is mid-change */
 	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
 		return 0;
+#ifdef DC_TXN_STATS
+	/*
+	 * Is the node we just claimed actually REACHABLE in the shard it says it
+	 * is on?  The shard word and list membership are maintained separately,
+	 * so they can disagree -- and a del of a node that is NOT linked derives
+	 * `prev` from a stale back-pointer, records prev->next : elem -> next
+	 * against a node that does not name elem, and loses that CAS on every
+	 * attempt forever.  That is the exact signature at the wedge, so measure
+	 * it rather than reason about it.  O(list) and diagnostic-only.
+	 */
+	{
+		struct dc_lru_shard *csh = &dc->lru[st - DC_LRU_ON(0)];
+		struct urcu_txn_list_node *w = urcu_txn_list_node_ptr(
+			urcu_txn_list_resolve(uatomic_load(&csh->list.node.next,
+							   CMM_RELAXED)));
+		unsigned int hops = 0;
+		int found = 0;
+
+		while (w && w != &csh->list.node && hops++ < 4096) {
+			void *raw;
+
+			if (w == &d->d_lru.link) { found = 1; break; }
+			raw = uatomic_load(&w->next, CMM_RELAXED);
+			if ((uintptr_t) raw & 0x1UL)
+				break;			/* mid-commit: give up */
+			w = urcu_txn_list_node_ptr(raw);
+		}
+		if (!found)
+			DC_TS_UNLINKED(DC_TS_LRU_DEL);
+	}
+#endif
 	{
 		int r = lru_list_del(dc, &d->d_lru.link);
 
@@ -598,31 +641,92 @@ static int lru_del_claimed(struct dcache *dc, struct dentry *d)
  * is unlink+link under one lock -- and decomposing it into two independent
  * commits is what cost the MCAS arm that guarantee.
  *
- * The node stays CLAIMED for the whole move (it is already ON, and we do not
- * pass through OFF), so a concurrent lru_add/lru_del cannot interleave: both
- * require a state transition through the shard word, and a move never publishes
- * one.  Returns 1 if it moved, 0 if it was already the tail or a peer removed
- * it, -1 on failure.
+ * Returns 1 if it moved, 0 if it was already the tail, a peer removed it, or a
+ * peer owns the node, -1 on failure.
  */
 const int dc_lru_inuse_is_removed = 0;	/* MCAS arm MOVES; see dcache.h */
 
 static int lru_move_tail(struct dcache *dc, struct dentry *d, unsigned int idx)
 {
 	struct dc_lru_shard *sh = &dc->lru[idx];
+	unsigned int st;
 	int r;
+
+	/*
+	 * CLAIM IT, exactly as add and del do.  The comment below used to argue
+	 * that a move needs no claim because it never publishes a state
+	 * transition -- true, and irrelevant: what protects the node is not the
+	 * transition but OWNING the word, and a move that never touches the word
+	 * owns nothing.  The shrinker reaches its victim through the LIST, not
+	 * through the word, so a concurrent lru_del_claimed can claim, unlink and
+	 * commit underneath a move that is already mid-transaction.  The move
+	 * then re-derives prev from the removed node's own edges and records
+	 * prev->next : elem -> next against a prev that no longer names elem -- a
+	 * CAS that can never match, retried forever.  That is the wedge.
+	 *
+	 * The word is the node's lock over ALL THREE mutators or it is a lock
+	 * over none of them.  A losing claim means a peer owns the node: report
+	 * "did not move" and let the caller move on, which is what the shrinker
+	 * already does for a lost del.
+	 */
+	st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+	if (st < DC_LRU_ON(0))
+		return 0;			/* off, or a peer is mid-change */
+	if (uatomic_cmpxchg(&d->d_lru.shard, st, DC_LRU_BUSY) != st)
+		return 0;
 
 	MLOCK(sh);
 	r = urcu_txn_list_move_tail_rcu(&d->d_lru.link, &sh->list,
 					&dc->lru_domain);
 	MUNLOCK(sh);
-	if (r == -ENOENT)
-		return 0;			/* a peer deleted it */
+	if (r != -ENOENT)			/* still linked: restore the claim */
+		uatomic_store(&d->d_lru.shard, st, CMM_RELEASE);
+	if (r == -ENOENT) {
+		/*
+		 * A peer deleted it: the node is NOT on the list any more, so
+		 * the shard word must stop claiming that it is.  Leaving it ON
+		 * desynchronises the word from actual membership, and a later
+		 * lru_del_claimed then claims a node it cannot find, derives
+		 * `prev` from a stale back-pointer, and records
+		 * prev->next : elem -> next against a node that does not name
+		 * elem -- a CAS that can never match, retried forever.
+		 * Measured as CLAIMED-BUT-NOT-LINKED under -DDC_TXN_STATS.
+		 */
+		uatomic_dec(&sh->count);
+		uatomic_store(&d->d_lru.shard, DC_LRU_OFF, CMM_RELEASE);
+		return 0;
+	}
 	return r == 0 ? 1 : -1;
 }
 
+/*
+ * Remove @d from whatever shard it is on, and do not return until it is off.
+ *
+ * lru_del_claimed() gives up when the node is BUSY -- some other thread is
+ * mid-transition on it -- and an earlier version simply discarded that.  That
+ * is fine for the shrinker, which can skip a node and come back, but NOT for
+ * dc_unlink: it calls this immediately before call_rcu'ing the dentry free, so
+ * giving up leaves a node on the list whose memory is about to be recycled.
+ * The list then points into reused storage, and every later operation on that
+ * shard derives garbage neighbours -- which is one way a node ends up CLAIMED
+ * BUT NOT LINKED (counted under -DDC_TXN_STATS).
+ *
+ * BUSY is a transition that always completes, so waiting it out is bounded.
+ */
 static void lru_del(struct dcache *dc, struct dentry *d)
 {
-	(void) lru_del_claimed(dc, d);
+	for (;;) {
+		unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+
+		if (st == DC_LRU_OFF)
+			return;			/* already off the list */
+		if (st == DC_LRU_BUSY) {
+			caa_cpu_relax();	/* a peer is mid-transition */
+			continue;
+		}
+		if (lru_del_claimed(dc, d))
+			return;
+	}
 }
 
 /*
