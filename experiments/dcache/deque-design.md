@@ -311,6 +311,45 @@ Three things that fell out and are worth keeping:
   passes. Worse, reuse *resets* `seq` to zero, so the guard's stated premise —
   "never decreases" — does not survive recycled storage at all. The guard is
   monotone per membership, not per address.
-- **TSAN cannot gate this.** It cannot model a QSBR grace period, so every
-  reclaim-vs-reader pair reads as a race: 27 reports with the reuse op, **38 with
-  it compiled out** (the MCAS descriptor slab alone). No TSAN arm, deliberately.
+- **TSAN gates it fine, and every report it made was real.** See below — the
+  claim that it could not was wrong twice over.
+
+## ⛔ CORRECTION 2: "TSAN cannot gate this" was wrong
+
+First written as: TSAN cannot model a QSBR grace period, so every
+reclaim-vs-reader pair reads as a race — 27 reports with the reuse op, 38 with it
+compiled out, therefore noise, therefore no TSAN arm. Two errors stacked:
+
+1. **The TSAN liburcu was four days stale.** `urcu-txn-tsan-build` was a Jul 31
+   copy; `rcu-txn-mcas.h` had moved on Aug 3. So those runs exercised a
+   *different engine* from every other gate, and no conclusion drawn from them
+   was worth anything. (`--enable-compiler-atomic-builtins` *was* set, and TSAN
+   *was* instrumenting the atomics — verified by finding `__tsan_atomic64_load`
+   in the generated code. The flag was not the problem; the staleness was.)
+   The hand-rolled command line also omitted `TSAN_SLAB_CPP`, which the Makefile
+   already warns about; harmless here only because both trees happen to build the
+   default slab route.
+2. **The reports that survived a correct rebuild were all real, and all mine.**
+   The control that showed it: `make stress-tsan` on the rebuilt tree is
+   **clean**, so the engine is not inherently TSAN-dirty and the reports had to
+   be coming from something this test does and the dcache does not.
+
+Sixteen races, and the classification is the whole lesson:
+
+| n | what | verdict |
+|---|---|---|
+| 11 | `urcu_txn_resolve_record` / `desc_status` vs `desc_commit` / `urcu_txn_add` | **real** — the harness resolved proxies off `CMM_RELAXED` loads |
+| 4 | `urcu_txn_read` vs `urcu_txn_deque_node_init` on `g_items` | **real** — same cause, the diagnostic reads |
+| 1 | `g_stop` | **real** — `volatile int` is not atomic |
+
+The first fifteen are one mistake: **resolving a proxy dereferences the writer's
+descriptor, so the load of the slot must be `CMM_ACQUIRE`.** A relaxed load
+carries no happens-before to that descriptor's initialisation — the reader can
+see the proxy pointer without seeing the fields it points at. The library's own
+accessors (`urcu_txn_deque_owner`, `_head`) get this right; the *diagnostic*
+reads in `push_dbg` / `remove_dbg` / the livelock dump did not, precisely because
+they are not part of the algorithm and got written casually.
+
+Fixed, the arm is **0 warnings** at 4 and 8 writers × 1, 4 and 16 deques.
+`make check-deque-tsan`, which refuses to run if the TSAN tree has drifted from
+`urcu-txn-build`.

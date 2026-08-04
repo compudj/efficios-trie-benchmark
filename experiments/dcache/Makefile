@@ -80,7 +80,8 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
-	check-filetype repro-samedir churn check-churn check-deque clean check-lib
+	check-filetype repro-samedir churn check-churn check-deque check-deque-tsan \
+	clean check-lib
 
 # ASan flags for the from-source concurrency builds.
 ASANFLAGS := -O1 -g -pthread -fsanitize=address -fno-omit-frame-pointer
@@ -807,11 +808,13 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 # load-bearing.  If this arm ever starts failing, the guard has earned its
 # place; while it passes, the honest statement is that it is unproven.
 #
-# ⛔ NO TSAN ARM, deliberately.  TSAN cannot model a QSBR grace period, so every
-# reclaim-vs-reader pair reads as a race: the MCAS descriptor slab alone
-# produces ~38 reports here with the reuse op COMPILED OUT, i.e. more than with
-# it in.  A TSAN gate would therefore be noise, not coverage.  See
-# deque-design.md.
+# ⚠ THE TSAN ARM IS check-deque-tsan, AND IT NEEDS A CURRENT TSAN LIBURCU.
+# An earlier revision of this comment said a TSAN gate here would be pure noise
+# -- "TSAN cannot model a QSBR grace period" -- on the strength of 20-38 reports
+# that all looked like descriptor recycle.  That was wrong twice over: the TSAN
+# liburcu was FOUR DAYS STALE (a Jul 31 copy against an Aug 3 engine), and every
+# surviving report was a real defect in the harness's own diagnostic reads.
+# Rebuilt and fixed, the arm is 0 warnings.  See the recipe above stress-tsan.
 check-deque: test_deque.c $(URCU_DEP) | check-lib
 	@for w in 2 8 32; do \
 	  echo "--- test_deque: $$w writers, 4 deques ---"; \
@@ -841,6 +844,33 @@ check-deque: test_deque.c $(URCU_DEP) | check-lib
 	$(CC) $(CFLAGS) -DNWRITERS=8 -DRETIRE_AUDIT $(CPPFLAGS) -o test_deque_audit \
 	  test_deque.c $(LDFLAGS) $(LDLIBS)
 	./test_deque_audit
+
+# TSAN over the deque.  Needs the TSAN liburcu -- built with
+# --enable-compiler-atomic-builtins, else uatomic is inline asm TSAN cannot see
+# -- AND KEPT IN SYNC WITH $(URCU_TXN_BUILD): a stale TSAN tree tests a
+# different engine and its reports cannot be reasoned about.  The recipe is in
+# the comment above stress-tsan; check the sync with
+#   md5sum $(URCU_TSAN_INC)/urcu/rcu-txn-mcas.h $(URCU_TXN_INC)/urcu/rcu-txn-mcas.h
+#
+# TSAN_SLAB_CPP, not SLAB_CPP: the latter describes $(URCU_TXN_BUILD)'s slab
+# route, and compiling one route against a library built for the other tests
+# neither.
+check-deque-tsan: test_deque.c
+	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see the recipe"; \
+	  echo "       in the stress-tsan comment in this Makefile."; exit 1; }
+	@cmp -s $(URCU_TSAN_INC)/urcu/rcu-txn-mcas.h $(URCU_TXN_INC)/urcu/rcu-txn-mcas.h || { \
+	  echo "ERROR: the TSAN liburcu is out of sync with $(URCU_TXN_BUILD)."; \
+	  echo "       Rebuild it (recipe above stress-tsan) -- a stale TSAN tree"; \
+	  echo "       reports races in an engine you are not running."; exit 1; }
+	@for a in "-DNWRITERS=4" "-DNWRITERS=8" "-DNWRITERS=4 -DNDEQUES=1" \
+		  "-DNWRITERS=4 -DNDEQUES=16"; do \
+	  echo "--- test_deque TSAN: $$a ---"; \
+	  $(CC) $(TSANFLAGS) $(TSAN_SLAB_CPP) $$a -DDURATION_MS=400 \
+	    -I$(URCU_TSAN_INC) -I. -o test_deque_tsan test_deque.c \
+	    -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS) || exit 1; \
+	  TSAN_OPTIONS="halt_on_error=0 history_size=4" ./test_deque_tsan || exit 1; \
+	done
 
 # LAYOUT arms.  The gates above sweep the causality arms and the chain
 # strategies, but they all build the DEFAULT 1-CL split layout -- while the

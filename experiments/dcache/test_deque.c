@@ -94,7 +94,13 @@ struct item {
 static struct urcu_txn_deque	g_dq[NDEQUES];
 static struct urcu_txn_domain	g_domain;
 static struct item		g_items[NNODES];
-static volatile int		g_stop;
+/*
+ * NOT `volatile int`.  volatile orders nothing and is not atomic, so main's
+ * store and the writers' loads are a plain data race -- which TSAN reports, and
+ * which the C memory model gives no guarantee about however well it happens to
+ * work.  uatomic_* is what the rest of this file already uses.
+ */
+static int			g_stop;
 static unsigned long		g_ops;
 
 static unsigned long		g_pushed, g_removed, g_rotated, g_exists, g_noent;
@@ -183,6 +189,15 @@ static void hist_dump(void *x, void *y, void *z)
 
 /*
  * PUSH with the same hand-opened bracket, so its derived edges are logged too.
+ *
+ * ⚠ EVERY out-of-transaction load of a transacted slot below is CMM_ACQUIRE, and
+ * that is not decoration.  A slot may hold a parked proxy, and resolving one
+ * DEREFERENCES the writer's descriptor -- so a relaxed load carries no
+ * happens-before to that descriptor's initialisation, and the reader can see a
+ * proxy pointer without seeing the fields it points at.  These are diagnostic
+ * reads, which is exactly why the mistake was easy to make and easy to miss:
+ * they are not part of the algorithm, so they got written casually.  TSAN
+ * reported all of them.
  */
 static int push_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 {
@@ -203,7 +218,7 @@ static int push_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 			return prep;
 		}
 		ot = (void *) urcu_txn_deque_resolve(uatomic_load(
-				(void **) &d->sentinel.prev, CMM_RELAXED));
+				(void **) &d->sentinel.prev, CMM_ACQUIRE));
 		st = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
 		hist_log(1, st == URCU_TXN_STATUS_OK ? 0 :
@@ -247,15 +262,15 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 			int reach = 0;
 
 			pv = urcu_txn_deque_resolve(
-				uatomic_load((void **) &n->prev, CMM_RELAXED));
+				uatomic_load((void **) &n->prev, CMM_ACQUIRE));
 			nx = urcu_txn_deque_resolve(
-				uatomic_load((void **) &n->next, CMM_RELAXED));
+				uatomic_load((void **) &n->next, CMM_ACQUIRE));
 			w = urcu_txn_deque_resolve(uatomic_load(
-				(void **) &d->sentinel.next, CMM_RELAXED));
+				(void **) &d->sentinel.next, CMM_ACQUIRE));
 			while (w && w != &d->sentinel && hop++ < 4096) {
 				if (w == n) { reach = 1; break; }
 				w = urcu_txn_deque_resolve(uatomic_load(
-					(void **) &w->next, CMM_RELAXED));
+					(void **) &w->next, CMM_ACQUIRE));
 			}
 			fprintf(stderr,
 				"LIVELOCK n=%p owner=%p(want %p, deque %lu) "
@@ -267,19 +282,19 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 				(void *) d, dq_index(d), reach,
 				(void *) pv,
 				pv ? (void *) uatomic_load((void **) &pv->next,
-							   CMM_RELAXED) : NULL,
+							   CMM_ACQUIRE) : NULL,
 				pv && urcu_txn_deque_resolve(uatomic_load(
-					(void **) &pv->next, CMM_RELAXED)) == n,
+					(void **) &pv->next, CMM_ACQUIRE)) == n,
 				(void *) nx,
 				nx ? (void *) uatomic_load((void **) &nx->prev,
-							   CMM_RELAXED) : NULL,
+							   CMM_ACQUIRE) : NULL,
 				nx && urcu_txn_deque_resolve(uatomic_load(
-					(void **) &nx->prev, CMM_RELAXED)) == n,
+					(void **) &nx->prev, CMM_ACQUIRE)) == n,
 				(pv && nx &&
 				 urcu_txn_deque_resolve(uatomic_load(
-					(void **) &pv->next, CMM_RELAXED)) == n &&
+					(void **) &pv->next, CMM_ACQUIRE)) == n &&
 				 urcu_txn_deque_resolve(uatomic_load(
-					(void **) &nx->prev, CMM_RELAXED)) == n &&
+					(void **) &nx->prev, CMM_ACQUIRE)) == n &&
 				 urcu_txn_deque_owner(n) == d)
 				? "STRUCTURE IS CORRECT -> the ENGINE is failing"
 				: "STRUCTURE IS CORRUPT -> the DEQUE is failing");
@@ -297,9 +312,9 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 		}
 		{
 			void *pv = (void *) urcu_txn_deque_resolve(
-				uatomic_load((void **) &n->prev, CMM_RELAXED));
+				uatomic_load((void **) &n->prev, CMM_ACQUIRE));
 			void *nx = (void *) urcu_txn_deque_resolve(
-				uatomic_load((void **) &n->next, CMM_RELAXED));
+				uatomic_load((void **) &n->next, CMM_ACQUIRE));
 
 			st = urcu_txn_commit(&txn);
 			urcu_txn_end(&txn);
@@ -404,7 +419,7 @@ static void retire_and_reuse(struct warg *w, struct item *it)
 		for (k = 0; k < NDEQUES; k++) {
 			struct urcu_txn_deque_node *w2 = urcu_txn_deque_resolve(
 				uatomic_load((void **) &g_dq[k].sentinel.next,
-					     CMM_RELAXED));
+					     CMM_ACQUIRE));
 			unsigned long hop = 0;
 
 			while (w2 && w2 != &g_dq[k].sentinel && hop++ <= NNODES) {
@@ -420,7 +435,7 @@ static void retire_and_reuse(struct warg *w, struct item *it)
 					abort();
 				}
 				w2 = urcu_txn_deque_resolve(uatomic_load(
-					(void **) &w2->next, CMM_RELAXED));
+					(void **) &w2->next, CMM_ACQUIRE));
 			}
 		}
 	}
@@ -439,7 +454,7 @@ static void *writer_fn(void *arg)
 
 	rcu_register_thread();
 	rcu_thread_online();
-	while (!g_stop) {
+	while (!uatomic_load(&g_stop, CMM_ACQUIRE)) {
 		unsigned long r = xrand(&w->seed);
 #ifdef OPS_DISJOINT
 		/* Each writer owns a private slice, so the only shared slots
@@ -492,7 +507,7 @@ static void *writer_fn(void *arg)
 		 * should exercise it as callers must.
 		 */
 		rcu_read_lock();
-		if (uatomic_load(&it->state, CMM_RELAXED) != ITEM_LIVE) {
+		if (uatomic_load(&it->state, CMM_ACQUIRE) != ITEM_LIVE) {
 			rcu_read_unlock();	/* claimed for reuse */
 			continue;
 		}
@@ -708,7 +723,7 @@ int main(void)
 			return 2;
 	}
 	nanosleep(&ts, NULL);
-	g_stop = 1;
+	uatomic_store(&g_stop, 1, CMM_RELEASE);
 	for (i = 0; i < NWRITERS; i++)
 		pthread_join(th[i], NULL);
 

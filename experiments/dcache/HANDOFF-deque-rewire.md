@@ -32,7 +32,24 @@ commits on one slot cannot both win — but it **moves the serialization point
 from the LRU word to the eviction**.
 
 Gates green: `make check`, `check-bucketlock`, `check-lru-arms` (9 PASS + 2 ASan
-stress), 390/394 checks, 0 failures.
+stress), `check-deque` (8 arms), `check-deque-tsan` (4 arms, 0 warnings).
+390/394 checks, 0 failures.
+
+⚠ **BEFORE ANY TSAN RUN, CHECK THE TSAN TREE IS CURRENT.** `urcu-txn-tsan-build`
+is a *copy* of `urcu-txn-build`, and it silently rots:
+
+    md5sum urcu-txn-tsan-build/include/urcu/rcu-txn-mcas.h \
+           urcu-txn-build/include/urcu/rcu-txn-mcas.h
+
+`check-deque-tsan` refuses to run when they differ. It cost a whole wrong
+conclusion this session. Rebuild recipe: the comment above `stress-tsan`.
+
+⚠ Also known: `urcu-txn-build/include/urcu/rcu-txn-slab.h` is behind the dev
+tree (the dev version adds `__attribute__((aligned(64)))` to the stats counter
+block, which changes `struct urcu_slab`'s layout **unconditionally** — it is not
+behind an ifdef). The build tree is self-consistent (old header, old library) so
+this session's numbers are sound, but syncing that header REQUIRES rebuilding
+the library with it or the .so and callers disagree about field offsets.
 
 ## RESOLVED: the legacy arm's collapse is a CALLER bug
 
@@ -94,9 +111,20 @@ Three things worth keeping from building it:
   passes. And reuse *resets* `seq` to zero, so its stated premise ("never
   decreases") does not survive recycled storage: it is monotone per membership,
   not per address. Worth a header caveat, not yet written.
-- **⛔ TSAN cannot gate the deque test.** It cannot model a QSBR grace period, so
-  every reclaim-vs-reader pair reads as a race: 27 reports with the reuse op,
-  **38 with it compiled out**. No TSAN arm, deliberately.
+- **⛔ "TSAN cannot gate the deque test" was WRONG.** Retracted: `make
+  check-deque-tsan` is **0 warnings**. The original claim rested on 20-38
+  reports blamed on TSAN not modelling a QSBR grace period. In fact (a) the TSAN
+  liburcu was a **Jul 31 copy against an Aug 3 engine**, so those runs exercised
+  a different engine from every other gate; `--enable-compiler-atomic-builtins`
+  was set and TSAN *was* instrumenting the atomics (`__tsan_atomic64_load` in
+  the output), so the flag was never the issue — the staleness was. And (b)
+  after a correct rebuild all 16 surviving reports were **real defects in the
+  harness**: 15 from resolving proxies off `CMM_RELAXED` loads (resolving a
+  proxy dereferences the writer's descriptor, so the slot load must be ACQUIRE
+  or there is no happens-before to that descriptor's init) and one from
+  `volatile int g_stop`, which is not atomic.
+  ⭐ The control that settled it: `make stress-tsan` on the rebuilt tree is
+  clean, so the engine was not the source and the reports had to be this test's.
 
 ## The former open defect — kept for the reasoning, superseded above
 
