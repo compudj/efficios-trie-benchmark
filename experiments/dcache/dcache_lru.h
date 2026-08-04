@@ -342,6 +342,8 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 {
 	struct urcu_txn txn;
 
+	unsigned long iter = 0;
+
 	urcu_txn_init(&txn, &dc->lru_domain);
 	for (;;) {
 		enum urcu_txn_status st;
@@ -349,6 +351,62 @@ static int lru_list_add_tail(struct dcache *dc, struct urcu_txn_list_node *n,
 
 		void *pre;
 
+#ifdef DC_ENABLE_TRACING
+		/*
+		 * ON EVERY RETRY, before re-running prepare: is @n ALREADY the
+		 * tail?  insert_before_prepare writes newp->next and newp->prev
+		 * as PLAIN stores at prepare time, with no CAS behind them and
+		 * no undo on abort, so a retry that runs against a node the
+		 * previous iteration actually LINKED overwrites live edges --
+		 * the predecessor keeps naming @n while @n's own next is reset,
+		 * which is the half-linked shape the wedge shows.  That can only
+		 * happen if a commit landed and did not report OK, so test
+		 * exactly that: the sentinel's prev naming @n means the previous
+		 * iteration's insert took effect.
+		 */
+		if (iter++ > 0) {
+			void *tp = uatomic_load(&head->node.prev, CMM_RELAXED);
+			struct urcu_txn_list_node *w = urcu_txn_list_node_ptr(
+				urcu_txn_list_resolve(uatomic_load(
+					&head->node.next, CMM_RELAXED)));
+			unsigned long hop = 0;
+			int linked = 0;
+
+			/*
+			 * REACHABILITY, not just the tail.  Testing head->prev
+			 * only catches a previous iteration that left @n as the
+			 * tail; an append by a peer since then leaves @n linked
+			 * in the MIDDLE and the tail test misses it entirely.
+			 * Retries are rare (tens per run), so the walk is free.
+			 */
+			while (w && w != &head->node && hop++ < 100000) {
+				void *raw;
+
+				if (w == n) { linked = 1; break; }
+				raw = uatomic_load(&w->next, CMM_RELAXED);
+				if ((uintptr_t) raw & 0x1UL)
+					break;		/* mid-commit */
+				w = urcu_txn_list_node_ptr(
+					urcu_txn_list_resolve(raw));
+			}
+			if (linked) {
+				DC_TP_WEDGE(n,
+					uatomic_load(&n->next, CMM_RELAXED),
+					uatomic_load(&n->prev, CMM_RELAXED),
+					tp, NULL, NULL, NULL,
+					(unsigned int) iter);
+				fprintf(stderr,
+					"ADD-RETRY-ON-LINKED n=%p iter=%lu "
+					"next=%p prev=%p tailp=%p\n",
+					(void *) n, iter,
+					uatomic_load(&n->next, CMM_RELAXED),
+					uatomic_load(&n->prev, CMM_RELAXED), tp);
+				if (system("lttng snapshot record 1>&2") == -1)
+					perror("lttng snapshot");
+				abort();
+			}
+		}
+#endif
 		urcu_txn_begin(&txn);
 		DC_TS_BEGIN(DC_TS_LRU_ADD, &txn);
 		/*
@@ -558,6 +616,36 @@ static int lru_list_del(struct dcache *dc, struct urcu_txn_list_node *n)
 			if (st == URCU_TXN_STATUS_OK && pv && nx)
 				lru_del_audit(n, pv, nx);
 		}
+#ifdef DC_ENABLE_TRACING
+		/*
+		 * AUDIT THE ABORT, not just the success.  lru_del_audit() only
+		 * runs on a commit that reports OK, and it is clean -- so if a
+		 * del ever applies part of its three slots, it does so on a
+		 * commit that reports ABORT.  The mark on &elem->next is the
+		 * cheapest witness: it is one of the three stores, so finding it
+		 * APPLIED after a commit that reported abort proves the commit
+		 * was partially planted and never rolled back.  That is the only
+		 * remaining way the forward and backward chains can disagree
+		 * about a node, which is the wedge's signature.
+		 */
+		if (st == URCU_TXN_STATUS_ABORT) {
+			void *raw = uatomic_load(&n->next, CMM_RELAXED);
+
+			if (!((uintptr_t) raw & 0x1UL) &&
+			    urcu_txn_list_is_marked(raw)) {
+				DC_TP_WEDGE(n, raw,
+					uatomic_load(&n->prev, CMM_RELAXED),
+					NULL, NULL, NULL, NULL, 99);
+				fprintf(stderr,
+					"ABORT-LEFT-MARK n=%p next=%p prev=%p\n",
+					(void *) n, raw,
+					uatomic_load(&n->prev, CMM_RELAXED));
+				if (system("lttng snapshot record 1>&2") == -1)
+					perror("lttng snapshot");
+				abort();
+			}
+		}
+#endif
 		if (st == URCU_TXN_STATUS_ABORT)
 			continue;
 		return st == URCU_TXN_STATUS_OK ? 1 : -1;
