@@ -1,16 +1,19 @@
-# Handoff — free-while-queued closed on all four arms, and PROVEN.
+# Handoff — free-while-queued CLOSED everywhere; one open correctness signal.
 
-2026-08-04. Written current-state-first, as the previous cut was: what is true
-now, then what is still open, then the retractions in one place at the end.
+2026-08-05. Written current-state-first: what is true now, then what is open,
+then the retractions in one place at the end. Read the retractions — five
+confident stories died to controls in the session that produced this file, and
+each control cost minutes.
 
-The LOCK arm's free-while-queued defect — the one open item the last handoff
-left — is fixed and mutation-tested, and the stale-`d_parent` use-after-free
-that came out of that work is root-caused and fixed on bucketlock.
+**CLOSED, all mutation-proven:** free-while-queued on all four arms (lock arms
+via a shrink-list handoff + a terminal state word; MCAS arms via a new liburcu
+deque seal); the stale-`d_parent` use-after-free (a guard pair); and `fold()`
+freeing dentries that were still on the LRU.
 
-The MCAS arm's residual is now closed too, and unlike the earlier claim it is
-MUTATION-PROVEN rather than sampled: at natural timings the defect is ~2 in 64
-runs, so a 40-trial mutation test came back 0/40 on the fix AND on the control
-and proved nothing. A targeted reproducer settles it — see below.
+**OPEN, and now narrowed to one sentence:** on the **MCAS LRU arm only**, the
+name-hash index and the child list can disagree about one entry — `dc_lookup`
+answers `DC_ABSENT` at a path `dc_walk` still reaches. See "THE ONE OPEN
+CORRECTNESS SIGNAL".
 
 Commits, all UNPUSHED, oldest first:
 
@@ -23,9 +26,13 @@ Commits, all UNPUSHED, oldest first:
     9f62bc7  close the LOCK arm: shrink-list handoff + DEAD seal
     cc6778f  root-cause the stale-d_parent UAF: a guard pair on the parent
     3e72f00  close the MCAS arm: no re-arm where the guard cannot be transacted
-    (this)   use the deque seal; bucketlock keeps its re-arm
+    2420ba0  seal the deque node on kill; bucketlock keeps its re-arm
              (liburcu side: urcu-txn-dev d9dd1a9e)
-    (this)   fold(): take the dentry off the LRU before freeing it
+    72587b8  fold(): take the dentry off the LRU before freeing it
+    df8a84a  RETRACT the park-while-online open item; the OOM was the harness
+    9140b83  measure the txn+MCAS+continuous instability instead of theorising
+    d789a58  churn: make the census anomaly name itself, and gate the OK line
+    ee00c67  narrow the census anomaly to the MCAS LRU arm
 
 ---
 
@@ -436,24 +443,17 @@ evict-before-remove ordering first.
 is also exactly what a resurrect-after-delete looks like, which is why the
 provenance print exists instead.
 
-### Previously recorded under this item, and NOT retracted
+### Earlier note kept, because it is the same lesson one level up
 
-### Previously recorded under this item
+⚠ A previous handoff said this configuration "hangs 3/3". It does not; that was
+three trials of a stochastic outcome reported as if deterministic. The honest
+figure is in the instability table above — and note that even the corrected
+8-trial figure was itself unstable. **Every claim about this configuration that
+rests on fewer than ~30 trials has been wrong so far.**
 
-
-
-⚠ **CORRECTION to the previous handoff, which said "hangs 3/3".** Re-measured 8
-trials on a clean HEAD control: **5 pass / 3 CONSERVATION FAILED / 0 hangs**.
-This tree over the same 8: 5 pass / 2 conservation / 1 timeout. Indistinguishable
-— the LRU change does not touch it. The earlier "3/3 hangs" was a small sample
-of a stochastic outcome reported as if deterministic.
-
-The escalation-lane analysis still stands and is a **liburcu** matter:
-`urcu_txn__enter_fallback()` → `cds_fair_mutex_park()` blocks on a futex while
-the thread is still RCU-online, which holds off every grace period, which stalls
-`call_rcu` reclaim, which deepens the contention that caused the escalation.
-Self-reinforcing and absorbing. The fix belongs there: go offline across the
-park.
+⛔ The escalation-lane paragraph that used to sit here — "the fix belongs in
+liburcu: go offline across the park" — is RETRACTED; the bracket already exists
+(`dcf1310c`). See the retraction section.
 
 ---
 
@@ -517,6 +517,18 @@ exactly like a deque defect.
   `-DDC_LRU_NO_SHRINK_READD` changes NOTHING. The ownership was the fix.
 - "the shard lock orders `lru_add` against `dc_unlink`" — it does not; the two
   sides pick DIFFERENT shards, and a killer that finds OFF takes no lock at all.
+- "liburcu must go offline across the escalation-lane park" — **already done**
+  (`urcu-txn-dev dcf1310c`). Carried as an open item across several handoffs and
+  never once re-checked against the code; one `git log -S` retires it.
+- "the txn shrink arm is blocked by that liburcu defect" — no: the ~1 GB/s OOM
+  was MY OWN unthrottled sweeper allocating descriptors faster than `call_rcu`
+  reclaims. All four arms are gates.
+- "the fold fix put a transaction on the reclaim thread and caused the timeouts"
+  — the mechanism is real, but the control without the fold fix measured **4/6
+  timeouts against the fixed tree's 0/6**.
+- "the conservation anomaly is gone" — one batch of 8 showed 0; it is 5/34.
+- "the census `extra` is a harness accounting artifact" — the offending slot's
+  last op is a **successful add**, 3/3 captures.
 
 **Earlier:** "the `owner == NULL` node in the ring is a deque defect" (caller
 bug); "evict-first fixes it" / "the default arm is clean" (bursty-only, stated
@@ -526,6 +538,24 @@ stale-prev forward rescan, the six-edge `move_tail` as cause, word-OFF-while-
 linked, "plain stores exonerated" (a TIMEOUT counted as THE WEDGE).
 
 ## Method rules earned the hard way
+
+⭐⭐ **THE DOMINANT FAILURE MODE OF THIS SESSION, five times over: reaching for a
+mechanism that explains the data before checking whether the data is stable
+enough to need explaining.** Every one of those five died to a control that cost
+two minutes. Run the control FIRST — `git archive <base>` a clean tree and
+measure both under one methodology.
+
+⭐⭐ **DO NOT GREP FOR THE VERDICT WHEN THE TOOL PRINTS THE DIAGNOSIS.** Twice:
+grepping a backtrace for `cds_fair_mutex_park` (the symbol my hypothesis
+predicted) and stopping, when the full seven-thread dump named a different
+thread entirely; and grepping runs for `RESULT:` while the harness was already
+printing `STATE MISMATCH` vs `CENSUS MISMATCH` and SIGTERM-dumping
+`TXNSTATS + LRUCHK`. Read the whole output before theorising about it.
+
+⭐ **CHECK A NEW TEST ARM IS DOING WORK before believing its pass OR its
+failure.** The first cut of the renames×shrinker arm emptied a 40-object
+namespace in a few hundred iterations and then ran ~80000 no-op iterations. It
+still caught the bug — on a workload that had stopped renaming.
 
 - **Verify a probe is live before trusting its zero.** Four wrong negatives now.
 - **Match the detector to the defect, and never read one tool's silence as
@@ -580,14 +610,20 @@ REQUIRES rebuilding the library with it.
 
 ## Gates — all green on this tree
 
-    make check                # 1 PASS (394 checks)
+    make check                # 1 PASS (394 checks, 0 failures)
     make check-bucketlock     # 8 PASS
-    make check-lru-arms       # 9 PASS + 2 ASan stress
-    make check-deque          # 10 arms PASS (incl. the seal arm + its control)
+    make check-lru-arms       # 15 PASS  (incl. the 4 renames-x-shrinker arms)
+    make check-deque          # 10 arms: 9 PASS + 1 must-fail control
     make check-deque-tsan     # 4 arms, 0 warnings
 
 Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} ×
-{with, without FREE_ASSERT}.
+{seal, no-seal, no-seal + re-arm}.
+
+⚠ **`make check-lru-arms` now runs a sweeper.** If you add another sweeper arm,
+give it a CADENCE and cap its memory — an unthrottled `dc_shrink` loop allocates
+transaction descriptors faster than `call_rcu` reclaims them and will take the
+machine down (it did). `scratchpad/capped` wraps a run in
+`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`.
 
 ## Build recipes
 
