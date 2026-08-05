@@ -308,29 +308,50 @@ doing work before believing either its pass or its failure.**
 leaves, so "every leaf exactly once" is not the invariant. It checks the probe,
 duplicate-free-ness, and that anything still present is RIGHT. Run both arms.
 
-## ▶ OPEN ITEM 3 — park-while-online: now an OOM, not just a hang (liburcu)
+## ⛔ RETRACTED — "park-while-online needs fixing in liburcu"
 
-⚠⚠ **THIS TOOK THE MACHINE DOWN AND KILLED A SESSION.** Run the txn engine with
-renames + a shrinker ONLY under a memory cgroup:
+**IT IS ALREADY FIXED, and has been.** `urcu_txn__enter_fallback()` brackets the
+lane wait with `thread_offline()` / `thread_online()` (urcu-txn-dev `dcf1310c`,
+"rcu-txn: take the escalation lane's blocking wait offline"). Grace periods DO
+advance while writers are queued on the escalation lane. Every handoff that
+carried "the fix belongs there: go offline across the park" as an open item was
+repeating a stale note — including this file, two commits ago.
 
-    systemd-run --user --scope -q --collect -p MemoryMax=4G -p MemorySwapMax=0 \
-      -- timeout 90 ./stress_shrink_txn 4 2 8 8 20000
+### And the OOM it was blamed for was THE TEST HARNESS
 
-`stress_dcache -DSTRESS_SHRINK` on the TXN engine grows **~1 GB/s without
-bound**. Three gdb samples 3 s apart: RSS 7.2 → 9.8 → 12.3 GB with **five
-threads in `urcu_txn__enter_fallback` → `cds_fair_mutex_park` in every sample**.
-That is the known absorbing state, now with a price tag: park while RCU-online →
-grace periods stall → `call_rcu` never drains → the shrinker keeps allocating
-descriptors nothing reclaims.
+`stress_dcache -DSTRESS_SHRINK` grew ~1 GB/s and killed a session. The samples
+that looked damning — five threads in `cds_fair_mutex_park` at RSS 7.2 → 9.8 →
+12.3 GB — were read as cause when they were CONSEQUENCE. Sampling all seven
+threads instead of grepping for the symbol I expected showed the actual grower:
 
-⭐ **NOT caused by the fold fix** — a tree built from `2420ba0` (pre-fix) with
-the same harness dies identically at the same cap. That A/B is the only reason
-the fold fix could be trusted at all.
+    urcu_txn_create <- urcu_txn__record <- urcu_txn_hlist_del_prepare
+      <- lru_evict_settled <- lru_shrink_range <- dc_shrink <- shrinker()
 
-Hence the `check-lru-arms` shrink arm is **bucketlock-only**, with the reason
-written in the recipe rather than left as an unexplained omission.
+My sweeper thread had **no cadence**. It called `dc_shrink` as fast as the CPU
+allowed, and on the txn engine every eviction ATTEMPT — including each one that
+fails because the entry is mid-rename — opens a transaction and allocates a
+descriptor. Those are freed via `call_rcu`, so a loop with no pause allocates
+faster than grace periods reclaim. No real shrinker looks like that:
+`bench_dcache_churn`'s continuous evictor does ONE `dc_shrink_local(.., 1)` per
+writer op and its bursty evictor sleeps between passes.
 
-The fix belongs in liburcu: go offline across the park.
+A 200 µs pause (offline across it) fixes it completely: **txn 3/3 PASS,
+bucketlock 3/3, zero OOM-kills under a 4 GB cap**, and the arm still catches the
+defect it was built for — **4/4 on both engines with the fold fix reverted**. So
+the throttle bought safety without costing detection, and all four arms are gates.
+
+⭐⭐ **TWO METHOD FAILURES WORTH KEEPING.** First: I grepped the backtrace for
+`cds_fair_mutex_park`, found it, and stopped — confirming a prior instead of
+testing it. The full thread dump was two minutes away and said something else.
+Second: an inherited "open item" was never re-checked against the code; one
+`git log -S` would have retired it at any point in the last several sessions.
+
+⚠ Still cap memory when writing new sweeper arms — `scratchpad/capped` wraps a
+run in `systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`. The
+lesson is not "the txn engine is dangerous", it is "an unthrottled allocator
+loop is", and that is easy to write again.
+
+### Previously recorded under this item, and NOT retracted
 
 ### Previously recorded under this item
 

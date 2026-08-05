@@ -66,6 +66,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <urcu-qsbr.h>
 
@@ -128,10 +129,41 @@ static void *shrinker(void *arg)
 	dc_register_thread();
 	while (!uatomic_load(&g_shrink_stop, CMM_RELAXED)) {
 		long n = dc_shrink(g_dc, 16);
+		struct timespec ts = { 0, 200 * 1000 };		/* 200us */
 
 		if (n > 0)
 			g_evicted += (unsigned long) n;
 		dc_quiescent();
+		/*
+		 * ⚠⚠ THE CADENCE IS LOAD-BEARING, and leaving it out cost a
+		 * machine.  An unthrottled sweeper calls dc_shrink as fast as
+		 * the CPU allows; on the txn engine every eviction ATTEMPT --
+		 * including every one that fails because the entry is
+		 * mid-rename -- opens a transaction and allocates a descriptor
+		 * (urcu_txn_create).  Those are freed via call_rcu, so a loop
+		 * with no pause allocates them faster than grace periods can
+		 * reclaim them and RSS grows without bound: ~1 GB/s, three gdb
+		 * samples 3s apart at 7.2 / 9.8 / 12.3 GB, until the OOM killer
+		 * fires.  It killed a session before it was understood.
+		 *
+		 * ⛔ AND IT IS NOT A LIBURCU DEFECT.  The five writers parked in
+		 * cds_fair_mutex_park in those samples are a CONSEQUENCE of the
+		 * contention this loop generates, not the cause -- and the lane
+		 * wait is already bracketed offline (urcu_txn__enter_fallback,
+		 * urcu-txn-dev dcf1310c), so grace periods do advance.  The
+		 * allocator simply cannot outrun a sweeper with no cadence.
+		 *
+		 * No real shrinker has one: bench_dcache_churn's continuous
+		 * evictor does ONE dc_shrink_local per writer op and its bursty
+		 * evictor sleeps between passes.  This mirrors that.
+		 *
+		 * OFFLINE across the sleep: a QSBR thread that blocks while
+		 * online holds off every grace period, which is the very stall
+		 * this pause exists to avoid.
+		 */
+		rcu_thread_offline();
+		(void) nanosleep(&ts, NULL);
+		rcu_thread_online();
 	}
 	dc_unregister_thread();
 	return NULL;

@@ -797,28 +797,22 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 	@# a populated LRU with no lru_del anywhere -- 3/3 FREE-WHILE-QUEUED once
 	@# the two were finally run together.
 	@#
-	@# ⛔ BUCKETLOCK ONLY, and the omission is not caution -- it is a known
-	@# defect.  On the TXN engine this workload drives liburcu's
-	@# park-while-online absorbing state: urcu_txn__enter_fallback ->
-	@# cds_fair_mutex_park blocks while RCU-online, grace periods stall,
-	@# call_rcu never drains, and the shrinker keeps allocating descriptors
-	@# nothing reclaims.  Measured: ~1 GB/s of unbounded growth (three gdb
-	@# samples 3s apart: 7.2 -> 9.8 -> 12.3 GB, five threads in the fair
-	@# mutex every time) until the OOM killer fires.  It reproduces
-	@# IDENTICALLY on the pre-fold-fix tree, so it is not this fix's doing.
-	@# Running it here would take the machine down, which is why it is a
-	@# documented repro rather than a gate.  See HANDOFF open item 3:
-	@#   scratch/capped 4G 90 ./stress_shrink_txn 4 2 8 8 20000
-	@# ⚠ ALWAYS RUN THE TXN ARM UNDER A MEMORY CGROUP.
+	@# ⚠ THE SWEEPER'S CADENCE IS LOAD-BEARING; see shrinker() in
+	@# stress_dcache.c.  Without it this arm grew ~1 GB/s and OOM-killed the
+	@# machine -- an unthrottled dc_shrink allocates a transaction descriptor
+	@# per eviction ATTEMPT faster than call_rcu can reclaim them.  That was
+	@# the harness, NOT liburcu and NOT the dcache.
 	@#
-	@# ulimit -v here is belt-and-braces for the bucketlock arms themselves:
-	@# they need a few MB, so a runaway is a bug and should die cheaply.
-	@for a in "" "-DDC_LRU_MCAS"; do \
-	  echo "  bucketlock $${a:-lock}"; \
-	  $(CC) $(CFLAGS) -DDC_MARK_GEN $$a -DSTRESS_SHRINK -DDC_LRU_FREE_ASSERT \
-	    $(HCPP) -o stress_shrink_tmp stress_dcache.c dcache_bucketlock.c \
-	    $(LDFLAGS) $(LDLIBS) || exit 1; \
-	  ( ulimit -v 8388608; ./stress_shrink_tmp 4 2 8 8 20000 ) || exit 1; \
+	@# ulimit -v is belt-and-braces: these arms need a few MB, so a runaway
+	@# is a bug and should die cheaply rather than take the box with it.
+	@for e in bucketlock txn; do \
+	  for a in "" "-DDC_LRU_MCAS"; do \
+	    echo "  $$e $${a:-lock}"; \
+	    $(CC) $(CFLAGS) -DDC_MARK_GEN $$a -DSTRESS_SHRINK -DDC_LRU_FREE_ASSERT \
+	      $(HCPP) -o stress_shrink_tmp stress_dcache.c dcache_$$e.c \
+	      $(LDFLAGS) $(LDLIBS) || exit 1; \
+	    ( ulimit -v 8388608; ./stress_shrink_tmp 4 2 8 8 20000 ) || exit 1; \
+	  done; \
 	done
 	@rm -f stress_shrink_tmp
 
