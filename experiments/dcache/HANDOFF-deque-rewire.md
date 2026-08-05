@@ -297,13 +297,39 @@ into storage `dentry_free_cb` had already freed.
 | unprotected | 3/12 | 6 |
 | **SEAL** | **0/12** | **0** |
 
-⚠ **HONEST LIMIT, and why it is still OFF BY DEFAULT:** 3/12 vs 0/12 is
-p ≈ 0.22 by run count — corroboration, not proof. The liveness case is settled
-at 20 trials; the correctness case rests on the STRUCTURE (one slot, one
-expected old, exclusion both ways) with the reproducer agreeing. ▶ **To make it
-decisive, WIDEN THE DELAY until the control approaches 100%** — not more trials
-at 25%. Then flipping the default is justified, and the txn engine stops
-shipping a known use-after-free.
+### ✅⭐⭐ NOW ON BY DEFAULT (`-DDC_TXN_NO_PARENT_SEAL` is the mutation arm)
+
+The 200 µs reproducer only reached 3/12 (p ≈ 0.22), so the delay was **swept,
+not cranked** — it sits on every eviction attempt, so too wide STARVES the
+shrinker and detects LESS:
+
+| delay | control fires | adds / evictions |
+|---|---|---|
+| 200 µs | 3/12 | ~13k / ~18k |
+| 1 ms | 2/3 | ~25k / ~34k |
+| **5 ms** | **6/6** | ~13k / ~18k |
+
+At 5 ms the control is DETERMINISTIC (2 UAFs every run). 6 trials/arm, equal
+work: unprotected **6/6 runs, 12 occurrences** · seal **0/6, 0** — Fisher
+**p = 0.0022**.
+
+Liveness, 20 trials/arm, ⚠ **BOTH CADENCES this time** (the first pass was
+bursty-only, which is not good enough to change a default):
+
+| | unprotected | GUARD | SEAL |
+|---|---|---|---|
+| `--evict bursty` | 1/20 | **9/20** | **0/20** |
+| `--evict continuous` | 1/20 | — | **0/20** |
+
+⚠⚠ **AND THE CONTINUOUS ROW IS WHY `check-churn-evict` CHANGED.** A gate run
+wedged on txn+continuous with the seal on and looked like a regression the seal
+had caused. It is not — the UNPROTECTED arm wedges 1/20 on that cadence too, so
+it is **PRE-EXISTING, ~1 run in 20**. The gate had no per-run timeout, so that
+wedge could hang it for ever; it now runs each arm under `timeout 120` and
+reports 124 as WEDGED rather than hanging or silently passing.
+⭐ The lesson is the one this file keeps re-learning: **a wedge on the arm you
+just changed is not evidence the change caused it — measure the arm you did NOT
+change.**
 
 ### TSAN residue (unchanged, not correctness)
 
