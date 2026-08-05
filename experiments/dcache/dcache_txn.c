@@ -1370,24 +1370,52 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		 * It works: the txn engine's TSAN heap-use-after-free goes 1/8
 		 * -> 0/8 with both halves on.  What it costs is LIVENESS.  Both
 		 * halves add read-set entries to hot paths (this one to every
-		 * add, the eviction's to every sweep), and the extra conflict
-		 * feeds the escalation lane, which on this engine is an
-		 * ABSORBING state -- cds_fair_mutex_park() blocks while still
-		 * RCU-online, so grace periods stall, call_rcu never runs, and
-		 * contention rises further.  --evict bursty, 48w/48r, 6 trials,
-		 * runs that failed to finish in 120s:
+		 * add, the eviction's to every sweep).
 		 *
-		 *   default (this off)          0/6
-		 *   both halves on              2/6   (4/6 on a second batch)
-		 *   add-side half only          4/6
+		 * RE-MEASURED at 20 trials/cell (the original figures were 6),
+		 * --evict bursty, 48w/48r, runs not finishing in 120s:
 		 *
-		 * So it is not a matter of picking the cheaper half; every
-		 * guarded variant lost runs where the unguarded tree lost none.
+		 *   guard off, dup-recheck on (shipped)     1/20
+		 *   guard ON,  dup-recheck on               9/20
+		 *   guard off, dup-recheck off              0/20
+		 *   guard ON,  dup-recheck off              8/20
+		 *
+		 * +40 points in BOTH rows (Fisher 0/20 vs 8/20, p ~ 0.003), and
+		 * the dc_add duplicate re-check contributes nothing (1/20 vs
+		 * 0/20).  So the cost is the guard's, it is real, and it is
+		 * bigger than the 2/6 that first shelved it.
+		 *
+		 * ⛔⭐⭐ BUT THE REASON RECORDED HERE WAS WRONG, AND THIS IS THE
+		 * RETRACTION.  This comment used to promise "re-measure once the
+		 * park-while-online defect is fixed in liburcu, which is where
+		 * that cost actually lives."  BOTH candidate mechanisms have
+		 * since been eliminated and the cost did not move:
+		 *
+		 *   - park-while-online was ALREADY fixed (urcu-txn-dev
+		 *     dcf1310c brackets the escalation-lane wait with
+		 *     thread_offline/online), so grace periods do advance while
+		 *     writers queue;
+		 *   - every rcu-txn-hlist.h bracket leaked the lane on its
+		 *     terminal bail until fc663f5a, which is the header this
+		 *     engine runs on -- also fixed, also no change.
+		 *
+		 * So the cost is NOT a liburcu bug waiting to be fixed.  It is
+		 * the intrinsic price of extra conflict-set entries on this
+		 * engine's hot paths, and the mechanism is now UNATTRIBUTED
+		 * rather than explained.  Do not re-shelve this behind another
+		 * pending fix without measuring first.
+		 *
 		 * Against that, the defect it closes is 1/8 here versus 6/8 on
 		 * bucketlock, where the fix is a third bucket lock and costs no
-		 * liveness at all.  Kept as a build arm rather than deleted so
-		 * it can be re-measured once the park-while-online defect is
-		 * fixed in liburcu, which is where that cost actually lives.
+		 * liveness at all.  Kept as a build arm.
+		 *
+		 * ▶ The open direction, and the shape that worked for the
+		 * duplicate re-check above: buy the exclusion with a slot the
+		 * transaction ALREADY WRITES instead of a new guard.  The add
+		 * writes &parent->d_child_head.first, which is the slot the
+		 * eviction guards -- that direction is already free.  It is THIS
+		 * direction (the add noticing an eviction that commits first)
+		 * that costs, and no rewriting of it has been found yet.
 		 *
 		 * ⭐ GUARD THE PARENT'S LIVENESS -- half of a GUARD PAIR with
 		 * lru_evict_settled(), and a DIFFERENT slot from the state word

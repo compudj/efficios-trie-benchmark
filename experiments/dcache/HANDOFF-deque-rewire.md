@@ -215,8 +215,50 @@ escalation lane, which on this engine is an ABSORBING state (open item 3).
 
 So it is not a matter of choosing the cheaper half. Against that cost the defect
 is 1-2/8 here versus 6/8 on bucketlock, where the fix is a third bucket lock and
-costs no liveness at all. Kept as a build arm so it can be re-measured once the
-park-while-online defect is fixed in liburcu, which is where that cost lives.
+costs no liveness at all.
+
+#### ✅ RE-MEASURED at 20 trials/cell — the cost is REAL, the REASON was WRONG
+
+The promise this section used to end with — "kept as a build arm so it can be
+re-measured once the park-while-online defect is fixed in liburcu, **which is
+where that cost lives**" — has been cashed in, and it was wrong. Both candidate
+mechanisms are now eliminated and the cost did not move.
+
+`--evict bursty`, 48w/48r, **20 trials per cell**, runs not finishing in 120s,
+run as a 2x2 so the dc_add duplicate re-check could not hide in the result:
+
+| | dup-recheck ON (shipped) | dup-recheck OFF |
+|---|---|---|
+| **guard off** | **1/20** | **0/20** |
+| **guard ON** | **9/20** | **8/20** |
+
+* **The guard costs ~+40 points, in both rows** (Fisher 0/20 vs 8/20,
+  p ≈ 0.003). Bigger than the 2/6 that first shelved it, and now measured at a
+  sample size this configuration's instability cannot explain away.
+* **The dup re-check costs nothing** — 1/20 vs 0/20, and 9/20 vs 8/20. No main
+  effect, no interaction. It is exonerated as a liveness regression.
+
+⛔⭐⭐ **RETRACTED: "that cost lives in the park-while-online defect."**
+`dcf1310c` had ALREADY fixed park-while-online (the lane wait is bracketed
+offline/online), and `fc663f5a` has since fixed the terminal-bail lane leak in
+every `rcu-txn-hlist.h` bracket — the header this engine runs on. Two mechanisms
+removed, cost unchanged. **The guard's price is not a liburcu bug waiting to be
+fixed; it is the intrinsic cost of extra conflict-set entries on this engine's
+hot paths, and the mechanism is now UNATTRIBUTED rather than explained.**
+⚠ Do not re-shelve it behind another pending fix without measuring first — that
+is exactly what the previous note did, and it cost two sessions of "once X is
+fixed" before anyone checked whether X was still true.
+
+▶ **The open direction** is the shape that worked for the duplicate re-check:
+buy the exclusion with a slot the transaction ALREADY WRITES rather than a new
+guard. One direction is already free — the add writes
+`&parent->d_child_head.first`, which is the slot the eviction guards. It is the
+OTHER direction (the add noticing an eviction that commits first) that costs,
+and no rewriting of it has been found.
+
+⚠ NOT re-run: the TSAN half (does the guard still take the UAF 1/8 → 0/8). It
+would not change the decision — the guard stays off on liveness alone — so the
+engine still ships with that use-after-free, knowingly.
 
 ### TSAN residue (unchanged, not correctness)
 
