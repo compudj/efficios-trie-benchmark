@@ -1331,6 +1331,9 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
  * residual with -DDC_LRU_FREE_ASSERT before paying it.
  */
 #ifdef DC_LRU_MCAS
+/* 0: this engine CANNOT transact the guard (see the comment above).  The header
+ * branches on it -- lru_retain's re-arm is compiled out here as a result. */
+#define DC_LRU_ALIVE_TRANSACTED 0
 static int lru_alive_validate(struct urcu_txn *txn, struct dentry *d)
 {
 	int marked = 0;

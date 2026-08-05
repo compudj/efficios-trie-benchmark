@@ -1,4 +1,4 @@
-# Handoff — both LOCK arms closed; the MCAS arm is NOT, at ~1 in 6.
+# Handoff — free-while-queued closed on all four arms, and PROVEN.
 
 2026-08-04. Written current-state-first, as the previous cut was: what is true
 now, then what is still open, then the retractions in one place at the end.
@@ -7,9 +7,10 @@ The LOCK arm's free-while-queued defect — the one open item the last handoff
 left — is fixed and mutation-tested, and the stale-`d_parent` use-after-free
 that came out of that work is root-caused and fixed on bucketlock.
 
-⚠ **The headline of the previous cut of this file ("closed on all four arms")
-was WRONG and is corrected below**: the MCAS arm fires FREE_ASSERT about 1 run
-in 6, which five-trial batches kept returning as 0/5. See the new open item.
+The MCAS arm's residual is now closed too, and unlike the earlier claim it is
+MUTATION-PROVEN rather than sampled: at natural timings the defect is ~2 in 64
+runs, so a 40-trial mutation test came back 0/40 on the fix AND on the control
+and proved nothing. A targeted reproducer settles it — see below.
 
 Commits, all UNPUSHED, oldest first:
 
@@ -20,7 +21,8 @@ Commits, all UNPUSHED, oldest first:
     961462b  restore retain_dentry's d_unhashed guard (MCAS arm closed)
     7b43b89  consolidate the handoff around the current position
     9f62bc7  close the LOCK arm: shrink-list handoff + DEAD seal
-    (this)   root-cause the stale-d_parent UAF: a guard pair on the parent
+    cc6778f  root-cause the stale-d_parent UAF: a guard pair on the parent
+    (this)   close the MCAS arm: no re-arm where the guard cannot be transacted
 
 ---
 
@@ -33,12 +35,13 @@ Commits, all UNPUSHED, oldest first:
 |---|---|---|---|---|
 | bucketlock LOCK | **5/5** | **0/6** | **5/5** | **0/6** |
 | txn LOCK | (no probe) | **0/6** | (no probe) | **0/6** |
-| bucketlock MCAS | 0/5 | 0/6 | 0/5 | ⚠ **1/6** |
-| txn MCAS | (no probe) | 0/6 | (no probe) | 0/6 |
+| bucketlock MCAS | 0/5 | 0/8 | ⚠ 0/5 was WRONG (~2 in 64) | **0/8** |
+| txn MCAS | (no probe) | 0/8 | (no probe) | 0/8 |
 
-⚠ The bucketlock MCAS "before" column is the number this work proved unreliable:
-it is 1/6 on the committed tree too. Read it as "not measured finely enough",
-not as a regression — and see the open item below.
+⚠ The bucketlock MCAS "before" numbers are what this work proved unreliable: the
+true rate is ~2 in 64, so five-trial batches read it as clean for two handoffs.
+**Five trials cannot call an arm clean** — and at that rate neither can forty;
+see the targeted reproducer below.
 
 ### Guard 1 — the shrink-list handoff (closes `--evict bursty`)
 
@@ -204,22 +207,59 @@ and read atomically without it — `sh->count` (`dc_lru_count`) and
 `d_lru.referenced` (`lru_retain` vs the shrinker's clear). Both deliberately
 approximate. Worth a `uatomic_*` pass for cleanliness; neither is a bug.
 
-## ▶ NEW OPEN ITEM — the MCAS arm still fires FREE_ASSERT ~1 in 6
+## ✅ RESOLVED — the MCAS arm's residual: an untransactable liveness guard
 
-`bucketlock` + `-DDC_LRU_MCAS`, `--evict continuous`, 48w/48r: **1/6**
-FREE-WHILE-QUEUED. **Pre-existing and NOT closed by any of this work** — the
-committed tree `9f62bc7` measures 1/6 at the same point and the guard-pair tree
-0/6, i.e. indistinguishable at this sample size.
+`lru_retain`'s re-arm was the last pusher on the MCAS arm. `lru_push_prepare`'s
+guard has to be in the SAME COMMIT as the edges, and on **bucketlock it cannot
+be**: `bl_hlist_del_locked` writes `d_hash.next` with a plain store, so an MCAS
+proxy there would be clobbered and the settle would resurrect a deleted node.
+The guard therefore only NARROWS, and a dentry unhashed between the read and the
+commit still gets pushed. The witness said exactly that — `owner == next ==
+prev`, i.e. the victim was the SOLE element of its shard, freshly pushed.
 
-⚠ Earlier handoffs recorded this arm as 0/5. At a ~1-in-6 rate, five trials
-returns zero about 40% of the time. **Five trials is not enough to call an arm
-clean**; the lock arm's 5/5 was only ever obvious because its rate was ~1.
+⚠⚠ **NATURAL TIMINGS COULD NOT GATE THIS, and nearly produced a fifth wrong
+negative.** The rate is ~2 in 64 runs. A 40-trial mutation test returned
+**0/40 for the fix AND 0/40 for the control** — the arm that should fail,
+passed. Reporting that as a fix would have been exactly the trap this file keeps
+recording.
 
-The MCAS arm's remaining pusher is most likely `lru_retain`'s re-arm, which
-`961462b` narrowed with `lru_alive_validate` but which — like everything else on
-that path — cannot be closed by a check that is not in the same commit as the
-push. Start by re-running the split probes (`-DDC_LRU_NO_RETAIN_READD`) at
-**20+ trials**, not 5.
+⭐⭐ Settled with `-DDC_LRU_PUSH_DELAY`, a TARGETED REPRODUCER that widens the
+window between the liveness read and the commit. 48w/48r `--evict continuous`,
+10 runs:
+
+| build | fires |
+|---|---|
+| bucketlock, re-arm restored (plain guard) | **10/10** |
+| bucketlock, re-arm removed (shipped) | 0/10 |
+| **txn, re-arm restored (transacted guard)** | **0/10** |
+
+⚠ A reproducer only ever argues ONE way: firing says the race is real and says
+which build closes it; not firing says nothing about shipped timings. Never
+quote a rate measured under it.
+
+That third row is why the fix is CONDITIONAL, not blanket. The engines now
+declare `DC_LRU_ALIVE_TRANSACTED` (bucketlock 0, txn 1) and the header BRANCHES
+on it: an engine that cannot transact the guard gets `lru_retain`'s re-arm
+compiled out; one that can keeps it, and keeps its LRU accuracy. The two
+spellings of `lru_alive_validate` were already documented as different — this
+makes the difference load-bearing and measured.
+
+The cost on bucketlock is near zero, and structurally so: **nothing takes a live
+dentry off the deque on that arm.** The shrinker ROTATES in-use entries instead
+of removing them (`dc_lru_inuse_is_removed == 0`) and `lru_del` runs only from
+`dc_unlink`, on a dentry that is dying anyway. The only node the re-arm could
+legitimately serve is one that never got on (`lru_add` answered -ENOMEM), which
+now stays un-evictable until it is unlinked.
+
+⭐ **The principled fix, not taken, is a liburcu change**: a remove-to-POISON
+variant in `<urcu/rcu-txn-deque.h>`. `push_tail_prepare` CASes `&n->owner : NULL
+-> d`, so any non-NULL sentinel makes it answer -EEXIST — the deque analogue of
+the LOCK arm's terminal `DC_LRU_DEAD`. Today `owner` has no poison value and
+nothing can install one in the same commit that removes, which is the whole
+reason bucketlock has to drop the re-arm instead. That would let it keep it.
+
+Shipped default, `-DDC_LRU_FREE_ASSERT`, 48w/48r, 8 trials, ALL FOUR ARMS x BOTH
+cadences: **0/8 everywhere.**
 
 ## ▶ OPEN ITEM 2 — rename × LRU × shrinker is jointly UNTESTED
 
@@ -325,9 +365,14 @@ linked, "plain stores exonerated" (a TIMEOUT counted as THE WEDGE).
 - **Match the detector to the defect, and never read one tool's silence as
   coverage for another's finding.** ASan was clean 24/24 on a defect TSAN hit
   4-6 times in 8, because the allocator recycled the region first.
-- **Five trials is not enough to call an arm clean.** A ~1-in-6 defect returns
-  0/5 about 40% of the time; that is how the MCAS arm read as clean for two
-  handoffs.
+- **Five trials is not enough to call an arm clean** — and neither is forty at a
+  low enough rate. The MCAS residual is ~2 in 64: it read as 0/5 for two
+  handoffs, and a 40-trial mutation test returned 0/40 for the fix AND 0/40 for
+  the control, i.e. the arm that had to fail passed.
+- **When natural timings cannot gate a race, BUILD A REPRODUCER** that widens
+  the specific window (`-DDC_LRU_PUSH_DELAY`), and use it only to argue one way:
+  firing proves the race and identifies the closing build; not firing says
+  nothing about shipped timings.
 - **When two locks are spelled alike, check they are the same object.**
   `&parent->d_child_head` in the evictor and in dc_add are DIFFERENT dentries'
   heads; assuming otherwise made a missing exclusion look complete.
@@ -397,6 +442,8 @@ Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} 
 Build arms: `-DDC_TXN_PARENT_GUARD` (txn parent guard pair; OFF by default,
 measured liveness cost -- see above).
 
-Probe flags: `-DDC_LRU_FREE_ASSERT` (BOTH engines now), `-DDC_LRU_NO_DEAD_SEAL`,
+Probe flags: `-DDC_LRU_FREE_ASSERT` (BOTH engines now), `-DDC_LRU_PUSH_DELAY`
+(the targeted reproducer), `-DDC_LRU_MCAS_RETAIN_READD` (its mutation arm),
+`-DDC_LRU_NO_DEAD_SEAL`,
 `-DDC_LRU_NO_SHRINK_OWN`, `-DDC_LRU_NO_SHRINK_READD`, `-DDC_LRU_NO_RETAIN_READD`,
 `-DDC_LRU_READD_LEGACY`, `-DURCU_TXN_DEQUE_NO_SEQ_GUARD`, `-DRETIRE_AUDIT`.

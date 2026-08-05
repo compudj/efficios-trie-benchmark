@@ -29,6 +29,13 @@
  *          in a slot the MCAS engine exclusively owns should RECORD A VALIDATE
  *          so the answer joins the commit's conflict set; one whose bit is
  *          written by a plain store under some other lock MUST NOT, and says so.
+ *   #define DC_LRU_ALIVE_TRANSACTED 0|1                          (MCAS arm)
+ *       -- WHICH of those two the engine just did, as a value this header can
+ *          branch on.  It is not documentation: an engine that answers 0 gets
+ *          lru_retain's re-arm COMPILED OUT, because a guard that only narrows
+ *          cannot make that push safe.  Measured, not asserted -- with the
+ *          window widened (-DDC_LRU_PUSH_DELAY) the 0-engine fires 10/10 and
+ *          the 1-engine 0/10.  See lru_retain().
  *   int lru_alive_hint(struct dentry *);   (LOCK arm)
  *       -- the same question with no transaction to put it in.
  *
@@ -439,7 +446,61 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 	 *   -DDC_LRU_NO_READD          kills BOTH (the historical spelling; keep
 	 *                              it only for reproducing old results).
 	 */
-#if !defined(DC_LRU_NO_READD) && !defined(DC_LRU_NO_RETAIN_READD)
+#if defined(DC_LRU_MCAS) && !DC_LRU_ALIVE_TRANSACTED && \
+	!defined(DC_LRU_MCAS_RETAIN_READD)
+	/*
+	 * ⛔ NO RE-ARM WHEN THE ENGINE CANNOT TRANSACT THE LIVENESS GUARD.
+	 *
+	 * This was the last free-while-queued pusher on the MCAS arm.  The
+	 * guard in lru_push_prepare() has to be part of the SAME COMMIT as the
+	 * edges, and DC_LRU_ALIVE_TRANSACTED says whether the engine can do
+	 * that.  On bucketlock it cannot: bl_hlist_del_locked writes
+	 * d_hash.next with a plain store, so an MCAS proxy there would be
+	 * clobbered and the settle would resurrect a deleted node.  The guard
+	 * therefore only NARROWS, and a dentry unhashed between the read and
+	 * the commit still gets pushed onto a deque that then names freed
+	 * storage -- the witness said exactly that: owner == next == prev, the
+	 * victim was the SOLE element of its shard, freshly pushed.
+	 *
+	 * ⭐⭐ PROVEN BY A TARGETED REPRO, because natural timings could not
+	 * gate it: the defect is ~2 in 64 runs, and a 40-trial mutation test
+	 * came back 0/40 on BOTH arms, proving nothing.  With
+	 * -DDC_LRU_PUSH_DELAY widening the window, at 48w/48r --evict
+	 * continuous, 10 runs:
+	 *
+	 *	bucketlock, re-arm restored (plain guard)     10/10 FIRES
+	 *	bucketlock, re-arm removed  (this)             0/10
+	 *	txn,        re-arm restored (transacted guard)  0/10
+	 *
+	 * That last row is why this is conditional rather than blanket: the
+	 * transacted guard genuinely closes it, so the txn engine keeps its
+	 * re-arm and its LRU accuracy.  It is also a direct demonstration of
+	 * the engine contract at the top of this file -- the two spellings of
+	 * lru_alive_validate are not stylistic.
+	 *
+	 * The cost here is near zero, and structurally so rather than by luck:
+	 * NOTHING TAKES A LIVE DENTRY OFF THE DEQUE on this arm.  The shrinker
+	 * ROTATES in-use entries instead of removing them
+	 * (dc_lru_inuse_is_removed == 0) and lru_del runs only from dc_unlink,
+	 * on a dentry that is dying anyway.  So the only node this path could
+	 * legitimately re-arm is one that never got on (lru_add answered
+	 * -ENOMEM), and the price is that it stays un-evictable until it is
+	 * unlinked.  A stale hint lands here too and push_tail answers -EEXIST.
+	 *
+	 * ⚠ The LOCK arm MUST keep re-arming: its shrinker REMOVES in-use
+	 * entries the way mainline does, so an entry off the list really is
+	 * waiting for its next touch.  That arm is safe because the state word
+	 * carries a terminal DC_LRU_DEAD a killer CASes in -- an exclusion the
+	 * deque's `owner` slot has no equivalent of, since NULL there means
+	 * "free to push" and nothing can poison it in the same commit that
+	 * removes.  Sealing the node would need a remove-to-POISON variant in
+	 * <urcu/rcu-txn-deque.h>: the principled fix, a liburcu change, and
+	 * what would let bucketlock keep its re-arm too.
+	 *
+	 * -DDC_LRU_MCAS_RETAIN_READD restores it (the mutation arm).
+	 */
+	(void) dc;
+#elif !defined(DC_LRU_NO_READD) && !defined(DC_LRU_NO_RETAIN_READD)
 	lru_add(dc, d);
 #else
 	(void) dc;
@@ -597,6 +658,31 @@ static int lru_push_prepare(struct urcu_txn *txn, struct urcu_txn_deque *q,
 
 	if (ret)
 		return ret;			/* -ENOENT: unhashed, drop it */
+#ifdef DC_LRU_PUSH_DELAY
+	{
+		/*
+		 * TARGETED REPRO (-DDC_LRU_PUSH_DELAY), not a control.
+		 *
+		 * WIDEN the exact window this guard fails to close on the
+		 * bucketlock engine: between the liveness read above and the
+		 * commit that installs the edges, a peer can unhash @d and hand
+		 * it to call_rcu, and the push then queues a dentry that is
+		 * about to be freed.  In the wild that window is a few hundred
+		 * cycles and the defect surfaced 2 times in 64 runs -- too rare
+		 * for a 40-trial mutation test to gate, which is exactly why the
+		 * mutation arm came back 0/40 and proved nothing.
+		 *
+		 * ⚠ IT IS A REPRODUCER, SO IT ONLY EVER ARGUES ONE WAY.  Firing
+		 * with it on says the race is real and says which build closes
+		 * it; NOT firing with it on says nothing about the shipped
+		 * timings.  Never quote a rate measured under it as the rate.
+		 */
+		volatile unsigned int spin;
+
+		for (spin = 0; spin < 2000; spin++)
+			caa_cpu_relax();
+	}
+#endif
 	return urcu_txn_deque_push_tail_prepare(txn, q, &d->d_lru.dnode);
 }
 

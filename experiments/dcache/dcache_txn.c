@@ -1244,6 +1244,10 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
  * that unlink simply retries.
  */
 #ifdef DC_LRU_MCAS
+/* 1: d_hash.next is MCAS-managed here, so the guard joins the push's conflict
+ * set and the push is ATOMIC with it.  The header branches on this -- it is why
+ * this engine keeps lru_retain's re-arm where bucketlock cannot. */
+#define DC_LRU_ALIVE_TRANSACTED 1
 static int lru_alive_validate(struct urcu_txn *txn, struct dentry *d)
 {
 	void *raw = urcu_txn_load_validate(txn, (void **) &d->d_hash.next,
