@@ -249,16 +249,61 @@ hot paths, and the mechanism is now UNATTRIBUTED rather than explained.**
 is exactly what the previous note did, and it cost two sessions of "once X is
 fixed" before anyone checked whether X was still true.
 
-▶ **The open direction** is the shape that worked for the duplicate re-check:
-buy the exclusion with a slot the transaction ALREADY WRITES rather than a new
-guard. One direction is already free — the add writes
-`&parent->d_child_head.first`, which is the slot the eviction guards. It is the
-OTHER direction (the add noticing an eviction that commits first) that costs,
-and no rewriting of it has been found.
+### ✅⭐⭐ AND THE OPEN DIRECTION PAID OFF: `-DDC_TXN_PARENT_SEAL`
 
-⚠ NOT re-run: the TSAN half (does the guard still take the UAF 1/8 → 0/8). It
-would not change the decision — the guard stays off on liveness alone — so the
-engine still ships with that use-after-free, knowingly.
+Buy the exclusion with a slot the transactions ALREADY WRITE — the shape that
+made the `dc_add` duplicate re-check free. **The eviction SEALS the victim's
+child head instead of guarding it:**
+
+    urcu_txn_store_mw(&txn, &d->d_child_head.first,
+                      NULL, urcu_txn_hlist_set_mark(NULL), TAG)
+
+Same slot, same expected old (`NULL` = "still empty"), **written rather than
+read**. `dc_add` publishes a child by writing `&parent->d_child_head.first`, so
+the two contend on ONE slot with ONE expected old and the MCAS admits exactly
+one — mutual exclusion in BOTH directions, where the guard needed two records:
+
+* add wins → the store's old-value check fails, the eviction aborts, retries,
+  sees a non-empty child list, answers `-EAGAIN`;
+* evict wins → the head is MARKED, and the add's own
+  `urcu_txn_hlist_insert_head_prepare()` answers `-ENOENT` **with no guard
+  record of its own**.
+
+⭐ It fits because the primitives existed: `<urcu/rcu-txn-hlist.h>` RESERVES a
+marked head as its sealing primitive and `insert_head_prepare` already refuses
+one; `urcu_txn_hlist_resolve()` STRIPS the mark, so a sealed head still reads as
+EMPTY to `children_empty()`, `dc_readdir` and the census; and `dc_add` already
+maps that `-ENOENT` to "the prefix went". Terminal per LIFETIME (`dentry_alloc`
+memsets) and sealed in the SAME commit as the unlinks — the rule `DC_LRU_DEAD`
+and `URCU_TXN_DEQUE_POISON` already follow. `dc_unlink` seals too (⚠ only when
+SETTLED: when `top != host` the host is not freed here).
+
+| `--evict bursty`, 48w/48r, 20 trials | timeouts |
+|---|---|
+| unprotected (shipped) | 1/20 |
+| `DC_TXN_PARENT_GUARD` | **9/20** |
+| **`DC_TXN_PARENT_SEAL`** | **0/20** |
+
+⚠⚠ **THE NATURAL-TIMING TSAN A/B COULD NOT SETTLE CORRECTNESS — AND ITS CONTROL
+NEVER FIRED.** Half its runs wedged at the cap having done ~0 work, so the
+protected arm's zero would have proved nothing. Killed it and built
+**`-DDC_TXN_PARENT_DELAY`**: 200 µs widening of the exact gap between
+`children_empty()` and the commit. The control then fires, with the documented
+backtrace — `lru_evict_settled` → `urcu_txn_commit` → `urcu_txn_try_cas`, CASing
+into storage `dentry_free_cb` had already freed.
+
+| reproducer, 8w/8r/15s/cap 8, 12 trials/arm | UAF runs | occurrences |
+|---|---|---|
+| unprotected | 3/12 | 6 |
+| **SEAL** | **0/12** | **0** |
+
+⚠ **HONEST LIMIT, and why it is still OFF BY DEFAULT:** 3/12 vs 0/12 is
+p ≈ 0.22 by run count — corroboration, not proof. The liveness case is settled
+at 20 trials; the correctness case rests on the STRUCTURE (one slot, one
+expected old, exclusion both ways) with the reproducer agreeing. ▶ **To make it
+decisive, WIDEN THE DELAY until the control approaches 100%** — not more trials
+at 25%. Then flipping the default is justified, and the txn engine stops
+shipping a known use-after-free.
 
 ### TSAN residue (unchanged, not correctness)
 
@@ -900,9 +945,13 @@ machine down (it did). `scratchpad/capped` wraps a run in
 The relative one above makes it exit 127 from a scratch dir — which a loop that
 records only `RESULT:` reads as eight silent failures.
 
-Build arms: `-DDC_TXN_PARENT_GUARD` (txn parent guard pair; OFF by default,
-measured liveness cost -- see above); `-DDC_NO_ADD_DUP_RECHECK` (mutation arm
-for the duplicate-name fix, BOTH engines).
+Build arms: `-DDC_TXN_PARENT_SEAL` (txn parent UAF closed via the child-head
+seal; OFF by default, **0/20 timeouts** — the one to promote, see above);
+`-DDC_TXN_PARENT_GUARD` (the older guard pair; OFF, **9/20** — kept as the A/B
+partner); `-DDC_TXN_PARENT_DELAY` (200 µs reproducer that makes the parent UAF
+fire; **never ship**, and its control must fire before any zero is believed);
+`-DDC_NO_ADD_DUP_RECHECK` (mutation arm for the duplicate-name fix, BOTH
+engines).
 
 Harness knobs: `DC_DUPSCAN_SELFTEST=1` (must-fail control for invariant 4).
 
