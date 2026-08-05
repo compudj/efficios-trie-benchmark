@@ -80,7 +80,8 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
-	check-filetype repro-samedir churn check-churn check-deque check-deque-tsan \
+	check-filetype repro-samedir churn check-churn check-churn-evict \
+	check-deque check-deque-tsan \
 	clean check-lib
 
 # ASan flags for the from-source concurrency builds.
@@ -364,6 +365,47 @@ check-churn: churn
 	./bench_dcache_churn_txn_mark --writers 6 --readers 6 --duration 1500
 	./bench_dcache_churn_txn_pernode --writers 6 --readers 6 --duration 1500
 	./bench_dcache_churn_seqlock --writers 6 --readers 6 --duration 1500
+
+# The EVICTION arms -- and they are a different gate, not a longer one.
+#
+# check-churn above never sets --evict-cap, so rebuild_prefix() never runs, so
+# the workload never issues CONCURRENT SAME-NAME CREATES.  That is the only
+# thing that exercised the duplicate-publish defect: every writer recreating a
+# shrinker-evicted directory at once, with -EEXIST as the arbitration.  Both
+# fast engines published duplicates there for as long as eviction has existed,
+# and nothing in the non-eviction gate could ever have seen it.
+#
+# All four LRU/engine combinations, because the 6-trial sweep that ordered them
+# was luck: under -DDC_NO_ADD_DUP_RECHECK the WORST arm is bucketlock+lock
+# (4/8), the one that sweep scored 0/6 twice.
+#
+# ⚠ ONE RUN PER ARM CATCHES ROUGHLY HALF.  Invariant 4 (no directory holds two
+# children of one name) fires on 3-5 of 8 runs per arm with the guard removed --
+# far better than the census's 1/8, but this is a screen, not a proof.  Re-run
+# it several times when touching dc_add, and use -DDC_NO_ADD_DUP_RECHECK as the
+# control that must fail.
+check-churn-evict: bench_dcache_churn_bucketlock bench_dcache_churn_bucketlock_mcas \
+                   bench_dcache_churn_txn_mark bench_dcache_churn_txn_mark_mcas
+	@for b in bench_dcache_churn_bucketlock bench_dcache_churn_bucketlock_mcas \
+	          bench_dcache_churn_txn_mark bench_dcache_churn_txn_mark_mcas; do \
+	  for c in continuous bursty; do \
+	    echo "--- $$b --evict $$c ---"; \
+	    ./$$b --writers 48 --readers 48 --duration 3000 \
+	          --evict $$c --evict-cap 32 || exit 1; \
+	  done; \
+	done
+	@echo "--- invariant 4's must-fail control (expect a DUPNAME report) ---"
+	@DC_DUPSCAN_SELFTEST=1 ./bench_dcache_churn_bucketlock \
+	   --writers 4 --readers 4 --duration 400 --evict continuous --evict-cap 32 \
+	   | grep -q '^DUPNAME ' \
+	  && echo "control OK: the duplicate detector fires when it should" \
+	  || { echo "CONTROL DID NOT FIRE -- invariant 4 is vacuous"; exit 1; }
+
+# MCAS-LRU churn arms, for check-churn-evict.
+bench_dcache_churn_bucketlock_mcas: bench_dcache_churn.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_LRU_MCAS $(HCPP) -o $@ bench_dcache_churn.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_churn_txn_mark_mcas: bench_dcache_churn.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_LRU_MCAS $(HCPP) -o $@ bench_dcache_churn.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 
 # Localized walk causality with NO counter: the hlist deletion mark is the
 # version, so d_seq is gone and DC_NAME_MAX rises 32 -> 40.  The DENTRY is
@@ -967,7 +1009,9 @@ clean:
 	  stress_dcache_tsan stress_dcache_dirs stress_dcache_dirs_asan \
 	  stress_dcache_dirs_tsan stress_dcache_xchg stress_dcache_xchg_asan \
 	  stress_dcache_xchg_tsan \
-	  bench_dcache_churn_bucketlock bench_dcache_bucketlock bench_dcache_height_bucketlock \
+	  bench_dcache_churn_bucketlock bench_dcache_churn_bucketlock_mcas \
+	  bench_dcache_churn_txn_mark_mcas \
+	  bench_dcache_bucketlock bench_dcache_height_bucketlock \
 	  bench_dcache_bucketlock_swmw bench_dcache_bucketlock_swmw_pad bench_dcache_churn_bucketlock_swmw \
 	  bench_dcache_height_bucketlock_swmw bench_dcache_bucketlock_chainlock \
 	  test_dcache_bucketlock_chainlock repro_dcache_bucketlock_chainlock repro_samedir_bucketlock_chainlock \
