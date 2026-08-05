@@ -31,7 +31,7 @@ Commits, all UNPUSHED, oldest first:
     cc6778f  root-cause the stale-d_parent UAF: a guard pair on the parent
     3e72f00  close the MCAS arm: no re-arm where the guard cannot be transacted
     2420ba0  seal the deque node on kill; bucketlock keeps its re-arm
-             (liburcu side: urcu-txn-dev 05dd26bc)
+             (liburcu side: urcu-txn-dev a816ba5b)
     72587b8  fold(): take the dentry off the LRU before freeing it
     df8a84a  RETRACT the park-while-online open item; the OOM was the harness
     9140b83  measure the txn+MCAS+continuous instability instead of theorising
@@ -240,7 +240,7 @@ timings.
 `3e72f00` fixed it by DROPPING the re-arm where the engine cannot transact the
 guard (`DC_LRU_ALIVE_TRANSACTED`). **That is now the fallback, not the fix.**
 
-### ⭐⭐ The real fix: `URCU_TXN_DEQUE_POISON` (liburcu `05dd26bc`)
+### ⭐⭐ The real fix: `URCU_TXN_DEQUE_POISON` (liburcu `a816ba5b`)
 
 `owner` gave push and remove a shared exclusion point but could not say "and
 never again", because its free value is NULL and NULL is what a push wants. It
@@ -633,8 +633,8 @@ because `remove()`'s `&n->owner : q -> NULL` makes exactly ONE sweeper win —
 evict-first removes exactly that. The shrink state is what replaces it, and that
 is why `lru_del_can_free` on the MCAS arm is a one-liner that always answers 1.
 
-Two upstream fixes that stay: `cf404e44` (`urcu_txn_deque_remove_prepare`
-load-validates its derivation read) and `5e4a9221` (the list convenience
+Two upstream fixes that stay: `43d35a7a` (`urcu_txn_deque_remove_prepare`
+load-validates its derivation read) and `73236953` (the list convenience
 brackets leaked the escalation lane on `-ENOENT` — five of them then, four now
 that `move_tail_rcu` is gone).
 
