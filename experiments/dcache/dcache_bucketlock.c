@@ -1853,6 +1853,8 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	if (!parent->d_isdir)
 		return -ENOTDIR;
 	name = &path->comp[path->ndepth - 1];
+	/* CHEAP REJECT ONLY.  The binding test is the one under the bucket lock
+	 * below; this one exists to answer -EEXIST without allocating. */
 	if (__child_lookup(dc, parent, name))
 		return -EEXIST;
 	d = dentry_alloc(dc, parent, name, id, isdir, positive);
@@ -1943,6 +1945,45 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 			free(d);		/* never published */
 			return -ENOENT;
 		}
+	}
+#endif
+#ifndef DC_NO_ADD_DUP_RECHECK
+	/*
+	 * ⭐ RE-CHECK THE NAME UNDER THE BUCKET LOCK -- the check above is a
+	 * CHECK-THEN-ACT and two concurrent adds of one name both pass it.
+	 *
+	 * The pre-check runs with no lock held, so nothing stops a peer from
+	 * publishing the same (parent, name) between it and this critical
+	 * section: both then reach the publish below and the bucket ends up
+	 * holding TWO dentries spelled alike.  A lookup resolves whichever the
+	 * chain reaches first while a child-list walk descends the other, so
+	 * everything added under the loser is reachable by dc_walk/dc_readdir
+	 * and ABSENT to dc_lookup -- the two indexes disagreeing permanently,
+	 * with nothing to unhash them.
+	 *
+	 * The old comment here said the race was "disjoint in the churn
+	 * workload".  That stopped being true when the churn bench gained
+	 * rebuild_prefix(), which has every writer recreate the SAME directory
+	 * names after an eviction and relies on -EEXIST to arbitrate.  Measured
+	 * on this tree: /p0/p1 held up to 33 children where 16 exist, on BOTH
+	 * LRU arms.
+	 *
+	 * The bucket lock is the right place for it, and this is what the
+	 * kernel-faithful seqlock baseline already does -- its exists-test and
+	 * its insert are both under the bucket lock, with a comment saying so.
+	 * Same (parent, name) hashes to the same bucket by construction, so one
+	 * lock covers every racer for this name.  Cost is one more walk of a
+	 * chain this thread already holds locked and just touched, on the miss
+	 * path only.
+	 *
+	 * ⚠ NOT the child head: siblings share a parent but scatter across
+	 * buckets, so scanning the child list would be O(children) instead of
+	 * O(chain) and would still be the WRONG lock for a name.
+	 */
+	if (__child_lookup(dc, parent, name)) {
+		bl_unlock2(bucket, &parent->d_child_head);
+		free(d);			/* never published */
+		return -EEXIST;
 	}
 #endif
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
