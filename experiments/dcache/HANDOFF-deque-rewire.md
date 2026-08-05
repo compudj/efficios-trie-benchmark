@@ -19,7 +19,13 @@ became reachable by `dc_walk` and absent to `dc_lookup`. See "THE CENSUS
 ANOMALY". The kernel-faithful **seqlock baseline never had it** — it does the
 same test under the bucket lock and says so in a comment.
 
-Commits, all UNPUSHED, oldest first:
+⚠⚠ **THE LIBURCU SIDE IS NOW PUSHED** (`github-dev/urcu-txn-dev` == `a816ba5b`).
+Three rewrites in this file's history — dropping the move API, amending the
+validate commit, splitting the lane fix — were all justified by "unpushed, so no
+force-push and nobody else's history". **That justification is spent.** Anything
+further on those commits is a NEW commit on top, not a rebase.
+
+Commits below are in THIS repo (benchmark side), oldest first:
 
     d4faf6b  move the MCAS LRU onto the deque
     f6eb10c  the legacy LRU collapse is a CALLER bug, and the deque is clean
