@@ -311,6 +311,18 @@ struct warg {
 					 * optimized away */
 	uint8_t *present;		/* owner-private truth for its slots */
 	int *dir;			/* which dir each slot lives in */
+	/*
+	 * PER-SLOT PROVENANCE, so a census anomaly can name itself.  "N extra"
+	 * -- the census sees a slot the owner believes gone -- is ambiguous
+	 * between a real resurrect-after-delete and the owner having believed
+	 * wrongly, and the two have opposite conclusions.  The owner clears
+	 * present[] on -ENOENT from unlink, which under eviction can mean THE
+	 * PREFIX WENT rather than the leaf being gone; recording the op and its
+	 * return separates that from corruption at the point of failure instead
+	 * of by argument afterwards.
+	 */
+	uint8_t *last_op;		/* 0 none, 1 add, 2 unlink, 3 add-retry */
+	int *last_ret;
 };
 
 static void wait_go(void)
@@ -367,6 +379,7 @@ static void *writer_fn(void *arg)
 		mk_slot_path(&p, me->dir[j], gid);
 		if (me->present[j]) {
 			ret = dc_unlink(g_dc, &p);
+			me->last_op[j] = 2; me->last_ret[j] = ret;
 			if (ret == 0) { me->present[j] = 0; me->nunlinks++; }
 			/*
 			 * Under eviction -ENOENT is the EXPECTED answer, not an
@@ -381,6 +394,7 @@ static void *writer_fn(void *arg)
 			} else me->errs++;
 		} else {
 			ret = dc_add(g_dc, &p, (uint64_t) gid);
+			me->last_op[j] = 1; me->last_ret[j] = ret;
 			if (ret == 0) { me->present[j] = 1; me->nadds++; }
 			/*
 			 * -ENOENT on an ADD means the PREFIX went: a writer's
@@ -392,8 +406,10 @@ static void *writer_fn(void *arg)
 			 */
 			else if (evict_cap && ret == -ENOENT) {
 				me->nrebuild++;
+				me->last_op[j] = 3;
 				if (rebuild_prefix(me->dir[j]) == 0 &&
-				    dc_add(g_dc, &p, (uint64_t) gid) == 0) {
+				    (me->last_ret[j] =
+				     dc_add(g_dc, &p, (uint64_t) gid)) == 0) {
 					me->present[j] = 1;
 					me->nadds++;
 				}
@@ -687,6 +703,8 @@ int main(int argc, char **argv)
 		wa[i].base = i * slots;
 		wa[i].seed = 0x9e3779b97f4a7c15ULL ^ ((uint64_t) (i + 1) * 0x100000001b3ULL);
 		wa[i].present = calloc(slots, 1);
+		wa[i].last_op = calloc(slots, 1);
+		wa[i].last_ret = calloc(slots, sizeof(*wa[i].last_ret));
 		wa[i].dir = calloc(slots, sizeof(int));
 		for (j = 0; j < slots; j++) {
 			struct dc_path p;
@@ -854,6 +872,41 @@ int main(int argc, char **argv)
 			printf("CENSUS MISMATCH: %ld missing, %ld extra, "
 			       "%ld stray, %ld dup\n",
 			       missing, extra, c.stray, c.dup);
+			/*
+			 * NAME THE OFFENDERS.  A bare count cannot distinguish
+			 * a resurrect-after-delete from an owner that believed
+			 * wrongly, and those have opposite conclusions.  Print
+			 * the slot, what the two indexes say about it now, and
+			 * the last op the owner ran on it with its return --
+			 * an "extra" whose last op was unlink -> -ENOENT under
+			 * eviction is the owner mis-believing (the prefix went,
+			 * not the leaf), whereas one whose last op was a
+			 * SUCCESSFUL unlink is real corruption.
+			 */
+			static const char *opn[] = { "none", "add", "unlink",
+						     "add-retry" };
+			long shown = 0;
+
+			for (i = 0; i < nwriters && shown < 8; i++)
+				for (j = 0; j < slots && shown < 8; j++) {
+					int gid = wa[i].base + j;
+					struct dc_path p;
+					uint64_t id = ~0ULL;
+					enum dc_result r;
+
+					if (wa[i].present[j] || !c.seen[gid])
+						continue;
+					mk_slot_path(&p, wa[i].dir[j], gid);
+					r = dc_lookup(g_dc, &p, &id);
+					printf("  EXTRA gid=%d dir=%d "
+					       "lookup=%d id=%llu last-op=%s "
+					       "last-ret=%d\n",
+					       gid, wa[i].dir[j], (int) r,
+					       (unsigned long long) id,
+					       opn[wa[i].last_op[j]],
+					       wa[i].last_ret[j]);
+					shown++;
+				}
 			anomaly++;
 		}
 	}
@@ -910,7 +963,10 @@ int main(int argc, char **argv)
 	else
 		if (dc_txn_stats_supported)
 		dc_txn_stats_dump(stdout);
-	printf("CHECK   conservation: OK (state, census and ids agree)\n");
+	/* ⚠ GATED.  This printed unconditionally, so a failing run reported
+	 * "CONSERVATION FAILED" and "conservation: OK" three lines apart. */
+	if (!anomaly)
+		printf("CHECK   conservation: OK (state, census and ids agree)\n");
 	printf("RESULT: %s\n", anomaly ? "FAIL" : "PASS");
 
 	rcu_unregister_thread();
