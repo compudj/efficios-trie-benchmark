@@ -30,15 +30,28 @@
  * TOGGLES it: present -> dc_unlink, absent -> dc_add (same path, same id).  It
  * knows its own slots' states exactly, since it is their only mutator.
  *
+ * ⚠ THE SLOTS ARE DISJOINT; THE DIRECTORIES ARE NOT.  Under --evict-cap the
+ * shrinker can take a writer's directory, and rebuild_prefix() has EVERY writer
+ * recreate the SAME names and rely on -EEXIST to arbitrate.  So this workload
+ * does issue concurrent same-name creates, and any engine comment claiming its
+ * callers are name-disjoint is wrong about this one (that exact stale premise
+ * hid a duplicate-publish defect in two of the three engines).
+ *
  * INVARIANT (designed for churn, not retrofitted).  At the end, after joining:
  *   1. every slot a writer believes PRESENT resolves, with its id;
  *   2. every slot a writer believes ABSENT does not resolve;
  *   3. a dc_walk census enumerates EXACTLY the union of the believed-present
- *      sets -- no strays, no duplicates, nothing leaked by a half-done op.
+ *      sets -- no strays, no duplicates, nothing leaked by a half-done op;
+ *   4. no directory holds two children of one name.
  * (3) is the one that catches a torn insert: dc_add's two commits mean a
  * dentry can exist in one index and not the other, and the census walks the
  * CHILD index while the checks in (1)/(2) go through the name hash, so a
  * discrepancy between them shows up here.
+ * (4) catches the CAUSE of one such discrepancy directly rather than waiting
+ * for it to strand a leaf: two dentries spelled alike put everything under the
+ * loser in the child index and nowhere in the name hash.  It is strictly more
+ * sensitive than (3) -- measured 3/8 against 1/8 on the same build -- because
+ * (3) needs a stranded leaf to still be there when the run ends.
  *
  * Readers do full-path lookups against the churning namespace and must tolerate
  * ABSENT -- a slot legitimately blinks out.  What they must never see is a
@@ -153,6 +166,8 @@ static unsigned int nbuckets = 1u << 16;
 static int *cpulist, cpulist_len;
 
 #define DIR_ID_BASE 1000000ULL		/* ids >= this are dirs, not slots */
+#define DC_ERRH_MAX 48			/* -ret histogram width (errno space) */
+#define DC_CENSUS_PATH 128		/* rendered path of a census sighting */
 
 static struct dcache *g_dc;
 static char g_prefix[8][DC_NAME_MAX];
@@ -323,7 +338,25 @@ struct warg {
 	 */
 	uint8_t *last_op;		/* 0 none, 1 add, 2 unlink, 3 add-retry */
 	int *last_ret;
+	/*
+	 * WHICH error, not how many.  "errors: 1223" fails the run without
+	 * saying what happened, and -EEXIST, -ENOTDIR and -ENOMEM have nothing
+	 * to do with each other: the first says the index still holds a name
+	 * this writer owns and believes gone, the last says the machine ran out
+	 * of descriptors.  Indexed by [op][-ret], op 1 add / 2 unlink.
+	 */
+	long long errh[4][DC_ERRH_MAX];
 };
+
+/* Record an unexpected return so the run can say WHICH error it hit. */
+static void err_note(struct warg *me, int op, int ret)
+{
+	int e = ret < 0 ? -ret : 0;
+
+	if (e >= DC_ERRH_MAX)
+		e = DC_ERRH_MAX - 1;
+	me->errh[op][e]++;
+}
 
 static void wait_go(void)
 {
@@ -391,7 +424,7 @@ static void *writer_fn(void *arg)
 			else if (evict_cap && ret == -ENOENT) {
 				me->present[j] = 0;
 				me->nlost++;
-			} else me->errs++;
+			} else { me->errs++; err_note(me, 2, ret); }
 		} else {
 			ret = dc_add(g_dc, &p, (uint64_t) gid);
 			me->last_op[j] = 1; me->last_ret[j] = ret;
@@ -405,15 +438,20 @@ static void *writer_fn(void *arg)
 			 * eroded, with the op rate still looking healthy.
 			 */
 			else if (evict_cap && ret == -ENOENT) {
+				int rr;
+
 				me->nrebuild++;
 				me->last_op[j] = 3;
-				if (rebuild_prefix(me->dir[j]) == 0 &&
-				    (me->last_ret[j] =
-				     dc_add(g_dc, &p, (uint64_t) gid)) == 0) {
+				rr = rebuild_prefix(me->dir[j]);
+				if (rr == 0)
+					rr = dc_add(g_dc, &p, (uint64_t) gid);
+				me->last_ret[j] = rr;
+				if (rr == 0) {
 					me->present[j] = 1;
 					me->nadds++;
-				}
-			} else me->errs++;
+				} else
+					err_note(me, 3, rr);
+			} else { me->errs++; err_note(me, 1, ret); }
 		}
 		if (evict_continuous && (long) dc_lru_count(g_dc) > evict_cap) {
 			/* LOCAL: evict where we allocate.  A continuous evictor
@@ -552,15 +590,29 @@ static void *reader_fn(void *arg)
 
 struct census {
 	uint8_t *seen;
+	char (*at)[DC_CENSUS_PATH];	/* WHERE the walk found each id */
 	int total;
 	long stray, dup;
 };
+
+/* Render a path as "/a/b/c" for a diagnostic. */
+static void path_str(const struct dc_path *p, char *out, size_t n)
+{
+	size_t k = 0;
+	uint32_t i;
+
+	if (!p->ndepth && k + 1 < n)
+		out[k++] = '/';
+	for (i = 0; i < p->ndepth && k + 1 < n; i++)
+		k += (size_t) snprintf(out + k, n - k, "/%.*s",
+				       (int) p->comp[i].len, p->comp[i].name);
+	out[k < n ? k : n - 1] = '\0';
+}
 
 static void census_cb(uint64_t id, const struct dc_path *p, void *arg)
 {
 	struct census *c = arg;
 
-	(void) p;
 	if (id >= DIR_ID_BASE)
 		return;			/* a directory */
 	if (id >= (uint64_t) c->total) {
@@ -569,6 +621,153 @@ static void census_cb(uint64_t id, const struct dc_path *p, void *arg)
 	}
 	if (c->seen[id]++)
 		c->dup++;
+	else if (c->at)
+		path_str(p, c->at[id], DC_CENSUS_PATH);
+}
+
+/*
+ * WHICH COMPONENT does the name-hash index fail on?
+ *
+ * The census reaches an id through the CHILD LISTS while dc_lookup walks the
+ * NAME HASH, so an id that is "extra" means the two disagree -- but not where.
+ * Resolving each prefix in turn separates "the leaf is missing from its bucket"
+ * from "an ancestor directory is child-list-reachable but unhashed", which have
+ * different causes and different fixes.  Returns the depth of the first
+ * component that does not resolve POSITIVE, or -1 if the whole path resolves.
+ */
+static int first_absent_depth(const struct dc_path *full)
+{
+	struct dc_path p;
+	uint32_t i;
+
+	dc_path_reset(&p);
+	for (i = 0; i < full->ndepth; i++) {
+		p.comp[p.ndepth++] = full->comp[i];
+		if (dc_lookup(g_dc, &p, NULL) != DC_POSITIVE)
+			return (int) i;
+	}
+	return -1;
+}
+
+/*
+ * DO TWO SIBLINGS SHARE A NAME?
+ *
+ * "the leaf is absent at depth N" and "the leaf is present under a DIFFERENT
+ * dentry that is spelled the same" render as the identical path string, so the
+ * component probe above cannot separate them.  This one can: it enumerates a
+ * directory's child list -- dc_readdir does not go through the name hash -- and
+ * reports any name that appears more than once.  A duplicate is only possible
+ * if two concurrent dc_add()s of one name both published, which is exactly what
+ * rebuild_prefix() does from every writer at once.
+ */
+struct dupscan {
+	char (*names)[DC_NAME_MAX];
+	uint32_t *lens;
+	int n, cap;
+	long dups;
+};
+
+/* Compare by (len, bytes) exactly as dc_qstr_eq does -- an engine's inline name
+ * is not promised to be NUL-terminated, so strcmp would be reading a byte the
+ * comparison it mirrors never reads. */
+static void dupscan_cb(uint64_t id, const struct qstr *name, void *arg)
+{
+	struct dupscan *ds = arg;
+	uint32_t len = name->len;
+	int k;
+
+	(void) id;
+	if (ds->n >= ds->cap || len >= DC_NAME_MAX)
+		return;
+	for (k = 0; k < ds->n; k++)
+		if (ds->lens[k] == len &&
+		    !memcmp(ds->names[k], name->name, len)) {
+			ds->dups++;
+			break;
+		}
+	memcpy(ds->names[ds->n], name->name, len);
+	ds->names[ds->n][len] = '\0';
+	ds->lens[ds->n++] = len;
+}
+
+static long g_dupscan_children;
+
+static long scan_dup_names(const struct dc_path *dir, const char *label)
+{
+	struct dupscan ds;
+	long n;
+
+	ds.cap = 4096;
+	ds.n = 0;
+	ds.dups = 0;
+	ds.names = calloc((size_t) ds.cap, DC_NAME_MAX);
+	ds.lens = calloc((size_t) ds.cap, sizeof(*ds.lens));
+	if (!ds.names || !ds.lens) {
+		free(ds.names);
+		free(ds.lens);
+		return 0;
+	}
+	n = dc_readdir(g_dc, dir, dupscan_cb, &ds);
+	/*
+	 * MUST-FAIL CONTROL.  A scan that reports "no duplicates" is only worth
+	 * anything if it can report one, and this detector has no other test.
+	 * DC_DUPSCAN_SELFTEST enumerates the same directory a second time into
+	 * the same name set, so every child is its own duplicate: it must then
+	 * report dups == children.  Four wrong negatives in this project came
+	 * from probes nobody checked could fire.
+	 */
+	if (getenv("DC_DUPSCAN_SELFTEST"))
+		(void) dc_readdir(g_dc, dir, dupscan_cb, &ds);
+	if (n > 0)
+		g_dupscan_children += n;
+	if (ds.dups)
+		printf("DUPNAME %s: %ld duplicate sibling names among %ld "
+		       "children\n", label, ds.dups, n);
+	free(ds.names);
+	free(ds.lens);
+	return ds.dups;
+}
+
+/*
+ * Scan every level a writer can create for siblings sharing a name.
+ *
+ * A DIRECTORY CANNOT HOLD TWO CHILDREN OF ONE NAME.  That is an invariant of
+ * the cache itself, and it is a STRICTLY STRONGER detector than the census for
+ * a duplicate-publish defect: the census only notices once a leaf happens to be
+ * stranded under the losing copy at the moment the run ends, so it scored 1/8
+ * where this scores 3/8 on the same builds (and 4/8 vs 4/8 on the other arm).
+ * Runs that "passed" with duplicates sitting in the tree are why this is now
+ * unconditional rather than a debug flag.  Cost is one readdir per directory,
+ * after the threads have stopped.
+ */
+static long dupname_report(void)
+{
+	struct dc_path dp;
+	long d = 0;
+	int lvl;
+
+	g_dupscan_children = 0;
+	dc_path_reset(&dp);
+	d += scan_dup_names(&dp, "/");
+	for (lvl = 0; lvl < g_prefix_len; lvl++) {
+		dc_path_push(&dp, g_prefix[lvl]);
+		d += scan_dup_names(&dp, g_prefix[lvl]);
+	}
+	for (lvl = 0; lvl < ndirs; lvl++) {
+		struct dc_path ddp;
+		char lb[32];
+
+		mk_dir_path(&ddp, lvl);
+		snprintf(lb, sizeof(lb), "d%d", lvl);
+		d += scan_dup_names(&ddp, lb);
+	}
+	/* Printed even when clean: a check whose silence is indistinguishable
+	 * from a check that did not run is how four wrong negatives happened
+	 * here.  The child count says it looked at something. */
+	if (!d)
+		printf("DUPNAME: none at any level (%ld children scanned)\n",
+		       g_dupscan_children);
+	return d;
 }
 
 /* ---- setup --------------------------------------------------------------- */
@@ -856,6 +1055,7 @@ int main(int argc, char **argv)
 	/* --- invariant 3: the census sees EXACTLY the believed-present set --- */
 	c.total = total_slots;
 	c.seen = calloc(total_slots, 1);
+	c.at = calloc((size_t) total_slots, DC_CENSUS_PATH);
 	c.stray = c.dup = 0;
 	dc_walk(g_dc, census_cb, &c);
 	{
@@ -890,6 +1090,7 @@ int main(int argc, char **argv)
 			for (i = 0; i < nwriters && shown < 8; i++)
 				for (j = 0; j < slots && shown < 8; j++) {
 					int gid = wa[i].base + j;
+					char want[DC_CENSUS_PATH];
 					struct dc_path p;
 					uint64_t id = ~0ULL;
 					enum dc_result r;
@@ -897,19 +1098,71 @@ int main(int argc, char **argv)
 					if (wa[i].present[j] || !c.seen[gid])
 						continue;
 					mk_slot_path(&p, wa[i].dir[j], gid);
+					path_str(&p, want, sizeof(want));
 					r = dc_lookup(g_dc, &p, &id);
+					/*
+					 * WHERE the two indexes part company.
+					 * want= is the path the owner uses;
+					 * walk= is where dc_walk actually found
+					 * the id; absent-at= is the first
+					 * component dc_lookup cannot resolve.
+					 * A leaf-depth absent-at with matching
+					 * paths means the leaf is missing from
+					 * its bucket; a shallower one means an
+					 * ANCESTOR is child-list-reachable but
+					 * unhashed, which is a different bug.
+					 */
 					printf("  EXTRA gid=%d dir=%d "
 					       "lookup=%d id=%llu last-op=%s "
-					       "last-ret=%d\n",
+					       "last-ret=%d absent-at=%d/%u "
+					       "want=%s walk=%s\n",
 					       gid, wa[i].dir[j], (int) r,
 					       (unsigned long long) id,
 					       opn[wa[i].last_op[j]],
-					       wa[i].last_ret[j]);
+					       wa[i].last_ret[j],
+					       first_absent_depth(&p), p.ndepth,
+					       want, c.at ? c.at[gid] : "?");
 					shown++;
 				}
 			anomaly++;
 		}
 	}
+	/*
+	 * --- invariant 4: no directory holds two children of one name ---
+	 *
+	 * DC_DUPSCAN_SELFTEST double-scans each directory so every child is its
+	 * own duplicate: the must-fail control for this detector, which
+	 * otherwise has no test of its own.
+	 */
+	if (dupname_report())
+		anomaly++;
+
+	/*
+	 * SAY WHICH ERROR.  A bare "errors: 1223" fails the run without naming
+	 * the failure, and the codes mean unrelated things here: -EEXIST says
+	 * the index still holds a name this writer owns and believes gone,
+	 * -ENOMEM says the machine ran out of descriptors, -ENOTDIR says a
+	 * component stopped being a directory.  Printed for the retry path too
+	 * (op 3), which is NOT counted in errs but is where a rebuild failure
+	 * would otherwise vanish silently.
+	 */
+	if (errs || anomaly) {
+		static const char *opn2[] = { "", "add", "unlink", "retry" };
+		int op, e;
+
+		for (op = 1; op <= 3; op++)
+			for (e = 0; e < DC_ERRH_MAX; e++) {
+				long long n = 0;
+
+				for (i = 0; i < nwriters; i++)
+					n += wa[i].errh[op][e];
+				if (n)
+					printf("ERR     %s -> -%s (%d): %lld\n",
+					       opn2[op], strerrorname_np(e) ?
+					       strerrorname_np(e) : "?", e, n);
+			}
+	}
+
 	anomaly += (errs != 0) + (wrong != 0);
 
 	printf("duration (s): %g\n", secs);
