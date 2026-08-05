@@ -1455,7 +1455,67 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 			return -ENOENT;		/* the prefix went */
 		}
 #endif
+#ifndef DC_NO_ADD_DUP_RECHECK
+		/*
+		 * ⭐ RE-CHECK THE NAME INSIDE THE TRANSACTION.  The
+		 * __child_lookup() before the loop is a CHECK-THEN-ACT: it holds
+		 * nothing, so two concurrent adds of one name both pass it and
+		 * both publish, leaving the bucket with TWO dentries spelled
+		 * alike.  A lookup then resolves whichever the chain reaches
+		 * first while a child-list walk descends the other, so
+		 * everything under the loser is reachable by dc_walk/dc_readdir
+		 * and ABSENT to dc_lookup -- permanently, with nothing to unhash
+		 * it.  The kernel-faithful seqlock baseline never had this: its
+		 * exists-test and its insert are both under the bucket lock.
+		 *
+		 * ⭐⭐ WHAT MAKES IT ATOMIC HERE IS A SLOT, NOT A LOCK, AND IT
+		 * COSTS NO NEW READ-SET ENTRY.  Read the bucket head ONCE, scan
+		 * for the name AFTER that read, and hand that SAME value to the
+		 * insert as its expected old.  Then:
+		 *
+		 *   a peer published BEFORE our head read -> the scan runs after
+		 *     it and sees the name              -> -EEXIST;
+		 *   a peer publishes AFTER our head read -> every insert of this
+		 *     name targets this same head slot, so the committed value
+		 *     no longer matches @fn            -> ABORT, and the retry
+		 *                                         re-scans and sees it.
+		 *
+		 * That is why insert_head_prepare() is opened up here rather
+		 * than called: it does its OWN load of the head, and a scan
+		 * placed before that load would only NARROW the window -- the
+		 * peer's publish would land between the two and be adopted as
+		 * this insert's expected old, which validates cleanly.
+		 *
+		 * ⚠ urcu_txn_load(), not the optimistic form: this slot enters
+		 * the write set, so the read policy requires the waiting load --
+		 * which also settles an undecided peer before we scan, so we
+		 * never read its logical-old and miss a name it is committing.
+		 *
+		 * A concurrent DELETE of the name can make this answer -EEXIST
+		 * for a name that is going away; that is the same benign
+		 * staleness the pre-check always had, and it cannot create a
+		 * duplicate, which is the property being bought.
+		 */
+		{
+			void *fn = urcu_txn_load(&txn, (void **) &bucket->first,
+						 URCU_TXN_HLIST_TAG);
+
+			if (urcu_txn_hlist_is_marked(fn)) {
+				p = -ENOENT;	/* head sealed: bucket is gone */
+			} else if (__child_lookup(dc, parent, name)) {
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
+				free(d);	/* never published */
+				return -EEXIST;
+			} else {
+				p = urcu_txn_hlist_insert_at_slot_prepare(&txn,
+					&d->d_hash, &bucket->first,
+					(struct urcu_txn_hlist_node *) fn);
+			}
+		}
+#else
 		p = urcu_txn_hlist_insert_head_prepare(&txn, &d->d_hash, bucket);
+#endif
 		if (!p)
 			p = urcu_txn_hlist_insert_head_prepare(&txn, &d->d_sib,
 							&parent->d_child_head);
