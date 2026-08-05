@@ -351,6 +351,48 @@ run in `systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`. The
 lesson is not "the txn engine is dangerous", it is "an unthrottled allocator
 loop is", and that is easy to write again.
 
+## ▶ THE ONE OPEN CORRECTNESS SIGNAL — txn + MCAS + `--evict continuous`
+
+⚠⚠ **DO NOT CHARACTERIZE THIS AT SINGLE-DIGIT SAMPLES. The identical binary
+gives contradictory pictures batch to batch**, and two wrong conclusions were
+drawn from exactly that before this table existed:
+
+| `df8a84a`, same binary, same command line | pass | consfail | timeout |
+|---|---|---|---|
+| batch of 8 | 3 | **0** | **5** |
+| batch of 6 | 3 | **3** | **0** |
+| batch of 20 | 12 | 2 | 6 |
+| **pooled (34)** | **18 (53%)** | **5 (15%)** | **11 (32%)** |
+
+The failure MODE flips between batches, not just the rate. On the 8-trial batch
+this read as "the conservation anomaly is fixed, but I introduced timeouts"; the
+6-trial batch says the opposite; the pooled figure says both modes are present
+throughout.
+
+⛔ **RETRACTED on the strength of the control:** "the fold fix put a transaction
+on the reclaim thread and that caused the timeouts." The mechanism is REAL and
+worth knowing — on the MCAS arm `lru_del_can_free(.., 1)` runs
+`lru_dq_remove_seal` on `dc->lru_domain` from `fold_cb`, i.e. the `call_rcu`
+thread, and `urcu_txn_begin` there can park in the fair-mutex FIFO behind the
+writers — but it is not what is happening: `2420ba0` WITHOUT the fold fix
+measured **4/6 timeouts against the fixed tree's 0/6**. "Can happen" is not "is
+happening", and a plausible mechanism plus a single batch is how this session
+produced three confident wrong stories in a row.
+
+⛔ **ALSO RETRACTED:** "the conservation anomaly is gone." It is not. It was
+3/8 at the original HEAD and it is 5/34 here; one batch of 8 happened to show 0.
+
+**What is actually known:** a real, intermittent, PRE-EXISTING conservation
+failure on this configuration, which none of this session's work fixed or
+worsened. Nothing in today's correctness work depends on it — the
+free-while-queued closure is mutation-proven on the lock arms and via the seal,
+and the fold fix is 4/4-detected by its own gate on both engines.
+
+⭐ **NEXT, and the order matters:** do NOT try to fix it yet. Make it MEASURABLE
+first — a campaign large enough to separate the two failure modes, and ideally a
+targeted reproducer for the conservation failure the way `-DDC_LRU_PUSH_DELAY`
+was built for the push race. Chasing it at n=6 will keep generating stories.
+
 ### Previously recorded under this item, and NOT retracted
 
 ### Previously recorded under this item
