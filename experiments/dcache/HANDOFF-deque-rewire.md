@@ -25,6 +25,7 @@ Commits, all UNPUSHED, oldest first:
     3e72f00  close the MCAS arm: no re-arm where the guard cannot be transacted
     (this)   use the deque seal; bucketlock keeps its re-arm
              (liburcu side: urcu-txn-dev d9dd1a9e)
+    (this)   fold(): take the dentry off the LRU before freeing it
 
 ---
 
@@ -277,20 +278,63 @@ are gates. Had the control passed, the seal arm would have proved nothing.
 Shipped default, `-DDC_LRU_FREE_ASSERT`, 48w/48r, 8 trials, ALL FOUR ARMS x BOTH
 cadences: **0/8 everywhere.**
 
-## ▶ OPEN ITEM 2 — rename × LRU × shrinker is jointly UNTESTED
+## ✅ RESOLVED (was open item 2) — fold() freed dentries that were on the LRU
 
-`fold()` frees dentries (`host_to_free`, `n` at dcache_bucketlock.c:2669, 3009,
-3130) with **no `lru_del` on any path**. That is safe only if a folded-away node
-is never on the LRU.
+Not a race: an unguarded path. `fold()` frees `host_to_free` and `n` via
+`call_rcu(dentry_free_cb)` and had **no `lru_del` on any path**, while
+`resolve()` marks recency on the HOST (`txn_child_lookup_rcu` ends
+`return host_of_rcu(top)`) — so hosts ARE on the LRU, and those two frees are
+hosts.
 
-Measured, not assumed: `stress_dcache` (renames) with the probe live is clean
-3/3. But `stress_dcache` never calls `dc_shrink` (grep: 0 hits) and
-`bench_dcache_churn` has **no renames at all** — so no test drives renames and
-the shrinker together. Closing this needs a shrinker thread in `stress_dcache`
-or a rename mode in the churn bench. Until then the fold's frees are unproven,
-not proven safe.
+It survived because **no test ran renames and the shrinker together**:
+`stress_dcache` never called `dc_shrink`, and `bench_dcache_churn` — the only
+thing that drives the LRU — has no renames. `-DSTRESS_SHRINK` adds a sweeper to
+`stress_dcache` and the probe fired **3/3 immediately, on both engines**, with
+`chain-reachable=1` (the dentry genuinely spliced into the shard chain).
 
-## ▶ OPEN ITEM 3 — txn + MCAS + `--evict continuous` is unstable (not ours)
+Fixed by routing all four fold free sites through `lru_del_can_free(dc, X, 1)` —
+the same kill the unlink and the shrinker use, which seals `DC_LRU_DEAD` on the
+lock arm and remove-seals the deque node on the MCAS arm. bucketlock lock arm
+3/3 → **0/10**, MCAS → **0/6**; churn unaffected (0/4 both engines).
+
+⚠ **The first cut of the harness measured almost nothing** and looked fine: the
+sweeper emptied the 40-object namespace within a few hundred iterations
+(`evicted=37`) and the remaining ~80000 writer iterations were all `-ENOENT`
+no-ops. It still fired — but on a workload that had stopped renaming. Re-seeding
+on `-ENOENT` took it to ~20000 evictions per run. **Check that a new arm is
+doing work before believing either its pass or its failure.**
+
+⚠ The shrink arm makes NO conservation claim — the sweeper legitimately evicts
+leaves, so "every leaf exactly once" is not the invariant. It checks the probe,
+duplicate-free-ness, and that anything still present is RIGHT. Run both arms.
+
+## ▶ OPEN ITEM 3 — park-while-online: now an OOM, not just a hang (liburcu)
+
+⚠⚠ **THIS TOOK THE MACHINE DOWN AND KILLED A SESSION.** Run the txn engine with
+renames + a shrinker ONLY under a memory cgroup:
+
+    systemd-run --user --scope -q --collect -p MemoryMax=4G -p MemorySwapMax=0 \
+      -- timeout 90 ./stress_shrink_txn 4 2 8 8 20000
+
+`stress_dcache -DSTRESS_SHRINK` on the TXN engine grows **~1 GB/s without
+bound**. Three gdb samples 3 s apart: RSS 7.2 → 9.8 → 12.3 GB with **five
+threads in `urcu_txn__enter_fallback` → `cds_fair_mutex_park` in every sample**.
+That is the known absorbing state, now with a price tag: park while RCU-online →
+grace periods stall → `call_rcu` never drains → the shrinker keeps allocating
+descriptors nothing reclaims.
+
+⭐ **NOT caused by the fold fix** — a tree built from `2420ba0` (pre-fix) with
+the same harness dies identically at the same cap. That A/B is the only reason
+the fold fix could be trusted at all.
+
+Hence the `check-lru-arms` shrink arm is **bucketlock-only**, with the reason
+written in the recipe rather than left as an unexplained omission.
+
+The fix belongs in liburcu: go offline across the park.
+
+### Previously recorded under this item
+
+
 
 ⚠ **CORRECTION to the previous handoff, which said "hangs 3/3".** Re-measured 8
 trials on a clean HEAD control: **5 pass / 3 CONSERVATION FAILED / 0 hangs**.

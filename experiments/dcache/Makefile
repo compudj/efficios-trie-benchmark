@@ -790,6 +790,37 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 	$(CC) $(ASANFLAGS) -DDC_LRU_MCAS $(HCPP) -o stress_lru_mcas_asan \
 	  stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 	./stress_lru_mcas_asan 4 4 8 16 15000
+	@echo "--- RENAMES x SHRINKER x FREE_ASSERT: the axis nothing covered ---"
+	@# Neither harness exercised these together: this one never called
+	@# dc_shrink, and bench_dcache_churn has no renames.  fold() frees HOSTS
+	@# and resolve() puts hosts on the LRU, so the fold's call_rcu ran against
+	@# a populated LRU with no lru_del anywhere -- 3/3 FREE-WHILE-QUEUED once
+	@# the two were finally run together.
+	@#
+	@# ⛔ BUCKETLOCK ONLY, and the omission is not caution -- it is a known
+	@# defect.  On the TXN engine this workload drives liburcu's
+	@# park-while-online absorbing state: urcu_txn__enter_fallback ->
+	@# cds_fair_mutex_park blocks while RCU-online, grace periods stall,
+	@# call_rcu never drains, and the shrinker keeps allocating descriptors
+	@# nothing reclaims.  Measured: ~1 GB/s of unbounded growth (three gdb
+	@# samples 3s apart: 7.2 -> 9.8 -> 12.3 GB, five threads in the fair
+	@# mutex every time) until the OOM killer fires.  It reproduces
+	@# IDENTICALLY on the pre-fold-fix tree, so it is not this fix's doing.
+	@# Running it here would take the machine down, which is why it is a
+	@# documented repro rather than a gate.  See HANDOFF open item 3:
+	@#   scratch/capped 4G 90 ./stress_shrink_txn 4 2 8 8 20000
+	@# ⚠ ALWAYS RUN THE TXN ARM UNDER A MEMORY CGROUP.
+	@#
+	@# ulimit -v here is belt-and-braces for the bucketlock arms themselves:
+	@# they need a few MB, so a runaway is a bug and should die cheaply.
+	@for a in "" "-DDC_LRU_MCAS"; do \
+	  echo "  bucketlock $${a:-lock}"; \
+	  $(CC) $(CFLAGS) -DDC_MARK_GEN $$a -DSTRESS_SHRINK -DDC_LRU_FREE_ASSERT \
+	    $(HCPP) -o stress_shrink_tmp stress_dcache.c dcache_bucketlock.c \
+	    $(LDFLAGS) $(LDLIBS) || exit 1; \
+	  ( ulimit -v 8388608; ./stress_shrink_tmp 4 2 8 8 20000 ) || exit 1; \
+	done
+	@rm -f stress_shrink_tmp
 
 # ---- the deque itself, below the dcache -----------------------------------
 #

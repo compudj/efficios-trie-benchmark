@@ -2501,13 +2501,18 @@ reclaim:
 		}
 		break;
 	}
-	if (host_to_free)
+	/* ⭐ OFF THE LRU BEFORE THE FREE; see the bucketlock fold for why the
+	 * fold frees hosts and why hosts are on the LRU. */
+	if (host_to_free) {
+		(void) lru_del_can_free(dc, host_to_free, 1);
 		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
+	}
 done:
 	rcu_read_unlock();
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
 #endif
+	(void) lru_del_can_free(dc, n, 1);
 	call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
 }
 

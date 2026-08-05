@@ -34,6 +34,25 @@
  * at exactly its owner's recorded final path, and a dc_lookup of that path must
  * return POSITIVE with the right id -- conservation across both indexes.
  *
+ * ---- -DSTRESS_SHRINK: renames AND the shrinker, together -----------------
+ *
+ * ⚠⚠ NOTHING EXERCISED THOSE TWO AXES JOINTLY, and that gap hid a defect for
+ * the whole life of this file: this harness never called dc_shrink (so nothing
+ * evicted), and bench_dcache_churn -- the one thing that drives the LRU -- has
+ * no renames at all.  Between them, fold()'s call_rcu frees were never run
+ * against a populated LRU, and fold() performs NO lru_del on any path.
+ *
+ * That matters because resolve() -> lru_retain() marks the HOST
+ * (txn_child_lookup_rcu ends `return host_of_rcu(top)`), so hosts ARE on the
+ * LRU -- and fold() frees hosts.  Build with -DSTRESS_SHRINK to run a sweeper
+ * alongside the renames and let -DDC_LRU_FREE_ASSERT answer it.
+ *
+ * ⚠ THE CONSERVATION CENSUS IS OFF IN THAT ARM, necessarily: the sweeper
+ * legitimately evicts leaves, so "every leaf exactly once" is no longer the
+ * invariant, and -ENOENT stops being an error for the writers.  What this arm
+ * checks is the probe, the sanitizers, and reader id-correctness -- so a PASS
+ * here is NOT the conservation claim the default arm makes.  Run both.
+ *
  * Usage: ./stress_dcache [writers [readers [dirs [leaves_per_writer [iters]]]]]
  * Exit 0 = conserved and race-clean (per the sanitizer); 1 = anomaly.
  */
@@ -87,7 +106,72 @@ static void mkpath(struct dc_path *p, int dir, int gid)
 
 /* ---- writer ------------------------------------------------------------- */
 
-struct warg { int w; long errs; };
+struct warg { int w; long errs; long lost; };
+
+#ifdef STRESS_SHRINK
+static int g_shrink_stop;
+static unsigned long g_evicted;
+
+/*
+ * The sweeper.  dc_shrink (every shard), not dc_shrink_local: this thread owns
+ * no shard, and the point is to reach the entries the writers are renaming.
+ *
+ * No sleep anywhere in the loop.  A QSBR thread that blocks while online holds
+ * off every grace period, which would stall the very call_rcu folds this arm
+ * exists to race against -- the park-while-online hazard the repro harnesses
+ * already guard against.  A tight loop with a quiescent state per iteration
+ * keeps it honest.
+ */
+static void *shrinker(void *arg)
+{
+	(void) arg;
+	dc_register_thread();
+	while (!uatomic_load(&g_shrink_stop, CMM_RELAXED)) {
+		long n = dc_shrink(g_dc, 16);
+
+		if (n > 0)
+			g_evicted += (unsigned long) n;
+		dc_quiescent();
+	}
+	dc_unregister_thread();
+	return NULL;
+}
+#endif	/* STRESS_SHRINK */
+
+/*
+ * -ENOENT is an ERROR in the default arm (a single owner per leaf means a
+ * rename cannot legitimately miss) and EXPECTED under -DSTRESS_SHRINK (the
+ * sweeper reached the leaf first).  Counting it either way would hide the
+ * distinction, so the arm decides -- and under shrink the leaf is re-seeded so
+ * the writer's belief stays true, exactly as bench_dcache_churn does.
+ */
+#ifdef STRESS_SHRINK
+/*
+ * RE-SEED after an eviction, or the arm measures nothing.  Without this the
+ * sweeper empties the tree within the first few hundred iterations -- 37
+ * evictions is the whole namespace here -- and the remaining ~80000 writer
+ * iterations are all -ENOENT no-ops.  The probe still fired, but on a workload
+ * that had stopped renaming, which is the opposite of what this arm is for.
+ * The directory is re-added too: it goes empty and becomes evictable itself.
+ */
+static void reseed(int dir, int gid)
+{
+	struct dc_path p;
+	char buf[DC_NAME_MAX];
+
+	snprintf(buf, sizeof(buf), "/d%d", dir);
+	dc_path_parse(&p, buf);
+	(void) dc_add(g_dc, &p, 1000000ULL + dir);	/* -EEXIST is fine */
+	mkpath(&p, dir, gid);
+	(void) dc_add(g_dc, &p, (uint64_t) gid);
+}
+
+#define WERR(wa, ret)	do { if ((ret) == -ENOENT) { (wa)->lost++; \
+				     reseed(pos[i], gid); } \
+			     else (wa)->errs++; } while (0)
+#else
+#define WERR(wa, ret)	do { (void) (ret); (wa)->errs++; } while (0)
+#endif
 
 static void *writer(void *arg)
 {
@@ -127,11 +211,11 @@ static void *writer(void *arg)
 			 */
 			ret = dc_rename(g_dc, &from, &to);
 			if (ret != 0)
-				wa->errs++;
-			else if (dc_unlink(g_dc, &to) != 0)
-				wa->errs++;
-			else if (dc_add(g_dc, &to, (uint64_t) gid) != 0)
-				wa->errs++;
+				WERR(wa, ret);
+			else if ((ret = dc_unlink(g_dc, &to)) != 0)
+				WERR(wa, ret);
+			else if ((ret = dc_add(g_dc, &to, (uint64_t) gid)) != 0)
+				WERR(wa, ret);
 			else
 				pos[i] = nd;
 		} else {
@@ -139,7 +223,7 @@ static void *writer(void *arg)
 			if (ret == 0)
 				pos[i] = nd;
 			else
-				wa->errs++;	/* single-owner: rename must succeed */
+				WERR(wa, ret);	/* single-owner: must succeed */
 		}
 		dc_quiescent();			/* let grace periods (folds) advance */
 	}
@@ -229,6 +313,10 @@ static void census_cb(uint64_t id, const struct dc_path *p, void *arg)
 int main(int argc, char **argv)
 {
 	pthread_t *wt, *rt;
+#ifdef STRESS_SHRINK
+	pthread_t st;
+	long wlost = 0;
+#endif
 	struct warg *wargs;
 	struct rarg *rargs;
 	struct census c;
@@ -288,6 +376,9 @@ int main(int argc, char **argv)
 		rargs[i].r = i;
 		pthread_create(&rt[i], NULL, reader, &rargs[i]);
 	}
+#ifdef STRESS_SHRINK
+	pthread_create(&st, NULL, shrinker, NULL);
+#endif
 	/*
 	 * Go RCU-offline while blocked in join: main is a registered QSBR thread
 	 * but reports no quiescent state inside pthread_join, so leaving it online
@@ -298,12 +389,21 @@ int main(int argc, char **argv)
 	for (i = 0; i < W; i++) {
 		pthread_join(wt[i], NULL);
 		werrs += wargs[i].errs;
+#ifdef STRESS_SHRINK
+		wlost += wargs[i].lost;
+#endif
 	}
 	for (i = 0; i < R; i++) {
 		pthread_join(rt[i], NULL);
 		rbad += rargs[i].bad;
 		rhits += rargs[i].hits;
 	}
+#ifdef STRESS_SHRINK
+	/* Stop the sweeper only AFTER the writers are done, so renames and
+	 * eviction overlap for the whole run. */
+	uatomic_store(&g_shrink_stop, 1, CMM_RELAXED);
+	pthread_join(st, NULL);
+#endif
 	rcu_thread_online();
 
 	/* Drive grace periods so any in-flight folds settle before the census. */
@@ -316,6 +416,7 @@ int main(int argc, char **argv)
 	c.seen = calloc(total, 1);
 	dc_walk(g_dc, census_cb, &c);
 
+#ifndef STRESS_SHRINK
 	for (i = 0; i < total; i++) {
 		struct dc_path p;
 		uint64_t id = ~0ULL;
@@ -326,6 +427,35 @@ int main(int argc, char **argv)
 		if (dc_lookup(g_dc, &p, &id) != DC_POSITIVE || id != (uint64_t) i)
 			anomaly++;
 	}
+#else
+	/*
+	 * ⚠ NO CONSERVATION CLAIM IN THIS ARM.  The sweeper evicts leaves, so
+	 * "every leaf exactly once" is simply not the invariant any more, and
+	 * asserting it would fail for the intended reason -- which would be
+	 * worse than not asserting it, because the failure would look like a
+	 * defect.  A leaf that is present must still be RIGHT, though, so the
+	 * census is walked and its ids checked; only absence is tolerated.
+	 */
+	for (i = 0; i < total; i++) {
+		struct dc_path p;
+		uint64_t id = ~0ULL;
+
+		if (c.seen[i] > 1)
+			anomaly++;		/* duplicated: never legal */
+		mkpath(&p, g_final_pos[i], i);
+		if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
+		    id != (uint64_t) i)
+			anomaly++;		/* present but WRONG: never legal */
+	}
+	printf("shrink arm: evicted=%lu  writer -ENOENT (expected) =%ld\n",
+	       g_evicted, wlost);
+	if (g_evicted == 0) {
+		fprintf(stderr, "FAIL: -DSTRESS_SHRINK evicted NOTHING -- the "
+			"sweeper never ran, so this arm proves nothing about "
+			"renames racing eviction\n");
+		anomaly++;
+	}
+#endif
 
 #ifdef DC_STRESS_DEBUG
 	{

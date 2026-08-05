@@ -2664,10 +2664,30 @@ done:
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
 #endif
-	if (host_to_free)
+	/*
+	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
+	 * and that was a free-while-queued by construction rather than by race.
+	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
+	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
+	 * frees are hosts.  Nothing had exercised it because no test ran renames
+	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
+	 *
+	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
+	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
+	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
+	 * answer is not consulted here: the shrinker cannot be holding a node
+	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
+	 * set), so the handoff branch is unreachable -- but calling the guarded
+	 * form is what keeps that true if the skip rule ever changes.
+	 */
+	if (host_to_free) {
+		(void) lru_del_can_free(dc, host_to_free, 1);
 		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	if (reclaim_n)
+	}
+	if (reclaim_n) {
+		(void) lru_del_can_free(dc, n, 1);
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
+	}
 }
 
 #else	/* ===== DC_CHAIN_MIXED: SW enqueue (store_sw); fold splits SWMW vs RMLOCK ===== */
@@ -3004,10 +3024,30 @@ done:
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
 #endif
-	if (host_to_free)
+	/*
+	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
+	 * and that was a free-while-queued by construction rather than by race.
+	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
+	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
+	 * frees are hosts.  Nothing had exercised it because no test ran renames
+	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
+	 *
+	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
+	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
+	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
+	 * answer is not consulted here: the shrinker cannot be holding a node
+	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
+	 * set), so the handoff branch is unreachable -- but calling the guarded
+	 * form is what keeps that true if the skip rule ever changes.
+	 */
+	if (host_to_free) {
+		(void) lru_del_can_free(dc, host_to_free, 1);
 		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	if (reclaim_n)
+	}
+	if (reclaim_n) {
+		(void) lru_del_can_free(dc, n, 1);
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
+	}
 }
 
 #else	/* DC_CHAIN_FOLDLOCK ---- dequeue = per-host FOLD LOCK (plain chain stores) ---- */
@@ -3125,10 +3165,30 @@ static void fold(struct dcache *dc, struct dentry *n)
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
 #endif
-	if (host_to_free)
+	/*
+	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
+	 * and that was a free-while-queued by construction rather than by race.
+	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
+	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
+	 * frees are hosts.  Nothing had exercised it because no test ran renames
+	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
+	 *
+	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
+	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
+	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
+	 * answer is not consulted here: the shrinker cannot be holding a node
+	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
+	 * set), so the handoff branch is unreachable -- but calling the guarded
+	 * form is what keeps that true if the skip rule ever changes.
+	 */
+	if (host_to_free) {
+		(void) lru_del_can_free(dc, host_to_free, 1);
 		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	if (reclaim_n)
+	}
+	if (reclaim_n) {
+		(void) lru_del_can_free(dc, n, 1);
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
+	}
 }
 
 #endif	/* DC_CHAIN_SWMW fold vs DC_CHAIN_FOLDLOCK fold */
