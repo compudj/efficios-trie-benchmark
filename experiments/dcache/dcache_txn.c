@@ -1184,6 +1184,26 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 			urcu_txn_end(&txn);
 			return -EAGAIN;
 		}
+#ifdef DC_TXN_PARENT_DELAY
+		/*
+		 * TARGETED REPRODUCER, never shipped.  children_empty() above is
+		 * a plain RCU read and the commit below is what acts on it, so
+		 * the defect lives in the gap between them -- a dc_add that
+		 * publishes a child into that gap leaves it hashed under a
+		 * directory this eviction is about to call_rcu.  At natural
+		 * timings the gap is a few instructions and 48w/48r under TSAN
+		 * did not reproduce it in 4 runs, so widen the gap itself.
+		 *
+		 * ⚠ Argues ONE WAY ONLY: firing proves the race exists and
+		 * identifies which build closes it.  It says NOTHING about the
+		 * rate at shipped timings.
+		 */
+		{
+			struct timespec ts = { 0, 200000 };	/* 200 us */
+
+			(void) nanosleep(&ts, NULL);
+		}
+#endif
 		/*
 		 * ⭐ GUARD THE CHILD LIST AS STILL EMPTY at the install point --
 		 * the other half of the pair with dc_add (see the long note
@@ -1200,6 +1220,47 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 #ifdef DC_TXN_PARENT_GUARD
 		urcu_txn_validate(&txn, (void **) &d->d_child_head.first,
 				  NULL, URCU_TXN_HLIST_TAG);
+#endif
+#ifdef DC_TXN_PARENT_SEAL
+		/*
+		 * ⭐⭐ THE SAME EXCLUSION, BOUGHT WITH A SLOT THIS COMMIT
+		 * ALREADY HAS TO TOUCH -- and therefore FREE on the add side,
+		 * which is where DC_TXN_PARENT_GUARD's measured cost lives.
+		 *
+		 * SEAL the victim's child head instead of guarding it: the same
+		 * slot, the same expected old (NULL == "still empty"), but
+		 * written rather than read.  dc_add publishes a child by writing
+		 * &parent->d_child_head.first, so the two now contend on ONE
+		 * slot with ONE expected old and the MCAS admits exactly one:
+		 *
+		 *   add wins   -> this store's old-value check fails, this
+		 *                 eviction ABORTS, retries, sees a non-empty
+		 *                 child list and answers -EAGAIN;
+		 *   evict wins -> the head is MARKED, and the add's own
+		 *                 urcu_txn_hlist_insert_head_prepare() answers
+		 *                 -ENOENT ("head sealed") with NO guard record
+		 *                 of its own.
+		 *
+		 * ⭐ The marked head is not an invention: <urcu/rcu-txn-hlist.h>
+		 * reserves it as the sealing primitive and insert_head_prepare
+		 * already refuses one.  urcu_txn_hlist_resolve() STRIPS the
+		 * mark, so a sealed head still reads as EMPTY to every walker --
+		 * children_empty(), dc_readdir() and the census are unaffected.
+		 *
+		 * Terminal per LIFETIME, not per address: dentry_alloc() memsets,
+		 * so a recycled dentry starts unsealed.  Same rule as
+		 * DC_LRU_DEAD and URCU_TXN_DEQUE_POISON, and sealed in the SAME
+		 * commit as the two unlinks for the same reason -- there must be
+		 * no instant at which @d is gone from an index but still
+		 * accepting children.
+		 */
+		if (urcu_txn_store_mw(&txn, (void **) &d->d_child_head.first,
+				      NULL, urcu_txn_hlist_set_mark(NULL),
+				      URCU_TXN_HLIST_TAG)) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			return -EAGAIN;		/* -ENOMEM: nothing published */
+		}
 #endif
 		p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_hash);
 		if (!p_)
@@ -1409,13 +1470,13 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		 * bucketlock, where the fix is a third bucket lock and costs no
 		 * liveness at all.  Kept as a build arm.
 		 *
-		 * ▶ The open direction, and the shape that worked for the
-		 * duplicate re-check above: buy the exclusion with a slot the
-		 * transaction ALREADY WRITES instead of a new guard.  The add
-		 * writes &parent->d_child_head.first, which is the slot the
-		 * eviction guards -- that direction is already free.  It is THIS
-		 * direction (the add noticing an eviction that commits first)
-		 * that costs, and no rewriting of it has been found yet.
+		 * ✅ THAT DIRECTION HAS NOW BEEN FOUND: -DDC_TXN_PARENT_SEAL.
+		 * The eviction SEALS &d->d_child_head.first (marked NULL) in its
+		 * own commit instead of guarding it, so the add's existing write
+		 * to that slot is the exclusion and the add needs NO record of
+		 * its own.  Measured 0/20 timeouts against this guard's 9/20,
+		 * and it closes the same use-after-free.  See lru_evict_settled.
+		 * This validate is kept only as the A/B partner.
 		 *
 		 * ⭐ GUARD THE PARENT'S LIVENESS -- half of a GUARD PAIR with
 		 * lru_evict_settled(), and a DIFFERENT slot from the state word
@@ -2018,6 +2079,28 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		 * the node, which the localized reader's top_unhashed_rcu observes
 		 * -- that detection is independent of the gen and remains.)
 		 */
+#ifdef DC_TXN_PARENT_SEAL
+		/*
+		 * SEAL the host's child head, for the same reason the shrinker
+		 * does (see lru_evict_settled): children_empty(host) above is a
+		 * plain RCU read, so on its own it is a check-then-act, and an
+		 * add can commit between it and this commit -- leaving a child
+		 * hashed under a directory this call is about to call_rcu.
+		 *
+		 * ⚠ ONLY WHEN SETTLED.  When top != host the host is NOT freed
+		 * here (a pending fold reclaims the chain), so sealing it would
+		 * refuse children to a directory that is still alive.
+		 */
+		if (settled &&
+		    urcu_txn_store_mw(&txn, (void **) &host->d_child_head.first,
+				      NULL, urcu_txn_hlist_set_mark(NULL),
+				      URCU_TXN_HLIST_TAG)) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -ENOMEM;
+			goto out;
+		}
+#endif
 		p = urcu_txn_hlist_del_prepare(&txn, &top->d_hash);
 		if (!p)
 			p = urcu_txn_hlist_del_prepare(&txn, &top->d_sib);
