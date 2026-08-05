@@ -1,19 +1,23 @@
-# Handoff — free-while-queued CLOSED everywhere; one open correctness signal.
+# Handoff — free-while-queued CLOSED everywhere; the census anomaly CLOSED too.
 
 2026-08-05. Written current-state-first: what is true now, then what is open,
 then the retractions in one place at the end. Read the retractions — five
 confident stories died to controls in the session that produced this file, and
-each control cost minutes.
+each control cost minutes. The session AFTER it killed two more, one of them a
+claim promoted to a headline in this very file.
 
 **CLOSED, all mutation-proven:** free-while-queued on all four arms (lock arms
 via a shrink-list handoff + a terminal state word; MCAS arms via a new liburcu
-deque seal); the stale-`d_parent` use-after-free (a guard pair); and `fold()`
-freeing dentries that were still on the LRU.
+deque seal); the stale-`d_parent` use-after-free (a guard pair); `fold()`
+freeing dentries that were still on the LRU; and the **census anomaly** — which
+was never an LRU defect at all.
 
-**OPEN, and now narrowed to one sentence:** on the **MCAS LRU arm only**, the
-name-hash index and the child list can disagree about one entry — `dc_lookup`
-answers `DC_ABSENT` at a path `dc_walk` still reaches. See "THE ONE OPEN
-CORRECTNESS SIGNAL".
+**The census anomaly, in one sentence:** `dc_add` tested for a duplicate name
+OUTSIDE the bucket lock (bucketlock) / outside the transaction (txn), so two
+concurrent adds of ONE name both published, and everything under the losing copy
+became reachable by `dc_walk` and absent to `dc_lookup`. See "THE CENSUS
+ANOMALY". The kernel-faithful **seqlock baseline never had it** — it does the
+same test under the bucket lock and says so in a comment.
 
 Commits, all UNPUSHED, oldest first:
 
@@ -358,7 +362,145 @@ run in `systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`. The
 lesson is not "the txn engine is dangerous", it is "an unthrottled allocator
 loop is", and that is easy to write again.
 
-## ▶ THE ONE OPEN CORRECTNESS SIGNAL — txn + MCAS + `--evict continuous`
+## ✅ THE CENSUS ANOMALY — RESOLVED: two dentries, one name
+
+**ROOT CAUSE: `dc_add` decided "this name is free" without holding anything.**
+
+    if (__child_lookup(dc, parent, name))     <- no lock, no txn
+            return -EEXIST;
+    d = dentry_alloc(...);
+    bl_lock2(bucket, &parent->d_child_head);  <- the exclusion starts HERE
+    ... publish into both indexes ...
+
+Two concurrent adds of one name both pass that test and both publish, so the
+bucket ends up holding TWO dentries spelled alike. A lookup resolves whichever
+the chain reaches first while a child-list walk descends the other, so
+everything added under the loser is reachable by `dc_walk`/`dc_readdir` and
+`DC_ABSENT` to `dc_lookup` — permanently, with nothing to unhash it. That is the
+census `extra`, exactly: `0 missing, N extra, 0 stray, 0 dup`.
+
+⭐⭐ **THE COMMENT SAYING IT WAS SAFE HAD A STALE PREMISE.** It read "racy under
+concurrent same-name adds — *disjoint in the churn workload*; harden with a
+re-check under the lock if ever needed". Writers do own disjoint slots — but
+`rebuild_prefix()` was added later, to let the bench survive eviction taking a
+directory, and it has EVERY writer recreate the SAME `d{i}` names and rely on
+-EEXIST to arbitrate. 105k–158k rebuilds per 3 s run. The precondition stopped
+holding the day that function landed, and the comment was never revisited.
+
+⭐⭐ **THE SEQLOCK BASELINE WAS RIGHT ALL ALONG** and is the tell: it does the
+existence test under `dir_wlock` + `bl_lock`, with a comment stating the
+guarantee ("a racing add of the same (parent, name) — which hashes to this same
+bucket — sees one or the other atomically"). The two fast engines diverged from
+the baseline they exist to be compared against, and were doing strictly less
+work per add than it.
+
+### The fixes, and why they are different shapes
+
+* **bucketlock** — re-check under `bl_lock2()`, the same lock the publish takes.
+  Same (parent, name) hashes to the same bucket, so one lock covers every racer.
+* **txn** — no lock to reuse, so the atom is A SLOT: read the bucket head ONCE
+  with `urcu_txn_load`, scan for the name AFTER that read, and hand that SAME
+  value to `urcu_txn_hlist_insert_at_slot_prepare` as its expected old. A peer
+  that published earlier is seen by the scan; a peer that publishes later
+  changes the head, so the install's old-value check fails and the retry
+  re-scans. ⚠ `insert_head_prepare()` is opened up rather than called *because*
+  it does its own load of the head — a scan placed before that load only
+  NARROWS: the peer's publish lands between the two and gets adopted as this
+  insert's expected old, which then validates cleanly. **Costs no new read-set
+  entry**, which matters on the engine where `DC_TXN_PARENT_GUARD` had to be
+  turned off for exactly that cost.
+
+Mutation knob kept on both: `-DDC_NO_ADD_DUP_RECHECK`.
+
+### Mutation matrix — 8 trials/arm, 48w/48r, `--evict continuous`
+
+| engine | build | FAIL | runs with duplicate names |
+|---|---|---|---|
+| bucketlock | fix, MCAS | **0/8** | **0/8** |
+| bucketlock | fix, lock | **0/8** | **0/8** |
+| bucketlock | `NO_ADD_DUP_RECHECK`, MCAS | 1/8 | 3/8 |
+| bucketlock | `NO_ADD_DUP_RECHECK`, lock | **4/8** | 4/8 |
+| txn | fix, MCAS | **0/8** | **0/8** |
+| txn | fix, lock | **0/8** | **0/8** |
+| txn | `NO_ADD_DUP_RECHECK`, MCAS | 2/8 + 1 timeout | 3/8 |
+| txn | `NO_ADD_DUP_RECHECK`, lock | 3/8 + 1 timeout | 5/8 |
+
+### ▶ AND IT TOOK THE TIMEOUT MODE WITH IT
+
+The other half of this configuration's bad behaviour — runs that never finish in
+120 s, pooled at **32% (11/34)** across the batches above and never explained —
+does not appear on a fixed build. txn + MCAS + `--evict continuous`, 20 trials
+per arm, `timeout 120`:
+
+| build | pass | consfail | **timeout** | runs with duplicates |
+|---|---|---|---|---|
+| fix | **20** | 0 | **0** | **0/20** |
+| `-DDC_NO_ADD_DUP_RECHECK` | 8 | 9 | **3** | 8/20 |
+
+Pooled with the 8-trial batch: **28/28 pass and 0 timeouts on the fix**, against
+4 timeouts in 28 with the guard removed.
+
+⚠ **Stated as evidence, not as a closed mechanism.** 0/28 against a ~14%
+baseline is p≈0.014 — good, and consistent with the conservation failures
+vanishing on the same builds, but this file's own instability table is the
+reason to say it that way. The plausible story (stranded leaves under a losing
+directory hold LRU capacity, so `dc_lru_count` stays over cap, so every writer
+op shrinks, while `rebuild_prefix` storms) is UNTESTED. If a timeout ever shows
+up on a fixed build, that story is why, and it should be measured rather than
+argued — the `timeout 120` path SIGTERMs into a full TXNSTATS + LRUCHK dump,
+which is the thing to read first.
+
+### ⛔⭐⭐ RETRACTED: "it is the MCAS LRU arm, not the index engine"
+
+`ee00c67` promoted a 6-trial sweep (txn-lock 0/6 · txn-MCAS 1/6 · bl-MCAS 3/6 ·
+bl-lock 0/6) to a headline and sent the next session to read
+`lru_evict_settled`. **It is all four arms.** The mutation rows above put
+bucketlock-LOCK at 4/8 — the arm the sweep called clean twice. The LRU is not
+involved in the mechanism at all; eviction only supplies the workload, because
+it is what makes `rebuild_prefix` run.
+
+⛔ **ALSO RETRACTED, before it reached a commit:** "the MCAS arm rotates in-use
+entries instead of removing them, so directories stay queued and get evicted
+more, so it rebuilds more." Plausible, mechanistic, and false — `prefix-rebuilds`
+is 105k–158k on the lock arm against 56k–154k on MCAS. One column of an existing
+report refuted it. **Sixth confident story killed by a control in two sessions.**
+
+### ⭐⭐ THE TRAP THAT NEARLY LANDED IT ON THE WRONG CODE
+
+The first self-diagnosing probe printed, for every offender:
+
+    absent-at=3/4  want=/p0/p1/d13/S989  walk=/p0/p1/d13/S989
+
+which reads as "the ancestors resolve, the LEAF is missing from its bucket" —
+and would have sent me into `lru_evict_settled`'s two `bl_hlist_del_locked`
+calls looking for a torn removal. **A path STRING cannot tell two dentries
+spelled alike apart.** `dc_lookup` resolved one `d13` while `dc_walk` descended
+the other, and both render identically. This is the same rule the
+stale-`d_parent` UAF turned on — *when two things are spelled alike, check they
+are the same OBJECT* — one level up, and the probe that settled it does not
+argue: it enumerates a directory's child list and counts repeated names.
+
+### ⭐ The new invariant is STRICTLY STRONGER than the census
+
+`CHECK conservation` only notices once a leaf happens to be stranded under the
+losing copy at the instant the run ends. The sibling-name scan notices the
+duplicate itself. On the same mutation builds: census 1/8 vs names 3/8, and runs
+that PASSED with duplicates sitting in the tree. It is now invariant 4, run
+unconditionally, with `DC_DUPSCAN_SELFTEST` as its must-fail control (double-scan
+each directory ⇒ every child is its own duplicate; it must report dups ==
+children). ⭐ It printed `DUPNAME: none at any level (N children scanned)` on a
+clean run from the start, so its silence is never confusable with not running.
+
+### ⚠ It was also distorting the READER panel by ~3×
+
+Same command line, 8 runs, `Mlookups/s` median: fixed 55.0 (MCAS) / 56.5 (lock)
+against 17.8 / 16.9 with the re-check removed. The one mutation run that
+finished with no duplicates measured 57.0 — on the fixed curve. So any
+`--evict` churn reader number taken before this is suspect. ⚠ **Bounded:**
+`rebuild_prefix` only runs when `--evict-cap` is set, so non-eviction panels
+cannot have duplicates and are unaffected.
+
+### The instability table that made it measurable (kept)
 
 ⚠⚠ **DO NOT CHARACTERIZE THIS AT SINGLE-DIGIT SAMPLES. The identical binary
 gives contradictory pictures batch to batch**, and two wrong conclusions were
@@ -389,11 +531,10 @@ produced three confident wrong stories in a row.
 ⛔ **ALSO RETRACTED:** "the conservation anomaly is gone." It is not. It was
 3/8 at the original HEAD and it is 5/34 here; one batch of 8 happened to show 0.
 
-**What is actually known:** a real, intermittent, PRE-EXISTING conservation
-failure on this configuration, which none of this session's work fixed or
-worsened. Nothing in today's correctness work depends on it — the
-free-while-queued closure is mutation-proven on the lock arms and via the seal,
-and the fold fix is 4/4-detected by its own gate on both engines.
+**What was actually known then:** a real, intermittent, PRE-EXISTING conservation
+failure on this configuration, which that session's work neither fixed nor
+worsened. It was pre-existing because `rebuild_prefix` had been there for
+several sessions; see "THE CENSUS ANOMALY" above for what it was.
 
 ### ✅ MEASURABLE NOW, and it named itself immediately
 
@@ -425,19 +566,22 @@ ignores the path, so the entry is genuinely in the tree. `missing=0`, `stray=0`,
 `dup=0` throughout. **The name-hash index and the child list disagree about one
 entry.**
 
-⭐⭐ **AND IT IS THE MCAS LRU ARM, NOT THE INDEX ENGINE.** 6 trials each:
+⛔⭐⭐ **AND HERE IS WHERE IT WENT WRONG — "IT IS THE MCAS LRU ARM, NOT THE
+INDEX ENGINE" IS RETRACTED.** 6 trials each:
 
-| arm | EXTRA |
-|---|---|
-| txn **lock** | 0/6 |
-| txn **MCAS** | 1/6 |
-| bucketlock **MCAS** | **3/6** |
-| bucketlock **lock** | 0/6 |
+| arm | EXTRA | what 8 trials of the mutation build say |
+|---|---|---|
+| txn **lock** | 0/6 | 3/8 FAIL |
+| txn **MCAS** | 1/6 | 2/8 FAIL |
+| bucketlock **MCAS** | **3/6** | 1/8 FAIL |
+| bucketlock **lock** | 0/6 | **4/8 FAIL** |
 
-Only with `-DDC_LRU_MCAS`, on BOTH index engines, never on either lock arm.
-That is a sharp starting point: the LRU is supposed to touch the index only
-through `lru_evict_settled`, so look there and at the MCAS shrinker's
-evict-before-remove ordering first.
+The right-hand column is the same defect measured on the arm the left-hand
+column called clean — and it is the WORST arm, not a clean one. Six trials of a
+~1-in-3 event ordered four arms by luck, the ordering looked mechanistic
+("only under `-DDC_LRU_MCAS`, on BOTH engines"), and it was written down as a
+place to start reading. **The rule this file already states — five trials cannot
+call an arm clean — applies just as hard to five trials calling an arm GUILTY.**
 
 ⚠ Do NOT reconcile "extra" away in the harness to make the gate green — "extra"
 is also exactly what a resurrect-after-delete looks like, which is why the
@@ -508,7 +652,22 @@ exactly like a deque defect.
 
 ## ⛔ Claims retracted — do not resurrect
 
-**This session:**
+**The session that CLOSED the census anomaly:**
+
+- **"the census anomaly is the MCAS LRU arm, not the index engine"** — all four
+  arms; the mutation build's worst arm is bucketlock-LOCK, which the 6-trial
+  sweep scored 0/6 twice. Six trials cannot convict an arm any more than they
+  can clear one.
+- "the MCAS arm rotates in-use entries, so directories stay queued and get
+  evicted more, so it rebuilds more" — `prefix-rebuilds` is 105k–158k on the
+  LOCK arm vs 56k–154k on MCAS. Refuted by a column already in the report.
+- "the leaf is missing from its bucket" (from `absent-at=3/4`, `want == walk`) —
+  a path STRING cannot distinguish two dentries spelled alike. Both `d13`s
+  render the same; the entry was under the OTHER one.
+- "the duplicate check is safe because the churn workload is disjoint" (an
+  in-tree comment) — true when written, falsified by `rebuild_prefix`.
+
+**The session before it:**
 
 - "txn MCAS 0/5" and "txn LOCK 0/5, 0 hits" — the probe was not in that file.
 - "txn + MCAS + continuous hangs 3/3" — it does not hang; it intermittently
@@ -565,6 +724,21 @@ still caught the bug — on a workload that had stopped renaming.
   low enough rate. The MCAS residual is ~2 in 64: it read as 0/5 for two
   handoffs, and a 40-trial mutation test returned 0/40 for the fix AND 0/40 for
   the control, i.e. the arm that had to fail passed.
+- ⭐⭐ **NOR IS IT ENOUGH TO CALL AN ARM GUILTY.** The same six trials that
+  cleared bucketlock-LOCK 0/6 convicted bucketlock-MCAS 3/6, and the ordering
+  read as a mechanism ("only under `-DDC_LRU_MCAS`"). Under mutation the two
+  arms are 4/8 and 1/8 — the ranking INVERTS. A small-sample sweep that produces
+  a tidy story is the most dangerous output a harness has, because a tidy story
+  is what stops you sampling more.
+- ⭐⭐ **WHEN A PROBE ANSWERS IN NAMES, IT CANNOT ANSWER ABOUT OBJECTS.**
+  `want == walk` and `absent-at=leaf` looked conclusive and pointed at the wrong
+  file; two dentries spelled `d13` render identically. Ask the question in a
+  form only one object can satisfy — here, "does any directory hold two children
+  of one name", which needs no path at all.
+- ⭐ **A COMMENT'S PRECONDITION EXPIRES.** "racy, but the workload is disjoint"
+  was true when written and false once `rebuild_prefix` landed, several sessions
+  later, in a different file. Grep for the callers a safety comment names,
+  rather than trusting that it still describes them.
 - **When natural timings cannot gate a race, BUILD A REPRODUCER** that widens
   the specific window (`-DDC_LRU_PUSH_DELAY`), and use it only to argue one way:
   firing proves the race and identifies the closing build; not firing says
@@ -612,12 +786,31 @@ REQUIRES rebuilding the library with it.
 
     make check                # 1 PASS (394 checks, 0 failures)
     make check-bucketlock     # 8 PASS
+    make check-churn          # 3 PASS  (no eviction: see check-churn-evict)
+    make check-churn-evict    # NEW: 8 runs + 1 must-fail control
     make check-lru-arms       # 15 PASS  (incl. the 4 renames-x-shrinker arms)
     make check-deque          # 10 arms: 9 PASS + 1 must-fail control
     make check-deque-tsan     # 4 arms, 0 warnings
 
 Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} ×
-{seal, no-seal, no-seal + re-arm}.
+{seal, no-seal, no-seal + re-arm} × {±`DC_NO_ADD_DUP_RECHECK`}.
+
+⭐ **`check-churn` COULD NOT HAVE CAUGHT THE DUPLICATE DEFECT and never could
+have** — it sets no `--evict-cap`, so `rebuild_prefix()` never runs, so the
+workload never issues concurrent same-name creates. That is why
+`check-churn-evict` exists: all four engine×LRU combinations, both cadences,
+plus `DC_DUPSCAN_SELFTEST` as the detector's must-fail control. ⚠ One run per
+arm catches only ~half (invariant 4 fires 3-5/8 per arm under
+`-DDC_NO_ADD_DUP_RECHECK`); it is a screen, not a proof. Re-run it when touching
+`dc_add`, with the mutation flag as the arm that must fail.
+
+⚠⚠ **RUN EVERYTHING UNDER A MEMORY CAP** (`scratchpad/capped <max> <secs> cmd`).
+A session was lost to OOM during this work. ⭐ And check WHOSE allocation it is
+before blaming your own: the top consumer on this box was 28 concurrent
+`test_urcu_ft_inv` processes from a DIFFERENT tree (`userspace-rcu`,
+`scratchpad/ss/run.sh`) holding 96 GB and climbing. `ps -eo rss,comm --sort=-rss`
+answers in one command what an afternoon of theorising does not — the same
+lesson as the seven-thread dump.
 
 ⚠ **`make check-lru-arms` now runs a sweeper.** If you add another sweeper arm,
 give it a CADENCE and cap its memory — an unthrottled `dc_shrink` loop allocates
@@ -642,8 +835,15 @@ machine down (it did). `scratchpad/capped` wraps a run in
     # counters + the ring dump out of a wedged process
     ./churn ... & kill -TERM $!    # dumps TXNSTATS + LRUCHK, _exit(3)
 
+⚠ Use an ABSOLUTE `-Wl,-rpath` when the binary goes anywhere but this directory.
+The relative one above makes it exit 127 from a scratch dir — which a loop that
+records only `RESULT:` reads as eight silent failures.
+
 Build arms: `-DDC_TXN_PARENT_GUARD` (txn parent guard pair; OFF by default,
-measured liveness cost -- see above).
+measured liveness cost -- see above); `-DDC_NO_ADD_DUP_RECHECK` (mutation arm
+for the duplicate-name fix, BOTH engines).
+
+Harness knobs: `DC_DUPSCAN_SELFTEST=1` (must-fail control for invariant 4).
 
 Probe flags: `-DDC_LRU_FREE_ASSERT` (BOTH engines now), `-DDC_LRU_PUSH_DELAY`
 (the targeted reproducer), `-DDC_LRU_MCAS_RETAIN_READD` (its mutation arm),
