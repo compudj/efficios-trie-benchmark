@@ -177,10 +177,20 @@ This is the subtle inversion and belongs in the header's first paragraph.
 
 ## Consequences elsewhere
 
-- `urcu_txn_list_move_tail_prepare` / `_rcu` should be **removed** from
-  `rcu-txn-list.h` (reverting `ff667579` and `0291f5ed`). They are the API that
-  should not exist on a traversable list, and this deque is where that operation
-  belongs.
+- ✅ **DONE.** `urcu_txn_list_move_tail_prepare` / `_rcu` are **removed** from
+  `rcu-txn-list.h`: the two commits that added them were dropped from
+  `urcu-txn-dev` rather than reverted on top, since neither had been pushed.
+  They are the API that should not exist on a traversable list, and this deque
+  is where that operation belongs.
+  ⭐ The removal was clean because nothing had ever called them — no test, no
+  engine, no bench. The rebase produced ONE conflict (the deque commit carried
+  the block as context) and the net effect against the old branch was exactly
+  141 deleted lines in that one file.
+  ⚠ It also left a comment in `del/remove prepare` naming
+  `move_tail_prepare` as a function that "does not need this" — a comment
+  pointing at something that no longer exists. Fixed in the same commit that
+  introduced it. A dropped API leaves dangling PROSE that no rebase conflict
+  will show you; grep the name, not just the callers.
 - The lock arm is unchanged: under exclusion, unlink+link is atomic and none of
   this applies. It stays the honest A/B control.
 - ~~The `DC_LRU_READD_LEGACY` control can go once the deque lands, since the shape
