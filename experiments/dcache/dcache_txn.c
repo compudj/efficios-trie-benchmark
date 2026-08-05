@@ -1184,6 +1184,23 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 			urcu_txn_end(&txn);
 			return -EAGAIN;
 		}
+		/*
+		 * ⭐ GUARD THE CHILD LIST AS STILL EMPTY at the install point --
+		 * the other half of the pair with dc_add (see the long note
+		 * there).  children_empty() above is a plain RCU read, so on its
+		 * own it is a check-then-act: an add can commit between it and
+		 * this commit, and then this eviction frees a parent that has
+		 * just gained a child.  Recording the slot makes dc_add's write
+		 * to it abort us instead.
+		 *
+		 * The rule this is an instance of, and the same one behind
+		 * 750572af and b69b4a53: AN OPERATION THAT READS A SLOT IT DOES
+		 * NOT WRITE MUST VALIDATE THAT READ.
+		 */
+#ifdef DC_TXN_PARENT_GUARD
+		urcu_txn_validate(&txn, (void **) &d->d_child_head.first,
+				  NULL, URCU_TXN_HLIST_TAG);
+#endif
 		p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_hash);
 		if (!p_)
 			p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_sib);
@@ -1340,6 +1357,99 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		urcu_txn_validate(&txn, (void **) &parent->d_iparent,
 				  (void *) parent_raw, DC_IPARENT_TAG);
 		DC_TEST_ADD_HOOK();		/* repro parks here */
+#endif
+#if defined(DC_TXN_PARENT_GUARD) && !defined(DC_NO_LRU)
+		/*
+		 * ⛔ OFF BY DEFAULT -- IMPLEMENTED, CORRECT, AND MEASURED TOO
+		 * EXPENSIVE ON THIS ENGINE.  Enable with -DDC_TXN_PARENT_GUARD.
+		 *
+		 * It works: the txn engine's TSAN heap-use-after-free goes 1/8
+		 * -> 0/8 with both halves on.  What it costs is LIVENESS.  Both
+		 * halves add read-set entries to hot paths (this one to every
+		 * add, the eviction's to every sweep), and the extra conflict
+		 * feeds the escalation lane, which on this engine is an
+		 * ABSORBING state -- cds_fair_mutex_park() blocks while still
+		 * RCU-online, so grace periods stall, call_rcu never runs, and
+		 * contention rises further.  --evict bursty, 48w/48r, 6 trials,
+		 * runs that failed to finish in 120s:
+		 *
+		 *   default (this off)          0/6
+		 *   both halves on              2/6   (4/6 on a second batch)
+		 *   add-side half only          4/6
+		 *
+		 * So it is not a matter of picking the cheaper half; every
+		 * guarded variant lost runs where the unguarded tree lost none.
+		 * Against that, the defect it closes is 1/8 here versus 6/8 on
+		 * bucketlock, where the fix is a third bucket lock and costs no
+		 * liveness at all.  Kept as a build arm rather than deleted so
+		 * it can be re-measured once the park-while-online defect is
+		 * fixed in liburcu, which is where that cost actually lives.
+		 *
+		 * ⭐ GUARD THE PARENT'S LIVENESS -- half of a GUARD PAIR with
+		 * lru_evict_settled(), and a DIFFERENT slot from the state word
+		 * guarded above.
+		 *
+		 * The shrinker can evict the parent itself: it removes it from
+		 * both indexes and hands it to call_rcu.  Nothing above notices
+		 * -- an eviction marks d_hash.next and d_sib.next, not
+		 * d_iparent -- so without this the add commits under a parent
+		 * that is one grace period from being freed.  The child is then
+		 * hashed, on the LRU, and naming dead memory; a later sweeper
+		 * reads its stale d_parent and CASes into the freed parent from
+		 * inside lru_evict_settled's own commit.
+		 *
+		 * The pair, and BOTH halves are needed -- exactly the argument
+		 * dc_set_negative_txn makes for the rmdir-to-negative pair:
+		 *
+		 *   this   WRITES parent->d_child_head, GUARDS parent->d_hash
+		 *   evict  WRITES parent->d_hash,       GUARDS parent->d_child_head
+		 *
+		 * so each side's write set hits the other's read set and they
+		 * cannot both commit, in EITHER order.  One half alone is
+		 * one-directional: this guard alone still lets an eviction
+		 * commit after it read the child list empty, and the eviction's
+		 * guard alone still lets this add land under an already-marked
+		 * parent.
+		 *
+		 * ⚠ The bucketlock engine needs only ONE explicit check for the
+		 * same race, because lru_evict_settled re-verifies emptiness
+		 * while holding &parent->d_child_head -- the lock IS the pair
+		 * there.  Here there is no such lock, so both halves are
+		 * written out.
+		 *
+		 * The root reads as hashed (its d_hash.next is NULL, hence
+		 * unmarked), so adds directly under it are unaffected; the cost
+		 * is one read-set entry on the add path.
+		 */
+		/*
+		 * ⚠⚠ ONLY FOR A SETTLED PARENT, exactly as on the bucketlock
+		 * engine.  A host with a shell stacked above it is legitimately
+		 * absent from the index -- the shell carries the entry -- so its
+		 * own d_hash reads MARKED while the directory is alive.  Testing
+		 * unconditionally rejected every add under a renamed directory
+		 * (test_dcache "name recreated over a moved directory", 8
+		 * failures on both engines).  A chained parent needs no test
+		 * from the shrinker's side: lru_evict_settled bails on
+		 * d_back/d_fwd, so it is not the one that could be killing it.
+		 *
+		 * ⚠ RESIDUAL, stated rather than papered over: a parent that is
+		 * chained HERE and settles before this commit is not covered by
+		 * this half, and the other half (the eviction's guard on
+		 * d_child_head.first) only aborts the eviction if this add
+		 * commits FIRST.  That needs a rename to complete inside the
+		 * window; it is narrower than the race being closed, not zero.
+		 */
+		if (!urcu_txn_read((void **) &parent->d_back, DC_FWD_TAG) &&
+		    !urcu_txn_read((void **) &parent->d_fwd, DC_FWD_TAG) &&
+		    urcu_txn_hlist_is_marked(
+			    urcu_txn_load_validate(&txn,
+						   (void **) &parent->d_hash.next,
+						   URCU_TXN_HLIST_TAG))) {
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			free(d);		/* never published */
+			return -ENOENT;		/* the prefix went */
+		}
 #endif
 		p = urcu_txn_hlist_insert_head_prepare(&txn, &d->d_hash, bucket);
 		if (!p)

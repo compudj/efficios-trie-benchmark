@@ -364,6 +364,25 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				rcu_read_unlock();
 				continue;
 			}
+			/*
+			 * ⛔ TRIED AND MEASURED TO CHANGE NOTHING: refusing the
+			 * put-back when @victim is no longer hashed -- i.e.
+			 * retain_dentry's d_unhashed test applied to the
+			 * shrinker's own re-add, which has no liveness test at
+			 * all.  It was written to close the stale-d_parent
+			 * use-after-free below, on the theory that the UAF came
+			 * from a detached dentry being relinked.
+			 *
+			 * TSAN, --evict continuous, 8 runs each: without it
+			 * 4/8, with it 3/8 -- noise.  The actual cause was an
+			 * ADD publishing a child under an already-evicted
+			 * parent (see the parent re-check in dc_add), and with
+			 * that fixed the guard's own mutation arm measured
+			 * 0/8 either way.  Not kept: a guard whose removal
+			 * changes nothing is not a fix, and this one carried a
+			 * comment asserting a mechanism the measurement
+			 * refuted.
+			 */
 #if defined(DC_LRU_NO_READD) || defined(DC_LRU_NO_SHRINK_READD)
 			/*
 			 * PROBE (-DDC_LRU_NO_SHRINK_READD): drop the put-back and

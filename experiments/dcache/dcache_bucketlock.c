@@ -1889,6 +1889,59 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		free(d);			/* never published */
 		return -ENOENT;
 	}
+#ifndef DC_NO_LRU
+	{
+		/*
+		 * ⭐ AND RE-CHECK THAT A SETTLED PARENT IS STILL HASHED -- a
+		 * DIFFERENT question from "is it positive", and the one the
+		 * shrinker makes live.
+		 *
+		 * Half of a GUARD PAIR with lru_evict_settled(); the other half
+		 * is that eviction now also holds &d->d_child_head while it
+		 * checks children_empty(d).  Both are needed:
+		 *
+		 *   add first    -> eviction blocks on this child head, then
+		 *                   sees a non-empty child list and skips;
+		 *   evict first  -> it has already marked the parent, and THIS
+		 *                   test is what stops the add.
+		 *
+		 * Without the second half, publishing here leaves the child
+		 * hashed, on the LRU, and naming a parent one grace period from
+		 * being freed -- a later sweeper then reads that child's stale
+		 * d_parent and takes bl_lock2() on freed memory.
+		 *
+		 * ⚠⚠ ONLY FOR A SETTLED PARENT.  A host with a shell stacked
+		 * above it is legitimately absent from the index -- the shell
+		 * carries the entry -- so its own d_hash reads MARKED while the
+		 * directory is perfectly alive.  Testing unconditionally
+		 * rejected every add under a renamed directory (test_dcache
+		 * "name recreated over a moved directory", 8 failures).  A
+		 * chained parent needs no test anyway: lru_evict_settled bails
+		 * on d_back/d_fwd, so it cannot be the one evicting it.
+		 *
+		 * ⚠ TSAN finds this race; ASan does NOT, because the churn
+		 * recycles the parent's storage before the sweeper's write
+		 * lands, so the access is to validly-allocated memory by then.
+		 * Do not read an ASan pass as coverage for it.
+		 *
+		 * -ENOENT is the right answer and callers already expect it: it
+		 * means "the prefix went", which is exactly what happened.  The
+		 * root reads as hashed (d_hash.next NULL, hence unmarked), so
+		 * adds directly under it are unaffected.
+		 */
+		int pmarked = 0;
+
+		if (!uatomic_load(&parent->d_back, CMM_RELAXED) &&
+		    !uatomic_load(&parent->d_fwd, CMM_RELAXED))
+			(void) bl_hlist_resolve(
+				rcu_dereference(parent->d_hash.next), &pmarked);
+		if (pmarked) {
+			bl_unlock2(bucket, &parent->d_child_head);
+			free(d);		/* never published */
+			return -ENOENT;
+		}
+	}
+#endif
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
 	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
@@ -3632,6 +3685,7 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 {
 	struct dentry *parent;
 	struct urcu_txn_sw_hlist_head *bucket;
+	struct urcu_txn_sw_hlist_head *heads[3];
 	int marked = 0;
 
 	if (uatomic_load(&d->d_back, CMM_RELAXED) ||
@@ -3642,19 +3696,40 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 		return -EAGAIN;			/* the root anchors the tree */
 	bucket = bucket_of(dc, parent, d->d_iname.hash);
 
-	bl_lock2(bucket, &parent->d_child_head);
-	/* RE-VERIFY under the lock, the same way dc_unlink does: still hashed,
+	/*
+	 * THREE heads, not two, and the third is the point: @d's OWN child head.
+	 *
+	 * children_empty(d) below decides whether a whole subtree is about to be
+	 * orphaned, and dc_add publishes a new child by taking exactly that lock
+	 * -- so without it this is a check-then-act and an add can land between
+	 * the test and the del.  The victim is then freed while a child of it is
+	 * hashed and on the LRU, naming memory one grace period from release.
+	 *
+	 * ⚠ THE TWO LOCKS ARE NOT THE SAME ONE.  This function holds the
+	 * PARENT'S child head (it is removing @d from that list); dc_add holds
+	 * @d's.  They only look alike.  Reading them as one lock is what hid
+	 * this: it makes the pair appear complete when neither half exists.
+	 *
+	 * bl_lock_n sorts by address and de-duplicates, so adding a third head
+	 * introduces no new deadlock edge -- the whole class stays
+	 * address-ordered, and {fold locks < bucket heads} is unchanged.
+	 */
+	heads[0] = bucket;
+	heads[1] = &parent->d_child_head;
+	heads[2] = &d->d_child_head;
+	bl_lock_n(heads, 3);
+	/* RE-VERIFY under the locks, the same way dc_unlink does: still hashed,
 	 * still childless, still settled.  A rename or an unlink can have landed
 	 * between the isolate and this acquire. */
 	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
 	if (marked || !children_empty(d) ||
 	    uatomic_load(&d->d_back, CMM_RELAXED)) {
-		bl_unlock2(bucket, &parent->d_child_head);
+		bl_unlock_n(heads, 3);
 		return -EAGAIN;
 	}
 	bl_hlist_del_locked(&d->d_hash);
 	bl_hlist_del_locked(&d->d_sib);
-	bl_unlock2(bucket, &parent->d_child_head);
+	bl_unlock_n(heads, 3);
 	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
 	return 0;
 }

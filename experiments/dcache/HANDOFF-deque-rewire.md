@@ -1,11 +1,15 @@
-# Handoff — the free-while-queued defect is CLOSED on all four arms.
+# Handoff — both LOCK arms closed; the MCAS arm is NOT, at ~1 in 6.
 
 2026-08-04. Written current-state-first, as the previous cut was: what is true
 now, then what is still open, then the retractions in one place at the end.
 
 The LOCK arm's free-while-queued defect — the one open item the last handoff
-left — is fixed and mutation-tested. Two new open items came out of the work,
-both of them PRE-EXISTING and both confirmed against a clean HEAD control.
+left — is fixed and mutation-tested, and the stale-`d_parent` use-after-free
+that came out of that work is root-caused and fixed on bucketlock.
+
+⚠ **The headline of the previous cut of this file ("closed on all four arms")
+was WRONG and is corrected below**: the MCAS arm fires FREE_ASSERT about 1 run
+in 6, which five-trial batches kept returning as 0/5. See the new open item.
 
 Commits, all UNPUSHED, oldest first:
 
@@ -15,7 +19,8 @@ Commits, all UNPUSHED, oldest first:
     fffc94a  the free-while-queued defect is PORT-WIDE, not the deque's
     961462b  restore retain_dentry's d_unhashed guard (MCAS arm closed)
     7b43b89  consolidate the handoff around the current position
-    (this)   close the LOCK arm: shrink-list handoff + DEAD seal
+    9f62bc7  close the LOCK arm: shrink-list handoff + DEAD seal
+    (this)   root-cause the stale-d_parent UAF: a guard pair on the parent
 
 ---
 
@@ -26,10 +31,14 @@ Commits, all UNPUSHED, oldest first:
 
 | arm | bursty before | bursty after | continuous before | continuous after |
 |---|---|---|---|---|
-| bucketlock LOCK | **5/5** | **0/5** | **5/5** | **0/5** |
-| txn LOCK | (no probe) | **0/5** | (no probe) | **0/5** |
-| bucketlock MCAS | 0/5 | 0/5 | 0/5 | 0/5 |
-| txn MCAS | (no probe) | 0/5 | (no probe) | 0/5 |
+| bucketlock LOCK | **5/5** | **0/6** | **5/5** | **0/6** |
+| txn LOCK | (no probe) | **0/6** | (no probe) | **0/6** |
+| bucketlock MCAS | 0/5 | 0/6 | 0/5 | ⚠ **1/6** |
+| txn MCAS | (no probe) | 0/6 | (no probe) | 0/6 |
+
+⚠ The bucketlock MCAS "before" column is the number this work proved unreliable:
+it is 1/6 on the committed tree too. Read it as "not measured finely enough",
+not as a regression — and see the open item below.
 
 ### Guard 1 — the shrink-list handoff (closes `--evict bursty`)
 
@@ -110,34 +119,107 @@ or run a control you know must fail.
 
 ---
 
-## ▶ OPEN ITEM 1 — an intermittent heap-use-after-free in `lru_evict_settled`
+## ✅ RESOLVED (was open item 1) — the stale-`d_parent` use-after-free
 
-TSAN, bucketlock LOCK arm, `--evict continuous`:
+`lru_evict_settled` derives `parent = parent_of_rcu(d)` and locks
+`&parent->d_child_head` — on a parent that has been freed. Root-caused and
+**fixed on bucketlock**; on the txn engine the fix is implemented but OFF by
+default (see below).
 
-    heap-use-after-free
-      bl_lock            dcache_bucketlock.c:506
-      bl_lock2           dcache_bucketlock.c:523
-      lru_evict_settled  dcache_bucketlock.c:3645   <- &parent->d_child_head
-      lru_shrink_range   dcache_lru_shrink.h:328
+**ROOT CAUSE: `dc_add` publishes a child under a parent the shrinker is
+evicting.** `lru_evict_settled(p)` checks `children_empty(p)` while holding
+`&parent_of(p)->d_child_head`; `dc_add` of a child under `p` holds
+`&p->d_child_head`. ⚠⚠ **THOSE ARE DIFFERENT LOCKS.** Reading them as the same
+lock is exactly what hid this — it makes the exclusion look complete when
+neither half exists. So the emptiness test was a check-then-act, the add landed
+after it, and the child ended up hashed, on the LRU, naming a dentry one grace
+period from release.
 
-`lru_evict_settled` derives `parent = parent_of_rcu(d)` and then takes
-`bl_lock2(bucket, &parent->d_child_head)` — on a parent that has been freed.
+Fixed as a GUARD PAIR, the same shape `dc_set_negative_txn` already uses for
+rmdir-to-negative, and **both halves are needed** — one alone is
+one-directional:
 
-**PRE-EXISTING, not introduced.** Present on a clean HEAD control built and run
-under the identical TSAN methodology (HEAD 2 occurrences / 3 runs; this tree 4 /
-3 runs, then **0 / 6** on a later batch). ⚠ **The rate is too low and too
-variable to rank the two trees at this sample size — do not quote 2-vs-4 as a
-regression.** Not chased to root cause. It is the next thing to look at.
+* `lru_evict_settled` now locks THREE heads (`bl_lock_n`, address-ordered and
+  de-duplicating, so no new deadlock edge): the bucket, the parent's child head,
+  and **@d's own child head**. An add that got there first now blocks it and is
+  seen.
+* `dc_add` re-checks that a **settled** parent is still hashed, and answers
+  -ENOENT ("the prefix went") if not — which callers already handle.
 
-Total TSAN warnings did drop (HEAD 119 → 82 over 3 runs), and the sites
-`lru_listed`, `lru_del` and `lru_link_tail_locked` — races on the state word
-itself — are **gone**, which is the state word becoming atomic everywhere.
+⚠⚠ **THE `dc_add` CHECK MUST BE GATED ON SETTLED-NESS.** A host with a shell
+stacked above it is legitimately absent from the index — the shell carries the
+entry — so its own `d_hash` reads MARKED while the directory is alive. Testing
+unconditionally rejected every add under a renamed directory: `test_dcache`
+"name recreated over a moved directory", 8 failures, on BOTH engines. A chained
+parent needs no test anyway, since `lru_evict_settled` bails on `d_back`/`d_fwd`.
 
-The residual non-UAF reports are all one pre-existing shape: fields written
-plainly under the shard lock and read atomically without it — `sh->count`
-(`dc_lru_count`) and `d_lru.referenced` (`lru_retain` vs the shrinker's clear).
-Both are deliberately approximate. Worth a pass of `uatomic_*` for TSAN
-cleanliness; neither is a correctness bug.
+Measured, TSAN `--evict continuous`, 8 runs, runs containing a UAF:
+
+| tree | bucketlock | txn |
+|---|---|---|
+| HEAD | 6/8 | — |
+| + shrink-list & DEAD seal (`9f62bc7`) | 4/8 | 1/8 |
+| + a "don't relink a detached victim" guard | 3/8 | — |
+| **+ the guard pair (shipped)** | **0/8** | 2/8 (guard off) |
+
+⛔ **ASan DOES NOT COVER THIS.** 24 ASan runs across all four arms at the
+headline config found nothing while TSAN found it 4-6 times in 8. The churn
+recycles the parent's 256-byte region before the sweeper's write lands, so ASan
+sees a legal write to validly-allocated memory. ASan's clean sweep IS good
+evidence for the free-while-queued defect (which writes the victim right after
+its own free — HEAD 10/10, fixed tree 0/24); it is NOT evidence here. **Match
+the detector to the defect.**
+
+⛔ **TRIED AND MEASURED TO CHANGE NOTHING:** refusing the shrinker's put-back
+when the victim is no longer hashed (`retain_dentry`'s `d_unhashed` test applied
+to the put-back, which has no liveness test at all). 4/8 → 3/8, i.e. noise; and
+once the real cause was fixed its mutation arm measured 0/8 either way. Removed
+rather than kept — it carried a comment asserting a mechanism the measurement
+refuted.
+
+### ⛔ The txn half is OFF by default: `-DDC_TXN_PARENT_GUARD`
+
+It is correct and it works (1/8 → 0/8 with both halves). It costs **liveness**.
+Both halves add read-set entries to hot paths, and the extra conflict feeds the
+escalation lane, which on this engine is an ABSORBING state (open item 3).
+`--evict bursty`, 48w/48r, 6 trials, runs not finishing in 120s:
+
+| build | timeouts |
+|---|---|
+| default (guard off) | 0/6 |
+| both halves on | 2/6, and 4/6 on a second batch |
+| add-side half only | 4/6 |
+
+So it is not a matter of choosing the cheaper half. Against that cost the defect
+is 1-2/8 here versus 6/8 on bucketlock, where the fix is a third bucket lock and
+costs no liveness at all. Kept as a build arm so it can be re-measured once the
+park-while-online defect is fixed in liburcu, which is where that cost lives.
+
+### TSAN residue (unchanged, not correctness)
+
+Total warnings dropped HEAD 119 → 82 over 3 runs, and the races on the state
+word itself (`lru_listed`, `lru_del`, `lru_link_tail_locked`) are **gone**. What
+remains is one pre-existing shape: fields written plainly under the shard lock
+and read atomically without it — `sh->count` (`dc_lru_count`) and
+`d_lru.referenced` (`lru_retain` vs the shrinker's clear). Both deliberately
+approximate. Worth a `uatomic_*` pass for cleanliness; neither is a bug.
+
+## ▶ NEW OPEN ITEM — the MCAS arm still fires FREE_ASSERT ~1 in 6
+
+`bucketlock` + `-DDC_LRU_MCAS`, `--evict continuous`, 48w/48r: **1/6**
+FREE-WHILE-QUEUED. **Pre-existing and NOT closed by any of this work** — the
+committed tree `9f62bc7` measures 1/6 at the same point and the guard-pair tree
+0/6, i.e. indistinguishable at this sample size.
+
+⚠ Earlier handoffs recorded this arm as 0/5. At a ~1-in-6 rate, five trials
+returns zero about 40% of the time. **Five trials is not enough to call an arm
+clean**; the lock arm's 5/5 was only ever obvious because its rate was ~1.
+
+The MCAS arm's remaining pusher is most likely `lru_retain`'s re-arm, which
+`961462b` narrowed with `lru_alive_validate` but which — like everything else on
+that path — cannot be closed by a check that is not in the same commit as the
+push. Start by re-running the split probes (`-DDC_LRU_NO_RETAIN_READD`) at
+**20+ trials**, not 5.
 
 ## ▶ OPEN ITEM 2 — rename × LRU × shrinker is jointly UNTESTED
 
@@ -240,6 +322,15 @@ linked, "plain stores exonerated" (a TIMEOUT counted as THE WEDGE).
 ## Method rules earned the hard way
 
 - **Verify a probe is live before trusting its zero.** Four wrong negatives now.
+- **Match the detector to the defect, and never read one tool's silence as
+  coverage for another's finding.** ASan was clean 24/24 on a defect TSAN hit
+  4-6 times in 8, because the allocator recycled the region first.
+- **Five trials is not enough to call an arm clean.** A ~1-in-6 defect returns
+  0/5 about 40% of the time; that is how the MCAS arm read as clean for two
+  handoffs.
+- **When two locks are spelled alike, check they are the same object.**
+  `&parent->d_child_head` in the evictor and in dc_add are DIFFERENT dentries'
+  heads; assuming otherwise made a missing exclusion look complete.
 - **Ask the cheap decisive question first.** `-DDC_LRU_NO_RETAIN_READD` took
   five minutes and killed the leading hypothesis (still 5/5), which is what
   redirected the whole session.
@@ -302,6 +393,9 @@ Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} 
 
     # counters + the ring dump out of a wedged process
     ./churn ... & kill -TERM $!    # dumps TXNSTATS + LRUCHK, _exit(3)
+
+Build arms: `-DDC_TXN_PARENT_GUARD` (txn parent guard pair; OFF by default,
+measured liveness cost -- see above).
 
 Probe flags: `-DDC_LRU_FREE_ASSERT` (BOTH engines now), `-DDC_LRU_NO_DEAD_SEAL`,
 `-DDC_LRU_NO_SHRINK_OWN`, `-DDC_LRU_NO_SHRINK_READD`, `-DDC_LRU_NO_RETAIN_READD`,
