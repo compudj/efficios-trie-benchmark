@@ -2087,75 +2087,11 @@ static void dentry_free_cb(struct rcu_head *rh)
 {
 	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
 
-#if !defined(DC_NO_LRU) && defined(DC_LRU_FREE_ASSERT)
-	/*
-	 * PROBE (-DDC_LRU_FREE_ASSERT): is this dentry still on the LRU at the
-	 * instant its memory is released?
-	 *
-	 * If it is, free() hands the storage back and the next dentry to land on
-	 * it is memset to zero, while the neighbours that were pointing at the
-	 * old node STILL NAME IT.  On the MCAS arm that shows up downstream as
-	 * "a live ring reaches a node with owner == NULL"; on the lock arm it
-	 * corrupts the shard's head/tail chain the same way.
-	 *
-	 * The free callback is the only place that can decide it: everywhere
-	 * else the answer is a race.
-	 *
-	 * ⚠ BOTH ARMS, deliberately.  Asking it only of the MCAS arm invites the
-	 * conclusion that the mechanism is at fault, when the question is
-	 * whether the PORT lets a dying dentry be re-added -- which is a
-	 * property of retain_dentry's policy, not of the structure underneath.
-	 */
-	{
-#ifdef DC_LRU_MCAS
-		struct urcu_txn_deque *q = urcu_txn_deque_owner(&d->d_lru.dnode);
-		int queued = q != NULL;
-		void *a = uatomic_load((void **) &d->d_lru.dnode.next, CMM_RELAXED);
-		void *b = uatomic_load((void **) &d->d_lru.dnode.prev, CMM_RELAXED);
-#else
-		unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
-		void *q = (void *) (uintptr_t) st;
-		int queued = st >= DC_LRU_ON(0);
-		void *a = uatomic_load(&d->d_lru.next, CMM_RELAXED);
-		void *b = uatomic_load(&d->d_lru.prev, CMM_RELAXED);
-#endif
-
-		if (caa_unlikely(queued)) {
-			int reachable = -1;
-#ifndef DC_LRU_MCAS
-			/*
-			 * SECOND, INDEPENDENT WITNESS on the lock arm: the state
-			 * word says "linked", but the word is exactly the thing
-			 * that could be stale.  Walk the shard it names, under
-			 * that shard's lock, and report whether the chain really
-			 * reaches @d.  One probe is not a finding, and this claim
-			 * -- that the LOCK arm, the honest A/B control, frees
-			 * linked dentries -- is too consequential to rest on a
-			 * word.
-			 */
-			if (dc_lru_validate_dc) {
-				struct dc_lru_shard *sh =
-					&dc_lru_validate_dc->lru[st - DC_LRU_ON(0)];
-				struct dentry *w;
-				unsigned long hop = 0;
-
-				lru_lock(sh);
-				reachable = 0;
-				for (w = sh->head; w && hop++ < 100000;
-				     w = w->d_lru.next) {
-					if (w == d) { reachable = 1; break; }
-				}
-				lru_unlock(sh);
-			}
-#endif
-			fprintf(stderr,
-				"FREE-WHILE-QUEUED d=%p owner=%p next=%p prev=%p "
-				"chain-reachable=%d\n",
-				(void *) d, (void *) q, a, b, reachable);
-			abort();
-		}
-	}
-#endif
+	/* -DDC_LRU_FREE_ASSERT; inert otherwise.  ONE definition, shared with
+	 * dcache_txn.c -- see lru_assert_not_queued() in dcache_lru.h for why
+	 * that matters (this probe used to live here, and its absence from the
+	 * other engine turned two handoff rows into vacuous zeros). */
+	lru_assert_not_queued(d);
 	free(d);
 }
 
@@ -2183,7 +2119,7 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
 	struct urcu_txn_sw_hlist_head *bucket;
-	int settled, ret;
+	int settled, ret, can_free;
 
 	if (path->ndepth == 0)
 		return -EINVAL;
@@ -2245,12 +2181,19 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	 * free cannot fire while a shard still points at it, so deferring this to
 	 * the shrinker would gate reclaim on memory pressure instead of on the
 	 * grace period -- unbounded live memory under churn without pressure.
-	 * See design/dcache-lru-txn.md section 6. */
-	lru_del(dc, host);
+	 * See design/dcache-lru-txn.md section 6.
+	 *
+	 * ⭐ ... EXCEPT when the shrinker is already holding @host, and then the
+	 * free is DELEGATED rather than taken: lru_del_can_free() answers 0, and
+	 * the shrinker call_rcu's it the moment its own eviction attempt lands.
+	 * This is mainline __dentry_kill's `can_free = false` for a dentry on a
+	 * shrink list.  Taking it off here instead would disown a victim mid-
+	 * eviction, which is exactly the free-while-queued defect. */
+	can_free = lru_del_can_free(dc, host, settled);
 	if (top != host)
 		lru_del(dc, top);
 	rcu_read_unlock();
-	if (settled)				/* host has no fold queued: free it */
+	if (settled && can_free)		/* host has no fold queued: free it */
 		call_rcu(&top->d_rcu, dentry_free_cb);
 	/* else: top is a shell; its pending fold RECLAIMs the orphaned chain */
 	return 0;

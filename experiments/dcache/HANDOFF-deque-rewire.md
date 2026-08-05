@@ -1,9 +1,11 @@
-# Handoff — MCAS LRU on the deque: done. One defect open, on the LOCK arm.
+# Handoff — the free-while-queued defect is CLOSED on all four arms.
 
-2026-08-04. Rewritten as a consolidated statement of the CURRENT position rather
-than the chronology it had become — four conclusions in that chronology were
-later retracted, and a reader who stopped halfway would have acted on one. The
-retractions are kept, in one place, at the end.
+2026-08-04. Written current-state-first, as the previous cut was: what is true
+now, then what is still open, then the retractions in one place at the end.
+
+The LOCK arm's free-while-queued defect — the one open item the last handoff
+left — is fixed and mutation-tested. Two new open items came out of the work,
+both of them PRE-EXISTING and both confirmed against a clean HEAD control.
 
 Commits, all UNPUSHED, oldest first:
 
@@ -12,261 +14,277 @@ Commits, all UNPUSHED, oldest first:
     c55a11d  RETRACT "TSAN cannot gate the deque test" -- it can, and found 16
     fffc94a  the free-while-queued defect is PORT-WIDE, not the deque's
     961462b  restore retain_dentry's d_unhashed guard (MCAS arm closed)
+    7b43b89  consolidate the handoff around the current position
+    (this)   close the LOCK arm: shrink-list handoff + DEAD seal
 
 ---
 
-## ▶ START HERE: the one open defect
+## ▶ WHAT LANDED: the LOCK arm needed TWO guards, not one
 
-**A dentry can be added to the LRU after it has been evicted and handed to
-`call_rcu`, and is then freed while the LRU still points at it.** Witness:
-`-DDC_LRU_FREE_ASSERT`, which asks in `dentry_free_cb` whether the dentry is
-still listed at the instant its storage is released. It covers BOTH arms
-deliberately — asking only the MCAS arm invites blaming the mechanism when the
-question is what the PORT allows.
+`-DDC_LRU_FREE_ASSERT`, `--writers 48 --readers 48 --duration 3000
+--evict-cap 32`, 5 trials, FREE-WHILE-QUEUED occurrences:
 
-Two independent pushers, and they are NOT the same fix:
+| arm | bursty before | bursty after | continuous before | continuous after |
+|---|---|---|---|---|
+| bucketlock LOCK | **5/5** | **0/5** | **5/5** | **0/5** |
+| txn LOCK | (no probe) | **0/5** | (no probe) | **0/5** |
+| bucketlock MCAS | 0/5 | 0/5 | 0/5 | 0/5 |
+| txn MCAS | (no probe) | 0/5 | (no probe) | 0/5 |
 
-| | pusher | where | status |
+### Guard 1 — the shrink-list handoff (closes `--evict bursty`)
+
+Mainline's `dentry_lru_isolate` does not disown its victim:
+`d_lru_shrink_move()` takes it off the shared list onto a PRIVATE one with
+`DCACHE_LRU_LIST` still set and `DCACHE_SHRINK_LIST` added; `__dentry_kill`
+honours that by skipping `d_lru_del` and leaving `can_free = false`, handing the
+free to `shrink_dentry_list`. **Isolation and ownership are the same act
+there.** This port isolated by UNLINKING, so the victim was ownerless for the
+whole eviction and a concurrent `dc_unlink` could unhash it, find nothing on the
+LRU, `call_rcu` it, and let the put-back relink a dentry queued for reclaim.
+
+Ported as two state bits on the existing shard word (`DC_LRU_SHRINK_BIT`,
+`DC_LRU_KILL_BIT`) plus `lru_del_can_free(dc, d, freeing)` — the `can_free`
+transfer — which both engines' `dc_unlink` now honours.
+
+### Guard 2 — the `DC_LRU_DEAD` seal (closes `--evict continuous`)
+
+⭐⭐ **THE TWO SIDES OF THIS RACE DO NOT SHARE A SHARD LOCK.** `lru_add`
+enqueues on the CALLER'S shard; a killer locks the shard the dentry is
+CURRENTLY on — different locks the moment a dentry migrates, and NO lock at all
+when the killer finds the word already OFF and returns early. So no shard-lock
+discipline can order an unhash against a concurrent enqueue, and `lru_add`'s
+"still hashed" test is a plain read of a bucket-locked slot it does not hold the
+bucket lock for: it NARROWS and never closes.
+
+Fixed by making the word itself the exclusion — every transition out of OFF is
+an RMW on that one word:
+
+* `lru_add` — `cmpxchg OFF -> ON(j)`, **taken under shard j's lock** so the
+  claim is never observable before the links exist (claiming outside the lock is
+  the "claimed but not linked" defect the MCAS arm already paid for);
+* a killer — `cmpxchg OFF -> DEAD`, terminal, so no enqueue can follow the free.
+
+Exactly one CAS wins. If the adder wins, the killer reads `ON(j)`, blocks on
+shard j's lock until the link is complete, and splices it out.
+
+⚠ **A killer must never let the word pass through OFF on its way to DEAD** — an
+adder holding a DIFFERENT shard's lock would see the transient and claim it.
+That is why `lru_unlink_locked_to()` takes its successor state as an argument,
+and why `lru_rotate_locked` and `lru_shrink_move_locked` were changed too (a
+rotate dipping to OFF could put one node in two lists).
+
+### The mutation matrix — both guards are load-bearing, on different cadences
+
+bucketlock LOCK, 5 trials per cell:
+
+| build | bursty | continuous | reads as |
 |---|---|---|---|
-| 1 | `lru_retain`'s re-arm | both arms | **FIXED on the MCAS arm** (`961462b`); narrowed only on bucketlock; unfixed on the LOCK arm |
-| 2 | the shrinker's put-back after a failed evict | LOCK arm always; MCAS legacy arm | **OPEN** |
+| as landed | 0/5 | 0/5 | closed |
+| `-DDC_LRU_NO_DEAD_SEAL` | 0/5 | **5/5** | the seal closes *continuous* |
+| `-DDC_LRU_NO_SHRINK_OWN` | **5/5** | **5/5** | the ownership closes *bursty* |
+| `-DDC_LRU_NO_SHRINK_READD` | 0/5 | 0/5 | the put-back was NEVER the cause |
 
-Current state, `--writers 48 --readers 48 --duration 3000 --evict-cap 32`, 5
-trials, FREE-WHILE-QUEUED occurrences:
-
-| arm | bursty | continuous |
-|---|---|---|
-| bucketlock MCAS deque | 0/5 | 0/5 |
-| txn MCAS deque | 0/5 | — |
-| **bucketlock LOCK** | **5/5** | **5/5** |
-| txn LOCK | — | 0/5 (1 SEGV, pre-existing) |
-
-### What the LOCK arm needs, and why the cheap answer does not work
-
-Mainline is protected by `d_lockref` **plus** two things that are not the
-refcount:
-
-- `retain_dentry` refuses to re-add an **unhashed** dentry — its FIRST test,
-  before any count is consulted (`fs/dcache.c`);
-- `d_lock` serialises `retain_dentry`'s `d_lru_add` against `__dentry_kill`'s
-  unhash + `d_lru_del`.
-
-And mainline's shrinker never does unlink-then-put-back: `dentry_lru_isolate`
-calls `d_lru_shrink_move`, which moves the dentry to a PRIVATE shrink list while
-keeping `DCACHE_LRU_LIST` set and adding `DCACHE_SHRINK_LIST`, so it is never
-ownerless; `__dentry_kill` honours that by skipping `d_lru_del` and leaving
-`can_free = false`, handing the free to `shrink_dentry_list`. **Isolation and
-ownership are the same act there.**
-
-Options for our lock arm, in the order I would try them:
-
-1. **The full shrink-list handoff.** Faithful, and the ONLY one that actually
-   closes it. Needs a `DC_LRU_SHRINK(i)` state and, critically, the `can_free`
-   transfer: `dc_unlink` must not `call_rcu` a dentry the shrinker owns. That
-   spans `dc_unlink` in both engines.
-2. **Keep isolation, add the liveness guard to the put-back** (re-check "still
-   hashed" under the shard lock before `lru_link_tail_locked`). Cheap; narrows
-   only, same class as bucketlock's fix 1.
-3. **Re-import a per-dentry `d_lock`.** Closes it exactly as mainline does; costs
-   a word plus an acquire on the enqueue path.
-
-⛔ **Do NOT try evict-first on the lock arm. It was tried and measured
-(fix 2, reverted).** No improvement on either cadence and **5/5 SEGV** on the txn
-lock arm, inside `urcu_txn_install_mw_depth` with a dangling `r->slot` from
-`lru_evict_settled`'s own commit — the victim freed underneath the eviction.
-Evict-first is safe on the MCAS arm only because
-`urcu_txn_deque_remove`'s `&n->owner : d -> NULL` record makes exactly ONE
-sweeper win — **the deque supplies ownership**. The lock arm got its ownership
-from isolation, and evict-first removes precisely that with nothing to replace
-it, so many sweepers evict one victim concurrently.
-
-⚠ Salvaged from that revert and still true: after dropping the shard lock, a
-membership re-check must be `shard == DC_LRU_ON(i)`, **not** `>= DC_LRU_ON(0)`.
-`lru_retain` enqueues on the CALLER's shard, so the victim can be removed and
-re-added on a DIFFERENT shard while the lock is down.
-
-## ▶ Second open item, and it is not ours
-
-`--evict continuous` on the **txn engine + MCAS deque** hangs. Three gdb samples
-two seconds apart: 47 of 48 writers in `cds_fair_mutex_park` every time, the 48th
-moving (`urcu_slab_alloc` → `sysmalloc` → `pthread_mutex_lock`), no assert. That
-is escalation-lane starvation plus the park-while-online QSBR stall — a
-**liburcu** matter. `urcu_txn__enter_fallback()` → `cds_fair_mutex_park()` blocks
-on a futex while the thread is still RCU-online, which holds off every grace
-period, which stalls `call_rcu` reclaim, which deepens the contention that caused
-the escalation. Self-reinforcing and absorbing. The fix belongs there: go offline
-across the park.
+That last row is the one worth keeping: removing the shrinker's put-back — the
+"obvious" fix, and the shape the MCAS arm's evict-first took — changes NOTHING.
+What fixed it was giving the victim an owner, not taking away the re-add.
 
 ---
 
-## What landed
+## ⚠⚠ CORRECTION: two rows of the previous table were VACUOUS ZEROS
 
-### The rewire (`d4faf6b`)
+The last handoff reported "txn MCAS deque 0/5" and "txn LOCK 0/5, 0 hits".
+**`-DDC_LRU_FREE_ASSERT` was never in `dcache_txn.c`** — its `dentry_free_cb`
+was a bare `free()`. The probe existed only in `dcache_bucketlock.c`, so those
+rows recorded that a probe which CANNOT FIRE did not fire. (`git log -S` on the
+macro shows it never touched that file.)
 
-The MCAS LRU runs on `<urcu/rcu-txn-deque.h>`; `rcu-txn-list.h` is out of the LRU.
+Fixed structurally, not locally: the probe is now `lru_assert_not_queued()` in
+`dcache_lru.h`, called from both engines' `dentry_free_cb`, so the divergence is
+no longer expressible. With it live, the txn LOCK arm fired **5/5 under
+`--evict continuous`** before the fix — i.e. it was never clean.
 
-- `d_lru` on the MCAS arm is `struct urcu_txn_deque_node dnode` and nothing else;
-  `shard` survives only on the lock arm. Membership is `urcu_txn_deque_owner()`.
-- The claim protocol is deleted (`lru_claim` / `lru_unclaim` / `lru_del_claimed`
-  / `lru_unlink_claimed`, `DC_LRU_BUSY`). `DC_LRU_OFF` / `DC_LRU_ON` are
-  `#ifndef DC_LRU_MCAS`, so a surviving use fails to compile rather than quietly
-  reintroducing a second membership record.
-- `lru_move_tail` → `urcu_txn_deque_rotate_head()`. Its old rationale
-  ("protect a lockless traverser standing on the node") was **vacuous**: this
-  port has no LRU traversal.
-- `dc->lru[i]` is a `struct urcu_txn_deque`; its own approximate `count` is the
-  only counter.
-- `dc:claim` / `dc:wedge` tracepoints removed (they instrumented a protocol that
-  no longer exists); `dc:commit` stays. Dead `DC_TS_LRU_EVICT` → `DC_TS_LRU_ROT`.
-
-Stated in `dcache_lru_shrink.h` rather than discovered later: with no claim, two
-sweepers can both reach `lru_evict_settled()` for one victim. Safe — bucketlock
-re-verifies the hlist mark under `bl_lock2`, txn's `hlist_del_prepare` answers
-`-ENOENT` — but it **moves the serialization point from the LRU word to the
-eviction**.
-
-### Fix 1: `retain_dentry`'s missing `d_unhashed` guard (`961462b`)
-
-A bare check is only a narrower race, so the guard is COMPOSED INTO THE PUSH
-(`lru_push_prepare`) via an engine-supplied predicate:
-
-- **txn**: `urcu_txn_load_validate(&d->d_hash.next)`. That slot is MCAS-managed
-  there, so the guard joins the push's conflict set — unhash-first aborts our
-  push; push-first is caught by the `lru_del` that runs after the unhash commit.
-  Cross-domain is fine: a domain owns only the escalation lane, conflict
-  detection is per-slot.
-- ⛔ **bucketlock: MUST NOT be transacted.** `bl_hlist_del_locked` writes that
-  slot with a plain `__atomic_store_n` under the bucket lock, so an MCAS guard
-  would plant a proxy the plain store overwrites — and this transaction's settle
-  would then write the pre-mark value back OVER that writer's mark, resurrecting
-  a node the index already deleted. Plain read only; narrowed, not closed.
-  Closing it needs the bucket lock on the enqueue path.
-
-## The deque itself
-
-`test_deque.c` now covers the two axes the dcache exercises and it did not:
-**many deques** (nodes migrate; `owner` must name the right one; remove derives
-its deque from a hint) and **reuse** (retire + re-init in place, resetting
-`seq`).
-
-`make check-deque` — 8 arms, all PASS: 2/8/32 writers × 4 deques, 1 deque
-(single-ring regression), 16 deques, the `NO_SEQ_GUARD` mutation, ASan, harness
-self-check. `make check-deque-tsan` — 4 arms, **0 warnings**.
-
-⚠ **The `seq` ABA guard is STILL UNPROVEN.** Reuse was the hypothesis that would
-make it load-bearing; compiled out at 32 writers with reuse on, the test still
-passes. Worse, reuse RESETS `seq` to zero, so its stated premise ("never
-decreases") does not survive recycled storage at all: it is monotone **per
-membership, not per address**. Worth a header caveat; not yet written.
-
-⚠ The harness's own retire needs TWO grace periods — one before removing (drain
-would-be pushers) and one after (drain peers holding the node as a derived
-pointer). The second was missing at first and looked exactly like a deque defect.
-`-DRETIRE_AUDIT` is opt-in because it widens every window and masked it 8/8.
+⭐⭐ That is the **fourth** dead-probe wrong-negative this project has recorded
+(after `dc_readdir` fn==NULL twice and the populated-dir rule). THE RULE:
+**verify a probe is live before trusting its zero** — print on the first call,
+or run a control you know must fail.
 
 ---
 
-## Measured facts — do not re-derive
+## ▶ OPEN ITEM 1 — an intermittent heap-use-after-free in `lru_evict_settled`
 
-MCAS deque, bucketlock engine, `--evict bursty --evict-cap 32`, 5 trials/point:
+TSAN, bucketlock LOCK arm, `--evict continuous`:
 
-| writers | 8 | 16 | 32 | 48 | 96 | 192 |
-|---|---|---|---|---|---|---|
-| complete | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
-| Mchurn/s | 2.44-2.60 | 3.40-3.61 | 3.98-4.19 | 3.41-3.61 | 1.81-1.89 | 0.98-1.02 |
+    heap-use-after-free
+      bl_lock            dcache_bucketlock.c:506
+      bl_lock2           dcache_bucketlock.c:523
+      lru_evict_settled  dcache_bucketlock.c:3645   <- &parent->d_child_head
+      lru_shrink_range   dcache_lru_shrink.h:328
 
-⚠ **NOT comparable to the pre-rewire 1.39-1.42 figure** — the command line behind
-that number was never recorded. A list-vs-deque throughput claim needs both arms
-re-run under one command line, and nobody has done that.
+`lru_evict_settled` derives `parent = parent_of_rcu(d)` and then takes
+`bl_lock2(bucket, &parent->d_child_head)` — on a parent that has been freed.
 
-Instrumented (`-DDC_TXN_STATS`), MCAS deque default arm, 3 trials of ~10M
-`lru_del` each: **0 escalations, maxretry 3, 0 disowned nodes in any shard.**
+**PRE-EXISTING, not introduced.** Present on a clean HEAD control built and run
+under the identical TSAN methodology (HEAD 2 occurrences / 3 runs; this tree 4 /
+3 runs, then **0 / 6** on a later batch). ⚠ **The rate is too low and too
+variable to rank the two trees at this sample size — do not quote 2-vs-4 as a
+regression.** Not chased to root cause. It is the next thing to look at.
 
-## Two upstream fixes that stay (independent of the LRU)
+Total TSAN warnings did drop (HEAD 119 → 82 over 3 runs), and the sites
+`lru_listed`, `lru_del` and `lru_link_tail_locked` — races on the state word
+itself — are **gone**, which is the state word becoming atomic everywhere.
 
-- `750572af` — `urcu_txn_list_del_prepare` load-validates its derivation read of
-  `&elem->prev`.
-- `b69b4a53` — all five list convenience brackets leaked the escalation lane on
-  their `-ENOENT` terminal bail (no `urcu_txn_abandon()` before `end()`).
+The residual non-UAF reports are all one pre-existing shape: fields written
+plainly under the shard lock and read atomically without it — `sh->count`
+(`dc_lru_count`) and `d_lru.referenced` (`lru_retain` vs the shrinker's clear).
+Both are deliberately approximate. Worth a pass of `uatomic_*` for TSAN
+cleanliness; neither is a correctness bug.
 
-⭐ The rule behind both: **an operation that READS a slot it does not WRITE must
-validate that read.**
+## ▶ OPEN ITEM 2 — rename × LRU × shrinker is jointly UNTESTED
+
+`fold()` frees dentries (`host_to_free`, `n` at dcache_bucketlock.c:2669, 3009,
+3130) with **no `lru_del` on any path**. That is safe only if a folded-away node
+is never on the LRU.
+
+Measured, not assumed: `stress_dcache` (renames) with the probe live is clean
+3/3. But `stress_dcache` never calls `dc_shrink` (grep: 0 hits) and
+`bench_dcache_churn` has **no renames at all** — so no test drives renames and
+the shrinker together. Closing this needs a shrinker thread in `stress_dcache`
+or a rename mode in the churn bench. Until then the fold's frees are unproven,
+not proven safe.
+
+## ▶ OPEN ITEM 3 — txn + MCAS + `--evict continuous` is unstable (not ours)
+
+⚠ **CORRECTION to the previous handoff, which said "hangs 3/3".** Re-measured 8
+trials on a clean HEAD control: **5 pass / 3 CONSERVATION FAILED / 0 hangs**.
+This tree over the same 8: 5 pass / 2 conservation / 1 timeout. Indistinguishable
+— the LRU change does not touch it. The earlier "3/3 hangs" was a small sample
+of a stochastic outcome reported as if deterministic.
+
+The escalation-lane analysis still stands and is a **liburcu** matter:
+`urcu_txn__enter_fallback()` → `cds_fair_mutex_park()` blocks on a futex while
+the thread is still RCU-online, which holds off every grace period, which stalls
+`call_rcu` reclaim, which deepens the contention that caused the escalation.
+Self-reinforcing and absorbing. The fix belongs there: go offline across the
+park.
+
+---
+
+## The state word (LOCK arm) — one word, every transition under the shard lock
+
+    DC_LRU_OFF         ownerless
+    DC_LRU_DEAD        terminal: unhashed and queued for reclaim; never link it
+    DC_LRU_ON(i)       linked into shard i          -- DCACHE_LRU_LIST
+    | DC_LRU_SHRINK_BIT   off the list, shrinker i holds it -- DCACHE_SHRINK_LIST
+    | DC_LRU_KILL_BIT     ... and a killer handed it the free  -- can_free=false
+
+`lru_listed()` asks **OWNED** (linked OR shrink-held), because that is the
+`DCACHE_LRU_LIST` question and so the one `lru_retain` must ask — a victim under
+eviction must not be re-armed. `DC_LRU_IS_LINKED` is the different question
+"is it actually spliced in", and conflating the two re-disowns the victim.
+
+A recycled allocation starts from zero (`memset` in `dentry_alloc`), i.e. OFF,
+so DEAD is terminal per LIFETIME, not per address.
+
+## What landed earlier (unchanged)
+
+The MCAS LRU runs on `<urcu/rcu-txn-deque.h>`; `d_lru` there is a
+`urcu_txn_deque_node dnode` and nothing else. Claim protocol deleted;
+membership is `urcu_txn_deque_owner()`. `lru_move_tail` → `rotate_head` (its
+"protect the traverser" rationale was VACUOUS — this port has no LRU traversal).
+Two sweepers can reach `lru_evict_settled()` for one victim: safe, but it MOVES
+THE SERIALIZATION POINT to the eviction's re-verify.
+
+⛔ **DO NOT PORT EVICT-FIRST TO THE LOCK ARM** — tried, measured, reverted: no
+improvement plus 5/5 SEGV in `urcu_txn_install_mw_depth`. On MCAS it is safe
+because `remove()`'s `&n->owner : q -> NULL` makes exactly ONE sweeper win —
+**the deque supplies ownership**. The lock arm got ownership from ISOLATION, and
+evict-first removes exactly that. The shrink state is what replaces it, and that
+is why `lru_del_can_free` on the MCAS arm is a one-liner that always answers 1.
+
+Two upstream fixes that stay: `750572af` (`urcu_txn_list_del_prepare`
+load-validates its derivation read) and `b69b4a53` (all five list convenience
+brackets leaked the escalation lane on `-ENOENT`). ⭐ The rule behind both: **an
+operation that READS a slot it does not WRITE must validate that read.**
+
+## Deque status
+
+`test_deque.c` covers **many deques** (migration, remove-via-hint) and **reuse**
+(retire + re-init in place). `make check-deque` 8 arms PASS.
+⚠ **`seq` ABA guard STILL UNPROVEN** — `NO_SEQ_GUARD` passes at 32 writers WITH
+reuse; and reuse **resets seq to 0**, so "never decreases" fails for recycled
+storage: monotone **per membership, not per address**.
+⚠ Reuse needs a GP **after** the node is off, not just before; missing it looked
+exactly like a deque defect.
 
 ---
 
 ## ⛔ Claims retracted — do not resurrect
 
-**This session** (each was argued convincingly, then refuted by measurement):
+**This session:**
 
-- "the ring reaching an `owner == NULL` node is a deque defect" — it is a
-  **caller** bug: the dentry was freed while queued, and the zeroes are reused
-  storage.
-- "evict-first fixes it" / "the default arm is clean" — true for `--evict
-  bursty` ONLY, stated unqualified. `--evict continuous` fires the other pusher.
-- "TSAN cannot gate the deque test; it cannot model a QSBR grace period" — it
-  can. The TSAN liburcu was four days stale, and all 16 surviving reports were
-  real harness defects.
-- "evict-first ports to the lock arm" — no improvement plus 5/5 SEGV.
+- "txn MCAS 0/5" and "txn LOCK 0/5, 0 hits" — the probe was not in that file.
+- "txn + MCAS + continuous hangs 3/3" — it does not hang; it intermittently
+  fails conservation, on HEAD as much as here.
+- "the shrinker's put-back is the pusher, so removing it is the fix" —
+  `-DDC_LRU_NO_SHRINK_READD` changes NOTHING. The ownership was the fix.
+- "the shard lock orders `lru_add` against `dc_unlink`" — it does not; the two
+  sides pick DIFFERENT shards, and a killer that finds OFF takes no lock at all.
 
-**Before the rewire:**
-
-- the stale-prev forward rescan (`prev_repair`); "a corrupt ring without the
-  sentinel"; the six-edge `move_tail` as the cause; word-OFF-while-linked;
-  "plain stores exonerated" (a TIMEOUT counted as THE WEDGE); "the slab lfstack
-  pop is spinning" (one gdb sample); "the deque reproduces the dcache wedge at
-  engine level" (same symptom, different cause).
+**Earlier:** "the `owner == NULL` node in the ring is a deque defect" (caller
+bug); "evict-first fixes it" / "the default arm is clean" (bursty-only, stated
+unqualified); "TSAN cannot gate the deque test" (it can — 16 real defects);
+"evict-first ports to the lock arm" (SEGV); and, before the rewire, the
+stale-prev forward rescan, the six-edge `move_tail` as cause, word-OFF-while-
+linked, "plain stores exonerated" (a TIMEOUT counted as THE WEDGE).
 
 ## Method rules earned the hard way
 
-- **Sweep the KNOB, not just the thread count.** Testing one evict cadence and
-  reporting the result unqualified cost two wrong conclusions in one session.
-- **Grep for the violation marker, not the exit status.** A timeout is not the
-  wedge; an abort is not a hang.
-- **One gdb sample is not a spin.** Three, two seconds apart, and check whether
-  frames move. That is what separated the retry wedge from lane starvation.
-- **Run the control under the SAME methodology.** The disowned-node finding was
-  only meaningful because the default arm was SIGTERM'd mid-run through the same
-  walk and came back clean. Likewise `make stress-tsan` on the rebuilt TSAN tree
-  is what proved 16 "phantoms" were mine.
+- **Verify a probe is live before trusting its zero.** Four wrong negatives now.
+- **Ask the cheap decisive question first.** `-DDC_LRU_NO_RETAIN_READD` took
+  five minutes and killed the leading hypothesis (still 5/5), which is what
+  redirected the whole session.
+- **READ THE WITNESS, do not reason from the design.** The `owner=0x10 ...
+  chain-reachable=0` line said "freed while LINKED on shard 14", which is what
+  exposed guard 2. Two rounds of careful argument had concluded guard 1 was
+  sufficient.
+- **Mutation-test every new guard**, and keep the mutation knob
+  (`NO_DEAD_SEAL`, `NO_SHRINK_OWN`). A guard whose removal changes nothing is
+  not a fix.
+- **Run the control under the SAME methodology.** Every "pre-existing" claim
+  here is against a HEAD tree built from `git archive` and run identically.
+- **Sweep the KNOB, not just the thread count.** Guard 1 alone looked like a
+  complete fix under `--evict bursty`.
+- **One macro must not gate two sites** (`DC_LRU_NO_READD` gated both re-adds).
 - **A probe that widens every window is not a control** (`-DRETIRE_AUDIT`).
-- **One macro must not gate two sites.** `DC_LRU_NO_READD` gated both re-adds,
-  making every result from it uninterpretable; split into
-  `DC_LRU_NO_SHRINK_READD` / `DC_LRU_NO_RETAIN_READD`.
-- **Verify a probe is live before trusting its zero**; print on the FIRST call
-  and run a with/without control. Bitten 3x.
-- **Mutation-test every new guard**; if removing it changes nothing, say so
-  instead of claiming a fix (`URCU_TXN_DEQUE_NO_SEQ_GUARD`).
-- **Ask the cheap decisive question first.** `-DDC_LRU_FREE_ASSERT` took five
-  minutes and overturned a conclusion I had already committed.
 
 ## Tree hygiene — both of these have cost real time
 
-⚠ **`urcu-txn-tsan-build` is a COPY of `urcu-txn-build` and silently rots.** It
-was a Jul 31 copy against an Aug 3 engine, so TSAN ran a different engine from
-every other gate. `check-deque-tsan` refuses to run when they differ; check
-manually before any other TSAN work:
+⚠ **`urcu-txn-tsan-build` is a COPY of `urcu-txn-build` and silently rots.**
+Verified in sync this session (md5 `20b17e74`). Check before any TSAN work:
 
-    md5sum urcu-txn-tsan-build/include/urcu/rcu-txn-mcas.h \
-           urcu-txn-build/include/urcu/rcu-txn-mcas.h
+    md5sum ../../urcu-txn-tsan-build/include/urcu/rcu-txn-mcas.h \
+           ../../urcu-txn-build/include/urcu/rcu-txn-mcas.h
 
-Rebuild recipe: the comment above `stress-tsan` in the Makefile. Verify
-instrumentation in the GENERATED CODE (`cc -S -fsanitize=thread … | grep
-__tsan_atomic64_load`), not in `config.h`. Pass `TSAN_SLAB_CPP`, not `SLAB_CPP`.
+Verify instrumentation in the GENERATED CODE (`cc -S -fsanitize=thread … |
+grep -c __tsan_atomic`, expect ~467 for `dcache_bucketlock.c`), not in
+`config.h`. Pass `TSAN_SLAB_CPP`, not `SLAB_CPP` (currently empty — neither
+`URCU_TXN_SLAB_BATCH` nor `URCU_SLAB_RSEQ` is set in that tree).
 
 ⚠ **`urcu-txn-build/include/urcu/rcu-txn-slab.h` is behind the dev tree.** The
-dev version adds `__attribute__((aligned(64)))` to the stats counter block, which
-changes `struct urcu_slab`'s layout **unconditionally** — it is not behind an
-ifdef. The build tree is self-consistent (old header, old library), so this
-session's numbers stand, but syncing that header REQUIRES rebuilding the library
-with it or the `.so` and its callers disagree about field offsets.
+dev version adds `__attribute__((aligned(64)))` to the stats counter block,
+changing `struct urcu_slab`'s layout UNCONDITIONALLY. The build tree is
+self-consistent, so this session's numbers stand, but syncing that header
+REQUIRES rebuilding the library with it.
 
-## Gates
+## Gates — all green on this tree
 
-    make check                # 1 PASS
+    make check                # 1 PASS (394 checks)
     make check-bucketlock     # 8 PASS
     make check-lru-arms       # 9 PASS + 2 ASan stress
-    make check-deque          # 8 arms
-    make check-deque-tsan     # 4 arms, 0 warnings
+    make check-deque          # 8 arms PASS
+
+Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} ×
+{with, without FREE_ASSERT}.
 
 ## Build recipes
 
@@ -283,8 +301,8 @@ with it or the `.so` and its callers disagree about field offsets.
     ./churn --writers 48 --readers 48 --duration 3000 --evict continuous --evict-cap 32
 
     # counters + the ring dump out of a wedged process
-    ./churn ... & kill -TERM $!    # the stats handler dumps TXNSTATS + LRUCHK, _exit(3)
+    ./churn ... & kill -TERM $!    # dumps TXNSTATS + LRUCHK, _exit(3)
 
-Probe flags: `-DDC_LRU_FREE_ASSERT` (both arms), `-DDC_LRU_NO_RETAIN_READD`,
-`-DDC_LRU_NO_SHRINK_READD`, `-DDC_LRU_READD_LEGACY` (the known-unsafe control),
-`-DURCU_TXN_DEQUE_NO_SEQ_GUARD`, `-DRETIRE_AUDIT` (test_deque).
+Probe flags: `-DDC_LRU_FREE_ASSERT` (BOTH engines now), `-DDC_LRU_NO_DEAD_SEAL`,
+`-DDC_LRU_NO_SHRINK_OWN`, `-DDC_LRU_NO_SHRINK_READD`, `-DDC_LRU_NO_RETAIN_READD`,
+`-DDC_LRU_READD_LEGACY`, `-DURCU_TXN_DEQUE_NO_SEQ_GUARD`, `-DRETIRE_AUDIT`.

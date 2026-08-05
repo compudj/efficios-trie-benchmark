@@ -172,7 +172,62 @@ static void lru_link_tail_locked(struct dc_lru_shard *sh, struct dentry *d,
 		sh->head = d;
 	sh->tail = d;
 	sh->count++;
-	d->d_lru.shard = DC_LRU_ON(idx);
+	/* SHRINK(i) -> ON(i) (the put-back) or ON(i) -> ON(i) (a rotate).  Never
+	 * from OFF: an adder's claim owns that transition, and it cannot be
+	 * racing us here precisely because the word is not OFF. */
+	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELAXED);
+}
+
+/*
+ * ISOLATE WITHOUT DISOWNING -- mainline's d_lru_shrink_move().
+ *
+ * @d comes OFF the shard's list (so no other sweeper and no lru_del can reach
+ * it through the links) while shard @idx keeps owning it.  That single fact is
+ * what the whole handoff rests on:
+ *
+ *   lru_retain sees OWNED and does not re-arm it            (DCACHE_LRU_LIST)
+ *   lru_del_can_free sees SHRINK and delegates the free     (DCACHE_SHRINK_LIST)
+ *
+ * so the put-back below can never link a dentry that is already queued for
+ * reclaim.  Isolating by UNLINKING -- which is what this did before -- gives up
+ * both, and -DDC_LRU_FREE_ASSERT fired 5/5 on both cadences as a result.
+ *
+ * -DDC_LRU_NO_SHRINK_OWN restores the disowning isolate.  It is the MUTATION
+ * TEST for the guard: if removing the ownership changes nothing, the ownership
+ * is not what fixed it and this comment is a story.
+ */
+static void lru_shrink_move_locked(struct dc_lru_shard *sh, struct dentry *d,
+				   unsigned int idx)
+{
+	/* ⚠ ONE store to the word -- unlinking to OFF and then overwriting with
+	 * SHRINK would expose a transient OFF to an adder holding a DIFFERENT
+	 * shard's lock, which would claim @d and link it somewhere we are not
+	 * looking.  See lru_unlink_locked_to(). */
+#ifndef DC_LRU_NO_SHRINK_OWN
+	lru_unlink_locked_to(sh, d, DC_LRU_SHRINK(idx));
+#else
+	(void) idx;
+	lru_unlink_locked(sh, d);
+#endif
+}
+
+/*
+ * Give up ownership of a victim that is about to be freed -- either we unhashed
+ * it ourselves (lru_evict_settled committed) or a killer did and handed us the
+ * debt.  Either way @d is already queued for reclaim.
+ *
+ * ⚠ IT SEALS, it does not merely release.  DC_LRU_OFF here would be an open
+ * invitation: lru_retain on any other thread would find the dentry unowned,
+ * win the claim, and enqueue it on ITS shard while call_rcu is already pending.
+ * The "still hashed" test in lru_add cannot be relied on to catch that -- it
+ * reads a bucket-locked slot without the bucket lock.  DC_LRU_DEAD is terminal
+ * for the dentry's lifetime, and a recycled allocation starts from zero
+ * (memset in dentry_alloc), i.e. DC_LRU_OFF again.
+ */
+static void lru_shrink_release_locked(struct dc_lru_shard *sh, struct dentry *d)
+{
+	(void) sh;
+	uatomic_store(&d->d_lru.shard, DC_LRU_DEAD, CMM_RELAXED);
 }
 
 /*
@@ -186,7 +241,11 @@ static void lru_link_tail_locked(struct dc_lru_shard *sh, struct dentry *d,
 static void lru_rotate_locked(struct dc_lru_shard *sh, struct dentry *d,
 			      unsigned int idx)
 {
-	lru_unlink_locked(sh, d);
+	/* ⚠ The word must NOT dip to OFF between the two halves.  A rotate
+	 * holds shard i's lock, but an adder claims on the CALLER'S shard, so a
+	 * transient OFF here lets it win the claim and splice @d into shard j
+	 * while we are re-linking it into shard i -- one node, two lists. */
+	lru_unlink_locked_to(sh, d, DC_LRU_ON(idx));
 	lru_link_tail_locked(sh, d, idx);
 }
 
@@ -261,17 +320,80 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				rcu_read_unlock();
 				continue;
 			}
-			lru_unlink_locked(sh, victim);	/* ISOLATE */
+			/* ISOLATE, KEEPING OWNERSHIP.  See lru_shrink_move_locked:
+			 * the victim leaves the list but shard i still owns it,
+			 * which is what makes every branch below safe. */
+			lru_shrink_move_locked(sh, victim, i);
 			lru_unlock(sh);
 			if (lru_evict_settled(dc, victim) == 0) {
-				freed++;
-			} else {
-				/* not evictable right now -- put it BACK, or it
-				 * would be silently un-evictable forever */
+				/*
+				 * WE unhashed it and call_rcu'd it, so drop
+				 * ownership -- still inside this iteration's
+				 * read-side section, which is the only reason
+				 * the free cannot have landed before this
+				 * store.  No killer can be racing us: dc_unlink
+				 * re-verifies "still hashed" under the bucket
+				 * lock, and we just cleared that, so it re-finds
+				 * and answers -ENOENT rather than reaching
+				 * lru_del_can_free at all.
+				 */
 				lru_lock(sh);
-				lru_link_tail_locked(sh, victim, i);
+				lru_shrink_release_locked(sh, victim);
 				lru_unlock(sh);
+				freed++;
+				rcu_read_unlock();
+				continue;
 			}
+			lru_lock(sh);
+			if (victim->d_lru.shard & DC_LRU_KILL_BIT) {
+				/*
+				 * THE HANDOFF FIRED.  A concurrent dc_unlink
+				 * removed @victim from both indexes while we
+				 * held it and declined to free it, because we
+				 * did.  This is mainline's shrink_dentry_list
+				 * completing a kill that __dentry_kill left at
+				 * can_free = false.
+				 *
+				 * Counted as freed: the eviction happened, it
+				 * just was not us who unhashed it.
+				 */
+				lru_shrink_release_locked(sh, victim);
+				lru_unlock(sh);
+				call_rcu(&victim->d_rcu, dentry_free_cb);
+				freed++;
+				rcu_read_unlock();
+				continue;
+			}
+#if defined(DC_LRU_NO_READD) || defined(DC_LRU_NO_SHRINK_READD)
+			/*
+			 * PROBE (-DDC_LRU_NO_SHRINK_READD): drop the put-back and
+			 * leave the victim off the LRU.  It costs eviction
+			 * accuracy -- an entry that failed once is un-evictable
+			 * until its next touch re-arms it -- and nothing else.
+			 *
+			 * ⚠ -DDC_LRU_NO_READD kills lru_retain's re-arm TOO, so
+			 * it cannot tell the two re-adds apart.  Use the split
+			 * spellings; see lru_retain().
+			 *
+			 * With the shrink-list handoff in place this is expected
+			 * to be a NO-OP for -DDC_LRU_FREE_ASSERT, and that is
+			 * the point of keeping it: it says the fix is the
+			 * OWNERSHIP, not the removal of the put-back.
+			 *
+			 * OFF, not DEAD: @victim survived the eviction attempt
+			 * and must stay re-armable.
+			 */
+			uatomic_store(&victim->d_lru.shard, DC_LRU_OFF,
+				      CMM_RELAXED);
+			lru_unlock(sh);
+#else
+			/* not evictable right now -- put it BACK, or it would be
+			 * silently un-evictable forever.  Safe now, and only
+			 * now: @victim was never ownerless, so no killer can
+			 * have freed it behind us. */
+			lru_link_tail_locked(sh, victim, i);
+			lru_unlock(sh);
+#endif
 			rcu_read_unlock();
 		}
 	}

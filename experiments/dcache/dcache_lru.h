@@ -106,8 +106,100 @@
  * rather than reintroducing a second membership record.
  */
 #ifndef DC_LRU_MCAS
-#define DC_LRU_OFF	0u		/* not on any shard */
-#define DC_LRU_ON(i)	((i) + 2u)	/* on shard i */
+/*
+ * ⭐ ISOLATION AND OWNERSHIP ARE THE SAME ACT -- the shrink-list handoff.
+ *
+ *   DC_LRU_OFF        ownerless: no shard names it, nobody owes it a free.
+ *   DC_LRU_DEAD       TERMINAL: unhashed and queued for reclaim -- never link it
+ *   DC_LRU_ON(i)      LINKED into shard i's list  -- mainline DCACHE_LRU_LIST
+ *   + DC_LRU_SHRINK_BIT   ... off the list, but shard i's SHRINKER holds it
+ *                                                  -- mainline DCACHE_SHRINK_LIST
+ *   + DC_LRU_KILL_BIT     ... and a killer handed it the free (`can_free`)
+ *
+ * ⭐⭐ THE WORD IS THE EXCLUSION, and it has to be, because THE TWO SIDES OF
+ * THIS RACE DO NOT SHARE A SHARD LOCK.  lru_add enqueues on the CALLER'S shard
+ * while a killer locks the shard the dentry is CURRENTLY on -- different locks
+ * the moment a dentry migrates, and NO lock at all when the killer finds the
+ * word already OFF.  So no amount of shard-lock discipline orders an unhash
+ * against a concurrent enqueue; the "still hashed" test in lru_add is a plain
+ * read of a slot written under a bucket lock the enqueue does not take, and it
+ * NARROWS the race without closing it.  (Measured: with only the shrink-list
+ * handoff below, --evict bursty went 5/5 -> 0/5 and --evict continuous stayed
+ * 5/5, the witness being a dentry freed while LINKED, state ON(14).)
+ *
+ * The fix is that every transition out of OFF is an RMW on this one word:
+ *
+ *   lru_add        cmpxchg OFF -> ON(j), TAKEN UNDER SHARD j's LOCK so the
+ *                  claim can never be observed before the links exist -- the
+ *                  "claimed but not linked" state is the old defect this port
+ *                  already paid for once.
+ *   a killer       cmpxchg OFF -> DEAD, which SEALS the dentry: every later
+ *                  claim fails, so no enqueue can follow the free.  Exactly one
+ *                  of the two CASes wins; if the adder wins, the killer then
+ *                  reads ON(j), blocks on shard j's lock until the link is
+ *                  complete, and splices it out.
+ *
+ * ⚠ A KILLER MUST NEVER LET THE WORD PASS THROUGH OFF on its way to DEAD.  The
+ * transient would be visible to an adder holding a DIFFERENT shard's lock,
+ * which would then claim and link a dentry already queued for reclaim -- the
+ * very hole being closed.  That is why lru_unlink_locked() takes its successor
+ * state as an argument instead of hardcoding OFF.
+ *
+ * Correctness therefore no longer rests on the liveness read at all; that read
+ * survives only as an optimisation (do not bother claiming a dentry already
+ * known dead).  Mainline gets the same atomicity from d_lock, which serialises
+ * retain_dentry's d_lru_add against __dentry_kill's unhash + d_lru_del; this
+ * port has no per-dentry lock, and the state word is what stands in for one.
+ *
+ * The shrink bit is what makes the isolate safe, and it is the one thing this
+ * port had left out.  Mainline's dentry_lru_isolate does NOT make its victim
+ * ownerless: d_lru_shrink_move() takes it off the shared list onto a PRIVATE
+ * one with DCACHE_LRU_LIST still set and DCACHE_SHRINK_LIST added, and
+ * __dentry_kill honours that by skipping d_lru_del and leaving can_free =
+ * false, handing the free to shrink_dentry_list.  So a victim under eviction
+ * is never unowned, and a killer that meets one does not free it -- it
+ * DELEGATES.
+ *
+ * This port isolated by UNLINKING, which disowned the victim for the whole
+ * length of the eviction.  A concurrent dc_unlink could then unhash it, find
+ * nothing on the LRU to remove, call_rcu it -- and the shrinker's put-back
+ * would link a dentry already queued for reclaim.  -DDC_LRU_FREE_ASSERT caught
+ * that 5/5 on BOTH cadences at 48 writers.
+ *
+ * ⭐ ONE WORD, and every transition to it is written UNDER THE SHARD LOCK, so
+ * membership, holder and debt stay coherent with the links.  That is the same
+ * rule the MCAS arm gets from the deque's `owner` living inside the commit: a
+ * separately-maintained second membership record is exactly the defect both
+ * arms exist to avoid.
+ */
+#define DC_LRU_OFF		0u		/* not on any shard */
+#ifndef DC_LRU_NO_DEAD_SEAL
+#define DC_LRU_DEAD		1u		/* terminal: sealed by a killer */
+#else
+/*
+ * MUTATION TEST (-DDC_LRU_NO_DEAD_SEAL): collapse DEAD onto OFF, which retires
+ * the seal without touching any other line -- `st == DC_LRU_DEAD` becomes the
+ * old early return on OFF, and every "seal it" store becomes the old release.
+ * The shrink-list handoff below is left intact, so this isolates exactly what
+ * the seal contributes.  If it changes nothing, the seal is not the fix and the
+ * comment above is a story.
+ */
+#define DC_LRU_DEAD		DC_LRU_OFF
+#endif
+#define DC_LRU_ON(i)		((i) + 2u)	/* linked into shard i */
+#define DC_LRU_SHRINK_BIT	0x80000000u	/* shard i's shrinker holds it */
+#define DC_LRU_KILL_BIT		0x40000000u	/* ... and owes it a free */
+#define DC_LRU_SHRINK(i)	(DC_LRU_ON(i) | DC_LRU_SHRINK_BIT)
+#define DC_LRU_STATE_BITS	(DC_LRU_SHRINK_BIT | DC_LRU_KILL_BIT)
+#define DC_LRU_SHARD_OF(st)	((((st) & ~DC_LRU_STATE_BITS)) - DC_LRU_ON(0))
+/* OWNED: some shard is responsible for it -- linked, or held by its shrinker.
+ * This is the DCACHE_LRU_LIST question, and so the one lru_retain must ask. */
+#define DC_LRU_IS_OWNED(st)	(((st) & ~DC_LRU_STATE_BITS) >= DC_LRU_ON(0))
+#define DC_LRU_IS_SHRINK(st)	(((st) & DC_LRU_SHRINK_BIT) != 0u)
+/* LINKED: actually spliced into the shard's list, so lru_unlink_locked applies.
+ * ⚠ NOT the same question as OWNED -- a shrink-held victim answers yes to one
+ * and no to the other, and conflating them is what re-disowns the victim. */
+#define DC_LRU_IS_LINKED(st)	(DC_LRU_IS_OWNED(st) && !DC_LRU_IS_SHRINK(st))
 #endif
 
 /*
@@ -170,9 +262,14 @@ static int lru_shards_init(struct dcache *dc);
 static unsigned int lru_nshards(void);
 #endif
 static void lru_add(struct dcache *dc, struct dentry *d);
+#ifdef DC_LRU_MCAS
+/* The shrinker's re-add targets a SPECIFIC shard; only that arm has one. */
 static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx);
+#endif
 static void lru_del(struct dcache *dc, struct dentry *d);
+static int lru_del_can_free(struct dcache *dc, struct dentry *d, int freeing);
 static inline void lru_retain(struct dcache *dc, struct dentry *d);
+static void lru_assert_not_queued(struct dentry *d);
 
 #else	/* the implementation */
 
@@ -271,7 +368,9 @@ static unsigned int lru_nshards(void)
  * directory costs a shared-state load and no invalidation.
  */
 static void lru_add(struct dcache *dc, struct dentry *d);
+#ifdef DC_LRU_MCAS
 static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx);
+#endif
 
 /*
  * Is @d on a shard?  A HINT on both arms, and deliberately only a hint.
@@ -302,9 +401,16 @@ static inline int lru_listed(struct dentry *d)
 	return on;
 }
 #else
+/*
+ * ⭐ OWNED, not LINKED.  A victim the shrinker is holding is off the shard's
+ * list but still owned by it, and mainline answers this question with
+ * DCACHE_LRU_LIST -- which d_lru_shrink_move deliberately LEAVES SET.  So
+ * retain_dentry does not re-add a dentry under eviction, which is one half of
+ * why mainline's shrinker can be interrupted safely at all.
+ */
 static inline int lru_listed(struct dentry *d)
 {
-	return uatomic_load(&d->d_lru.shard, CMM_RELAXED) >= DC_LRU_ON(0);
+	return DC_LRU_IS_OWNED(uatomic_load(&d->d_lru.shard, CMM_RELAXED));
 }
 #endif
 
@@ -615,6 +721,30 @@ static void lru_del(struct dcache *dc, struct dentry *d)
 }
 
 /*
+ * The MCAS arm never hands a free off, so this always answers "yes, free it".
+ *
+ * It is not that the arm was careful; it is that the deque already supplies the
+ * ownership the lock arm has to spell out.  Two things do it: the sweeper here
+ * EVICTS BEFORE REMOVING, so a victim is still queued for the whole eviction and
+ * never ownerless; and urcu_txn_deque_remove's `&n->owner : q -> NULL` record
+ * makes exactly ONE remover win, so "took it off" and "may free it" are the same
+ * answer from the same commit.
+ *
+ * ⛔ AND THAT IS PRECISELY WHY EVICT-FIRST DOES NOT PORT TO THE LOCK ARM -- it
+ * was tried, measured, and reverted (no improvement, 5/5 SEGV inside
+ * urcu_txn_install_mw_depth on a dangling slot).  There, isolation WAS the
+ * ownership, so evicting first removes it with nothing to replace it and many
+ * sweepers evict one victim at once.  The lock arm needs the shrink state
+ * instead; see lru_del_can_free() in the other half of this file.
+ */
+static int lru_del_can_free(struct dcache *dc, struct dentry *d, int freeing)
+{
+	(void) freeing;
+	lru_del(dc, d);
+	return 1;
+}
+
+/*
  * The MCAS arm ROTATES an in-use entry rather than removing it; see
  * dcache_lru_shrink.h for why the two arms diverge here.  Consumed by
  * test_dcache.c, which must not expect a populated directory to leave the LRU.
@@ -798,10 +928,35 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 	unsigned int idx = lru_shard_index(dc);
 	struct dc_lru_shard *sh = &dc->lru[idx];
 
+	/*
+	 * The liveness test is an OPTIMISATION, not the guard.  It reads a slot
+	 * written under a bucket lock this path does not take, so it can be
+	 * stale in the one direction that matters; what actually makes the
+	 * enqueue safe is the claim below.  Skipping the work for a dentry
+	 * already known dead is still worth a load.
+	 */
 	if (!lru_alive_hint(d))
 		return;			/* unhashed: never re-arm a dying dentry */
 	lru_lock(sh);
-	if (!lru_alive_hint(d)) {
+	/*
+	 * CLAIM THE WORD, UNDER THIS SHARD'S LOCK.  Both halves are load-bearing:
+	 *
+	 *   the cmpxchg is what a killer's OFF -> DEAD seal races against, so
+	 *   exactly one of us wins and an enqueue can never follow a free;
+	 *
+	 *   holding the lock ACROSS the claim and the splice is what stops the
+	 *   killer from acting on a claimed-but-not-yet-linked node -- it reads
+	 *   ON(idx), comes to this same lock, and by the time it gets in the
+	 *   links exist.  (Claiming outside the lock is the "claimed but not
+	 *   linked" defect the MCAS arm's history records, and it corrupted the
+	 *   list by splicing a node whose prev/next were still NULL.)
+	 *
+	 * A failed claim means DEAD, or already ON/SHRINK somewhere: in every
+	 * case there is nothing to do, which is also what makes lru_listed()
+	 * safe to consult as a mere hint.
+	 */
+	if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF, DC_LRU_ON(idx)) !=
+	    DC_LRU_OFF) {
 		lru_unlock(sh);
 		return;
 	}
@@ -813,12 +968,20 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 		sh->head = d;
 	sh->tail = d;
 	sh->count++;
-	d->d_lru.shard = DC_LRU_ON(idx);
 	lru_unlock(sh);
 }
 
-/* Splice out, wherever it sits.  Caller holds @sh. */
-static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
+/*
+ * Splice out, wherever it sits, and leave the word at @newst.  Caller holds @sh.
+ *
+ * ⚠ @newst is a PARAMETER rather than a hardcoded DC_LRU_OFF because a killer
+ * must not let the word pass through OFF on its way to DEAD: an adder holding
+ * some OTHER shard's lock would see the transient, win the claim, and link a
+ * dentry already queued for reclaim.  DC_LRU_OFF is right only when @d is
+ * genuinely alive and re-armable (the shrinker's LRU_REMOVED case).
+ */
+static void lru_unlink_locked_to(struct dc_lru_shard *sh, struct dentry *d,
+				 unsigned int newst)
 {
 	if (d->d_lru.prev)
 		d->d_lru.prev->d_lru.next = d->d_lru.next;
@@ -829,8 +992,90 @@ static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
 	else
 		sh->tail = d->d_lru.prev;
 	d->d_lru.prev = d->d_lru.next = NULL;
-	d->d_lru.shard = DC_LRU_OFF;
+	uatomic_store(&d->d_lru.shard, newst, CMM_RELAXED);
 	sh->count--;
+}
+
+/* @d stays alive and re-armable: the shrinker's LRU_REMOVED, and lru_rotate. */
+static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
+{
+	lru_unlink_locked_to(sh, d, DC_LRU_OFF);
+}
+
+/*
+ * Take @d off the LRU, and answer whether the caller may still free it.
+ *
+ * @freeing says whether the caller was ABOUT TO call_rcu @d.  It has to be told,
+ * because the answer is a TRANSFER of that obligation, not advice: when the
+ * shrinker holds @d, this marks the debt and returns 0, and the shrinker frees
+ * it instead.  That is mainline __dentry_kill's
+ *
+ *	if (dentry->d_flags & DCACHE_SHRINK_LIST) { ... can_free = false; }
+ *
+ * with shrink_dentry_list finishing the kill.  A caller that was not going to
+ * free @d passes 0 and always gets 1 back -- there is nothing to hand over, and
+ * the shrinker simply keeps its victim.
+ *
+ * ⛔ THE TEMPTING WRONG ANSWER is to unlink it here anyway.  A shrink-held
+ * victim is not ON the list, so there is nothing to splice; forcing it OFF only
+ * clears the ownership that stops the shrinker's put-back from resurrecting a
+ * dentry already queued for reclaim.  Disowning IS the bug.
+ */
+static int lru_del_can_free(struct dcache *dc, struct dentry *d, int freeing)
+{
+	for (;;) {
+		unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+		struct dc_lru_shard *sh;
+
+		if (st == DC_LRU_DEAD)
+			return 1;		/* already sealed by a peer */
+		if (st == DC_LRU_OFF) {
+			/*
+			 * ⭐ SEAL IT.  Returning here -- which is what this did
+			 * before -- leaves nothing to stop a concurrent
+			 * lru_retain from claiming @d and enqueueing it on ITS
+			 * OWN shard AFTER we call_rcu.  There is no shard lock
+			 * to take on this branch (no shard owns @d), so the
+			 * word is the only place the exclusion can live.
+			 * Losing this cmpxchg means an adder claimed first --
+			 * re-read and take it off through the shard it named.
+			 */
+			if (uatomic_cmpxchg(&d->d_lru.shard, DC_LRU_OFF,
+					    DC_LRU_DEAD) == DC_LRU_OFF)
+				return 1;
+			continue;
+		}
+		sh = &dc->lru[DC_LRU_SHARD_OF(st)];
+		lru_lock(sh);
+		/*
+		 * ⚠ RE-DERIVE, do not merely re-test.  lru_retain enqueues on the
+		 * CALLER'S shard, so a dentry that left this shard can come back
+		 * on a DIFFERENT one while the lock was down.  The old
+		 * `>= DC_LRU_ON(0)` re-check passed in that case and spliced the
+		 * dentry out of the wrong shard's list.  Compare the WHOLE word,
+		 * which also catches a LINKED -> SHRINK transition on the same
+		 * shard -- exactly the race this function exists to resolve.
+		 */
+		if (uatomic_load(&d->d_lru.shard, CMM_RELAXED) != st) {
+			lru_unlock(sh);
+			continue;
+		}
+		if (DC_LRU_IS_SHRINK(st)) {
+			if (!freeing) {
+				lru_unlock(sh);
+				return 1;	/* nothing to hand over */
+			}
+			uatomic_store(&d->d_lru.shard, st | DC_LRU_KILL_BIT,
+				      CMM_RELAXED);
+			lru_unlock(sh);
+			return 0;		/* HANDED OFF: do not free */
+		}
+		/* ON(i) -> DEAD in one store, never through OFF: see
+		 * lru_unlink_locked_to(). */
+		lru_unlink_locked_to(sh, d, freeing ? DC_LRU_DEAD : DC_LRU_OFF);
+		lru_unlock(sh);
+		return 1;
+	}
 }
 
 /*
@@ -843,20 +1088,13 @@ static void lru_unlink_locked(struct dc_lru_shard *sh, struct dentry *d)
  * memory exactly where a dcache is busiest.  A Harris-style logical mark does not
  * rescue it either: Harris needs every traverser to help unlink, and this list
  * has exactly one traverser.
+ *
+ * For a caller that is about to free @d, use lru_del_can_free() instead -- this
+ * spelling cannot express the handoff and would silently drop it.
  */
 static void lru_del(struct dcache *dc, struct dentry *d)
 {
-	unsigned int idx;
-	struct dc_lru_shard *sh;
-
-	idx = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
-	if (idx < DC_LRU_ON(0))
-		return;				/* not on any shard */
-	sh = &dc->lru[idx - DC_LRU_ON(0)];
-	lru_lock(sh);
-	if (d->d_lru.shard >= DC_LRU_ON(0))	/* re-check under the lock */
-		lru_unlink_locked(sh, d);
-	lru_unlock(sh);
+	(void) lru_del_can_free(dc, d, 0);
 }
 
 unsigned long dc_lru_count(struct dcache *dc)
@@ -870,6 +1108,87 @@ unsigned long dc_lru_count(struct dcache *dc)
 }
 #endif	/* DC_LRU_MCAS */
 
+/*
+ * PROBE (-DDC_LRU_FREE_ASSERT): is @d still owned by the LRU at the instant its
+ * storage is released?
+ *
+ * If it is, free() hands the storage back and the next dentry to land on it is
+ * memset to zero, while the neighbours that pointed at the old node STILL NAME
+ * IT.  On the MCAS arm that surfaces downstream as "a live ring reaches a node
+ * with owner == NULL"; on the lock arm it corrupts the shard's head/tail chain
+ * the same way.  The free callback is the only place that can decide it --
+ * everywhere else the answer is a race.
+ *
+ * ⚠⚠ IT LIVES HERE, ONCE, BECAUSE THE COPY IN ONE ENGINE WAS A VACUOUS ZERO.
+ * This started life inline in dcache_bucketlock.c's dentry_free_cb and was
+ * never added to dcache_txn.c's, whose callback is a bare free().  Two rows of
+ * a handoff table -- "txn MCAS deque 0/5", "txn LOCK 0/5, 0 hits" -- were
+ * therefore reporting that a probe which CANNOT FIRE did not fire.  Both
+ * engines now call this one definition, so the divergence is not expressible.
+ * (The same fn==NULL / dead-probe trap has now cost this project four wrong
+ * negatives; the rule is: verify a probe is live before trusting its zero.)
+ *
+ * ⚠ BOTH ARMS, deliberately.  Asking it only of the MCAS arm invites the
+ * conclusion that the mechanism is at fault, when the question is whether the
+ * PORT lets a dying dentry be re-added -- a property of retain_dentry's policy
+ * and of the shrinker's isolate, not of the structure underneath.
+ */
+static void lru_assert_not_queued(struct dentry *d)
+{
+#ifdef DC_LRU_FREE_ASSERT
+	int reachable = -1;
+#ifdef DC_LRU_MCAS
+	struct urcu_txn_deque *q = urcu_txn_deque_owner(&d->d_lru.dnode);
+	void *a = uatomic_load((void **) &d->d_lru.dnode.next, CMM_RELAXED);
+	void *b = uatomic_load((void **) &d->d_lru.dnode.prev, CMM_RELAXED);
+	int queued = q != NULL;
+#else
+	unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+	void *q = (void *) (uintptr_t) st;
+	void *a = uatomic_load(&d->d_lru.next, CMM_RELAXED);
+	void *b = uatomic_load(&d->d_lru.prev, CMM_RELAXED);
+	int queued = DC_LRU_IS_OWNED(st);
+#endif
+
+	if (caa_likely(!queued))
+		return;
+#ifndef DC_LRU_MCAS
+	/*
+	 * SECOND, INDEPENDENT WITNESS on the lock arm: the state word says
+	 * "owned", but the word is exactly the thing that could be stale.  Walk
+	 * the shard it names, under that shard's lock, and report whether the
+	 * chain really reaches @d.  One probe is not a finding, and this claim
+	 * -- that the LOCK arm, the honest A/B control, frees owned dentries --
+	 * is too consequential to rest on a word.
+	 *
+	 * A SHRINK-held victim is legitimately unreachable (it is off the list
+	 * by design), so chain-reachable=0 with the shrink bit set means the
+	 * handoff was missed, not that the list is corrupt.  The state word is
+	 * printed raw so the two cases are distinguishable.
+	 */
+	if (dc_lru_validate_dc) {
+		struct dc_lru_shard *sh =
+			&dc_lru_validate_dc->lru[DC_LRU_SHARD_OF(st)];
+		struct dentry *w;
+		unsigned long hop = 0;
+
+		lru_lock(sh);
+		reachable = 0;
+		for (w = sh->head; w && hop++ < 100000; w = w->d_lru.next) {
+			if (w == d) { reachable = 1; break; }
+		}
+		lru_unlock(sh);
+	}
+#endif
+	fprintf(stderr,
+		"FREE-WHILE-QUEUED d=%p owner=%p next=%p prev=%p "
+		"chain-reachable=%d\n",
+		(void *) d, (void *) q, a, b, reachable);
+	abort();
+#else
+	(void) d;
+#endif	/* DC_LRU_FREE_ASSERT */
+}
 
 #else	/* DC_NO_LRU: the A/B control -- no LRU field, no rseq, no shrinker */
 static inline void lru_retain(struct dcache *dc, struct dentry *d)
@@ -878,6 +1197,9 @@ static inline void lru_add(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_del(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
+static inline int lru_del_can_free(struct dcache *dc, struct dentry *d, int f)
+{ (void) dc; (void) d; (void) f; return 1; }
+static inline void lru_assert_not_queued(struct dentry *d) { (void) d; }
 unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 const int dc_lru_inuse_is_removed = 1;

@@ -1721,7 +1721,15 @@ out:
 
 static void dentry_free_cb(struct rcu_head *rh)
 {
-	free(caa_container_of(rh, struct dentry, d_rcu));
+	struct dentry *d = caa_container_of(rh, struct dentry, d_rcu);
+
+	/* -DDC_LRU_FREE_ASSERT; inert otherwise.  ⚠ THIS ENGINE HAD NO PROBE AT
+	 * ALL until now -- the callback was a bare free() while the identical
+	 * question was being asked, and answered, only in dcache_bucketlock.c.
+	 * Every "txn ... 0 hits" figure taken before this line existed is a
+	 * vacuous zero.  See lru_assert_not_queued() in dcache_lru.h. */
+	lru_assert_not_queued(d);
+	free(d);
 }
 
 /*
@@ -1748,7 +1756,7 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
 	struct urcu_txn txn;
-	int settled, ret;
+	int settled, ret, can_free;
 
 	if (path->ndepth == 0)
 		return -EINVAL;
@@ -1829,12 +1837,20 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	/* PHASE 3: off the LRU IMMEDIATELY, never lazily -- the call_rcu free
 	 * below cannot fire while a shard still points at the node, so deferring
 	 * this to the shrinker would gate reclaim on memory pressure instead of
-	 * on the grace period (design/dcache-lru-txn.md section 6). */
-	lru_del(dc, host);
+	 * on the grace period (design/dcache-lru-txn.md section 6).
+	 *
+	 * ⭐ ... EXCEPT when the shrinker is already holding @host, in which case
+	 * the free is DELEGATED, not taken: lru_del_can_free() answers 0 and the
+	 * shrinker call_rcu's it.  Mainline __dentry_kill's `can_free = false`
+	 * for a dentry on a shrink list; disowning it here instead is the
+	 * free-while-queued defect.  (LOCK arm only -- the MCAS arm's deque
+	 * supplies the same ownership from inside the commit and always
+	 * answers 1.) */
+	can_free = lru_del_can_free(dc, host, settled);
 	if (top != host)
 		lru_del(dc, top);
 	rcu_read_unlock();
-	if (settled)				/* host has no fold queued: free it */
+	if (settled && can_free)		/* host has no fold queued: free it */
 		call_rcu(&top->d_rcu, dentry_free_cb);
 	/* else: top is a shell; its pending fold RECLAIMs the orphaned chain */
 	return 0;
