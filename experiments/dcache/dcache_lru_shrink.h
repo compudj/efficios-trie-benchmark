@@ -122,7 +122,13 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			 * deque removed the cause or merely the symptom.
 			 */
 			if (lru_evict_settled(dc, victim) == 0) {
-				lru_del(dc, victim);
+				/* ⭐ SEAL, not a plain remove: lru_evict_settled
+				 * has ALREADY call_rcu'd @victim, so between a
+				 * bare remove and the free a peer's lru_retain
+				 * could push it straight back on.  That was the
+				 * measured pusher.  lru_del_can_free(.., 1)
+				 * removes and poisons `owner` in ONE commit. */
+				(void) lru_del_can_free(dc, victim, 1);
 				freed++;
 			} else {
 				(void) lru_dq_rotate(dc, q);

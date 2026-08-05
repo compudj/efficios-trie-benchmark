@@ -836,6 +836,18 @@ check-deque: test_deque.c $(URCU_DEP) | check-lib
 	@./test_deque_noseq && \
 	  echo "  NOTE: passes without the seq guard -- the guard remains UNPROVEN" \
 	  || { echo "  the seq guard is LOAD-BEARING -- record this"; exit 1; }
+	@echo "--- test_deque: SEAL retire (owner poison replaces GP #1) ---"
+	$(CC) $(CFLAGS) -DNWRITERS=32 -DDEQUE_SEAL_RETIRE $(CPPFLAGS) \
+	  -o test_deque_seal test_deque.c $(LDFLAGS) $(LDLIBS)
+	./test_deque_seal
+	@echo "--- test_deque: CONTROL -- GP #1 dropped WITHOUT the seal (must FAIL) ---"
+	$(CC) $(CFLAGS) -DNWRITERS=32 -DDEQUE_NO_GP1 $(CPPFLAGS) \
+	  -o test_deque_nogp1 test_deque.c $(LDFLAGS) $(LDLIBS)
+	@timeout 90 ./test_deque_nogp1 >/dev/null 2>&1 && { \
+	  echo "  CONTROL PASSED -- GP #1 is NOT load-bearing, so the seal arm"; \
+	  echo "  above proves NOTHING.  Do not claim the seal replaced it."; \
+	  exit 1; } || \
+	  echo "  control does not complete, as required: the seal arm is meaningful"
 	@echo "--- test_deque: ASan ---"
 	$(CC) $(ASANFLAGS) -DNWRITERS=8 $(CPPFLAGS) -o test_deque_asan \
 	  test_deque.c $(LDFLAGS) $(LDLIBS)

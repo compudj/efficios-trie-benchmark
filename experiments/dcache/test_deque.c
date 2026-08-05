@@ -339,7 +339,9 @@ static int remove_dbg(struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
  */
 static int remove_by_hint(struct warg *w, struct item *it)
 {
-	struct urcu_txn_deque *q = urcu_txn_deque_owner(&it->dn);
+	/* queued(), not owner(): a sealed node is owned by nothing, and asking
+	 * the wrong question here would hand remove_dbg() the POISON value. */
+	struct urcu_txn_deque *q = urcu_txn_deque_queued(&it->dn);
 
 	if (!q)
 		return -ENOENT;
@@ -347,7 +349,7 @@ static int remove_by_hint(struct warg *w, struct item *it)
 		int ret = remove_dbg(q, &it->dn);
 
 		if (ret == -ENOENT &&
-		    urcu_txn_deque_owner(&it->dn) != NULL)
+		    urcu_txn_deque_queued(&it->dn) != NULL)
 			w->hintmiss++;	/* it migrated under the hint */
 		return ret;
 	}
@@ -357,7 +359,8 @@ static int remove_by_hint(struct warg *w, struct item *it)
  * RETIRE AND REUSE -- the axis that models call_rcu handing a node's storage to
  * a new object.
  *
- * TWO GRACE PERIODS, and getting this wrong cost a debugging round, so both are
+ * TWO GRACE PERIODS by default, and getting this wrong cost a debugging round,
+ * so both are
  * spelled out:
  *
  *   unpublish       state LIVE -> RETIRING, so nobody NEW can select the node;
@@ -383,19 +386,61 @@ static void retire_and_reuse(struct warg *w, struct item *it)
 {
 	if (uatomic_cmpxchg(&it->state, ITEM_LIVE, ITEM_RETIRING) != ITEM_LIVE)
 		return;				/* a peer is retiring it */
-	synchronize_rcu();			/* GP #1: drain would-be pushers */
+#if !defined(DEQUE_SEAL_RETIRE) && !defined(DEQUE_NO_GP1)
+	/*
+	 * GP #1: drain would-be pushers.  Needed ONLY because a plain remove
+	 * leaves owner == NULL, which is exactly what a push wants -- so
+	 * without a grace period here a thread that read the node before we
+	 * started can still push it after our removal loop finishes.
+	 *
+	 * -DDEQUE_SEAL_RETIRE drops it and seals instead, which is the whole
+	 * point of the seal: it makes "no push may ever queue this again" a
+	 * postcondition of a commit rather than of a grace period.  That arm is
+	 * the load-bearing test of URCU_TXN_DEQUE_POISON -- if it passes, the
+	 * seal really did replace this synchronisation; if it corrupts, it did
+	 * not, and no amount of reading the header would have told us.
+	 */
+	synchronize_rcu();
+#endif
 	for (;;) {
 		struct urcu_txn_deque *q;
+		int r;
 
 		rcu_read_lock();
-		q = urcu_txn_deque_owner(&it->dn);
+		/*
+		 * ⚠ queued(), NOT owner().  A sealed node has a non-NULL owner
+		 * and belongs to no deque, so the old `while (owner(n))` shape
+		 * spins for ever the moment the seal arm is built.
+		 */
+		q = urcu_txn_deque_queued(&it->dn);
+#ifdef DEQUE_SEAL_RETIRE
+		r = q ? urcu_txn_deque_remove_seal(q, &it->dn, &g_domain)
+		      : urcu_txn_deque_seal(&it->dn, &g_domain);
+		rcu_read_unlock();
+		/* 0 or -ESTALE: sealed, and nothing can push it again.
+		 * -ENOENT (a peer removed it) / -EEXIST (a peer pushed it):
+		 * re-read and take the other branch.  Bounded, because each
+		 * outcome that retries requires a peer to have won a CAS. */
+		if (r == 0 || r == -ESTALE)
+			break;
+#else
 		if (!q) {
 			rcu_read_unlock();
 			break;
 		}
-		(void) remove_dbg(q, &it->dn);
+		r = remove_dbg(q, &it->dn);
+		(void) r;
 		rcu_read_unlock();
+#endif
 	}
+#ifdef DEQUE_SEAL_RETIRE
+	if (!urcu_txn_deque_sealed(&it->dn)) {
+		fprintf(stderr, "FAIL: node %lu left the retire loop UNSEALED "
+			"(owner=%p)\n", it->id,
+			(void *) urcu_txn_deque_owner(&it->dn));
+		abort();
+	}
+#endif
 	synchronize_rcu();			/* GP #2: drain pointer holders */
 	/*
 	 * AUDIT THE HARNESS BEFORE BLAMING THE STRUCTURE.  Re-initialising a

@@ -403,6 +403,9 @@ static inline int lru_listed(struct dentry *d)
 	 * writer's descriptor -- so this read needs RCU even though it reads no
 	 * neighbour.  Nested inside a caller's section under QSBR: a counter. */
 	rcu_read_lock();
+	/* owner(), so this answers "queued OR SEALED" -- both of which mean
+	 * "do not re-arm", which is exactly what lru_retain wants.  Anything
+	 * asking the MEMBERSHIP question must use urcu_txn_deque_queued(). */
 	on = urcu_txn_deque_owner(&d->d_lru.dnode) != NULL;
 	rcu_read_unlock();
 	return on;
@@ -447,9 +450,17 @@ static inline void lru_retain(struct dcache *dc, struct dentry *d)
 	 *                              it only for reproducing old results).
 	 */
 #if defined(DC_LRU_MCAS) && !DC_LRU_ALIVE_TRANSACTED && \
-	!defined(DC_LRU_MCAS_RETAIN_READD)
+	defined(DC_LRU_NO_DEQUE_SEAL) && !defined(DC_LRU_MCAS_RETAIN_READD)
 	/*
-	 * ⛔ NO RE-ARM WHEN THE ENGINE CANNOT TRANSACT THE LIVENESS GUARD.
+	 * ⛔ NO RE-ARM WHEN THE ENGINE CANNOT TRANSACT THE LIVENESS GUARD
+	 * *AND* THE DEQUE SEAL IS DISABLED (-DDC_LRU_NO_DEQUE_SEAL).
+	 *
+	 * ⭐ THE SEAL RETIRED THIS.  urcu_txn_deque_remove_seal_prepare() poisons
+	 * `owner` in the same commit that unlinks, so a push after the kill is
+	 * refused by the engine rather than by a guard that has to be read
+	 * early.  With it, the re-arm is safe on BOTH engines and is kept -- the
+	 * branch below survives only as the A/B arm that shows what the seal is
+	 * worth.  See lru_del_can_free().
 	 *
 	 * This was the last free-while-queued pusher on the MCAS arm.  The
 	 * guard in lru_push_prepare() has to be part of the SAME COMMIT as the
@@ -700,6 +711,25 @@ static int lru_dq_remove(struct dcache *dc, struct urcu_txn_deque *q,
 		urcu_txn_deque_remove_prepare(&txn, q, n))
 }
 
+#ifndef DC_LRU_NO_DEQUE_SEAL
+/*
+ * The two halves of a KILL: take @n off (if it is on) and make it unpushable,
+ * in ONE commit either way.  See lru_del_can_free().
+ */
+static int lru_dq_remove_seal(struct dcache *dc, struct urcu_txn_deque *q,
+			      struct urcu_txn_deque_node *n)
+{
+	LRU_DQ_BRACKET(DC_TS_LRU_DEL, dc,
+		urcu_txn_deque_remove_seal_prepare(&txn, q, n))
+}
+
+static int lru_dq_seal(struct dcache *dc, struct urcu_txn_deque_node *n)
+{
+	LRU_DQ_BRACKET(DC_TS_LRU_DEL, dc,
+		urcu_txn_deque_seal_prepare(&txn, n))
+}
+#endif	/* !DC_LRU_NO_DEQUE_SEAL */
+
 static int lru_dq_rotate(struct dcache *dc, struct urcu_txn_deque *q)
 {
 	LRU_DQ_BRACKET(DC_TS_LRU_ROT, dc,
@@ -771,7 +801,9 @@ static int lru_try_del(struct dcache *dc, struct dentry *d)
 	int r;
 
 	rcu_read_lock();
-	q = urcu_txn_deque_owner(&d->d_lru.dnode);
+	/* queued(), NOT owner(): a SEALED node has a non-NULL owner and is on
+	 * no deque, so owner() would hand lru_dq_remove the poison value. */
+	q = urcu_txn_deque_queued(&d->d_lru.dnode);
 	r = q ? lru_dq_remove(dc, q, &d->d_lru.dnode) : -ENOENT;
 	/* Inside the read section: see lru_add_at(). */
 	if (r == 0)
@@ -802,32 +834,70 @@ static int lru_try_del(struct dcache *dc, struct dentry *d)
  */
 static void lru_del(struct dcache *dc, struct dentry *d)
 {
-	while (lru_listed(d))
+	/* ⚠ NOT lru_listed(): that answers "queued OR sealed", and a sealed
+	 * node never leaves, so this loop would never terminate. */
+	while (urcu_txn_deque_queued(&d->d_lru.dnode))
 		(void) lru_try_del(dc, d);
 }
 
 /*
- * The MCAS arm never hands a free off, so this always answers "yes, free it".
+ * The MCAS arm never hands a free OFF -- it always answers "yes, free it" --
+ * but when the caller really is freeing, it must also make the node
+ * UNPUSHABLE, and that is what @freeing selects.
  *
- * It is not that the arm was careful; it is that the deque already supplies the
- * ownership the lock arm has to spell out.  Two things do it: the sweeper here
- * EVICTS BEFORE REMOVING, so a victim is still queued for the whole eviction and
- * never ownerless; and urcu_txn_deque_remove's `&n->owner : q -> NULL` record
- * makes exactly ONE remover win, so "took it off" and "may free it" are the same
- * answer from the same commit.
+ * ⭐ THE SEAL IS WHY THIS ARM CAN KEEP lru_retain's RE-ARM.  A plain remove
+ * leaves `owner` NULL, which is exactly what a push wants, so between the
+ * remove and the call_rcu a concurrent push may legitimately queue storage that
+ * is already condemned.  No check outside the commit closes that; it narrows
+ * it, and this port shipped the narrowed version and measured it firing.
+ * urcu_txn_deque_remove_seal_prepare() writes `owner : q -> POISON` in the SAME
+ * three-slot commit as the unlink, so there is no instant at which a push can
+ * win -- the deque's own analogue of the LOCK arm's terminal DC_LRU_DEAD.
  *
- * ⛔ AND THAT IS PRECISELY WHY EVICT-FIRST DOES NOT PORT TO THE LOCK ARM -- it
- * was tried, measured, and reverted (no improvement, 5/5 SEGV inside
- * urcu_txn_install_mw_depth on a dangling slot).  There, isolation WAS the
- * ownership, so evicting first removes it with nothing to replace it and many
- * sweepers evict one victim at once.  The lock arm needs the shrink state
- * instead; see lru_del_can_free() in the other half of this file.
+ * Two entry points because the node may or may not currently be queued, and
+ * the loop is bounded: every outcome that retries requires a peer to have won
+ * a CAS on the one slot both sides contend.
+ *
+ * ⛔ EVICT-FIRST STILL DOES NOT PORT TO THE LOCK ARM -- tried, measured,
+ * reverted (no improvement, 5/5 SEGV inside urcu_txn_install_mw_depth on a
+ * dangling slot).  There, isolation WAS the ownership, so evicting first
+ * removes it with nothing to replace it and many sweepers evict one victim at
+ * once.  That arm uses the shrink state instead; see the other half of this
+ * file.
  */
 static int lru_del_can_free(struct dcache *dc, struct dentry *d, int freeing)
 {
-	(void) freeing;
+	if (!freeing) {
+		lru_del(dc, d);
+		return 1;
+	}
+#ifdef DC_LRU_NO_DEQUE_SEAL
+	/* A/B ARM: the pre-seal behaviour -- remove, then free, with the window
+	 * between them open.  Pair with -DDC_LRU_MCAS_RETAIN_READD to reproduce
+	 * the defect the seal closes. */
 	lru_del(dc, d);
 	return 1;
+#else
+	for (;;) {
+		struct urcu_txn_deque *q;
+		int r;
+
+		rcu_read_lock();
+		q = urcu_txn_deque_queued(&d->d_lru.dnode);
+		r = q ? lru_dq_remove_seal(dc, q, &d->d_lru.dnode)
+		      : lru_dq_seal(dc, &d->d_lru.dnode);
+		rcu_read_unlock();
+		if (r == 0) {
+			if (q)
+				uatomic_dec(&q->count);
+			return 1;
+		}
+		if (r == -ESTALE)		/* a peer sealed it already */
+			return 1;
+		/* -ENOENT: removed under us.  -EEXIST: pushed under us.
+		 * -ENOMEM: transient.  Re-derive and take the other branch. */
+	}
+#endif
 }
 
 /*
@@ -1224,7 +1294,15 @@ static void lru_assert_not_queued(struct dentry *d)
 #ifdef DC_LRU_FREE_ASSERT
 	int reachable = -1;
 #ifdef DC_LRU_MCAS
-	struct urcu_txn_deque *q = urcu_txn_deque_owner(&d->d_lru.dnode);
+	/*
+	 * ⚠ queued(), NOT owner().  A SEALED node has a non-NULL owner and is on
+	 * no deque -- which is the state a correctly-killed dentry is SUPPOSED
+	 * to be freed in, so asking owner() here makes this probe fire on every
+	 * single free.  It did: 10/10 immediately after the seal landed, which
+	 * looked exactly like the seal having failed rather than the probe
+	 * having asked the wrong question.
+	 */
+	struct urcu_txn_deque *q = urcu_txn_deque_queued(&d->d_lru.dnode);
 	void *a = uatomic_load((void **) &d->d_lru.dnode.next, CMM_RELAXED);
 	void *b = uatomic_load((void **) &d->d_lru.dnode.prev, CMM_RELAXED);
 	int queued = q != NULL;

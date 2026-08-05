@@ -22,7 +22,9 @@ Commits, all UNPUSHED, oldest first:
     7b43b89  consolidate the handoff around the current position
     9f62bc7  close the LOCK arm: shrink-list handoff + DEAD seal
     cc6778f  root-cause the stale-d_parent UAF: a guard pair on the parent
-    (this)   close the MCAS arm: no re-arm where the guard cannot be transacted
+    3e72f00  close the MCAS arm: no re-arm where the guard cannot be transacted
+    (this)   use the deque seal; bucketlock keeps its re-arm
+             (liburcu side: urcu-txn-dev d9dd1a9e)
 
 ---
 
@@ -207,56 +209,70 @@ and read atomically without it — `sh->count` (`dc_lru_count`) and
 `d_lru.referenced` (`lru_retain` vs the shrinker's clear). Both deliberately
 approximate. Worth a `uatomic_*` pass for cleanliness; neither is a bug.
 
-## ✅ RESOLVED — the MCAS arm's residual: an untransactable liveness guard
+## ✅ RESOLVED — the MCAS arm, and then PROPERLY, with a deque seal
 
-`lru_retain`'s re-arm was the last pusher on the MCAS arm. `lru_push_prepare`'s
-guard has to be in the SAME COMMIT as the edges, and on **bucketlock it cannot
-be**: `bl_hlist_del_locked` writes `d_hash.next` with a plain store, so an MCAS
-proxy there would be clobbered and the settle would resurrect a deleted node.
-The guard therefore only NARROWS, and a dentry unhashed between the read and the
-commit still gets pushed. The witness said exactly that — `owner == next ==
-prev`, i.e. the victim was the SOLE element of its shard, freshly pushed.
+`lru_retain`'s re-arm was the last pusher. `lru_push_prepare`'s guard must be in
+the SAME COMMIT as the edges, and on **bucketlock it cannot be**:
+`bl_hlist_del_locked` plain-stores `d_hash.next`, so an MCAS proxy there would
+be clobbered and the settle would resurrect a deleted node. The witness said so
+directly — `owner == next == prev`, the victim was the SOLE element of its
+shard, freshly pushed.
 
-⚠⚠ **NATURAL TIMINGS COULD NOT GATE THIS, and nearly produced a fifth wrong
-negative.** The rate is ~2 in 64 runs. A 40-trial mutation test returned
-**0/40 for the fix AND 0/40 for the control** — the arm that should fail,
-passed. Reporting that as a fix would have been exactly the trap this file keeps
-recording.
+⚠⚠ **NATURAL TIMINGS COULD NOT GATE THIS.** The rate is ~2 in 64 runs, and a
+40-trial mutation test returned **0/40 for the fix AND 0/40 for the control**.
+Settled instead with `-DDC_LRU_PUSH_DELAY`, a targeted REPRODUCER that widens
+the read→commit window. ⚠ A reproducer argues ONE way only: firing proves the
+race and identifies the closing build; not firing says nothing about shipped
+timings.
 
-⭐⭐ Settled with `-DDC_LRU_PUSH_DELAY`, a TARGETED REPRODUCER that widens the
-window between the liveness read and the commit. 48w/48r `--evict continuous`,
-10 runs:
+`3e72f00` fixed it by DROPPING the re-arm where the engine cannot transact the
+guard (`DC_LRU_ALIVE_TRANSACTED`). **That is now the fallback, not the fix.**
+
+### ⭐⭐ The real fix: `URCU_TXN_DEQUE_POISON` (liburcu `d9dd1a9e`)
+
+`owner` gave push and remove a shared exclusion point but could not say "and
+never again", because its free value is NULL and NULL is what a push wants. It
+now takes a terminal third value:
+
+    urcu_txn_deque_remove_seal_prepare()   owner : d    -> POISON
+    urcu_txn_deque_seal_prepare()          owner : NULL -> POISON
+
+`remove_seal` is the SAME three-slot commit as `remove` with one different
+expected-new — not a second operation layered on it, because the instant between
+a remove and a separate seal is exactly the window being closed. `push_tail`
+then answers `-ESTALE` (deliberately not `-EEXIST`: one means try later, the
+other means never). This is the deque's analogue of the LOCK arm's terminal
+`DC_LRU_DEAD`.
+
+With it, `lru_del_can_free(dc, d, 1)` removes-and-seals in one commit, the
+shrinker's post-eviction removal seals too, and **both engines keep
+`lru_retain`'s re-arm**. `-DDC_LRU_PUSH_DELAY`, bucketlock + MCAS, re-arm
+ACTIVE, 10 runs:
 
 | build | fires |
 |---|---|
-| bucketlock, re-arm restored (plain guard) | **10/10** |
-| bucketlock, re-arm removed (shipped) | 0/10 |
-| **txn, re-arm restored (transacted guard)** | **0/10** |
+| `-DDC_LRU_NO_DEQUE_SEAL` (the A/B arm) | **10/10** |
+| seal on (shipped) | **0/10** |
 
-⚠ A reproducer only ever argues ONE way: firing says the race is real and says
-which build closes it; not firing says nothing about shipped timings. Never
-quote a rate measured under it.
+⚠⚠ **`owner != NULL` NO LONGER MEANS "QUEUED"** — it means "queued OR sealed".
+Use `urcu_txn_deque_queued()` for membership; `while (owner(n)) remove(n);`
+spins for ever on a sealed node. This bit immediately and instructively: the
+FREE_ASSERT probe itself asked `owner() != NULL`, so it fired 10/10 the moment
+the seal landed — **which looked exactly like the seal having failed rather than
+the probe asking the wrong question.** A sealed node being freed is the
+CORRECT state.
 
-That third row is why the fix is CONDITIONAL, not blanket. The engines now
-declare `DC_LRU_ALIVE_TRANSACTED` (bucketlock 0, txn 1) and the header BRANCHES
-on it: an engine that cannot transact the guard gets `lru_retain`'s re-arm
-compiled out; one that can keeps it, and keeps its LRU accuracy. The two
-spellings of `lru_alive_validate` were already documented as different — this
-makes the difference load-bearing and measured.
+The seal is terminal PER LIFETIME, not per address: `node_init` clears it, which
+is both correct and the only way to reuse a node — the same rule `seq` has.
 
-The cost on bucketlock is near zero, and structurally so: **nothing takes a live
-dentry off the deque on that arm.** The shrinker ROTATES in-use entries instead
-of removing them (`dc_lru_inuse_is_removed == 0`) and `lru_del` runs only from
-`dc_unlink`, on a dentry that is dying anyway. The only node the re-arm could
-legitimately serve is one that never got on (`lru_add` answered -ENOMEM), which
-now stays un-evictable until it is unlinked.
+### The deque test proves the seal replaces a grace period
 
-⭐ **The principled fix, not taken, is a liburcu change**: a remove-to-POISON
-variant in `<urcu/rcu-txn-deque.h>`. `push_tail_prepare` CASes `&n->owner : NULL
--> d`, so any non-NULL sentinel makes it answer -EEXIST — the deque analogue of
-the LOCK arm's terminal `DC_LRU_DEAD`. Today `owner` has no poison value and
-nothing can install one in the same commit that removes, which is the whole
-reason bucketlock has to drop the re-arm instead. That would let it keep it.
+`test_deque`'s retire path needed TWO grace periods, the first purely to drain
+would-be pushers — the same window. `-DDEQUE_SEAL_RETIRE` drops it and seals
+instead: PASS at 2/8/32 writers, ~100k retire/reuse cycles each. ⭐ And the
+CONTROL is what makes that meaningful: `-DDEQUE_NO_GP1` drops the same grace
+period WITHOUT sealing and **does not complete** (unbounded `REMOVE ABORT`). Both
+are gates. Had the control passed, the seal arm would have proved nothing.
 
 Shipped default, `-DDC_LRU_FREE_ASSERT`, 48w/48r, 8 trials, ALL FOUR ARMS x BOTH
 cadences: **0/8 everywhere.**
@@ -417,7 +433,8 @@ REQUIRES rebuilding the library with it.
     make check                # 1 PASS (394 checks)
     make check-bucketlock     # 8 PASS
     make check-lru-arms       # 9 PASS + 2 ASan stress
-    make check-deque          # 8 arms PASS
+    make check-deque          # 10 arms PASS (incl. the seal arm + its control)
+    make check-deque-tsan     # 4 arms, 0 warnings
 
 Plus: `-Wall -Wextra` clean across {bucketlock, txn} × {lock, MCAS, DC_NO_LRU} ×
 {with, without FREE_ASSERT}.
