@@ -388,10 +388,53 @@ worsened. Nothing in today's correctness work depends on it — the
 free-while-queued closure is mutation-proven on the lock arms and via the seal,
 and the fold fix is 4/4-detected by its own gate on both engines.
 
-⭐ **NEXT, and the order matters:** do NOT try to fix it yet. Make it MEASURABLE
-first — a campaign large enough to separate the two failure modes, and ideally a
-targeted reproducer for the conservation failure the way `-DDC_LRU_PUSH_DELAY`
-was built for the push race. Chasing it at n=6 will keep generating stories.
+### ✅ MEASURABLE NOW, and it named itself immediately
+
+The harness was already more informative than the grep being applied to it: it
+distinguishes STATE MISMATCH from CENSUS MISMATCH, and the timeout path sends
+SIGTERM, which the bench handles with a full TXNSTATS + LRUCHK dump. Both were
+being discarded by grepping for the verdict line. (Same error as grepping a
+backtrace for the symbol I expected — twice in one session.)
+
+Keeping the output, 24 trials: **9 of 11 non-passes are ONE signature**, and
+STATE MISMATCH never fires:
+
+    CENSUS MISMATCH: 0 missing, 1-2 extra, 0 stray, 0 dup
+
+`d789a58` makes it self-diagnosing — the anomaly now prints the offending slot,
+what `dc_lookup` says, and the owner's last op with its return:
+
+    EXTRA gid=521 dir=9 lookup=0 id=... last-op=add last-ret=0
+
+⛔ **RETRACTED before it was written down:** "extra is a harness accounting
+artifact" — the owner clears `present[]` on `-ENOENT` from unlink, which under
+eviction can mean THE PREFIX went rather than the leaf, and the reconciliation
+pass only ever corrects present→absent, never the reverse. Good story; wrong.
+The last op is a **successful add** (ret 0), reproducibly across three captures.
+
+**What the signature actually says:** `dc_lookup` answers `DC_ABSENT` at the
+slot's path while `dc_walk` reaches the id — and `census_cb` keys on ID and
+ignores the path, so the entry is genuinely in the tree. `missing=0`, `stray=0`,
+`dup=0` throughout. **The name-hash index and the child list disagree about one
+entry.**
+
+⭐⭐ **AND IT IS THE MCAS LRU ARM, NOT THE INDEX ENGINE.** 6 trials each:
+
+| arm | EXTRA |
+|---|---|
+| txn **lock** | 0/6 |
+| txn **MCAS** | 1/6 |
+| bucketlock **MCAS** | **3/6** |
+| bucketlock **lock** | 0/6 |
+
+Only with `-DDC_LRU_MCAS`, on BOTH index engines, never on either lock arm.
+That is a sharp starting point: the LRU is supposed to touch the index only
+through `lru_evict_settled`, so look there and at the MCAS shrinker's
+evict-before-remove ordering first.
+
+⚠ Do NOT reconcile "extra" away in the harness to make the gate green — "extra"
+is also exactly what a resurrect-after-delete looks like, which is why the
+provenance print exists instead.
 
 ### Previously recorded under this item, and NOT retracted
 
