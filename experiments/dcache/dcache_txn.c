@@ -154,6 +154,28 @@ void (*dc_test_del_hook)(void);
  * tag encoding, so it implies the SPLIT layout.  Retiring d_seq hands its 8
  * bytes to the name (DC_NAME_MAX 40).
  */
+/*
+ * ⭐ THE PARENT SEAL IS ON BY DEFAULT.  It closes the stale-d_parent
+ * use-after-free -- an eviction freeing a directory that an add is
+ * concurrently publishing a child under -- by having the freeing side SEAL the
+ * victim's child head in its own commit, so the add's EXISTING write to that
+ * slot is the exclusion.  See lru_evict_settled().
+ *
+ * It is on where DC_TXN_PARENT_GUARD (the older, guard-based pair) is off,
+ * because the seal costs nothing measurable and the guard cost 40 points of
+ * liveness:
+ *
+ *   --evict bursty, 48w/48r, 20 trials, runs not finishing in 120s
+ *       unprotected 1/20 · GUARD 9/20 · SEAL 0/20
+ *   -DDC_TXN_PARENT_DELAY_US=5000 reproducer, 6 trials/arm, equal work
+ *       unprotected UAF 6/6 runs (12 occurrences) · SEAL 0/6 (0)
+ *
+ * -DDC_TXN_NO_PARENT_SEAL is the mutation arm: it must fail the reproducer.
+ */
+#ifndef DC_TXN_NO_PARENT_SEAL
+#define DC_TXN_PARENT_SEAL 1
+#endif
+
 #ifdef DC_MARK_GEN
 #define DC_HOT1CL_SPLIT 1
 /*
@@ -1198,8 +1220,21 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 		 * identifies which build closes it.  It says NOTHING about the
 		 * rate at shipped timings.
 		 */
+		/*
+		 * ⚠ SWEEP THIS, do not just crank it.  The delay sits on EVERY
+		 * eviction attempt, so a large one starves the shrinker: fewer
+		 * evictions means fewer chances for an add to land in the gap,
+		 * and past some width the reproducer detects LESS, not more.
+		 * -DDC_TXN_PARENT_DELAY_US selects the width.
+		 */
+#ifndef DC_TXN_PARENT_DELAY_US
+#define DC_TXN_PARENT_DELAY_US 200
+#endif
 		{
-			struct timespec ts = { 0, 200000 };	/* 200 us */
+			struct timespec ts = {
+				DC_TXN_PARENT_DELAY_US / 1000000,
+				(DC_TXN_PARENT_DELAY_US % 1000000) * 1000L,
+			};
 
 			(void) nanosleep(&ts, NULL);
 		}
