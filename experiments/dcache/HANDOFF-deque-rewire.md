@@ -331,6 +331,56 @@ reports 124 as WEDGED rather than hanging or silently passing.
 just changed is not evidence the change caused it — measure the arm you did NOT
 change.**
 
+### ✅ TSAN residue of the seal: NO NEW RACE SHAPE (and a pre-existing one found)
+
+⚠ The only TSAN data on the seal at first came from a REPRODUCER binary with a
+5 ms sleep injected, where only `heap-use-after-free` was counted and 33 `data
+race` warnings were ignored. A default was flipped on a partially-read run, so
+this is the sweep that closes that: plain TSAN, seal ON vs OFF, 3 runs each,
+8w/8r/15s/cap 8.
+
+⚠⚠ **COUNTS ARE USELESS HERE** — off 132/128/98, on 116/12/98. The overlap says
+nothing. Compare SHAPES.
+⭐ And the shape function matters: hashing whole CALL STACKS reported ten shapes
+the seal had supposedly *removed*, which is nonsense — stacks differ by inlining
+and caller. The right key is the **pair of racing ACCESS SITES** (the `#0` frame
+of each access).
+
+    distinct access-site pairs   sealoff 15 · sealon 15
+    pairs only with the seal     ONE, seen once:
+                                 dc_lru_count <-> lru_link_tail_locked
+
+and `dc_lru_count` already races with two OTHER link sites on BOTH arms
+(off 7/on 4, off 2/on 3). Same field, same family, n=1 — not a new race.
+
+⭐⭐ **DECISIVE: the seal's slots never appear as an access site at all.** Every
+racing site across the whole sweep is one of six functions:
+
+    lru_add 79 · lru_unlink_locked_to 47 · lru_shrink_range 32
+    lru_retain 13 · dc_lru_count 8 · lru_link_tail_locked 5
+
+No `d_child_head`, no `lru_evict_settled`, no `dc_add_typed`, no txn commit
+path. ⚠ Beware the obvious grep: `dc_add_typed` DOES appear in these reports —
+in the CALL STACK of a race whose access site is `lru_add`, because dc_add calls
+lru_add. Grepping all frames scores 76 hits and means nothing.
+
+### ▶ OPEN, and NOT the seal's: the txn LRU lock arm has ~100 races/run
+
+This sweep is the first TSAN characterisation of the **txn** engine's LRU lock
+arm; the residue documented earlier in this file (`sh->count` and
+`d_lru.referenced`, both deliberately approximate) was measured on
+**bucketlock**. On txn the set is larger and includes the LRU LIST LINKS
+themselves — `lru_add`'s `d->d_lru.prev/next` and `sh->tail->d_lru.next` against
+`lru_unlink_locked_to`'s stores — at ~20 occurrences for the top pair.
+
+Those are written under a shard lock, so either the two sides hold DIFFERENT
+shard locks (which this file already documents as true — `lru_add` uses the
+CALLER's shard) and the exclusion is the state word rather than the lock, in
+which case TSAN cannot see it; or something is genuinely unguarded. **NOT
+DETERMINED.** It is identical with the seal on and off, so it is pre-existing
+and orthogonal to that change — but "TSAN is clean on the txn engine" is NOT a
+claim this sweep supports, and nobody should quote it as one.
+
 ### TSAN residue (unchanged, not correctness)
 
 Total warnings dropped HEAD 119 → 82 over 3 runs, and the races on the state
