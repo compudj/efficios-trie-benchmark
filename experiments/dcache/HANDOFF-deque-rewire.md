@@ -1,6 +1,6 @@
-# Handoff — free-while-queued CLOSED everywhere; the census anomaly CLOSED too.
+# Handoff — the `--evict continuous` wedge is a LEAKED ESCALATION LANE.
 
-2026-08-05. Written current-state-first: what is true now, then what is open,
+2026-08-06 (was 2026-08-05). Written current-state-first: what is true now, then what is open,
 then the retractions in one place at the end. Read the retractions — five
 confident stories died to controls in the session that produced this file, and
 each control cost minutes. The session AFTER it killed two more, one of them a
@@ -45,6 +45,106 @@ Commits below are in THIS repo (benchmark side), oldest first:
     ee00c67  narrow the census anomaly to the MCAS LRU arm
 
 ---
+
+
+## ▶⭐⭐ 2026-08-06 — THE `--evict continuous` WEDGE: **a leaked escalation lane**
+
+Root-caused under LTTng. **6/6 wedge without the fix, 0/6 with it**
+(`-DDC_NO_LANE_GIVEBACK` is the arm that must wedge).
+
+### What it is
+
+`urcu_txn_end()` KEEPS an escalated handle's lane while the last commit
+ABORTed, so the re-attempt need not go to the back of the FIFO. The lane is
+therefore **operation-scoped, not bracket-scoped**. `rcu-txn.h` states both the
+obligation and the penalty verbatim — end without re-attempting and *"the
+domain's lane is held forever and every other writer parks behind it."*
+
+### Where it leaks — **not at any bail**
+
+The three bails that end their own bracket were already fixed and are NOT the
+wedge. The retry loops **re-decide at their HEAD**, and those head checks exit
+the operation:
+
+    for (;;) {
+            top = find_top_rcu(...);
+            if (!top) { ret = -ENOENT; goto out; }   <-- lane still held
+            ...
+            if (p) { urcu_txn_conflict(&txn);        <-- keeps the turn
+                     urcu_txn_end(&txn);             <-- so end() KEEPS it
+                     continue; }                     <-- re-decides at the TOP
+    }
+
+The `conflict(); end(); continue;` is **correct** — it does re-attempt. The
+lane is lost **one iteration later**, by a `goto out` that knows nothing about
+transactions. A per-bail fix cannot reach it, so `dc_lane_giveback()` puts the
+release at the **operation's exit**, in the only three functions whose retry
+loop can `goto out` with a live handle: `dc_unlink`, `stack_shell`,
+`dc_rename_exchange`.
+
+### ⚠⚠ NECESSARY, NOT PROVEN SUFFICIENT
+
+0/6 under the amplifier, but a later `check-lru-arms` **still wedged
+intermittently** in the MCAS stress arm with the same signature (threads parked
+in `cds_fair_mutex_park` under `urcu_txn_begin`). **At least one more path
+reaches this state.** The probes and mutation knobs are kept in tree for that
+hunt.
+
+### ⭐⭐ The design point, worth raising upstream
+
+The special case conflates **mutual exclusion** with **queue position**, and
+only the position must survive a retry. `conflict()` vs `abandon()` is a
+promise about what happens *after* the bracket closes, made *before* the loop
+head re-decides — **the API asks you to declare your future before you know
+it.** If `cds_fair_mutex` could release the lock while keeping the waiter
+queued, `end()` would always unlock, `retrying` would drop out of the release
+decision, and this defect class would be *unrepresentable*.
+
+### ⛔⭐⭐ A regression I shipped, that the gate would have caught
+
+`d45ff25` gave `stack_one_prepare()` a destination re-check. **An EXCHANGE's
+destination is occupied BY DESIGN** — by the counterpart — so it fired on every
+exchange, and `dc_rename_exchange` treats only `-EINVAL` as terminal ⇒ a
+**deterministic single-threaded hang** in `test_midtransition` (3/3; parent
+commit 3/3 pass). Fixed in `413fae5` with `@expect_dest` (NULL for a rename,
+the counterpart's top for an exchange). **I did not run `check-lru-arms` after
+committing it.**
+
+⚠ That livelock ran *inside* the lane, so it presented as a whole-process
+wedge — **the same thread dump as the lane leak. Two distinct defects that look
+identical from a backtrace.**
+
+### ⭐⭐ Method (the transferable part)
+
+- **PROVE THE PROBE LIVE BEFORE ITS ZERO MEANS ANYTHING.** A bracket trace
+  showed `in_fallback=0` on *every* thread and I nearly read it as "nobody
+  escalated". `in_fallback` is set **after** the lock is taken, so caller-side
+  events **cannot see the lane at all**. Events *inside* the acquire path
+  answered it in one line: **ATTEMPT 940 / HELD 932 / RELEASE 931** — exactly
+  one lane taken and never returned, 8 threads parked behind it.
+- **AMPLIFY THE RARE PRECONDITION.** Escalation is essentially never reached
+  naturally — **0 lane acquisitions in 111k healthy brackets** — which is why
+  ~280 quiet runs and a 40-pair A/B all came back empty, and why I twice
+  declared this hypothesis refuted. Forcing `want_fallback` true makes it
+  deterministic.
+- ⚠ `babeltrace2 <session-dir>` reads **every accumulated snapshot**; two
+  "per-arm" traces shared vtids. Fresh session per arm or attribution is void.
+- ⚠ `pgrep -f <pattern>` matches **my own monitoring shells** — cost ~30 min
+  twice, once by reporting a finished gate as still running.
+
+### Reproducer
+
+Probes live in the **gitignored** `urcu-txn-build` copy (weak hook, inert
+without the flag) plus the `dc:txn` event in `dcache_tp.h`:
+
+    # in urcu-txn-build/include/urcu/rcu-txn.h (gitignored, see the commit):
+    #   URCU_TXN_LANE_TP(0/1/2, txn) at attempt / held / release
+    # amplifier: make urcu_txn__want_fallback() return domain && !in_fallback
+    cc ... -DDC_ENABLE_TRACING -DURCU_TXN_LANE_TRACE ... bench_dcache_churn.c \
+           dcache_txn.c dcache_tp.c
+    timeout 45 ./a.out --writers 8 --readers 8 --duration 500 \
+           --evict continuous --evict-cap 32     # rc=124 == wedged
+
 
 ## ▶ WHAT LANDED: the LOCK arm needed TWO guards, not one
 
@@ -971,6 +1071,8 @@ REQUIRES rebuilding the library with it.
     make check-churn          # 3 PASS  (no eviction: see check-churn-evict)
     make check-churn-evict    # NEW: 8 runs + 1 must-fail control
     make check-lru-arms       # 15 PASS  (incl. the 4 renames-x-shrinker arms)
+                              # ⚠ INTERMITTENT: the MCAS stress arm can still
+                              # wedge on the lane (see the 2026-08-06 section)
     make check-deque          # 10 arms: 9 PASS + 1 must-fail control
     make check-deque-tsan     # 4 arms, 0 warnings
 
