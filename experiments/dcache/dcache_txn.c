@@ -2209,7 +2209,8 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 			     struct dentry *top, struct dentry *host,
 			     struct dentry *new_parent,
 			     struct urcu_txn_hlist_head *new_bucket,
-			     struct dentry *shell, int cross_parent)
+			     struct dentry *shell, int cross_parent,
+			     struct dentry *expect_dest)
 {
 	int p;
 
@@ -2264,14 +2265,28 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	 * check fails and the retry re-scans.  Opening up insert_head_prepare()
 	 * is the point -- it does its own load, and a scan placed before that
 	 * load only NARROWS the window.
+	 *
+	 * ⛔⭐⭐ @expect_dest IS LOAD-BEARING, and omitting it was a LIVELOCK, not
+	 * a missing check.  An EXCHANGE moves A onto B's name and B onto A's, so
+	 * the destination name is OCCUPIED BY DESIGN -- by the counterpart.  A
+	 * bare "the name exists -> -EEXIST" therefore fires on every exchange,
+	 * every retry, for ever; dc_rename_exchange treats only -EINVAL as
+	 * terminal, so it span in conflict-and-continue inside the escalation
+	 * lane and parked every other writer behind it (deterministic hang in
+	 * test_midtransition).  So the question is not "is the name taken" but
+	 * "is it taken by someone OTHER than the entry I am swapping with":
+	 * @expect_dest is NULL for a rename (any occupant is a duplicate) and the
+	 * counterpart's current top for an exchange.
 	 */
 	{
 		void *fn = urcu_txn_load(txn, (void **) &new_bucket->first,
 					 URCU_TXN_HLIST_TAG);
+		struct dentry *cur;
 
 		if (urcu_txn_hlist_is_marked(fn))
 			return -ENOENT;		/* destination bucket sealed */
-		if (find_top_rcu(dc, new_parent, &shell->d_iname))
+		cur = find_top_rcu(dc, new_parent, &shell->d_iname);
+		if (cur && cur != expect_dest)
 			return -EEXIST;		/* the name appeared under us */
 		p = urcu_txn_hlist_insert_at_slot_prepare(txn, &shell->d_hash,
 				&new_bucket->first,
@@ -2448,7 +2463,7 @@ static int stack_shell(struct dcache *dc,
 		if (host->d_isdir)
 			txn_bump_gen(&txn, dc, host);	/* dir move: host gen */
 		p = stack_one_prepare(&txn, dc, top, host, new_parent, new_bucket,
-				      shell, cross_parent);
+				      shell, cross_parent, NULL);
 		if (p) {
 			/*
 			 * ⚠ -EEXIST IS TERMINAL, and getting that wrong is a
@@ -2952,19 +2967,23 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		if (hostb->d_isdir)
 			txn_bump_gen(&txn, dc, hostb);
 		p = stack_one_prepare(&txn, dc, topa, hosta, pb, bucket_b, sa,
-				      cross);		/* A -> (pb, nb) */
+				      cross, topb);	/* A -> (pb, nb) */
 		if (!p)
 			p = stack_one_prepare(&txn, dc, topb, hostb, pa, bucket_a,
-					      sb, cross);	/* B -> (pa, na) */
+					      sb, cross, topa); /* B -> (pa, na) */
 		if (p) {
-			if (p == -EINVAL) {	/* the swap would create a cycle: terminal */
+			/* Terminal, both of them: a cycle and an occupant that is
+			 * not the counterpart are STATES, not races, so retrying
+			 * re-derives the same answer for ever.  See the
+			 * @expect_dest note in stack_one_prepare. */
+			if (p == -EINVAL || p == -EEXIST) {
 				urcu_txn_abandon(&txn);
 				urcu_txn_end(&txn);
 				if (cross) {
 					uatomic_and(&hosta->d_moving, ~1UL);
 					uatomic_and(&hostb->d_moving, ~1UL);
 				}
-				ret = -EINVAL;
+				ret = p;
 				goto out_free;
 			}
 			urcu_txn_conflict(&txn);	/* -ENOENT/-EAGAIN: keep the turn */
