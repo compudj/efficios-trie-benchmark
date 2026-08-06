@@ -176,6 +176,142 @@ void (*dc_test_del_hook)(void);
 #define DC_TXN_PARENT_SEAL 1
 #endif
 
+/*
+ * TXN BRACKET TRACING, scaffolding behind -DDC_ENABLE_TRACING (see dcache_tp.h).
+ * DC_TXN_TP(handle, site, act, st) samples the handle's own `in_fallback` --
+ * "we currently hold the lane" -- so an `end` that holds it on a path which
+ * then RETURNS is visible in the event itself.
+ */
+#ifdef DC_ENABLE_TRACING
+#include "dcache_tp.h"
+enum { DC_TA_BEGIN = 0, DC_TA_END, DC_TA_ABANDON, DC_TA_CONFLICT, DC_TA_COMMIT };
+#define DC_TXN_TP(h, site, act, st) \
+	lttng_ust_tracepoint(dc, txn, (h), (site), (act), (st), (h)->in_fallback)
+
+/*
+ * ⭐ THE SITE IS __LINE__, not an enum, and the wrappers are defined BEFORE the
+ * macros that redirect to them -- so the bodies below call the real functions
+ * and there is no recursion.  That gets exact per-call-site attribution across
+ * ~30 bracket sites without touching any of them.
+ *
+ * begin is traced AFTER it returns: a thread PARKED inside urcu_txn_begin()
+ * emits nothing, so its last event stays the previous `end` -- which is exactly
+ * the signal wanted (who ended last, and did they still hold the lane).
+ */
+/*
+ * ⭐ @st carries `retrying` for END, and that pair is the whole diagnosis:
+ * end() releases the lane only when !retrying, so an END with in_fb=1 AND
+ * retrying=1 is a bracket walking away from a held lane.  __LINE__ then names
+ * the exact bail that leaked it.
+ */
+static inline void dc_tp_end(struct urcu_txn *t, int line)
+{ DC_TXN_TP(t, line, DC_TA_END, t->retrying); urcu_txn_end(t); }
+static inline void dc_tp_abandon(struct urcu_txn *t, int line)
+{ DC_TXN_TP(t, line, DC_TA_ABANDON, 0); urcu_txn_abandon(t); }
+static inline void dc_tp_conflict(struct urcu_txn *t, int line)
+{ DC_TXN_TP(t, line, DC_TA_CONFLICT, 0); urcu_txn_conflict(t); }
+static inline void dc_tp_begin(struct urcu_txn *t, int line)
+{ urcu_txn_begin(t); DC_TXN_TP(t, line, DC_TA_BEGIN, 0); }
+static inline enum urcu_txn_status dc_tp_commit(struct urcu_txn *t, int line)
+{
+	enum urcu_txn_status s = urcu_txn_commit(t);
+
+	DC_TXN_TP(t, line, DC_TA_COMMIT, (int) s);
+	return s;
+}
+/*
+ * ⭐ THE LANE ITSELF, via the weak hook in the (gitignored) urcu build tree's
+ * rcu-txn.h under -DURCU_TXN_LANE_TRACE.  Bracket events alone CANNOT answer
+ * "does an owner exist": `in_fallback` is set only AFTER the lock is taken, so
+ * "no thread ever showed in_fallback=1" is equally consistent with "nobody ever
+ * acquired" and with "an owner acquired before the ring window and never let
+ * go".  These three events -- attempt / held / release, in the acquire path
+ * itself -- name the last successful acquirer and separate the two.
+ *
+ * Rate is escalation-only, so this cannot flood the ring.
+ */
+enum { DC_TA_LANE_ATTEMPT = 5, DC_TA_LANE_HELD, DC_TA_LANE_RELEASE };
+void urcu_txn__lane_trace(int what, void *txn)
+{
+	lttng_ust_tracepoint(dc, txn, txn, 0, DC_TA_LANE_ATTEMPT + what, 0,
+			     ((struct urcu_txn *) txn)->in_fallback);
+}
+
+#define urcu_txn_end(t)		dc_tp_end((t), __LINE__)
+#define urcu_txn_abandon(t)	dc_tp_abandon((t), __LINE__)
+#define urcu_txn_conflict(t)	dc_tp_conflict((t), __LINE__)
+#define urcu_txn_begin(t)	dc_tp_begin((t), __LINE__)
+#define urcu_txn_commit(t)	dc_tp_commit((t), __LINE__)
+#else
+#define DC_TXN_TP(h, site, act, st)			do { } while (0)
+#endif
+
+/*
+ * ⭐⭐ RELEASE THE ESCALATION LANE ON EVERY PATH THAT DOES NOT RE-ATTEMPT.
+ *
+ * urcu_txn_end() keeps an ESCALATED handle's lane so a re-attempt need not go
+ * to the back of the FIFO -- so a bracket that ends WITHOUT re-attempting owes
+ * urcu_txn_abandon() first, or the domain's lane is held for ever and every
+ * other writer parks behind it.  fc663f5a fixed that in the liburcu convenience
+ * brackets; this engine's own hand-rolled retry loops had the same defect on
+ * three paths, and it is what wedges --evict continuous.
+ *
+ * ⚠ urcu_txn_conflict() IS NOT A SUBSTITUTE: it deliberately KEEPS the turn,
+ * which is correct only when the same handle re-attempts.  Two of the three
+ * sites called it and then returned.
+ *
+ * -DDC_NO_LANE_ABANDON is the mutation arm: it must wedge.
+ */
+#ifdef DC_NO_LANE_ABANDON
+#define DC_LANE_GIVE_UP(txn)	do { } while (0)
+#else
+#define DC_LANE_GIVE_UP(txn)	urcu_txn_abandon(txn)
+#endif
+
+/*
+ * ⭐⭐ ...AND GIVE BACK A LANE KEPT FOR A RE-ATTEMPT THAT NEVER COMES.
+ *
+ * The abandon-before-end rule above covers the bails that END the bracket
+ * themselves.  It does NOT cover the one that actually wedges --evict
+ * continuous, because there the conflict()+end()+continue is CORRECT -- the
+ * loop does re-attempt -- and the lane is lost one iteration LATER:
+ *
+ *	for (;;) {
+ *		top = find_top_rcu(...);
+ *		if (!top) { ret = -ENOENT; goto out; }	<-- lane still held
+ *		...
+ *		if (p) { urcu_txn_conflict(&txn);	 <-- keeps the turn
+ *			 urcu_txn_end(&txn);		 <-- so end() KEEPS it
+ *			 continue; }			 <-- re-decides at the TOP
+ *	}
+ *
+ * The retry loops re-decide at their HEAD, and those head checks exit the
+ * operation.  So the iteration after a conflict() may never begin another
+ * bracket, and `out:` returns with the fair mutex locked: every later begin()
+ * in the domain parks for ever (rcu-txn.h, urcu_txn_end()).  A per-bail fix
+ * cannot reach this -- the leaking statement is a `goto out` that knows nothing
+ * about transactions -- so the release belongs at the operation's exit.
+ *
+ * begin() CANNOT re-acquire here: urcu_txn__want_fallback() requires
+ * !in_fallback, which is exactly the state being unwound.  So this is a bounded
+ * begin/abandon/end that only forfeits the turn, and it is a no-op on the
+ * overwhelmingly common path where the handle never escalated.
+ *
+ * -DDC_NO_LANE_GIVEBACK is the mutation arm: it must wedge.
+ */
+static inline void dc_lane_giveback(struct urcu_txn *txn)
+{
+#ifndef DC_NO_LANE_GIVEBACK
+	if (!txn->in_fallback)
+		return;
+	urcu_txn_begin(txn);
+	urcu_txn_abandon(txn);		/* forfeit the turn -> end() releases */
+	urcu_txn_end(txn);
+#else
+	(void) txn;
+#endif
+}
+
 #ifdef DC_MARK_GEN
 #define DC_HOT1CL_SPLIT 1
 /*
@@ -1301,7 +1437,17 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 		if (!p_)
 			p_ = urcu_txn_hlist_del_prepare(&txn, &d->d_sib);
 		if (p_) {			/* -ENOENT (gone) / -EAGAIN */
-			urcu_txn_conflict(&txn);
+			/*
+			 * ⚠⚠ ABANDON, NOT CONFLICT -- THIS PATH RETURNS.
+			 * urcu_txn_conflict() "keeps the FIFO turn exactly as a
+			 * commit ABORT does", which is right only when the
+			 * caller then re-attempts with the SAME handle.  This
+			 * one hands -EAGAIN back to lru_shrink_range, which
+			 * rotates and moves on -- so the lane was kept by a
+			 * handle nobody ever re-attempts, i.e. HELD FOR EVER
+			 * with every other writer parked behind it.
+			 */
+			DC_LANE_GIVE_UP(&txn);
 			urcu_txn_end(&txn);
 			return -EAGAIN;
 		}
@@ -1649,6 +1795,7 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 			continue;
 		}
 		if (p) {			/* -ENOENT: a head is sealed */
+			DC_LANE_GIVE_UP(&txn);	/* terminal: release the lane */
 			urcu_txn_end(&txn);
 			ret = p;
 			goto fail;
@@ -2175,6 +2322,8 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	/* else: top is a shell; its pending fold RECLAIMs the orphaned chain */
 	return 0;
 out:
+	/* the retry loop may have exited while holding the lane */
+	dc_lane_giveback(&txn);
 	rcu_read_unlock();
 	return ret;
 }
@@ -2512,6 +2661,8 @@ static int stack_shell(struct dcache *dc,
 		*out_host = host;
 	return 0;
 out_free:
+	/* the retry loop may have exited while holding the lane */
+	dc_lane_giveback(&txn);
 	rcu_read_unlock();
 	free(shell);
 	return ret;
@@ -2685,10 +2836,21 @@ static void fold(struct dcache *dc, struct dentry *n)
 				/* @n out of the index; a still-NULL d_back means an
 				 * unlink removed it (a re-rename would have set
 				 * d_back) -> tear the orphaned chain down. */
-				urcu_txn_conflict(&txn);
+				int orphan;
+
+				/* ⚠ DECIDE BEFORE ENDING.  One of these two exits
+				 * re-attempts and one does not, so which of
+				 * conflict/abandon is owed depends on the branch --
+				 * taking the decision after end() is what left the
+				 * `goto reclaim` side holding the lane for ever. */
+				orphan = urcu_txn_read((void **) &n->d_back,
+						       DC_FWD_TAG) == NULL;
+				if (orphan)
+					DC_LANE_GIVE_UP(&txn);	/* terminal */
+				else
+					urcu_txn_conflict(&txn); /* re-attempting */
 				urcu_txn_end(&txn);
-				if (urcu_txn_read((void **) &n->d_back,
-						   DC_FWD_TAG) == NULL)
+				if (orphan)
 					goto reclaim;
 				continue;	/* re-rename demoted @n: re-read -> SPLICE */
 			}
@@ -3016,6 +3178,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	call_rcu(&sb->d_rcu, fold_cb);
 	return 0;
 out_free:
+	/* the retry loop may have exited while holding the lane */
+	dc_lane_giveback(&txn);
 	rcu_read_unlock();
 	free(sa);
 	free(sb);

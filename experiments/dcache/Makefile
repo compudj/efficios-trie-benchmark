@@ -386,11 +386,16 @@ check-churn: churn
 # control that must fail.
 check-churn-evict: bench_dcache_churn_bucketlock bench_dcache_churn_bucketlock_mcas \
                    bench_dcache_churn_txn_mark bench_dcache_churn_txn_mark_mcas
-	@# ⚠ TIMEOUT EVERY RUN.  --evict continuous on the txn engine has a
-	@# PRE-EXISTING wedge of roughly 1 run in 20 (measured: 1/20 with the
-	@# parent seal off, 0/20 with it on -- it is not the seal's), and a 3s
-	@# benchmark that does not return would otherwise hang this gate for
-	@# ever.  124 is reported as a WEDGE rather than silently passing.
+	@# ⚠ TIMEOUT EVERY RUN.  --evict continuous on the txn engine can WEDGE:
+	@# a 3s benchmark that does not return would otherwise hang this gate for
+	@# ever, so 124 is reported rather than silently passing.
+	@#
+	@# ⚠⚠ THE RATE IS NOT ESTABLISHED, and an earlier version of this comment
+	@# said "roughly 1 run in 20" on the strength of the SEAL-OFF arm (1/20)
+	@# plus one anecdote.  On the shipped default it is 0 in 60 (20 + 40),
+	@# which does not sit comfortably with 5%.  What is certain is only that
+	@# the wedge EXISTS and is not the seal's doing; how often, and why, are
+	@# open -- see the handoff.  Do not quote a rate from here.
 	@for b in bench_dcache_churn_bucketlock bench_dcache_churn_bucketlock_mcas \
 	          bench_dcache_churn_txn_mark bench_dcache_churn_txn_mark_mcas; do \
 	  for c in continuous bursty; do \
