@@ -2245,7 +2245,41 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	p = urcu_txn_hlist_del_prepare(txn, &top->d_hash);
 	if (p)					/* -ENOENT: top demoted; -EAGAIN */
 		return p;
+#ifndef DC_NO_RENAME_DEST_RECHECK
+	/*
+	 * ⭐ RE-CHECK THE DESTINATION NAME INSIDE THE TRANSACTION.  dc_rename's
+	 * __child_lookup(to_parent, to_name) is a CHECK-THEN-ACT holding nothing
+	 * -- the same shape dc_add had -- so two renames to one destination, or
+	 * a rename racing a dc_add of that name, both pass it and both publish,
+	 * leaving TWO dentries spelled alike in this bucket.
+	 *
+	 * ⚠ dc_add's own re-check does NOT cover this: it makes the ADD notice a
+	 * publish, and does nothing to make the RENAME notice one.  The pair was
+	 * closed in one direction only.
+	 *
+	 * Same construction as dc_add: read the head ONCE, scan for the name
+	 * AFTER that read, and hand that SAME value to the insert as its
+	 * expected old.  A peer that published earlier is seen by the scan; a
+	 * peer that publishes later changes the head, so the install's old-value
+	 * check fails and the retry re-scans.  Opening up insert_head_prepare()
+	 * is the point -- it does its own load, and a scan placed before that
+	 * load only NARROWS the window.
+	 */
+	{
+		void *fn = urcu_txn_load(txn, (void **) &new_bucket->first,
+					 URCU_TXN_HLIST_TAG);
+
+		if (urcu_txn_hlist_is_marked(fn))
+			return -ENOENT;		/* destination bucket sealed */
+		if (find_top_rcu(dc, new_parent, &shell->d_iname))
+			return -EEXIST;		/* the name appeared under us */
+		p = urcu_txn_hlist_insert_at_slot_prepare(txn, &shell->d_hash,
+				&new_bucket->first,
+				(struct urcu_txn_hlist_node *) fn);
+	}
+#else
 	p = urcu_txn_hlist_insert_head_prepare(txn, &shell->d_hash, new_bucket);
+#endif
 	if (p)
 		return p;
 	p = urcu_txn_hlist_del_prepare(txn, &top->d_sib);
@@ -2416,12 +2450,20 @@ static int stack_shell(struct dcache *dc,
 		p = stack_one_prepare(&txn, dc, top, host, new_parent, new_bucket,
 				      shell, cross_parent);
 		if (p) {
-			if (p == -EINVAL) {	/* the move would create a cycle: terminal */
+			/*
+			 * ⚠ -EEXIST IS TERMINAL, and getting that wrong is a
+			 * LIVELOCK not a wrong answer: the destination name is
+			 * still there on every retry, so falling into the
+			 * conflict-and-continue path below would spin for ever
+			 * (inside the escalation lane, parking every other
+			 * writer behind it).  Same shape as -EINVAL.
+			 */
+			if (p == -EINVAL || p == -EEXIST) {
 				urcu_txn_abandon(&txn);	/* forfeit turn -> end() releases lane */
 				urcu_txn_end(&txn);
 				if (cross_parent)
 					uatomic_and(&host->d_moving, ~1UL);
-				ret = -EINVAL;
+				ret = p;
 				goto out_free;
 			}
 			urcu_txn_conflict(&txn);	/* -ENOENT/-EAGAIN: keep the turn */

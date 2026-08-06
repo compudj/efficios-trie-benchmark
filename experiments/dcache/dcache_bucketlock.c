@@ -2549,6 +2549,35 @@ static int stack_shell(struct dcache *dc,
 			ret = -ENOENT;
 			goto out_free;
 		}
+#ifndef DC_NO_RENAME_DEST_RECHECK
+		/*
+		 * ⭐ AND RE-CHECK THE DESTINATION NAME UNDER new_bucket -- the
+		 * caller's __child_lookup() is a CHECK-THEN-ACT holding nothing,
+		 * exactly like the one dc_add used to have.  Two renames to one
+		 * destination, or a rename racing a dc_add of that name, both
+		 * pass it and both publish, and the bucket ends up with TWO
+		 * dentries spelled alike: a lookup resolves whichever the chain
+		 * reaches first while a child-list walk descends the other.
+		 *
+		 * ⚠ dc_add's fix does NOT cover this.  That one makes the ADD
+		 * notice a publish; it does nothing to make the RENAME notice
+		 * one, so the pair was closed in one direction only.
+		 *
+		 * new_bucket is heads[2] and is already held, so the test and
+		 * the publish below are atomic against every racer for this
+		 * name -- same (parent, name) hashes to the same bucket.  The
+		 * caller's unlocked check stays as the cheap reject that avoids
+		 * allocating a shell.
+		 */
+		if (find_top_rcu(dc, new_parent, new_name)) {
+			bl_unlock_n(heads, 4);
+			fold_unlock(host);
+			if (cross_parent)
+				uatomic_and(&host->d_moving, ~1UL);
+			ret = -EEXIST;
+			goto out_free;
+		}
+#endif
 
 		urcu_txn_sw_init(&txn);
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
