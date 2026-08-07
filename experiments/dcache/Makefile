@@ -76,7 +76,7 @@ ENGINE   ?= seqlock
 # so one line makes a liburcu rebuild invalidate every binary that links it.
 HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 
-.PHONY: check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
+.PHONY: check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
@@ -821,6 +821,40 @@ check-txnstats: test_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 # tree has published vacuous zeros before.  -DDC_LC_SELFTEST drops the
 # to-DEAD transition, so a reclaimed dentry reaches dentry_free_cb() still LIVE
 # and the run MUST abort.  If it does not, the gate above proved nothing.
+# ---- the SEALED-DESTINATION livelock -----------------------------------------
+#
+# A rename whose destination parent has been SEALED gets -ENOENT from
+# insert_head_prepare, and a seal is TERMINAL for that dentry's lifetime -- so
+# retrying re-derives it for ever, INSIDE the escalation lane, parking every
+# other writer.  -ESTALE distinguishes "destination gone" (terminal) from
+# "source moved" (retryable); see stack_one_prepare().
+#
+# ⚠ THE DETECTOR IS "STILL ALIVE AT 30s", not CPU-progress: the spinner BURNS
+# CPU, so a progress check calls a livelock healthy.  A clean run is ~1s here.
+# ⚠ NOT amplified.  Forcing every txn through the lane slows this harness ~100x
+# and a fixed timeout then cannot tell a hang from the amplifier -- it reported
+# a false wedge when tried.
+#
+# -DDC_NO_ESTALE_TERMINAL is the mutation arm; measured 17/112 vs 0/112.
+check-rename-livelock: stress_dcache.c dcache_txn.c $(HDRS) | check-lib
+	@$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_LRU_MCAS -DSTRESS_SHRINK \
+	  -DDC_LRU_FREE_ASSERT -DDC_SPLIT_KEEPID $(HCPP) -o rl_fix \
+	  stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	@echo "--- 6 concurrent x 8 rounds, must all finish (~1s each) ---"
+	@for r in 1 2 3 4 5 6 7 8; do \
+	  pids=""; \
+	  for c in 1 2 3 4 5 6; do ./rl_fix 4 2 8 8 20000 >/dev/null 2>&1 & \
+	    pids="$$pids $$!"; done; \
+	  for t in $$(seq 1 30); do sleep 1; a=0; \
+	    for p in $$pids; do kill -0 $$p 2>/dev/null && a=1; done; \
+	    [ $$a = 0 ] && break; done; \
+	  for p in $$pids; do if kill -0 $$p 2>/dev/null; then \
+	    echo "FAIL: WEDGED in round $$r"; kill -9 $$pids 2>/dev/null; exit 1; fi; done; \
+	done
+	@echo "  8 rounds clean: PASS"
+	@rm -f rl_fix
+	@echo "check-rename-livelock: OK (mutation arm -DDC_NO_ESTALE_TERMINAL wedges 17/112)"
+
 check-lifecycle: test_dcache.c stress_dcache.c dcache_txn.c $(HDRS) | check-lib
 	@echo "--- lifecycle assertions ON (must PASS) ---"
 	@for a in "" "-DDC_LRU_MCAS"; do \

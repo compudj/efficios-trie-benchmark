@@ -2401,8 +2401,38 @@ out:
  * The caller owns urcu_txn_begin/commit/end, the walk-causality gen bump and the
  * retry loop, so two entries can share ONE commit (the atomic exchange).
  * Returns 0, -ENOENT/-EAGAIN (a link moved: caller aborts, re-finds, retries),
- * or -EINVAL (the move would create a directory cycle).
+ * or -EINVAL (the move would create a directory cycle), or -ESTALE (the
+ * DESTINATION is gone).
+ *
+ * ⛔⭐⭐ -ESTALE EXISTS BECAUSE -ENOENT MEANT TWO OPPOSITE THINGS, and conflating
+ * them was a LIVELOCK that parked the whole domain.  An -ENOENT from a DEL
+ * prepare means the SOURCE moved under us -- transient, re-find and retry.  An
+ * -ENOENT from an INSERT prepare means the DESTINATION's head is SEALED, and a
+ * seal is TERMINAL for that dentry's lifetime -- so the retry re-derives the
+ * same answer for ever.  Measured: 24650 identical -ENOENT retries from one
+ * thread out of a 250k-event window, from
+ * insert_head_prepare(shell->d_sib -> new_parent->d_child_head).
+ *
+ * ⚠⚠ AND IT SPINS INSIDE THE ESCALATION LANE.  urcu_txn_conflict() keeps the
+ * FIFO turn, so a retry loop that can never succeed holds the lane for ever and
+ * every other writer parks behind it -- a whole-process wedge whose thread dump
+ * is INDISTINGUISHABLE from a leaked lane.  That is why this is a distinct code
+ * and not a comment: the callers must treat it as terminal, exactly as they
+ * already do for -EINVAL and -EEXIST.
  */
+/*
+ * ⚠ MUTATION ARM (-DDC_NO_ESTALE_TERMINAL): collapse the destination-gone code
+ * back onto -ENOENT, which is what the callers already retry.  That restores
+ * the livelock -- the sealed head answers the same thing on every attempt, from
+ * inside the escalation lane -- so this arm MUST wedge.  If it does not, the
+ * distinction is not what fixed it and the comment above is a story.
+ */
+#ifdef DC_NO_ESTALE_TERMINAL
+#define DC_DEST_GONE	(-ENOENT)
+#else
+#define DC_DEST_GONE	(-ESTALE)
+#endif
+
 static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 			     struct dentry *top, struct dentry *host,
 			     struct dentry *new_parent,
@@ -2482,16 +2512,20 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 		struct dentry *cur;
 
 		if (urcu_txn_hlist_is_marked(fn))
-			return -ENOENT;		/* destination bucket sealed */
+			return DC_DEST_GONE;	/* destination bucket sealed */
 		cur = find_top_rcu(dc, new_parent, &shell->d_iname);
 		if (cur && cur != expect_dest)
 			return -EEXIST;		/* the name appeared under us */
 		p = urcu_txn_hlist_insert_at_slot_prepare(txn, &shell->d_hash,
 				&new_bucket->first,
 				(struct urcu_txn_hlist_node *) fn);
+		if (p == -ENOENT)
+			p = DC_DEST_GONE;
 	}
 #else
 	p = urcu_txn_hlist_insert_head_prepare(txn, &shell->d_hash, new_bucket);
+	if (p == -ENOENT)
+		p = DC_DEST_GONE;
 #endif
 	if (p)
 		return p;
@@ -2501,7 +2535,7 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	p = urcu_txn_hlist_insert_head_prepare(txn, &shell->d_sib,
 					       &new_parent->d_child_head);
 	if (p)
-		return p;
+		return p == -ENOENT ? DC_DEST_GONE : p;
 	/* Demote the old top atomically with its removal (d_back: NULL -> shell). */
 	(void) urcu_txn_store_mw(txn, (void **) &top->d_back, NULL, shell,
 			      DC_FWD_TAG);
@@ -2671,12 +2705,14 @@ static int stack_shell(struct dcache *dc,
 			 * (inside the escalation lane, parking every other
 			 * writer behind it).  Same shape as -EINVAL.
 			 */
-			if (p == -EINVAL || p == -EEXIST) {
+			if (p == -EINVAL || p == -EEXIST || p == -ESTALE) {
 				urcu_txn_abandon(&txn);	/* forfeit turn -> end() releases lane */
 				urcu_txn_end(&txn);
 				if (cross_parent)
 					uatomic_and(&host->d_moving, ~1UL);
-				ret = p;
+				/* -ESTALE is internal: the destination is gone,
+				 * which the caller sees as -ENOENT. */
+				ret = (p == -ESTALE) ? -ENOENT : p;
 				goto out_free;
 			}
 			urcu_txn_conflict(&txn);	/* -ENOENT/-EAGAIN: keep the turn */
@@ -3189,14 +3225,14 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			 * not the counterpart are STATES, not races, so retrying
 			 * re-derives the same answer for ever.  See the
 			 * @expect_dest note in stack_one_prepare. */
-			if (p == -EINVAL || p == -EEXIST) {
+			if (p == -EINVAL || p == -EEXIST || p == -ESTALE) {
 				urcu_txn_abandon(&txn);
 				urcu_txn_end(&txn);
 				if (cross) {
 					uatomic_and(&hosta->d_moving, ~1UL);
 					uatomic_and(&hostb->d_moving, ~1UL);
 				}
-				ret = p;
+				ret = (p == -ESTALE) ? -ENOENT : p;
 				goto out_free;
 			}
 			urcu_txn_conflict(&txn);	/* -ENOENT/-EAGAIN: keep the turn */
