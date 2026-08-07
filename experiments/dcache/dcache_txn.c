@@ -231,10 +231,18 @@ static inline enum urcu_txn_status dc_tp_commit(struct urcu_txn *t, int line)
  * Rate is escalation-only, so this cannot flood the ring.
  */
 enum { DC_TA_LANE_ATTEMPT = 5, DC_TA_LANE_HELD, DC_TA_LANE_RELEASE };
-void urcu_txn__lane_trace(int what, void *txn)
+
+/*
+ * The lane hook is now UPSTREAM (liburcu 49a5ff73, -DURCU_TXN_LANE_TRACE), so
+ * this is a plain implementation of a documented contract rather than a local
+ * patch to a gitignored build tree that `make urcu-txn` silently discarded.
+ * The enum ordering matches the upstream one, so the action code is a bias.
+ */
+void urcu_txn_lane_trace(enum urcu_txn_lane_event ev, const struct urcu_txn *txn)
 {
-	lttng_ust_tracepoint(dc, txn, txn, 0, DC_TA_LANE_ATTEMPT + what, 0,
-			     ((struct urcu_txn *) txn)->in_fallback);
+	lttng_ust_tracepoint(dc, txn, (void *) txn, 0,
+			     DC_TA_LANE_ATTEMPT + (int) ev, 0,
+			     txn->in_fallback);
 }
 
 #define urcu_txn_end(t)		dc_tp_end((t), __LINE__)
