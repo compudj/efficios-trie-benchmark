@@ -951,13 +951,16 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 # The arms are the AXES, not repetitions: NDEQUES=1 is the single-ring shape the
 # first version of this test had (kept as the regression), 4 and 16 add
 # MIGRATION between rings, and the reuse op adds a node whose storage is
-# recycled -- which resets `seq` and so is the one event that breaks the ABA
-# guard's monotonicity premise.
+# recycled.
 #
-# NO_SEQ_GUARD is a MUTATION TEST, and it is here to keep an uncomfortable fact
-# measurable rather than forgotten: the guard has never been shown to be
-# load-bearing.  If this arm ever starts failing, the guard has earned its
-# place; while it passes, the honest statement is that it is unproven.
+# ⛔ THE seq ABA GUARD IS GONE, and the mutation arm that measured it with it.
+# It was never shown to be load-bearing, and once the two kinds of ABA were
+# separated it could not be: identity ABA is excluded by RCU, and structural
+# ABA is already decided by each derived write's expected-old, which asserts
+# the CURRENT structure rather than a version.  repro_deque_seq_aba.c is the
+# permanent regression for that -- it FORCES the structural ABA and requires
+# the commit to succeed with the ring intact.  See the no-membership-sequence
+# note in <urcu/rcu-txn-deque.h>.
 #
 # ⚠ THE TSAN ARM IS check-deque-tsan, AND IT NEEDS A CURRENT TSAN LIBURCU.
 # An earlier revision of this comment said a TSAN gate here would be pure noise
@@ -966,7 +969,11 @@ check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-l
 # liburcu was FOUR DAYS STALE (a Jul 31 copy against an Aug 3 engine), and every
 # surviving report was a real defect in the harness's own diagnostic reads.
 # Rebuilt and fixed, the arm is 0 warnings.  See the recipe above stress-tsan.
-check-deque: test_deque.c $(URCU_DEP) | check-lib
+check-deque: test_deque.c repro_deque_seq_aba.c $(URCU_DEP) | check-lib
+	@echo "--- forced STRUCTURAL ABA: must commit, ring intact ---"
+	@$(CC) $(CFLAGS) $(CPPFLAGS) -o repro_seq_aba repro_deque_seq_aba.c \
+	  $(LDFLAGS) $(LDLIBS) && ./repro_seq_aba || exit 1
+	@rm -f repro_seq_aba
 	@for w in 2 8 32; do \
 	  echo "--- test_deque: $$w writers, 4 deques ---"; \
 	  $(CC) $(CFLAGS) -DNWRITERS=$$w $(CPPFLAGS) -o test_deque \
@@ -981,17 +988,6 @@ check-deque: test_deque.c $(URCU_DEP) | check-lib
 	$(CC) $(CFLAGS) -DNWRITERS=8 -DNDEQUES=16 $(CPPFLAGS) -o test_deque_16dq \
 	  test_deque.c $(LDFLAGS) $(LDLIBS)
 	./test_deque_16dq
-	@echo "--- test_deque: MUTATION -- seq ABA guard compiled out ---"
-	$(CC) $(CFLAGS) -DNWRITERS=32 -DURCU_TXN_DEQUE_NO_SEQ_GUARD $(CPPFLAGS) \
-	  -o test_deque_noseq test_deque.c $(LDFLAGS) $(LDLIBS)
-	@./test_deque_noseq && \
-	  echo "  NOTE: random stress passes without the seq guard.  It is now" && \
-	  echo "        known to be ACTIVE rather than dead -- see" && \
-	  echo "        repro_deque_seq_aba.c, which forces the documented ABA and" && \
-	  echo "        makes the arms diverge (ON aborts, OFF commits).  Whether it" && \
-	  echo "        is LOAD-BEARING is still open: in that interleaving the ABA" && \
-	  echo "        is benign, and no harmful one has been constructed." \
-	  || { echo "  the seq guard is LOAD-BEARING -- record this"; exit 1; }
 	@echo "--- test_deque: SEAL retire (owner poison replaces GP #1) ---"
 	$(CC) $(CFLAGS) -DNWRITERS=32 -DDEQUE_SEAL_RETIRE $(CPPFLAGS) \
 	  -o test_deque_seal test_deque.c $(LDFLAGS) $(LDLIBS)

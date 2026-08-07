@@ -3,40 +3,42 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Is the deque's `seq` membership guard LOAD-BEARING?  A targeted attempt.
+ * FORCED STRUCTURAL ABA -- the regression that keeps the deque's missing
+ * membership sequence honest.
  *
- * check-deque prints "passes without the seq guard -- the guard remains
- * UNPROVEN", and random stress does not settle it: 12 runs at high ABA pressure
- * (down to 8 nodes / 32 writers / 8 deques) with -DURCU_TXN_DEQUE_NO_SEQ_GUARD
- * all pass.  So this AMPLIFIES THE PRECONDITION instead of hoping for it --
- * the technique that cracked the escalation-lane wedges.
+ * The deque used to carry a per-node `seq`, bumped by every membership
+ * transition and validated by anyone holding a derivation, as an ABA guard.  It
+ * was removed, and this is the test that says the removal is still sound.
  *
- * THE SCENARIO THE GUARD DOCUMENTS.  remove(n) derives &prev->next from
- * &n->prev.  It cannot validate &prev->next, because that is the slot it writes
- * and a validate+store on one slot is the same-slot merge the list documents as
- * corrupting.  So it validates prev->seq, a separate slot bumped by every
- * membership transition -- "unchanged since I read it" made decidable.
+ * THE ARGUMENT IT GUARDS.  ABA here is two different things:
+ *   identity ABA   -- node freed, address reused as something else.  RCU
+ *                     excludes it: mutators run inside a read-side section.
+ *   structural ABA -- the SAME node leaves the deque and comes back.
+ * Only the second can happen, and it is already decided by the expected-old on
+ * every derived write: remove() stores &prev->next : n -> next, so "prev still
+ * points at n" is asserted against the CURRENT structure.  If that holds at
+ * commit, splicing n out is correct however many times prev left and returned.
  *
- * FORCING IT.  The derivation happens inside remove_prepare() and the commit is
- * a separate call, so the window is the CALLER'S -- no header patch is needed:
+ * WHAT THIS FORCES.  remove_prepare() does the derivation and commit() is a
+ * separate call, so the window belongs to the caller -- no header hook needed:
  *
- *	T1: begin(); remove_prepare(d, N);	<- derives prev = P
- *	    ... hand off to T2, wait ...
- *	T2: remove(P); push_tail(P); rotate_head(); rotate_head(); ...
- *	        -- P leaves and returns, so its seq moves by 4, and the
- *	           rotations put it back in front of N so that &N->prev
- *	           reads P again, defeating the load_validate on that slot
+ *	T1: begin(); remove_prepare(d, N)	<- derives prev = P
+ *	T2: remove(P); push_tail(P); rotate...	<- P leaves and returns, and
+ *	                                           the neighbourhood is rotated
+ *	                                           back so BOTH of N's edges
+ *	                                           read their original values
  *	T1: commit()
  *
- * WHAT EACH OUTCOME MEANS, decided BEFORE the run:
- *   guard ON,  commit ABORTs           -> the guard sees the membership change
- *   guard OFF, commit succeeds + ring intact -> the guard is REDUNDANT HERE:
- *        &n->prev and &n->next are both load_validated, and in a consistent
- *        deque "&n->prev still reads P" already implies P is a member
- *   guard OFF, commit succeeds + ring BROKEN -> the guard is LOAD-BEARING
+ * ⚠ BOTH EDGES, and that is the whole trick.  remove_prepare load_validates
+ * &N->prev AND &N->next.  Restoring only the back edge leaves the forward one
+ * changed, and THAT validate aborts the commit -- for a reason with nothing to
+ * do with ABA.  An earlier version of this repro did exactly that and measured
+ * nothing.
  *
- * ⚠ The third outcome is the only one that PROVES it.  The second does not
- * prove the guard useless -- it proves this interleaving does not need it.
+ * PASS = the commit SUCCEEDS and the ring is intact: the structural ABA was
+ * genuine (P's identity left and returned) and the expected-olds handled it.
+ * FAIL = the ring is broken, which would mean the expected-old argument is
+ * wrong and the membership sequence has to come back.
  */
 
 #ifndef _GNU_SOURCE
@@ -69,7 +71,7 @@ static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_phase;		/* 0: T1 preparing  1: T2's turn  2: T2 done */
 
 static int g_commit_status;
-static unsigned long g_seq_before, g_seq_after;
+static int g_peer_ok;
 
 static void wait_phase(int want)
 {
@@ -87,11 +89,6 @@ static void set_phase(int p)
 	pthread_mutex_unlock(&g_mx);
 }
 
-static unsigned long seq_of(struct urcu_txn_deque_node *n)
-{
-	return (unsigned long) uatomic_load(&n->seq, CMM_RELAXED);
-}
-
 /* T2: take P out and put it back, then rotate until it precedes N again. */
 static void *peer_fn(void *arg)
 {
@@ -102,7 +99,6 @@ static void *peer_fn(void *arg)
 	rcu_thread_online();
 	wait_phase(1);
 
-	g_seq_before = seq_of(p);
 	if (urcu_txn_deque_remove(&g_d, p, &g_dom))
 		fprintf(stderr, "peer: remove(P) failed\n");
 	if (urcu_txn_deque_push_tail(&g_d, p, &g_dom))
@@ -130,7 +126,7 @@ static void *peer_fn(void *arg)
 			break;
 		(void) urcu_txn_deque_rotate_head(&g_d, &g_dom);
 	}
-	g_seq_after = seq_of(p);
+	g_peer_ok = 1;
 
 	rcu_thread_offline();
 	rcu_unregister_thread();
@@ -191,17 +187,9 @@ int main(void)
 		if (c != sent || steps > NR_NODES + 2)
 			broken = 1;
 
-		printf("guard:      %s\n",
-#ifdef URCU_TXN_DEQUE_NO_SEQ_GUARD
-			"OFF (-DURCU_TXN_DEQUE_NO_SEQ_GUARD)"
-#else
-			"ON"
-#endif
-			);
-		printf("P seq:      %lu -> %lu (%s)\n", g_seq_before,
-			g_seq_after,
-			g_seq_after != g_seq_before ? "membership changed"
-						    : "UNCHANGED -- setup failed");
+		printf("peer:       %s\n", g_peer_ok
+			? "P removed and re-pushed (membership changed)"
+			: "PEER FAILED -- setup did not force the ABA");
 		printf("N->prev==P: %s   N->next==orig: %s\n",
 			urcu_txn_deque_resolve(uatomic_load(&g_n[1].prev,
 					CMM_RELAXED)) == &g_n[0] ? "yes" : "NO",
@@ -212,14 +200,16 @@ int main(void)
 			: g_commit_status < 0 ? "error" : "OK");
 		printf("ring:       %s\n", broken ? "BROKEN" : "intact");
 		printf("VERDICT:    %s\n",
-			g_commit_status == URCU_TXN_STATUS_ABORT
-				? "guard caught the membership change"
-			: broken ? "*** GUARD IS LOAD-BEARING: ring corrupted "
-				   "without it ***"
-				 : "committed and ring intact -- this "
-				   "interleaving does not need the guard");
+			!g_peer_ok ? "*** FAIL: the ABA was not forced ***"
+			: broken ? "*** FAIL: ring corrupted -- the expected-old "
+				   "argument is wrong, seq must come back ***"
+			: g_commit_status == URCU_TXN_STATUS_ABORT
+				? "*** FAIL: aborted -- something still versions "
+				  "membership ***"
+			: "PASS: structural ABA committed, ring intact");
 		rcu_thread_offline();
 		rcu_unregister_thread();
-		return broken ? 2 : 0;
+		return (broken || !g_peer_ok ||
+			g_commit_status == URCU_TXN_STATUS_ABORT) ? 2 : 0;
 	}
 }

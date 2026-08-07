@@ -665,18 +665,10 @@ static int verify(void)
 		walked += here;
 	}
 
-	/* 1b. seq must stay EVEN: bit 0 is the engine's descriptor proxy tag on
-	 * every transacted slot, so an odd value means either a leaked proxy or
-	 * a bump by 1 somewhere.  Reuse resets seq to 0, which is even, so this
-	 * still holds across recycles. */
+	/* 1b. The seq membership counter is GONE -- structural ABA is handled by
+	 * each derived write's expected-old, and identity ABA by RCU.  See the
+	 * no-membership-sequence note in <urcu/rcu-txn-deque.h>. */
 	for (i = 0; i < NNODES; i++) {
-		if (g_items[i].dn.seq & 1UL) {
-			fprintf(stderr,
-				"FAIL: node %lu seq=%lu is ODD -- bit 0 is the "
-				"proxy tag and must stay clear\n",
-				i, g_items[i].dn.seq);
-			fail = 1;
-		}
 		if (uatomic_load(&g_items[i].state, CMM_RELAXED) != ITEM_LIVE) {
 			fprintf(stderr,
 				"FAIL: node %lu left RETIRING -- a retire did "
@@ -719,16 +711,14 @@ static int verify(void)
 		fail = 1;
 	}
 	{
-		unsigned long tot = 0, rec = 0;
+		unsigned long rec = 0;
 
-		for (i = 0; i < NNODES; i++) {
-			tot += g_items[i].dn.seq;
+		for (i = 0; i < NNODES; i++)
 			rec += g_items[i].recycles;
-		}
 		printf("  %d rings: %lu nodes, closed, both edges agree, "
 		       "owner<=>reachable and names the right deque;\n"
-		       "  seq total %lu (all even) across %lu recycles\n",
-		       NDEQUES, walked, tot, rec);
+		       "  across %lu recycles\n",
+		       NDEQUES, walked, rec);
 	}
 	free(found);
 	return fail;
