@@ -985,7 +985,12 @@ check-deque: test_deque.c $(URCU_DEP) | check-lib
 	$(CC) $(CFLAGS) -DNWRITERS=32 -DURCU_TXN_DEQUE_NO_SEQ_GUARD $(CPPFLAGS) \
 	  -o test_deque_noseq test_deque.c $(LDFLAGS) $(LDLIBS)
 	@./test_deque_noseq && \
-	  echo "  NOTE: passes without the seq guard -- the guard remains UNPROVEN" \
+	  echo "  NOTE: random stress passes without the seq guard.  It is now" && \
+	  echo "        known to be ACTIVE rather than dead -- see" && \
+	  echo "        repro_deque_seq_aba.c, which forces the documented ABA and" && \
+	  echo "        makes the arms diverge (ON aborts, OFF commits).  Whether it" && \
+	  echo "        is LOAD-BEARING is still open: in that interleaving the ABA" && \
+	  echo "        is benign, and no harmful one has been constructed." \
 	  || { echo "  the seq guard is LOAD-BEARING -- record this"; exit 1; }
 	@echo "--- test_deque: SEAL retire (owner poison replaces GP #1) ---"
 	$(CC) $(CFLAGS) -DNWRITERS=32 -DDEQUE_SEAL_RETIRE $(CPPFLAGS) \
