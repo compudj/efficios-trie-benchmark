@@ -1,4 +1,4 @@
-# Handoff — the `--evict continuous` wedge is a LEAKED ESCALATION LANE.
+# Handoff — the wedge was TWO defects: a leaked lane, and a livelock inside it.
 
 2026-08-06 (was 2026-08-05). Written current-state-first: what is true now, then what is open,
 then the retractions in one place at the end. Read the retractions — five
@@ -82,13 +82,30 @@ release at the **operation's exit**, in the only three functions whose retry
 loop can `goto out` with a live handle: `dc_unlink`, `stack_shell`,
 `dc_rename_exchange`.
 
-### ⚠⚠ NECESSARY, NOT PROVEN SUFFICIENT
+### ✅ RESOLVED — the second path was a LIVELOCK, not a leak
 
-0/6 under the amplifier, but a later `check-lru-arms` **still wedged
-intermittently** in the MCAS stress arm with the same signature (threads parked
-in `cds_fair_mutex_park` under `urcu_txn_begin`). **At least one more path
-reaches this state.** The probes and mutation knobs are kept in tree for that
-hunt.
+The residual wedge is closed (`a458263`). It was never a second leak: a rename
+whose destination parent has been **sealed** gets `-ENOENT` from
+`insert_head_prepare(shell->d_sib -> new_parent->d_child_head)`, and a seal is
+**terminal for that dentry's lifetime** — so the retry re-derives it for ever,
+*inside* the lane, parking every other writer. That is why the thread dump was
+indistinguishable from a leak.
+
+⛔⭐⭐ **`-ENOENT` meant two opposite things**: from a DEL prepare, "the source
+moved" (retryable); from an INSERT prepare, "the destination is gone"
+(terminal). The insert side now answers `-ESTALE` and both callers treat it as
+terminal, as they already did for `-EINVAL`/`-EEXIST`.
+
+**Same defect class as `413fae5`**, and the warning was already written two
+lines above the site. A terminal state reached through a retryable-*looking*
+error code is now a known shape here.
+
+Evidence: the trace named the line — **24650 identical `-ENOENT` retries from
+one thread** in a 250k-event window, all from line 2512, with 4 threads parked.
+A/B pooled over 112 rounds × 6 concurrent: **fix 0/112, mutation 17/112,
+p = 4.0e-06**. ⚠ The first 40 rounds alone were 0/40 vs 3/40, **p = 0.12 — not
+significant**; the run was extended rather than the number quoted.
+Gate: `make check-rename-livelock`.
 
 ### ⭐⭐ The design point, worth raising upstream
 
@@ -131,6 +148,15 @@ identical from a backtrace.**
   "per-arm" traces shared vtids. Fresh session per arm or attribution is void.
 - ⚠ `pgrep -f <pattern>` matches **my own monitoring shells** — cost ~30 min
   twice, once by reporting a finished gate as still running.
+- ⚠⚠ **"No CPU progress" does NOT detect a livelock** — the spinner burns CPU.
+  Only "still alive at 30s against a ~1s baseline" catches it.
+- ⚠⚠ **THE AMPLIFIER IS NOT A DETECTOR.** Forcing `want_fallback` true
+  serialises every txn through the FIFO lane and slows the stress harness ~100×,
+  so a fixed timeout cannot tell a hang from the amplifier. It reported a false
+  wedge, retracted after measuring CPU deltas (799 ticks in an 8s window =
+  progressing). The mutation A/B stands because **both arms were equally
+  amplified and the fixed arm completed** — a differential, never an absolute
+  verdict.
 
 ### Reproducer
 
