@@ -1,7 +1,13 @@
 # dcache: a per-dentry lifecycle state machine
 
 Design note. Derived from the four terminal markers the code already enforces,
-not invented alongside them. Nothing here is implemented.
+not invented alongside them.
+
+> **⛔⭐⭐ CORRECTION (step 1 is now implemented; see `experiments/dcache/dcache_state.h`
+> and `make check-lifecycle`).** The central claim below — that R5 has no
+> witness — **was wrong**, and building it is what showed that. Two corrections,
+> both recorded in §2a rather than edited out of §2, because the reasoning that
+> produced them is the useful part.
 
 The question that prompted it: the per-structure presence markers live in
 separate words that are not transacted by every mutation — is that racy, and
@@ -43,6 +49,42 @@ ordering has been violated twice in this tree, both times found the hard way:
 Both are the same shape: **an LRU operation racing a namespace teardown**.
 That is the invariant with no witness, and it is what a lifecycle state would
 add.
+
+## 2a. ⛔ CORRECTIONS from implementing it
+
+**(i) R5 is already witnessed.** `dentry_free_cb()` already calls
+`lru_assert_not_queued()` under `-DDC_LRU_FREE_ASSERT`, and `check-lru-arms`
+already builds with it. That is the same check §2 proposed to add, in the right
+place, already gated. The in-tree comment even records that this engine had no
+probe at all until it was added, and that figures taken before it were vacuous
+zeros — so the gap was real, and it was closed before this note was written.
+
+**(ii) "Off the LRU before the free" is the wrong phrasing, and the check
+belongs post-grace-period.** The first implementation asserted at the
+`call_rcu` sites and fired instantly on a healthy tree. That was the CHECK
+being wrong, not the code: the shrinker deliberately queues the reclaim FIRST
+and drops LRU ownership after, both inside one read-side section — *"which is
+the only reason the free cannot have landed before this store"*
+(`dcache_lru_shrink.h`). So the rule is:
+
+> **R5: a dentry must be off the LRU before the GRACE PERIOD completes** — not
+> before the reclaim is queued.
+
+**(iii) A membership question must be asked in the membership form.** The first
+version asked `lru_listed()`, which deliberately answers *"queued OR SEALED"*
+because both mean "do not re-arm". A correctly removed-and-sealed node still
+answers yes. Membership is `urcu_txn_deque_queued()`, which maps POISON to
+NULL. Both `dcache_lru.h` and `rcu-txn-deque.h` say so explicitly; I read past
+both. ⚠ It failed in the SAFE direction (over-reporting), which is why one run
+caught it — the opposite error would have been a silently vacuous check.
+
+**What survives.** Membership is covered twice over, so the lifecycle word's
+remaining value is NOT R5. It is the thing no single marker sees: the lifecycle
+itself — illegal EDGES (a resurrection, `DYING -> LIVE`) and reclaim of a
+dentry that never passed through the states. That is real but **smaller than
+§2 claimed**, and it does not by itself justify putting the word in every
+transaction. Step 2 (retiring any marker in its favour) is NOT recommended on
+this evidence.
 
 ## 3. Layout audit (shipped MCAS config: `DC_MARK_GEN` + `DC_SPLIT_KEEPID` + `DC_LRU_MCAS`)
 
@@ -140,16 +182,21 @@ measure, and it is a contained A/B on `bench_dcache_churn` with
 Readers pay nothing: they never validate, and under the §4 split they never see
 a write to CL0 that they do not see today.
 
-## 7. Suggested order of work
+## 7. Order of work
 
-1. Land the state word **debug-gated first**, maintained alongside the existing
-   markers and cross-checked against them in a verify pass. This proves the
-   transition table matches what the code actually does before anything depends
-   on it — and if the table is wrong, that is where it shows.
-2. Only then decide whether any existing marker is *retired* in its favour. The
-   seals are individually optimal (§1); retiring one must be justified per
-   marker, not as a package.
-3. Measure the LRU-vs-namespace validate cost before making it unconditional.
+1. ✅ **DONE** — the state word is landed **debug-gated** and cross-checked
+   against the markers: `-DDC_LIFECYCLE_STATE`, `make check-lifecycle` (2 LRU
+   arms x 2 harnesses + a must-fail control). It immediately corrected three
+   things in this note (§2a), which is exactly what step 1 was for.
+   ⚠ The control is load-bearing: `-DDC_LC_SELFTEST` drops the to-DEAD
+   transition so a reclaimed dentry arrives still LIVE and the run MUST abort.
+   Without it a clean pass is indistinguishable from assertions that never ran.
+2. ⛔ **NOT recommended on this evidence** — retiring any existing marker in
+   its favour. The seals are individually optimal (§1) and membership is
+   already witnessed twice (§2a); the residual value is illegal-edge detection,
+   which does not pay for a word in every transaction.
+3. If it is ever made unconditional, measure the LRU-vs-namespace validate cost
+   first — that is the only genuinely new contention (§6).
 
 ⚠ Do NOT read a state word with a plain `urcu_txn_load`: it is settled/RYW and
 is not exclusion. This tree has already lost a `d_delete` to exactly that

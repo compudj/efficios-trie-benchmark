@@ -76,7 +76,7 @@ ENGINE   ?= seqlock
 # so one line makes a liburcu rebuild invalidate every binary that links it.
 HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
 
-.PHONY: all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
+.PHONY: check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
@@ -810,6 +810,42 @@ check-txnstats: test_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 # default; per-CPU and mm_cid are the userspace refinements this compares against.
 # Correctness must hold on all three -- a shard axis is not allowed to change what
 # the cache CONTAINS, only how the eviction order is approximated.
+# ---- the LIFECYCLE state machine (design/dcache-lifecycle-state.md, step 1) --
+#
+# Debug-gated: -DDC_LIFECYCLE_STATE maintains a per-dentry lifecycle word and
+# asserts the transitions.  It is CROSS-CHECKING, not new enforcement -- the
+# per-structure markers still do the work.
+#
+# ⚠ THE CONTROL IS NOT OPTIONAL.  A clean run of an assertion build is equally
+# consistent with "no violations" and "the assertions never executed", and this
+# tree has published vacuous zeros before.  -DDC_LC_SELFTEST drops the
+# to-DEAD transition, so a reclaimed dentry reaches dentry_free_cb() still LIVE
+# and the run MUST abort.  If it does not, the gate above proved nothing.
+check-lifecycle: test_dcache.c stress_dcache.c dcache_txn.c $(HDRS) | check-lib
+	@echo "--- lifecycle assertions ON (must PASS) ---"
+	@for a in "" "-DDC_LRU_MCAS"; do \
+	  $(CC) $(CFLAGS) -DDC_MARK_GEN $$a -DDC_SPLIT_KEEPID -DDC_LRU_FREE_ASSERT \
+	    -DDC_LIFECYCLE_STATE $(HCPP) -o lc_tmp test_dcache.c dcache_txn.c \
+	    $(LDFLAGS) $(LDLIBS) || exit 1; \
+	  ./lc_tmp > /dev/null || { echo "FAIL: lifecycle violation ($${a:-lock})"; exit 1; }; \
+	  $(CC) $(CFLAGS) -DDC_MARK_GEN $$a -DSTRESS_SHRINK -DDC_LRU_FREE_ASSERT \
+	    -DDC_LIFECYCLE_STATE -DDC_SPLIT_KEEPID $(HCPP) -o lc_tmp \
+	    stress_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS) || exit 1; \
+	  ( ulimit -v 8388608; ./lc_tmp 4 2 8 8 20000 ) > /dev/null \
+	    || { echo "FAIL: lifecycle violation under stress ($${a:-lock})"; exit 1; }; \
+	  echo "  $${a:-lock}: PASS"; \
+	done
+	@echo "--- MUST-FAIL control: -DDC_LC_SELFTEST ---"
+	@$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_LRU_MCAS -DDC_SPLIT_KEEPID \
+	  -DDC_LRU_FREE_ASSERT -DDC_LIFECYCLE_STATE -DDC_LC_SELFTEST $(HCPP) \
+	  -o lc_tmp test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	@if ./lc_tmp > /dev/null 2>&1; then \
+	  echo "FAIL: the control PASSED -- the assertions are not running,"; \
+	  echo "      so the runs above are vacuous."; exit 1; \
+	else echo "  control aborted as required: PASS"; fi
+	@rm -f lc_tmp
+	@echo "check-lifecycle: OK (2 arms x 2 harnesses + 1 must-fail control)"
+
 check-lru-arms: test_dcache.c dcache_bucketlock.c dcache_txn.c $(HDRS) | check-lib
 	@echo "--- txn engine (all-MW): lock arm, MCAS arm, no-LRU control ---"
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(HCPP) -o test_dcache_txn_lru \

@@ -464,6 +464,17 @@ struct dentry {
 	struct urcu_txn_hlist_node d_hash;
 #endif
 	struct rcu_head d_rcu;
+#ifdef DC_LIFECYCLE_STATE
+	/*
+	 * Debug-gated lifecycle state (dcache_state.h).  FREE: it lands in the
+	 * 24-byte hole between d_rcu@152 and the cacheline-aligned d_lru@192, so
+	 * sizeof(struct dentry) stays 256 and the gated build has the SAME layout
+	 * as the shipped one -- which is the point, since a debug build that
+	 * moved the hot line would stop reproducing the races it is here to
+	 * catch.  Cold line; the reader never touches it.
+	 */
+	unsigned int d_lc;
+#endif
 #ifndef DC_NO_LRU
 	/*
 	 * ---- PHASE 3: LRU, ON ITS OWN CACHELINE --------------------------------
@@ -650,6 +661,9 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 
 #define DCACHE_LRU_TYPES
 #include "dcache_lru.h"		/* PHASE 3: shard types + axis arms */
+/* Debug-gated lifecycle assertions.  Included HERE, above the reclaim sites
+ * that use them; the R5 check reads lru_listed() at its use site. */
+#include "dcache_state.h"
 #undef DCACHE_LRU_TYPES
 
 struct dcache {
@@ -1459,6 +1473,7 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 			return -EAGAIN;
 		break;
 	}
+	DC_LC_TO_DEAD(d);			/* R5: must be off the LRU by now */
 	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
 	ret = 0;
 	return ret;
@@ -1813,6 +1828,7 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	/* PHASE 3: on the LRU at the TAIL (newest), after publishing and outside
 	 * the commit -- the LRU has no reader, so it need not be atomic with the
 	 * index edit. */
+	DC_LC_SET(d, DC_LC_M(DC_LC_NEW), DC_LC_LIVE);	/* published into both indexes */
 	lru_add(dc, d);
 	return 0;
 fail:
@@ -2174,6 +2190,10 @@ static void dentry_free_cb(struct rcu_head *rh)
 	 * Every "txn ... 0 hits" figure taken before this line existed is a
 	 * vacuous zero.  See lru_assert_not_queued() in dcache_lru.h. */
 	lru_assert_not_queued(d);
+	/* ...and the lifecycle side of the same moment: a dentry must not reach
+	 * reclaim without having passed through the states.  The membership
+	 * question is the line above; this one is "did it get here legally". */
+	DC_LC_ASSERT(d, DC_LC_M(DC_LC_DEAD));
 	free(d);
 }
 
@@ -2313,12 +2333,15 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	 * free-while-queued defect.  (LOCK arm only -- the MCAS arm's deque
 	 * supplies the same ownership from inside the commit and always
 	 * answers 1.) */
+	DC_LC_SET(top, DC_LC_M(DC_LC_NEW) | DC_LC_M(DC_LC_LIVE), DC_LC_DYING);
 	can_free = lru_del_can_free(dc, host, settled);
 	if (top != host)
 		lru_del(dc, top);
 	rcu_read_unlock();
-	if (settled && can_free)		/* host has no fold queued: free it */
+	if (settled && can_free) {		/* host has no fold queued: free it */
+		DC_LC_TO_DEAD(top);		/* R5: must be off the LRU by now */
 		call_rcu(&top->d_rcu, dentry_free_cb);
+	}
 	/* else: top is a shell; its pending fold RECLAIMs the orphaned chain */
 	return 0;
 out:
@@ -2930,6 +2953,7 @@ reclaim:
 	 * fold frees hosts and why hosts are on the LRU. */
 	if (host_to_free) {
 		(void) lru_del_can_free(dc, host_to_free, 1);
+		DC_LC_TO_DEAD(host_to_free);	/* R5 */
 		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
 	}
 done:
@@ -2938,6 +2962,7 @@ done:
 	uatomic_inc(&dc_dbg_folds);
 #endif
 	(void) lru_del_can_free(dc, n, 1);
+	DC_LC_TO_DEAD(n);			/* R5 */
 	call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
 }
 
