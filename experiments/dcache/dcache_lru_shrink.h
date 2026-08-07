@@ -106,11 +106,12 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			 * the read-side section to wait is exactly what would let
 			 * dentry_free_cb reclaim the node it means to re-add.
 			 *
-			 * The remove AFTER the eviction is also why this whole
-			 * loop must stay inside rcu_read_lock(): lru_evict_settled
-			 * has already call_rcu'd the dentry, and only the
-			 * read-side section keeps that free from landing before
-			 * the deque stops pointing at it.
+			 * ⭐ The reclaim is queued by the CALLER, after the
+			 * deque removal (dc_reclaim), so the free can no longer
+			 * be pending while a shard still points at the node --
+			 * this loop no longer needs the read-side section to
+			 * span the call_rcu for MEMORY SAFETY, only for the
+			 * deque reads themselves.
 			 *
 			 * On failure, ROTATE rather than leave it at the head, or
 			 * the sweeper re-examines the same unevictable victim for
@@ -122,13 +123,19 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			 * deque removed the cause or merely the symptom.
 			 */
 			if (lru_evict_settled(dc, victim) == 0) {
-				/* ⭐ SEAL, not a plain remove: lru_evict_settled
-				 * has ALREADY call_rcu'd @victim, so between a
-				 * bare remove and the free a peer's lru_retain
-				 * could push it straight back on.  That was the
-				 * measured pusher.  lru_del_can_free(.., 1)
-				 * removes and poisons `owner` in ONE commit. */
+				/* ⭐ SEAL, not a plain remove -- and this is
+				 * INDEPENDENT of where the call_rcu sits.  A
+				 * bare remove leaves `owner` NULL, which is
+				 * exactly what a push wants, so between the
+				 * remove and the reclaim below a peer's
+				 * lru_retain could push @victim straight back
+				 * on and the grace period would then free queued
+				 * storage.  That was the measured pusher.
+				 * lru_del_can_free(.., 1) removes and poisons
+				 * `owner` in ONE commit, so no instant exists in
+				 * which a push can win. */
 				(void) lru_del_can_free(dc, victim, 1);
+				dc_reclaim(victim);	/* off the LRU FIRST */
 				freed++;
 			} else {
 				(void) lru_dq_rotate(dc, q);
@@ -140,8 +147,10 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				rcu_read_unlock();
 				continue;	/* a peer took it */
 			}
-			if (lru_evict_settled(dc, victim) == 0)
+			if (lru_evict_settled(dc, victim) == 0) {
+				dc_reclaim(victim);	/* already unlinked above */
 				freed++;
+			}
 #if defined(DC_LRU_NO_READD) || defined(DC_LRU_NO_SHRINK_READD)
 			/*
 			 * PROBE (-DDC_LRU_NO_SHRINK_READD): drop the SAME-GRACE-
@@ -333,19 +342,29 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 			lru_unlock(sh);
 			if (lru_evict_settled(dc, victim) == 0) {
 				/*
-				 * WE unhashed it and call_rcu'd it, so drop
-				 * ownership -- still inside this iteration's
-				 * read-side section, which is the only reason
-				 * the free cannot have landed before this
-				 * store.  No killer can be racing us: dc_unlink
-				 * re-verifies "still hashed" under the bucket
-				 * lock, and we just cleared that, so it re-finds
-				 * and answers -ENOENT rather than reaching
+				 * WE unhashed it, so drop ownership and only
+				 * THEN queue the reclaim.  No killer can be
+				 * racing us: dc_unlink re-verifies "still
+				 * hashed" under the bucket lock, and we just
+				 * cleared that, so it re-finds and answers
+				 * -ENOENT rather than reaching
 				 * lru_del_can_free at all.
+				 *
+				 * ⭐ This used to call_rcu INSIDE
+				 * lru_evict_settled, i.e. before this store, and
+				 * was safe only because the read-side section
+				 * spans both -- "the only reason the free cannot
+				 * have landed before this store".  Resting
+				 * memory safety on the extent of an
+				 * rcu_read_lock() is a property no local reading
+				 * of this loop can see, and the delegated-kill
+				 * branch below already did it the other way
+				 * round.  Now both seal first and free after.
 				 */
 				lru_lock(sh);
 				lru_shrink_release_locked(sh, victim);
 				lru_unlock(sh);
+				dc_reclaim(victim);	/* sealed DEAD first */
 				freed++;
 				rcu_read_unlock();
 				continue;
@@ -365,7 +384,7 @@ static long lru_shrink_range(struct dcache *dc, long nr,
 				 */
 				lru_shrink_release_locked(sh, victim);
 				lru_unlock(sh);
-				call_rcu(&victim->d_rcu, dentry_free_cb);
+				dc_reclaim(victim);
 				freed++;
 				rcu_read_unlock();
 				continue;

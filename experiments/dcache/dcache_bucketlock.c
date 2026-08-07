@@ -1830,6 +1830,16 @@ static int children_empty(struct dentry *d)
 
 static void dentry_free_cb(struct rcu_head *rh);
 
+/*
+ * Queue the reclaim.  The CALLER does this, after the victim is off the LRU;
+ * it used to be the tail of lru_evict_settled(), which condemned the node while
+ * a shard could still reach it.  See the long note in dcache_txn.c.
+ */
+static inline void dc_reclaim(struct dentry *d)
+{
+	call_rcu(&d->d_rcu, dentry_free_cb);
+}
+
 /* ---- add / unlink ------------------------------------------------------ */
 
 static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
@@ -3863,7 +3873,8 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	bl_hlist_del_locked(&d->d_hash);
 	bl_hlist_del_locked(&d->d_sib);
 	bl_unlock_n(heads, 3);
-	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
+	/* ⭐ The caller queues the reclaim, once the victim is off the LRU --
+	 * see dc_reclaim().  Returning 0 means "committed; the free is yours". */
 	return 0;
 }
 

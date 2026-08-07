@@ -1320,6 +1320,32 @@ static int children_empty(struct dentry *d)
 
 static void dentry_free_cb(struct rcu_head *rh);
 
+/*
+ * ⭐⭐ QUEUE THE RECLAIM -- and the CALLER does it, AFTER the victim is off the
+ * LRU.  This used to be the last line of lru_evict_settled(), which put the
+ * call_rcu BEFORE the deque removal / shrink-release and left a window in which
+ * the node was simultaneously condemned and still reachable from a shard.  That
+ * window was safe only because the sweeper's read-side section happened to span
+ * it -- i.e. MEMORY SAFETY rested on the extent of an rcu_read_lock(), with
+ * nothing in the code's shape saying so.
+ *
+ * It was never a designed ordering: the delegated-kill branch of the very same
+ * sweeper loop already sealed first and called call_rcu second.  Two adjacent
+ * branches disagreed, and the only reason was that one of them inherited the
+ * free from the tail of a helper.  Now both go through here.
+ *
+ * ⚠ The SEAL is still required and this does not replace it: between a plain
+ * remove and this call a concurrent lru_retain() could push the node back onto
+ * a deque, and then the grace period would free queued storage.  The seal makes
+ * the node unpushable in the SAME commit as the unlink, which is what closes
+ * that; see lru_del_can_free().
+ */
+static inline void dc_reclaim(struct dentry *d)
+{
+	DC_LC_TO_DEAD(d);
+	call_rcu(&d->d_rcu, dentry_free_cb);
+}
+
 #ifndef DC_NO_LRU
 /*
  * Evict one SETTLED dentry: remove it from BOTH indexes in one commit and defer
@@ -1473,8 +1499,8 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 			return -EAGAIN;
 		break;
 	}
-	DC_LC_TO_DEAD(d);			/* R5: must be off the LRU by now */
-	call_rcu(&d->d_rcu, dentry_free_cb);	/* honest deferred reclaim */
+	/* ⭐ The caller queues the reclaim, once the victim is off the LRU --
+	 * see dc_reclaim().  Returning 0 means "committed; the free is yours". */
 	ret = 0;
 	return ret;
 }
