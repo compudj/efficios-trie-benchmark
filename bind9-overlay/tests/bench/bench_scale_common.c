@@ -125,7 +125,11 @@ struct thread_arg {
 struct writer_arg {
 	unsigned long writes;
 	int cpu;
+	int id;
 };
+
+int bench_nr_writers = 1;
+__thread int bench_writer_id;
 
 /*
  * Pin worker @cpu (a dense worker index) to a physical core.  Delegates to the
@@ -217,9 +221,10 @@ static void *writer_thread(void *arg)
 {
 	struct writer_arg *wa = arg;
 	unsigned long writes = 0;
-	uint64_t seed = 99999;
+	uint64_t seed = 99999 + (uint64_t) wa->id * 7919;
 	void *ctx;
 
+	bench_writer_id = wa->id;
 	bench_pin_to_cpu(wa->cpu);
 	ctx = g_eng->writer_setup ? g_eng->writer_setup() : NULL;
 
@@ -240,9 +245,12 @@ static void *writer_thread(void *arg)
 
 static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 {
-	pthread_t *threads = calloc(nr_readers + 1, sizeof(pthread_t));
+	pthread_t *threads = calloc(nr_readers + bench_nr_writers,
+			sizeof(pthread_t));
 	struct thread_arg *rargs = calloc(nr_readers, sizeof(struct thread_arg));
-	struct writer_arg warg = { .writes = 0 };
+	struct writer_arg *wargs = calloc(bench_nr_writers,
+			sizeof(struct writer_arg));
+	unsigned long total_writes = 0;
 	struct timespec ts;
 	unsigned long total_reads = 0;
 	/*
@@ -268,8 +276,13 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 		pthread_create(&threads[i], NULL, reader_thread, &rargs[i]);
 	}
 	if (!no_writer) {
-		warg.cpu = nr_readers;	/* writer on the core past the readers */
-		pthread_create(&threads[nr_readers], NULL, writer_thread, &warg);
+		/* Writers on the cores past the readers. */
+		for (int i = 0; i < bench_nr_writers; i++) {
+			wargs[i].id = i;
+			wargs[i].cpu = nr_readers + i;
+			pthread_create(&threads[nr_readers + i], NULL,
+				writer_thread, &wargs[i]);
+		}
 	}
 
 	/*
@@ -287,7 +300,7 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 	usleep(DURATION_SEC * 1000000);
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
 
-	for (int i = 0; i < nr_readers + (no_writer ? 0 : 1); i++)
+	for (int i = 0; i < nr_readers + (no_writer ? 0 : bench_nr_writers); i++)
 		pthread_join(threads[i], NULL);
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -298,13 +311,16 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 		total_reads += rargs[i].count;
 
 	*read_mops = (double)total_reads / elapsed / 1e6;
-	*write_kops = no_writer ? 0.0 : (double)warg.writes / elapsed / 1e3;
+	for (int i = 0; i < bench_nr_writers; i++)
+		total_writes += wargs[i].writes;
+	*write_kops = no_writer ? 0.0 : (double)total_writes / elapsed / 1e3;
 
 	if (g_eng->cleanup_churn)
 		g_eng->cleanup_churn();
 
 	free(threads);
 	free(rargs);
+	free(wargs);
 }
 
 void bench_arena_init(struct bench_arena *a, size_t cap_bytes)
@@ -656,7 +672,18 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	 * top per mode.
 	 */
 	int no_writer = (getenv("BENCH_NO_WRITER") != NULL);
-	int writer_slots = no_writer ? 0 : 1;
+	const char *bw = getenv("BENCH_WRITERS");
+
+	if (bw) {
+		bench_nr_writers = atoi(bw);
+		if (bench_nr_writers < 1 || bench_nr_writers > CHURN_KEYS ||
+				(bench_nr_writers > 1 && !eng->multi_writer)) {
+			fprintf(stderr, "BENCH_WRITERS=%s: unsupported by engine "
+				"%s\n", bw, eng->name);
+			return 1;
+		}
+	}
+	int writer_slots = no_writer ? 0 : bench_nr_writers;
 	int thread_counts[] = {1, 2, 4, 8, 16, 32, 64, 96, 128, 191, 192, 256, 383};
 	int nr_counts = sizeof(thread_counts) / sizeof(thread_counts[0]);
 
@@ -669,7 +696,8 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 		int nt = atoi(bt);
 		double r, w;
 
-		if (nt > 0 && nt + writer_slots <= max_threads) {
+		if ((nt > 0 || (nt == 0 && writer_slots)) &&
+				nt + writer_slots <= max_threads) {
 			run_bench(nt, &r, &w);
 			printf("%d %.1f %.1f\n", nt, r, w);
 			fflush(stdout);

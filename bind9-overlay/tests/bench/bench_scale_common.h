@@ -123,6 +123,11 @@ struct bench_engine {
 	void  (*reader_teardown)(void *ctx);			/* optional */
 
 	void *(*writer_setup)(void);				/* optional */
+	/*
+	 * One churn operation.  Pick the key with bench_churn_pick(): with
+	 * BENCH_WRITERS > 1 it keeps each writer on its own slice of the churn
+	 * set, so no two writers ever toggle the same key.
+	 */
 	void  (*writer_step)(void *ctx, uint64_t *seed, unsigned long writes);
 	void  (*writer_teardown)(void *ctx);			/* optional */
 
@@ -153,7 +158,31 @@ struct bench_engine {
 	 * runs in this mode.
 	 */
 	unsigned long (*iterate)(void *ctx);
+
+	/*
+	 * Set when writer_step is safe to run from BENCH_WRITERS > 1 threads at
+	 * once (each on its own churn slice).  The driver refuses more than one
+	 * writer otherwise.
+	 */
+	int   multi_writer;
 };
+
+/*
+ * BENCH_WRITERS=N (default 1): N concurrent churn writers, each on the core
+ * past the readers and the writers before it.  Writer @w of @n owns the churn
+ * keys {w, w + n, w + 2n, ...}; with n == 1 this is the whole set and the
+ * same seed sequence as the single-writer driver always used.
+ */
+extern int bench_nr_writers;
+extern __thread int bench_writer_id;
+
+static inline unsigned int bench_churn_pick(uint64_t *seed)
+{
+	unsigned int n = (unsigned int) bench_nr_writers;
+
+	return (unsigned int) bench_writer_id +
+		n * (unsigned int) (xorshift64(seed) % (CHURN_KEYS / n));
+}
 
 /*
  * Generic entry point.  Each engine's main() calls this with its vtable:

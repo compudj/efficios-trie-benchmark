@@ -386,6 +386,34 @@ freshly-shaped trie rather than one progressively fragmented by churn (closer
 to BIND9-QP, which stays compact via `dns_qp_compact`). It affects
 throughput/shape, not the reported RSS (sampled once after build).
 
+**Concurrent writers (FT engine).** `BENCH_WRITERS=N` runs N churn writers
+instead of one, on the cores past the readers. Writer `w` of `n` owns the churn
+keys `{w, w + n, w + 2n, ...}`, so no two writers ever toggle the same key; with
+`n = 1` this is the single writer exactly as before (same keys, same seed).
+`BENCH_THREADS=0` then gives a writers-only run. `BENCH_FT_WRITER=fine|coarse|external-sync`
+picks the trie's writer strategy, and the FT library's `CDS_FT_LOCK_SPACING`
+(per-node / exponential / root-only, when built with
+`-DFEATURE_FT_LOCK_SPACING_ENV`) its lock granularity. The application mutex
+the churn always took is then held only for `external-sync`, whose contract asks
+the application for writer exclusion; `fine` and `coarse` exclude their own
+writers, and each op runs inside an RCU read-side section because a peer now
+retires nodes this writer's descents cross. Both knobs need a liburcu with the
+writer-strategy API and the engine compiled with `-DBENCH_FT_WRITER_STRATEGY`;
+without it the FT engine is the single-writer one and refuses `BENCH_WRITERS > 1`
+(as do the other engines). For example, built standalone against a liburcu
+build tree `$U`:
+
+```sh
+gcc -O3 -march=native -mpopcnt -msse4.2 -DNDEBUG -DBENCH_FT_WRITER_STRATEGY \
+    -Ibind9-overlay/tests/bench -I$U/include -I$U/../include \
+    bind9-overlay/tests/bench/bench_scale_{ft,common}.c \
+    bind9-overlay/tests/bench/bench_topology.c -o bench_scale_ft_mw \
+    -Wl,-rpath,$U/src/.libs $U/src/.libs/liburcu-cds.so $U/src/.libs/liburcu.so \
+    -lhwloc -lnuma -lpthread
+BENCH_THREADS=0 BENCH_WRITERS=8 BENCH_FT_WRITER=fine CDS_FT_LOCK_SPACING=per-node \
+    ./bench_scale_ft_mw 64
+```
+
 ### Result — read throughput vs reader threads
 
 Read throughput on 1M DNS keys (priming on), **threads pinned one per physical

@@ -66,6 +66,23 @@ struct ft_entry {
 
 static struct cds_ft *g_ft;
 static pthread_mutex_t g_ft_mutex = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * g_ft_mutex is the APPLICATION's writer exclusion: the single-writer churn
+ * has always taken it (uncontended).
+ *
+ * Built with -DBENCH_FT_WRITER_STRATEGY, against a liburcu that has the
+ * writer-strategy API (cds_ft_group_attr_set_writer_strategy):
+ * BENCH_FT_WRITER=fine|coarse|external-sync picks the trie's strategy
+ * (default: the library's, fine), and BENCH_WRITERS > 1 is supported -- the
+ * mutex is then taken only for external-sync, whose contract asks the
+ * application for it; fine and coarse exclude their own writers.  Without
+ * it the engine is exactly the single-writer one it always was.
+ */
+#ifdef BENCH_FT_WRITER_STRATEGY
+static enum cds_ft_writer_strategy g_ft_writer_strategy =
+	CDS_FT_WRITER_LOCK_FINE;
+#endif
+static int g_ft_writer_mutex = 1;
 
 /*
  * Compact arena holding the N_KEYS lookup-set external nodes (the ft_entry
@@ -124,6 +141,27 @@ static void ft_build(void)
 	rcu_thread_offline();
 
 	cds_ft_group_attr_create(&attr);
+#ifdef BENCH_FT_WRITER_STRATEGY
+	{
+		const char *ws = getenv("BENCH_FT_WRITER");
+
+		if (ws) {
+			if (!strcmp(ws, "fine"))
+				g_ft_writer_strategy = CDS_FT_WRITER_LOCK_FINE;
+			else if (!strcmp(ws, "coarse"))
+				g_ft_writer_strategy = CDS_FT_WRITER_LOCK_COARSE;
+			else if (!strcmp(ws, "external-sync"))
+				g_ft_writer_strategy = CDS_FT_WRITER_EXTERNAL_SYNC;
+			else {
+				fprintf(stderr, "BENCH_FT_WRITER=%s: unknown\n", ws);
+				abort();
+			}
+			if (cds_ft_group_attr_set_writer_strategy(attr,
+					g_ft_writer_strategy) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+#endif
 	cds_ft_group_attr_set_max_key_len(attr, 256);
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	/*
@@ -309,6 +347,12 @@ static void ft_reader_batch(void *ctx, uint64_t *seed)
 static void *ft_writer_setup(void)
 {
 	struct cds_ft_iter *ft_iter;
+
+#ifdef BENCH_FT_WRITER_STRATEGY
+	/* BENCH_WRITERS is known by now (the trie is built before it is read). */
+	g_ft_writer_mutex = bench_nr_writers == 1 ||
+		g_ft_writer_strategy == CDS_FT_WRITER_EXTERNAL_SYNC;
+#endif
 	rcu_register_thread();
 	/*
 	 * The writer mutates under g_ft_mutex and never reads under RCU (its
@@ -334,12 +378,33 @@ static void ft_writer_teardown(void *ctx)
 	rcu_unregister_thread();
 }
 
+/*
+ * One writer never needs a read-side section: nothing else frees the nodes
+ * its lookup walks.  With BENCH_WRITERS > 1 a PEER retires nodes this
+ * writer's lookup and update descents cross, so each op runs inside one.
+ */
+static inline void ft_writer_lock(void)
+{
+	if (g_ft_writer_mutex)
+		pthread_mutex_lock(&g_ft_mutex);
+	if (bench_nr_writers > 1)
+		rcu_read_lock();
+}
+
+static inline void ft_writer_unlock(void)
+{
+	if (bench_nr_writers > 1)
+		rcu_read_unlock();
+	if (g_ft_writer_mutex)
+		pthread_mutex_unlock(&g_ft_mutex);
+}
+
 static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 {
 	struct cds_ft_iter *ft_iter = ctx;
-	unsigned int cidx = xorshift64(seed) % CHURN_KEYS;
+	unsigned int cidx = bench_churn_pick(seed);
 
-	pthread_mutex_lock(&g_ft_mutex);
+	ft_writer_lock();
 	if (churn_entries[cidx]) {
 		/* Remove the currently-present churn key. */
 		struct ft_entry *old = churn_entries[cidx];
@@ -364,7 +429,7 @@ static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 			abort();
 		}
 		churn_entries[cidx] = NULL;
-		pthread_mutex_unlock(&g_ft_mutex);
+		ft_writer_unlock();
 		/* Defer the free until after a grace period. */
 		call_rcu(&old->rcu_head, free_ft_entry_rcu);
 	} else {
@@ -389,7 +454,7 @@ static void ft_writer_step(void *ctx, uint64_t *seed, unsigned long writes)
 			fprintf(stderr, "insert_unique error: %d\n", status);
 			abort();
 		}
-		pthread_mutex_unlock(&g_ft_mutex);
+		ft_writer_unlock();
 	}
 
 	(void) writes;	/* writer is rcu_thread_offline(); no quiescent state to report */
@@ -594,6 +659,10 @@ static const struct bench_engine ft_engine = {
 	.cleanup_churn	= ft_cleanup_churn,
 	.writer_op	= ft_writer_op,
 	.iterate	= ft_iterate,
+#if defined(BENCH_FT_WRITER_STRATEGY) && !defined(BENCH_FT_QSBR)
+	/* QSBR keeps its writer offline: single-writer only. */
+	.multi_writer	= 1,
+#endif
 };
 
 int main(int argc, char **argv)
