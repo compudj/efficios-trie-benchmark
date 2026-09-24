@@ -140,6 +140,19 @@ static void ft_build(void)
 	 */
 	rcu_thread_offline();
 
+	/*
+	 * Per-CPU call_rcu workers, before anything defers a free.  The default
+	 * is ONE global worker: every thread's call_rcu -- this engine's churn
+	 * frees and the trie's own node / txn-descriptor retires -- would share
+	 * its queue, and any multi-threaded measurement would measure that
+	 * worker.  Fatal if it cannot be set up: a run without it is not
+	 * comparable.
+	 */
+	if (create_all_cpu_call_rcu_data(0)) {
+		perror("create_all_cpu_call_rcu_data");
+		abort();
+	}
+
 	cds_ft_group_attr_create(&attr);
 #ifdef BENCH_FT_WRITER_STRATEGY
 	{
