@@ -573,6 +573,39 @@ static inline uint64_t xorshift64(uint64_t *s)
 	return *s = x;
 }
 
+/*
+ * BENCH_SHUFFLE=<seed>: place the stable nodes of rculist (and its control
+ * arms) and txn_sw_list at random positions in their arena.  List order and
+ * keys are unchanged -- keys still ascend along the list -- only where each
+ * node sits in memory moves, so a hop no longer lands on the line the
+ * prefetcher already fetched.  This varies the per-hop stall of a traversal:
+ * a list that fits L2 then costs an L2 hit per hop, larger lists reach L3 and
+ * DRAM.  The permutation is a fixed function of the seed, so both engines and
+ * every run get the same layout.  Other engines ignore it.
+ */
+static int *g_arena_perm;
+
+static int *make_arena_perm(int n, uint64_t seed)
+{
+	int *p = malloc((size_t) n * sizeof(*p));
+	int i;
+
+	if (!p)
+		abort();
+	for (i = 0; i < n; i++)
+		p[i] = i;
+	seed = seed * 0x9E3779B97F4A7C15ULL | 1;	/* xorshift state must be non-zero */
+	for (i = n - 1; i > 0; i--) {
+		int j = (int) (xorshift64(&seed) % (uint64_t) (i + 1));
+		int t = p[i];
+
+		p[i] = p[j];
+		p[j] = t;
+	}
+	return p;
+}
+#define ARENA_IDX(i)	(g_arena_perm ? g_arena_perm[i] : (i))
+
 /* ════════════════════════════════════════════════════════════════
  * Plain doubly-linked list, shared by every lock/seqlock engine.
  * Permanent per-slot churn nodes (recycled in place: safe under the
@@ -957,7 +990,7 @@ static void su_build(void)
 #endif
 	for (i = 0; i < LIST_SIZE; i++) {
 #ifndef LIST_RCU_INLINE_RCU_HEAD
-		struct su_elem *e = &arena[i];	/* dense, packed */
+		struct su_elem *e = &arena[ARENA_IDX(i)];	/* dense; BENCH_SHUFFLE permutes */
 #else
 		struct su_elem *e = node_alloc(sizeof(*e));
 #endif
@@ -1540,7 +1573,7 @@ static void rl_build(void)
 #endif
 	for (i = 0; i < LIST_SIZE; i++) {
 #ifndef LIST_RCU_INLINE_RCU_HEAD
-		struct rl_elem *e = &arena[i];	/* dense, packed */
+		struct rl_elem *e = &arena[ARENA_IDX(i)];	/* dense; BENCH_SHUFFLE permutes */
 #else
 		struct rl_elem *e = node_alloc(sizeof(*e));
 #endif
@@ -3124,6 +3157,12 @@ int main(int argc, char **argv)
 	if ((e = getenv("DURATION_SEC")))  DURATION_SEC = atoi(e);
 	if (CHURN > LIST_SIZE) CHURN = LIST_SIZE;
 	STEP_LIMIT = (LIST_SIZE + CHURN) + 64;
+	if ((e = getenv("BENCH_SHUFFLE")) && atoi(e) > 0) {
+		g_arena_perm = make_arena_perm(LIST_SIZE, (uint64_t) atoi(e));
+		fprintf(stderr, "BENCH_SHUFFLE: stable nodes at random arena "
+			"positions (seed %d); rculist* and txn_sw_list only\n",
+			atoi(e));
+	}
 
 	/* Churn schedule: unique, spread-out stable anchors.  CHURN=0 is allowed
 	 * (a pure static list for the read-only cache-footprint experiments). */
