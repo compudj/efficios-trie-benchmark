@@ -32,6 +32,7 @@ struct exl_ctx {
 	const int *anchor;	/* [churn] g_anchor */
 	int8_t *present;	/* [churn] g_present, shared with the harness */
 	int forward_only;	/* second read pass walks forward (see su_read) */
+	const int *perm;	/* BENCH_SHUFFLE placement, or NULL for allocation order */
 };
 
 void exl_build(const struct exl_ctx *ctx);

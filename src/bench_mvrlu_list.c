@@ -235,14 +235,26 @@ void mvl_build(const struct mvl_ctx *ctx)
 	g_mv_head = mvrlu_alloc(sizeof(*g_mv_head));
 	g_mv_head->key = INT_MIN;
 	g_mv_stable = calloc((size_t) g_ctx.list_size, sizeof(*g_mv_stable));
+	/* Allocate every node first, then link: the allocation sequence is
+	 * unchanged, and a BENCH_SHUFFLE permutation (ctx->perm) can then place
+	 * list position i on the perm[i]-th allocation. */
+	for (i = 0; i < g_ctx.list_size; i++)
+		g_mv_stable[i] = mvrlu_alloc(sizeof(*g_mv_stable[i]));
+	if (g_ctx.perm) {
+		struct mv_lnode **alloc = g_mv_stable;
+
+		g_mv_stable = calloc((size_t) g_ctx.list_size, sizeof(*g_mv_stable));
+		for (i = 0; i < g_ctx.list_size; i++)
+			g_mv_stable[i] = alloc[g_ctx.perm[i]];
+		free(alloc);
+	}
 	prev = g_mv_head;
 	for (i = 0; i < g_ctx.list_size; i++) {
-		struct mv_lnode *n = mvrlu_alloc(sizeof(*n));
+		struct mv_lnode *n = g_mv_stable[i];
 
 		n->key = 2 * i;
 		n->prev = prev;
 		prev->next = n;
-		g_mv_stable[i] = n;
 		prev = n;
 	}
 	prev->next = g_mv_head;			/* close the ring */
@@ -250,15 +262,21 @@ void mvl_build(const struct mvl_ctx *ctx)
 	g_mv_churn = calloc((size_t) g_ctx.churn, sizeof(*g_mv_churn));
 }
 
-unsigned long mvl_read(long *viol)
+/*
+ * One walk, specialized at compile time on @sorted so neither variant carries
+ * per-step harness bookkeeping.  Sorted (the churn workload): the key-order
+ * check is the only per-step test; it also stops any cycle within one lap (see
+ * su_read in bench_list_scale.c), so no step guard.  Random-position mode keeps
+ * no sortedness invariant, so there the step guard is the only runaway
+ * protection.
+ */
+static inline __attribute__((always_inline))
+unsigned long mvl_walk(mvrlu_thread_struct_t *self, long *viol, const int sorted)
 {
-	mvrlu_thread_struct_t *self = mv_self();
 	struct mv_lnode *head = g_mv_head, *h, *p;
 	unsigned long vis = 0;
 	int prev, steps;
-	/* Hoisted out of the traversal: see run_deref_cost.sh -- loading these
-	 * per iteration charges the engine memory references the harness owns. */
-	const int rnd = g_ctx.random_pos, slim = g_ctx.step_limit;
+	const int slim = g_ctx.step_limit;
 
 	mvrlu_reader_lock(self);
 	h = mvrlu_deref(self, head);
@@ -267,10 +285,11 @@ unsigned long mvl_read(long *viol)
 			!mvrlu_cmp_ptrs(p, head);
 			p = mvrlu_deref(self, p->next)) {
 		int k = p->key;
-		if (++steps > slim) { (*viol)++; break; }
-		if (!rnd) {
+		if (sorted) {
 			if (k <= prev) { (*viol)++; break; }
 			prev = k;
+		} else if (++steps > slim) {
+			(*viol)++; break;
 		}
 		vis++;
 	}
@@ -279,15 +298,24 @@ unsigned long mvl_read(long *viol)
 			!mvrlu_cmp_ptrs(p, head);
 			p = mvrlu_deref(self, p->prev)) {
 		int k = p->key;
-		if (++steps > slim) { (*viol)++; break; }
-		if (!rnd) {
+		if (sorted) {
 			if (k >= prev) { (*viol)++; break; }
 			prev = k;
+		} else if (++steps > slim) {
+			(*viol)++; break;
 		}
 		vis++;
 	}
 	mvrlu_reader_unlock(self);
 	return vis;
+}
+
+unsigned long mvl_read(long *viol)
+{
+	mvrlu_thread_struct_t *self = mv_self();
+
+	/* Tested once per walk, not per step: see mvl_walk. */
+	return g_ctx.random_pos ? mvl_walk(self, viol, 0) : mvl_walk(self, viol, 1);
 }
 
 void mvl_write(int slot)

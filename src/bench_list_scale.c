@@ -580,8 +580,11 @@ static inline uint64_t xorshift64(uint64_t *s)
  * node sits in memory moves, so a hop no longer lands on the line the
  * prefetcher already fetched.  This varies the per-hop stall of a traversal:
  * a list that fits L2 then costs an L2 hit per hop, larger lists reach L3 and
- * DRAM.  The permutation is a fixed function of the seed, so both engines and
- * every run get the same layout.  Other engines ignore it.
+ * DRAM.  The permutation is a fixed function of the seed, so every engine and
+ * every run get the same layout.  Honoured by the list engines P1 measures
+ * (rculist* and txn_sw_list over their arenas; rlu_list, mvrlu_list and
+ * existence_list by linking their per-node allocations in permuted order);
+ * other engines ignore it.
  */
 static int *g_arena_perm;
 
@@ -1854,14 +1857,27 @@ static void rlu_build(void)
 	g_rlu_head = (struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
 	g_rlu_head->key = INT_MIN;
 	g_rlu_stable = calloc(LIST_SIZE, sizeof(*g_rlu_stable));
+	/* Allocate every node first, then link: the allocation sequence is
+	 * unchanged, and BENCH_SHUFFLE can then place list position i on the
+	 * perm[i]-th allocation (see make_arena_perm). */
+	for (i = 0; i < LIST_SIZE; i++)
+		g_rlu_stable[i] =
+			(struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+	if (g_arena_perm) {
+		struct rlu_lnode **alloc = g_rlu_stable;
+
+		g_rlu_stable = calloc(LIST_SIZE, sizeof(*g_rlu_stable));
+		for (i = 0; i < LIST_SIZE; i++)
+			g_rlu_stable[i] = alloc[g_arena_perm[i]];
+		free(alloc);
+	}
 	prev = g_rlu_head;
 	for (i = 0; i < LIST_SIZE; i++) {
-		struct rlu_lnode *n =
-			(struct rlu_lnode *) RLU_ALLOC(sizeof(struct rlu_lnode));
+		struct rlu_lnode *n = g_rlu_stable[i];
+
 		n->key = 2 * i;
 		n->prev = prev;
 		prev->next = n;
-		g_rlu_stable[i] = n;
 		prev = n;
 	}
 	prev->next = g_rlu_head;		/* close the ring */
@@ -1901,18 +1917,20 @@ static void rlu_build(void)
 #define RLU_LOOP_NE(p, head)	(!RLU_IS_SAME_PTRS((p), (head)))
 #endif
 
-static unsigned long rlu_read(long *viol)
+/*
+ * One walk, specialized at compile time on @sorted so neither variant carries
+ * per-step harness bookkeeping.  Sorted (the churn workload): the key-order
+ * check is the only per-step test; it also stops any cycle within one lap (see
+ * su_read), so no step guard.  Random-position mode keeps no sortedness
+ * invariant, so there the step guard is the only runaway protection.
+ */
+static inline __attribute__((always_inline))
+unsigned long rlu_walk(rlu_thread_data_t *self, long *viol, const int sorted)
 {
-	rlu_thread_data_t *self = rlu_self();
 	struct rlu_lnode *head = g_rlu_head, *h, *p;
 	unsigned long vis = 0;
 	int prev, steps;
-	/* Hoisted: loading this global per iteration would charge the engine a
-	 * memory reference the harness owns, not the mechanism -- and the
-	 * per-dereference load/branch measurement (scripts/run_deref_cost.sh)
-	 * differences against rculist, whose reader does not consult it. */
-	const int rnd = g_random_pos;
-	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+	const int slim = STEP_LIMIT;
 	/* (see RLU_LOOP_NE) terminate the walk with a plain pointer compare
 	 * instead of RLU_IS_SAME_PTRS.  DIAGNOSTIC ONLY, and valid ONLY with no
 	 * writer: RLU forbids comparing pointers directly because either side
@@ -1930,10 +1948,11 @@ static unsigned long rlu_read(long *viol)
 			RLU_LOOP_NE(p, head);
 			p = (struct rlu_lnode *) RLU_DEREF(self, p->next)) {
 		int k = p->key;
-		if (++steps > slim) { (*viol)++; break; }	/* runaway guard: always */
-		if (!rnd) {				/* sortedness only in the sorted (churn) mode */
+		if (sorted) {
 			if (k <= prev) { (*viol)++; break; }
 			prev = k;
+		} else if (++steps > slim) {
+			(*viol)++; break;
 		}
 		vis++;
 	}
@@ -1942,15 +1961,24 @@ static unsigned long rlu_read(long *viol)
 			RLU_LOOP_NE(p, head);
 			p = (struct rlu_lnode *) RLU_DEREF(self, p->prev)) {
 		int k = p->key;
-		if (++steps > slim) { (*viol)++; break; }
-		if (!rnd) {
+		if (sorted) {
 			if (k >= prev) { (*viol)++; break; }
 			prev = k;
+		} else if (++steps > slim) {
+			(*viol)++; break;
 		}
 		vis++;
 	}
 	RLU_READER_UNLOCK(self);
 	return vis;
+}
+
+static unsigned long rlu_read(long *viol)
+{
+	rlu_thread_data_t *self = rlu_self();
+
+	/* Tested once per walk, not per step: see rlu_walk. */
+	return g_random_pos ? rlu_walk(self, viol, 0) : rlu_walk(self, viol, 1);
 }
 
 static void rlu_write(int slot)
@@ -2648,6 +2676,7 @@ static void mv_build(void)
 	ctx.step_limit = STEP_LIMIT;
 	ctx.anchor     = g_anchor;
 	ctx.present    = g_present;
+	ctx.perm       = g_arena_perm;
 	mvl_build(&ctx);
 }
 
@@ -2675,6 +2704,7 @@ static void ex_build(void)
 	ctx.anchor       = g_anchor;
 	ctx.present      = g_present;
 	ctx.forward_only = g_su_forward;
+	ctx.perm         = g_arena_perm;
 	exl_build(&ctx);
 }
 
@@ -3160,7 +3190,7 @@ int main(int argc, char **argv)
 	if ((e = getenv("BENCH_SHUFFLE")) && atoi(e) > 0) {
 		g_arena_perm = make_arena_perm(LIST_SIZE, (uint64_t) atoi(e));
 		fprintf(stderr, "BENCH_SHUFFLE: stable nodes at random arena "
-			"positions (seed %d); rculist* and txn_sw_list only\n",
+			"positions (seed %d); P1's list engines only\n",
 			atoi(e));
 	}
 

@@ -31,6 +31,7 @@ struct mvl_ctx {
 	int step_limit;		/* STEP_LIMIT runaway-walk guard */
 	const int *anchor;	/* [churn] g_anchor  */
 	int8_t *present;	/* [churn] g_present, shared with the harness */
+	const int *perm;	/* BENCH_SHUFFLE placement, or NULL for allocation order */
 };
 
 void mvl_build(const struct mvl_ctx *ctx);

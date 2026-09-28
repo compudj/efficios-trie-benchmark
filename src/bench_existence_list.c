@@ -300,9 +300,22 @@ void exl_build(const struct exl_ctx *ctx)
 	g_ctx = *ctx;
 	CDS_INIT_LIST_HEAD(&g_ex_head);
 	g_ex_stable = calloc((size_t) g_ctx.list_size, sizeof(*g_ex_stable));
+	/* Allocate every node first, then link: the allocation sequence is
+	 * unchanged, and a BENCH_SHUFFLE permutation (ctx->perm) can then place
+	 * list position i on the perm[i]-th allocation. */
+	for (i = 0; i < g_ctx.list_size; i++)
+		g_ex_stable[i] = ex_node_alloc();
+	if (g_ctx.perm) {
+		struct ex_lnode **alloc = g_ex_stable;
+
+		g_ex_stable = calloc((size_t) g_ctx.list_size, sizeof(*g_ex_stable));
+		for (i = 0; i < g_ctx.list_size; i++)
+			g_ex_stable[i] = alloc[g_ctx.perm[i]];
+		free(alloc);
+	}
 	prev = &g_ex_head;
 	for (i = 0; i < g_ctx.list_size; i++) {
-		struct ex_lnode *n = ex_node_alloc();
+		struct ex_lnode *n = g_ex_stable[i];
 
 		n->key = 2 * i;
 		n->anchor = -1;
@@ -315,7 +328,6 @@ void exl_build(const struct exl_ctx *ctx)
 #endif
 		n->list.prev = prev;
 		prev->next = &n->list;
-		g_ex_stable[i] = n;
 		prev = &n->list;
 	}
 	prev->next = &g_ex_head;
@@ -398,60 +410,78 @@ static void exs_node_free(struct rcu_head *rhp)
 #define EX_EXISTS(n)	existence_exists(&(n)->eh)
 #endif /* EXL_SPLIT */
 
-/* One traversal step, resolved: skip nodes that do not exist. */
-static inline int ex_visit(struct cds_list_head *p, int *prev, int desc,
-			   int rnd, long *viol, unsigned long *vis)
+/*
+ * One traversal step, resolved: skip nodes that do not exist.  Returns -1 to
+ * stop the walk (an order violation or a runaway), 0 to go on.
+ *
+ * @sorted is a compile-time constant at every call site (exl_walk is
+ * specialized on it), so neither walk carries per-step harness bookkeeping.
+ * Sorted: every node that exists is order-checked, which stops any cycle through
+ * existing nodes within one lap (see su_read in bench_list_scale.c), so the step
+ * guard counts only skipped nodes -- the one path the order check does not
+ * cover, and never taken with no writer.  Random-position mode keeps no
+ * sortedness invariant, so there every step counts.
+ */
+static inline __attribute__((always_inline))
+int ex_visit(struct cds_list_head *p, int *prev, int desc, const int sorted,
+	     int *steps, int slim, long *viol, unsigned long *vis)
 {
 	struct ex_lnode *n = container_of(p, struct ex_lnode, list);
 	int k;
 
-	if (!EX_EXISTS(n))
+	if (!EX_EXISTS(n)) {
+		if (++*steps > slim) { (*viol)++; return -1; }
 		return 0;			/* logically absent */
+	}
 	k = n->key;
-	if (!rnd) {
+	if (sorted) {
 		if (desc ? (k >= *prev) : (k <= *prev)) { (*viol)++; return -1; }
 		*prev = k;
+	} else if (++*steps > slim) {
+		(*viol)++; return -1;
 	}
 	(*vis)++;
 	return 0;
 }
 
-unsigned long exl_read(long *viol)
+static inline __attribute__((always_inline))
+unsigned long exl_walk(long *viol, const int sorted)
 {
 	struct cds_list_head *p;
 	unsigned long vis = 0;
 	int prev, steps;
-	/* Hoisted out of the traversal: see run_deref_cost.sh -- loading these
-	 * per iteration charges the engine memory references the harness owns. */
-	const int rnd = g_ctx.random_pos, slim = g_ctx.step_limit;
+	const int slim = g_ctx.step_limit;
 
 	rcu_read_lock();
 	prev = INT_MIN; steps = 0;
 	for (p = rcu_dereference(g_ex_head.next); p != &g_ex_head;
 			p = rcu_dereference(p->next)) {
-		if (++steps > slim) { (*viol)++; break; }
-		if (ex_visit(p, &prev, 0, rnd, viol, &vis) < 0)
+		if (ex_visit(p, &prev, 0, sorted, &steps, slim, viol, &vis) < 0)
 			break;
 	}
 	if (g_ctx.forward_only) {
 		prev = INT_MIN; steps = 0;
 		for (p = rcu_dereference(g_ex_head.next); p != &g_ex_head;
 				p = rcu_dereference(p->next)) {
-			if (++steps > slim) { (*viol)++; break; }
-			if (ex_visit(p, &prev, 0, rnd, viol, &vis) < 0)
+			if (ex_visit(p, &prev, 0, sorted, &steps, slim, viol, &vis) < 0)
 				break;
 		}
 	} else {
 		prev = INT_MAX; steps = 0;
 		for (p = rcu_dereference(g_ex_head.prev); p != &g_ex_head;
 				p = rcu_dereference(p->prev)) {
-			if (++steps > slim) { (*viol)++; break; }
-			if (ex_visit(p, &prev, 1, rnd, viol, &vis) < 0)
+			if (ex_visit(p, &prev, 1, sorted, &steps, slim, viol, &vis) < 0)
 				break;
 		}
 	}
 	rcu_read_unlock();
 	return vis;
+}
+
+unsigned long exl_read(long *viol)
+{
+	/* Tested once per walk, not per step: see ex_visit. */
+	return g_ctx.random_pos ? exl_walk(viol, 0) : exl_walk(viol, 1);
 }
 
 #ifdef EXL_SPLIT
