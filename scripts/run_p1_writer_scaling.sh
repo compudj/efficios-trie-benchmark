@@ -43,10 +43,13 @@
 # writer counts the transacted arms spend most of a fresh process's first ~2 s
 # in a slow start (txn_list at 192 writers: 62 Mops/s over 2 s, 339 after 4 s of
 # warm-up), so they were discarded.  TAG=_c with ...-nodelock3 and
-# BENCH_WARMUP_SEC=4 (default here) is the steady-state batch: each point runs
-# 4 s untimed, then times 2 s.  It rotated a sixth arm, rculist with
+# BENCH_WARMUP_SEC=4 (default here) was the first steady-state batch: each point
+# runs 4 s untimed, then times 2 s.  It rotated a sixth arm, rculist with
 # BENCH_NODE_LOCKS=bit and the unsound prev read above; that arm's rows were
-# removed from its csv and log.
+# removed from its csv and log.  The harness then refused that arm and had
+# su_write_nodelock zero a new element's state word (a slab-recycled element
+# would still carry its tombstone; this build allocates with calloc).  TAG=_d
+# with ...-nodelock4 (default here) re-runs the five arms on that source.
 #
 # SIZING is P2's sweep A: CHURN = 64 x writers, LIST_SIZE = 2 x CHURN, writer
 # wid owns churn slots wid, wid+nw, ... after unique anchors two nodes apart, so
@@ -60,8 +63,8 @@
 # the harness's stderr).
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-nodelock3}
-TAG=${TAG:-_c}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-nodelock4}
+TAG=${TAG:-_d}
 export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
 ENG_TREE=urcu-txn-build-b3e23f9f
 DUR=${DUR:-2}

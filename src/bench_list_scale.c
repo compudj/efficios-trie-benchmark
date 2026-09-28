@@ -641,6 +641,7 @@ static int *make_arena_perm(int n, uint64_t seed)
  *          state word (bit 1 is the tombstone), the head sentinel's in a word of
  *          its own.  A true per-node lock, no table and no collisions; readers
  *          never read the word, and the element stays 24 bytes packed.
+ *          txn_sw_list only: see rl_write_nodelock.
  * Either way a commit takes its locks in ascending order of LOCK ADDRESS -- a
  * total order independent of the list's circular shape (the last node's
  * successor is the head) -- and a failed validation releases every lock before
@@ -1315,6 +1316,7 @@ static void su_write_nodelock(int slot)
 		struct su_elem *e = node_alloc(sizeof(*e));
 #endif
 		e->key = 2 * a + 1;
+		e->state = 0;	/* a slab-recycled element still carries NL_DEAD */
 		for (;;) {
 			/* plan, without locks */
 			struct urcu_txn_sw_list_node *succ =
@@ -1911,7 +1913,15 @@ static void rl_write(int slot)
 
 /*
  * BENCH_NODE_LOCKS write path for rculist: the same protocol as
- * su_write_nodelock, over cds_list.
+ * su_write_nodelock, over cds_list, with STRIPES only (main refuses "bit").
+ * The delete plans its predecessor by reading e->list.prev, which plain RCU
+ * writes with plain stores after the forward publish.  A stripe only hashes
+ * that value, and the validation that dereferences it runs under a lock held by
+ * whichever writer stored it, so it is sound.  A lock IN the node would be taken
+ * by dereferencing the unordered value, which weakly-ordered hardware may show
+ * before the node's initialization.  The sound alternative takes the
+ * predecessor from a forward walk, which su_write_nodelock does not pay (the
+ * txn list's prev is coherent), so that pairing would not compare like for like.
  */
 static int g_rl_head_state __attribute__((aligned(64)));	/* the head's lock word */
 
@@ -3663,6 +3673,11 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		g_bit_locks = !strcmp(getenv("BENCH_NODE_LOCKS"), "bit");
+		if (g_bit_locks && strcmp(g_eng->name, "txn_sw_list")) {
+			fprintf(stderr, "BENCH_NODE_LOCKS=bit applies to txn_sw_list "
+				"only: see rl_write_nodelock\n");
+			exit(1);
+		}
 		if (!g_bit_locks)
 			while (n < 4UL * (unsigned long) (LIST_SIZE + CHURN + 1))
 				n <<= 1;
