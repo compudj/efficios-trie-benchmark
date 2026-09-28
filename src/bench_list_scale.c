@@ -609,6 +609,149 @@ static int *make_arena_perm(int n, uint64_t seed)
 }
 #define ARENA_IDX(i)	(g_arena_perm ? g_arena_perm[i] : (i))
 
+/*
+ * BENCH_NODE_LOCKS: fine-grained writer locks for the single-writer arms
+ * (txn_sw_list, rculist) in place of their global writer mutex.  This is the
+ * deployment P1 describes (sec:exclusion): exclusion over the slots a commit
+ * writes, not over the structure, so writers on disjoint slots commit
+ * concurrently -- as the dentry cache (lock per bucket) and the Fractal Trie
+ * (lock per node) do.
+ *
+ * The protocol is the one those structures follow: PLAN without locks, LOCK the
+ * planned nodes, then VALIDATE the plan under the locks -- no planned node
+ * tombstoned, and the planned links still in place -- and retry on failure.
+ *   insert after anchor a:  plan pred = a, succ = next(a); lock pred, succ;
+ *                           validate !dead(pred), !dead(succ), next(pred) == succ.
+ *   delete e:               plan pred = prev(e), succ = next(e); lock pred, e,
+ *                           succ; validate none dead, next(pred) == e,
+ *                           prev(succ) == e; tombstone e, then unlink it.
+ * The tombstone is bit 1 of a state word in the element's tail padding (the
+ * element stays 24 bytes packed -- asserted below), so readers' layout is
+ * unchanged; readers never look at it.  In this harness a plan cannot go stale (each writer owns
+ * its slots, and stable nodes are never removed), so validation never fails:
+ * g_plan_retries counts failures and must read 0.  What the arm measures is the
+ * cost of planning, locking and validating, which a real embedder pays.
+ *
+ * Two lock layouts, selected by the value of BENCH_NODE_LOCKS:
+ *   (any)  a table of stripes keyed by node address -- 4x the node count,
+ *          rounded up to a power of two -- each a test-and-test-and-set
+ *          spinlock on its own cache line.  A stripe shared by two nodes of one
+ *          commit is taken once.
+ *   "bit"  a bit spinlock in each node: bit 0 of the element's tail-padding
+ *          state word (bit 1 is the tombstone), the head sentinel's in a word of
+ *          its own.  A true per-node lock, no table and no collisions; readers
+ *          never read the word, and the element stays 24 bytes packed.
+ * Either way a commit takes its locks in ascending order of LOCK ADDRESS -- a
+ * total order independent of the list's circular shape (the last node's
+ * successor is the head) -- and a failed validation releases every lock before
+ * planning again.
+ */
+struct node_spinlock {
+	int v;
+} __attribute__((aligned(64)));
+static struct node_spinlock *g_node_locks;	/* [g_node_lock_mask + 1], or NULL */
+static unsigned long g_node_lock_mask;
+static unsigned long g_plan_retries;
+static int g_bit_locks;				/* BENCH_NODE_LOCKS=bit */
+
+/*
+ * BENCH_WARMUP_SEC: run each point's threads untimed for that long, then zero
+ * their counts and start the timed window.  At high writer counts the
+ * transacted arms start slowly -- at 192 writers, 2 s windows measured txn_list
+ * at 62 Mops/s against 241 over 6 s -- while plain rculist and a single writer
+ * show no such transient.  run_point bumps g_warm_epoch at the end of the
+ * warm-up; a thread that sees it change zeroes its count.  With the variable
+ * unset, g_warmup_sec is 0 and threads skip the check.
+ */
+static int g_warmup_sec;
+static int g_warm_epoch;
+
+#define NL_LOCK	1				/* state word: bit spinlock */
+#define NL_DEAD	2				/* state word: tombstone */
+
+static inline void bit_lock(int *w)
+{
+	for (;;) {
+		int v = uatomic_load(w, CMM_RELAXED);
+
+		if (!(v & NL_LOCK) && uatomic_cmpxchg(w, v, v | NL_LOCK) == v)
+			return;			/* cmpxchg: full barrier */
+		caa_cpu_relax();
+	}
+}
+static inline void bit_unlock(int *w)
+{
+	/* Only the holder writes the word while it is locked, so a release
+	 * store of the word minus the lock bit is exact. */
+	uatomic_store(w, uatomic_load(w, CMM_RELAXED) & ~NL_LOCK, CMM_RELEASE);
+}
+
+static inline unsigned long node_stripe(const void *node)
+{
+	uint64_t x = (uint64_t) (uintptr_t) node >> 4;
+
+	return (unsigned long) ((x * 0x9E3779B97F4A7C15ULL) >> 32) & g_node_lock_mask;
+}
+static inline void stripe_lock(unsigned long i)
+{
+	while (uatomic_xchg(&g_node_locks[i].v, 1))
+		while (uatomic_load(&g_node_locks[i].v, CMM_RELAXED))
+			caa_cpu_relax();
+}
+static inline void stripe_unlock(unsigned long i)
+{
+	uatomic_store(&g_node_locks[i].v, 0, CMM_RELEASE);
+}
+/*
+ * The locks of up to three nodes, taken in ascending lock-address order,
+ * duplicates once.  @node[i] is a node (stripe mode keys on its address); @word[i]
+ * is that node's state word (bit mode locks it).  Both orders are by the address
+ * of the lock itself: the stripe index orders the stripe array, and a state word
+ * is its own lock.
+ */
+struct lockset {
+	uintptr_t key[3];
+	int n;
+};
+static inline void lockset_lock(struct lockset *ls, const void *const node[],
+		int *const word[], int n)
+{
+	uintptr_t v[3];
+	int i, j;
+
+	for (i = 0; i < n; i++)
+		v[i] = g_bit_locks ? (uintptr_t) word[i] :
+			(uintptr_t) &g_node_locks[node_stripe(node[i])];
+	for (i = 1; i < n; i++)
+		for (j = i; j > 0 && v[j - 1] > v[j]; j--) {
+			uintptr_t t = v[j];
+
+			v[j] = v[j - 1];
+			v[j - 1] = t;
+		}
+	ls->n = 0;
+	for (i = 0; i < n; i++)
+		if (ls->n == 0 || ls->key[ls->n - 1] != v[i])
+			ls->key[ls->n++] = v[i];
+	for (i = 0; i < ls->n; i++) {
+		if (g_bit_locks)
+			bit_lock((int *) ls->key[i]);
+		else
+			stripe_lock((struct node_spinlock *) ls->key[i] - g_node_locks);
+	}
+}
+static inline void lockset_unlock(const struct lockset *ls)
+{
+	int i;
+
+	for (i = ls->n - 1; i >= 0; i--) {
+		if (g_bit_locks)
+			bit_unlock((int *) ls->key[i]);
+		else
+			stripe_unlock((struct node_spinlock *) ls->key[i] - g_node_locks);
+	}
+}
+
 /* ════════════════════════════════════════════════════════════════
  * Plain doubly-linked list, shared by every lock/seqlock engine.
  * Permanent per-slot churn nodes (recycled in place: safe under the
@@ -952,6 +1095,7 @@ static void seg_call_rcu(void *node)		/* node: an individually-malloc'd churn no
 struct su_elem {
 	struct urcu_txn_sw_list_node node;
 	int key;
+	int state;	/* BENCH_NODE_LOCKS: NL_LOCK | NL_DEAD; in the tail padding */
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
@@ -1071,8 +1215,13 @@ static unsigned long su_read(long *viol)
 	rcu_read_unlock();
 	return vis;
 }
+static void su_write_nodelock(int slot);
 static void su_write(int slot)
 {
+	if (g_node_locks) {
+		su_write_nodelock(slot);
+		return;
+	}
 	if (!g_su_nolock)
 		pthread_mutex_lock(&g_su_wlock);
 	if (g_present[slot]) {
@@ -1102,6 +1251,90 @@ static void su_write(int slot)
 	}
 	if (!g_su_nolock)
 		pthread_mutex_unlock(&g_su_wlock);
+}
+
+/*
+ * BENCH_NODE_LOCKS write path for txn_sw_list: plan, lock, validate, commit.
+ * See the lock-table comment above for the protocol.
+ */
+static int g_su_head_state __attribute__((aligned(64)));	/* the head's lock word */
+
+static inline int *su_word(struct urcu_txn_sw_list_node *n)
+{
+	return n == &g_su_head.node ? &g_su_head_state :
+		&caa_container_of(n, struct su_elem, node)->state;
+}
+static inline int su_dead(struct urcu_txn_sw_list_node *n)
+{
+	return uatomic_load(su_word(n), CMM_RELAXED) & NL_DEAD;
+}
+static void su_write_nodelock(int slot)
+{
+	struct lockset ls;
+
+	if (g_present[slot]) {
+		struct su_elem *e = g_su_churn[slot];
+
+		for (;;) {
+			/* plan, without locks */
+			struct urcu_txn_sw_list_node *pred =
+				urcu_txn_sw_list_prev_rcu(&e->node);
+			struct urcu_txn_sw_list_node *succ =
+				urcu_txn_sw_list_next_rcu(&e->node);
+			const void *nodes[3] = { pred, &e->node, succ };
+			int *words[3] = { su_word(pred), &e->state, su_word(succ) };
+
+			lockset_lock(&ls, nodes, words, 3);
+			if (!su_dead(&e->node) && !su_dead(pred) && !su_dead(succ) &&
+			    urcu_txn_sw_list_next_rcu(pred) == &e->node &&
+			    urcu_txn_sw_list_prev_rcu(succ) == &e->node)
+				break;
+			lockset_unlock(&ls);
+			uatomic_inc(&g_plan_retries);
+		}
+		/* tombstone, under the lock (the holder is the word's only writer) */
+		uatomic_store(&e->state, uatomic_load(&e->state, CMM_RELAXED) | NL_DEAD,
+			CMM_RELAXED);
+		if (urcu_txn_sw_list_del_rcu(&e->node))
+			abort();
+		lockset_unlock(&ls);
+#ifndef LIST_RCU_INLINE_RCU_HEAD
+		seg_call_rcu(e);
+#else
+		call_rcu(&e->rh, g_pcpu_alloc ? su_slab_free : su_free);
+#endif
+		g_su_churn[slot] = NULL;
+		g_present[slot] = 0;
+	} else {
+		int a = g_anchor[slot];
+		struct su_elem *pe = g_su_stable[a];
+#ifdef LIST_RCU_INLINE_RCU_HEAD
+		struct su_elem *e = g_pcpu_alloc ?
+			(struct su_elem *) pcpu_slab_alloc(g_slab) : node_alloc(sizeof(*e));
+#else
+		struct su_elem *e = node_alloc(sizeof(*e));
+#endif
+		e->key = 2 * a + 1;
+		for (;;) {
+			/* plan, without locks */
+			struct urcu_txn_sw_list_node *succ =
+				urcu_txn_sw_list_next_rcu(&pe->node);
+			const void *nodes[2] = { &pe->node, succ };
+			int *words[2] = { &pe->state, su_word(succ) };
+
+			lockset_lock(&ls, nodes, words, 2);
+			if (!su_dead(&pe->node) && !su_dead(succ) &&
+			    urcu_txn_sw_list_next_rcu(&pe->node) == succ)
+				break;
+			lockset_unlock(&ls);
+			uatomic_inc(&g_plan_retries);
+		}
+		if (urcu_txn_sw_list_add_after_rcu(&e->node, &pe->node))
+			abort();
+		lockset_unlock(&ls);
+		g_su_churn[slot] = e;
+		g_present[slot] = 1;
+	}
 }
 
 /* ── txn_list: concurrent coherent bidirectional RCU list ── */
@@ -1541,10 +1774,17 @@ static void lf_reset_index(void)
 struct rl_elem {
 	struct cds_list_head list;
 	int key;
+	int state;	/* BENCH_NODE_LOCKS: NL_LOCK | NL_DEAD; in the tail padding */
 #ifdef LIST_RCU_INLINE_RCU_HEAD
 	struct rcu_head rh;
 #endif
 } LIST_NODE_ALIGNED;
+#if LIST_NODE_ALIGN == 0 && !defined(LIST_RCU_INLINE_RCU_HEAD)
+/* The BENCH_NODE_LOCKS tombstone must sit in tail padding: P1's read figures
+ * are measured on 24-byte packed elements. */
+_Static_assert(sizeof(struct su_elem) == 24, "su_elem grew past 24 bytes");
+_Static_assert(sizeof(struct rl_elem) == 24, "rl_elem grew past 24 bytes");
+#endif
 static struct cds_list_head g_rl_head = CDS_LIST_HEAD_INIT(g_rl_head);
 static struct rl_elem **g_rl_stable;
 static struct rl_elem **g_rl_churn;
@@ -1638,8 +1878,13 @@ static unsigned long rl_read(long *viol)
 	rcu_read_unlock();
 	return vis;
 }
+static void rl_write_nodelock(int slot);
 static void rl_write(int slot)
 {
+	if (g_node_locks) {
+		rl_write_nodelock(slot);
+		return;
+	}
 	if (!g_rl_nolock)
 		pthread_mutex_lock(&g_rl_wlock);
 	if (g_present[slot]) {
@@ -1662,6 +1907,79 @@ static void rl_write(int slot)
 	}
 	if (!g_rl_nolock)
 		pthread_mutex_unlock(&g_rl_wlock);
+}
+
+/*
+ * BENCH_NODE_LOCKS write path for rculist: the same protocol as
+ * su_write_nodelock, over cds_list.
+ */
+static int g_rl_head_state __attribute__((aligned(64)));	/* the head's lock word */
+
+static inline int *rl_word(struct cds_list_head *n)
+{
+	return n == &g_rl_head ? &g_rl_head_state :
+		&caa_container_of(n, struct rl_elem, list)->state;
+}
+static inline int rl_dead(struct cds_list_head *n)
+{
+	return uatomic_load(rl_word(n), CMM_RELAXED) & NL_DEAD;
+}
+static void rl_write_nodelock(int slot)
+{
+	struct lockset ls;
+
+	if (g_present[slot]) {
+		struct rl_elem *e = g_rl_churn[slot];
+
+		for (;;) {
+			/* plan, without locks */
+			struct cds_list_head *pred = CMM_LOAD_SHARED(e->list.prev);
+			struct cds_list_head *succ = rcu_dereference(e->list.next);
+			const void *nodes[3] = { pred, &e->list, succ };
+			int *words[3] = { rl_word(pred), &e->state, rl_word(succ) };
+
+			lockset_lock(&ls, nodes, words, 3);
+			if (!rl_dead(&e->list) && !rl_dead(pred) && !rl_dead(succ) &&
+			    pred->next == &e->list && succ->prev == &e->list)
+				break;
+			lockset_unlock(&ls);
+			uatomic_inc(&g_plan_retries);
+		}
+		/* tombstone, under the lock (the holder is the word's only writer) */
+		uatomic_store(&e->state, uatomic_load(&e->state, CMM_RELAXED) | NL_DEAD,
+			CMM_RELAXED);
+		cds_list_del_rcu(&e->list);
+		lockset_unlock(&ls);
+#ifndef LIST_RCU_INLINE_RCU_HEAD
+		seg_call_rcu(e);
+#else
+		call_rcu(&e->rh, rl_free);
+#endif
+		g_rl_churn[slot] = NULL;
+		g_present[slot] = 0;
+	} else {
+		int a = g_anchor[slot];
+		struct rl_elem *pe = g_rl_stable[a];
+		struct rl_elem *e = node_alloc(sizeof(*e));
+
+		e->key = 2 * a + 1;
+		for (;;) {
+			/* plan, without locks */
+			struct cds_list_head *succ = rcu_dereference(pe->list.next);
+			const void *nodes[2] = { &pe->list, succ };
+			int *words[2] = { &pe->state, rl_word(succ) };
+
+			lockset_lock(&ls, nodes, words, 2);
+			if (!rl_dead(&pe->list) && !rl_dead(succ) && pe->list.next == succ)
+				break;
+			lockset_unlock(&ls);
+			uatomic_inc(&g_plan_retries);
+		}
+		cds_list_add_rcu(&e->list, &pe->list);		/* after anchor */
+		lockset_unlock(&ls);
+		g_rl_churn[slot] = e;
+		g_present[slot] = 1;
+	}
 }
 
 /*
@@ -2762,7 +3080,14 @@ static void *reader_thread(void *arg)
 	while (!start_flag)
 		caa_cpu_relax();
 
+	const int warm = g_warmup_sec > 0;
+	int seen = 0;
+
 	while (!uatomic_load(&stop_flag, CMM_RELAXED)) {
+		if (warm && caa_unlikely(uatomic_load(&g_warm_epoch, CMM_RELAXED) != seen)) {
+			seen = uatomic_load(&g_warm_epoch, CMM_RELAXED);
+			visits = 0;
+		}
 		visits += g_eng->read_pass(&viol);
 		if (g_eng->uses_rcu)
 			rcu_quiescent_state();
@@ -2812,8 +3137,16 @@ static void *writer_thread(void *arg)
 		caa_cpu_relax();
 	base = mono_ns();
 
+	const int warm = g_warmup_sec > 0;
+	int seen = 0;
+
 	while (!uatomic_load(&stop_flag, CMM_RELAXED)) {
 		uint64_t t0 = g_lat ? mono_ns() : 0;
+
+		if (warm && caa_unlikely(uatomic_load(&g_warm_epoch, CMM_RELAXED) != seen)) {
+			seen = uatomic_load(&g_warm_epoch, CMM_RELAXED);
+			writes = 0;
+		}
 		if (random_pos) {
 			g_eng->write_random(&rng);
 		} else {
@@ -2937,6 +3270,20 @@ static void run_point(int nr_readers, int nr_writers,
 
 	t0 = mono_ns();
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
+
+	if (g_warmup_sec > 0) {
+		/* Untimed warm-up, quiescing as below; then restart the clock and
+		 * have every thread zero its count. */
+		uint64_t wend = t0 + (uint64_t) g_warmup_sec * 1000000000ULL;
+
+		while (mono_ns() < wend) {
+			usleep(2000);
+			if (g_eng->uses_rcu)
+				rcu_quiescent_state();
+		}
+		t0 = mono_ns();
+		uatomic_inc(&g_warm_epoch);
+	}
 
 	/* Keep main online but quiescing so call_rcu grace periods advance and
 	 * deferred frees stay bounded during the timed window. */
@@ -3162,6 +3509,12 @@ static void usage(const char *p)
 		" -DLIST_RCU_INLINE_RCU_HEAD = inline (40B) artifact build\n");
 }
 
+static void report_plan_retries(void)
+{
+	fprintf(stderr, "node locks: plan revalidation retries = %lu\n",
+		uatomic_read(&g_plan_retries));
+}
+
 int main(int argc, char **argv)
 {
 	int max_threads = 384, i;
@@ -3299,6 +3652,34 @@ int main(int argc, char **argv)
 	g_random_pos = getenv("BENCH_RANDOM_POS") != NULL;
 	g_su_nolock = getenv("BENCH_SU_NOLOCK") != NULL;
 	g_rl_nolock = getenv("BENCH_RL_NOLOCK") != NULL;
+	if (getenv("BENCH_WARMUP_SEC"))
+		g_warmup_sec = atoi(getenv("BENCH_WARMUP_SEC"));
+	if (getenv("BENCH_NODE_LOCKS")) {
+		unsigned long n = 1;
+
+		if (strcmp(g_eng->name, "txn_sw_list") && strcmp(g_eng->name, "rculist")) {
+			fprintf(stderr, "BENCH_NODE_LOCKS applies to txn_sw_list and "
+				"rculist only\n");
+			exit(1);
+		}
+		g_bit_locks = !strcmp(getenv("BENCH_NODE_LOCKS"), "bit");
+		if (!g_bit_locks)
+			while (n < 4UL * (unsigned long) (LIST_SIZE + CHURN + 1))
+				n <<= 1;
+		/* Bit mode still allocates a one-entry table: g_node_locks non-NULL is
+		 * what routes the write paths to their node-lock variants. */
+		g_node_lock_mask = n - 1;
+		if (posix_memalign((void **) &g_node_locks, 64, n * sizeof(*g_node_locks)))
+			abort();
+		memset(g_node_locks, 0, n * sizeof(*g_node_locks));
+		atexit(report_plan_retries);
+		if (g_bit_locks)
+			fprintf(stderr, "%s: fine-grained writer locks (BENCH_NODE_LOCKS=bit), "
+				"a bit spinlock per node; plan, lock, validate\n", g_eng->name);
+		else
+			fprintf(stderr, "%s: fine-grained writer locks (BENCH_NODE_LOCKS), %lu "
+				"stripes; plan, lock, validate\n", g_eng->name, n);
+	}
 	g_rl_reverse = getenv("BENCH_RL_REVERSE") != NULL;
 	g_su_forward = getenv("BENCH_SU_FORWARD") != NULL;
 	if (g_rl_reverse && !getenv("BENCH_NO_WRITER")) {
