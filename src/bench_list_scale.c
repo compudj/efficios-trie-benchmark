@@ -1620,6 +1620,56 @@ static void rl_write(int slot)
 		pthread_mutex_unlock(&g_rl_wlock);
 }
 
+/*
+ * rculist_resolve: rculist with the facility's reader-side tag test added, and
+ * nothing else.  A control arm for P1's read-ceiling claim.
+ *
+ * P1 explains the parity between txn_sw_list and rculist by saying that the
+ * proxy marker rides in the word the reader had to load anyway, so the only
+ * residue is a predicted branch.  That is an explanation inferred from the
+ * ABSENCE of a gap.  This arm tests it directly (Paul McKenney's suggestion):
+ * take rculist -- same list, same element, same build, same writer -- and wrap
+ * every forward dereference in urcu_txn_sw_resolve(), the exact inline the
+ * facility's reader runs, with the list's own tag.  rculist never installs a
+ * proxy, so the tag test is never true: what is added is the test, the
+ * never-taken branch, and the cold resolve path the compiler lays out for it.
+ *
+ * Reading the three arms together:
+ *   rculist_resolve ~ rculist ~ txn_sw_fwd   the branch is free; the
+ *                                            explanation holds.
+ *   rculist_resolve ~ txn_sw_fwd < rculist   the branch costs something the
+ *                                            parity band was hiding.
+ *   rculist_resolve !~ txn_sw_fwd            the two lists differ by more than
+ *                                            the branch; the explanation fails.
+ *
+ * Forward twice, like rl_read and like txn_sw_list under BENCH_SU_FORWARD, so
+ * the access pattern is fixed across all three.  BENCH_RL_REVERSE is not
+ * honoured here.  Writes go through rl_write unchanged.
+ */
+static unsigned long rl_read_resolve(long *viol)
+{
+	struct cds_list_head *p;
+	unsigned long vis = 0;
+	int pass, prev, steps;
+	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+
+	rcu_read_lock();
+	for (pass = 0; pass < 2; pass++) {
+		prev = INT_MIN; steps = 0;
+		for (p = urcu_txn_sw_resolve(rcu_dereference(g_rl_head.next),
+					     URCU_TXN_SW_LIST_PROXY_TAG);
+				p != &g_rl_head;
+				p = urcu_txn_sw_resolve(rcu_dereference(p->next),
+							URCU_TXN_SW_LIST_PROXY_TAG)) {
+			int k = caa_container_of(p, struct rl_elem, list)->key;
+			if (k <= prev || ++steps > slim) { (*viol)++; break; }
+			prev = k; vis++;
+		}
+	}
+	rcu_read_unlock();
+	return vis;
+}
+
 /* ════════════════════════════════════════════════════════════════
  * rlu_list: reference Read-Log-Update bidirectional list
  *
@@ -2559,6 +2609,7 @@ static const struct lengine engines[] = {
 	{ "rcu_hlist", "RCU + per-bucket lock hash-of-sorted-lists", 1, chl_build, chl_read, chl_write },
 	{ "lfht",      "liburcu cds_lfht (resizable lock-free hash)", 1, lfht_build, lfht_read, lfht_write },
 	{ "rculist",   "RCU classic, forward-only (ref)",    1, rl_build,  rl_read,  rl_write  },
+	{ "rculist_resolve", "RCU classic + the facility's tag test (control)", 1, rl_build, rl_read_resolve, rl_write },
 	{ "mutex",     "pthread_mutex",                      0, mtx_build, mtx_read, mtx_write },
 	{ "fairmutex", "liburcu cds_fair_mutex (MCS/FIFO)",  0, fm_build,  fm_read,  fm_write  },
 	{ "rwlock_r",  "pthread_rwlock, reader-preferring",  0, rw_build_reader, rw_read, rw_write },
