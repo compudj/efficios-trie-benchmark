@@ -25,6 +25,11 @@
 # and that batch (see su_read), so it was removed; TAG=_noguard with
 # BIN=arms-p1/bench_list_scale.pin-packed-noguard is that build, and adds the two
 # load controls.
+#
+# LAYOUT.  BENCH_SHUFFLE=<seed> in the environment (44cd638) places the nodes at
+# random memory positions, list order unchanged; the log records it.  The
+# shuffled batch is TAG=_shuffled with BIN=arms-p1/bench_list_scale.pin-packed-
+# readclass (06f998a), whose five reader loops are those of the _noguard binary.
 # All three are re-measured here rather than set beside the July curves, because
 # the harness changed since that capture (STEP_LIMIT hoisted, f16cb3f).
 #
@@ -83,7 +88,7 @@ ldd "$BIN" | grep -qi jemalloc \
   echo "# bench HEAD $(git rev-parse --short=8 HEAD); bench_list_scale.c sha256 $(sha256sum src/bench_list_scale.c | cut -c1-16)"
   echo "# binary $BIN"
   echo "# binary sha256 $(sha256sum "$BIN" | cut -c1-16); engine $(git -C "$ENG_TREE" rev-parse --short=8 HEAD)"
-  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT"
+  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT BENCH_SHUFFLE=${BENCH_SHUFFLE:-unset}"
   echo "# start: $(cat /proc/loadavg)"
 } > "$LOG"
 
