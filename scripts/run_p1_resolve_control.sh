@@ -11,10 +11,20 @@
 # is instruction-for-instruction su_read's forward loop (checked with objdump):
 # rculist's loop + one `test` + one never-taken `je`, no extra load.
 #
-# THREE ARMS, ONE BATCH, ONE BINARY:
+# ARMS, ONE BATCH, ONE BINARY:
 #   rculist          the published baseline
-#   rculist_resolve  rculist + the branch
+#   rculist_resolve  rculist + the facility's tag test (one branch)
+#   rculist_load     rculist + one load        (guard-free build only)
+#   rculist_loadbr   rculist + one load + a branch on it   (guard-free build only)
 #   txn_sw_fwd       the facility, forward twice (BENCH_SU_FORWARD=1)
+# See the control-arm comment above rl_read_resolve in src/bench_list_scale.c.
+#
+# BUILDS.  The first batch (TAG empty) used arms-p1/bench_list_scale.pin-packed,
+# whose read loops still carried the runaway step guard.  The guard is redundant
+# with the key-order check and was the only difference between the July capture
+# and that batch (see su_read), so it was removed; TAG=_noguard with
+# BIN=arms-p1/bench_list_scale.pin-packed-noguard is that build, and adds the two
+# load controls.
 # All three are re-measured here rather than set beside the July curves, because
 # the harness changed since that capture (STEP_LIMIT hoisted, f16cb3f).
 #
@@ -41,21 +51,22 @@
 # by the differenced method of run_deref_cost.sh (1 reader, 2 s vs 8 s).
 #
 # Writes:
-#   scripts/p1_resolve_control.csv  mode,engine,run,x,read_mvisits,write_mops,viol
-#   scripts/p1_resolve_deref.csv    engine,run,seconds,mvisits_per_s,instructions,branches,loads
-#   scripts/p1_resolve_control.log  provenance + per-invocation machine state
+#   scripts/p1_resolve_control$TAG.csv  mode,engine,run,x,read_mvisits,write_mops,viol
+#   scripts/p1_resolve_deref$TAG.csv    engine,run,seconds,mvisits_per_s,instructions,branches,loads
+#   scripts/p1_resolve_control$TAG.log  provenance + per-invocation machine state
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=./arms-p1/bench_list_scale.pin-packed
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed}
+TAG=${TAG:-}
 ENG_TREE=urcu-txn-build-b3e23f9f
 export DURATION_SEC=${DURATION_SEC:-3}
 export LIST_SIZE=${LIST_SIZE:-10000} CHURN=${CHURN:-200}
 RUNS=${RUNS:-5}
 MAXT=${MAXT:-192}
 DRUNS=${DRUNS:-2}
-OUT=scripts/p1_resolve_control.csv
-DOUT=scripts/p1_resolve_deref.csv
-LOG=scripts/p1_resolve_control.log
+OUT=scripts/p1_resolve_control$TAG.csv
+DOUT=scripts/p1_resolve_deref$TAG.csv
+LOG=scripts/p1_resolve_control$TAG.log
 
 [ -x "$BIN" ] || { echo "missing $BIN (see header to build it)" >&2; exit 1; }
 [ "$(git -C "$ENG_TREE" rev-parse --short=8 HEAD)" = b3e23f9f ] \
@@ -70,6 +81,7 @@ ldd "$BIN" | grep -qi jemalloc \
 {
   echo "# run_p1_resolve_control.sh  $(date -Is)"
   echo "# bench HEAD $(git rev-parse --short=8 HEAD); bench_list_scale.c sha256 $(sha256sum src/bench_list_scale.c | cut -c1-16)"
+  echo "# binary $BIN"
   echo "# binary sha256 $(sha256sum "$BIN" | cut -c1-16); engine $(git -C "$ENG_TREE" rev-parse --short=8 HEAD)"
   echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT"
   echo "# start: $(cat /proc/loadavg)"
@@ -79,6 +91,9 @@ echo "mode,engine,run,x,read_mvisits,write_mops,viol" > "$OUT"
 
 # label|bench-engine|extra-env
 ARMS=("rculist|rculist|X=0" "rculist_resolve|rculist_resolve|X=0" "txn_sw_fwd|txn_sw_list|BENCH_SU_FORWARD=1")
+if "$BIN" 2>&1 | grep -q rculist_loadbr; then
+  ARMS+=("rculist_load|rculist_load|X=0" "rculist_loadbr|rculist_loadbr|X=0")
+fi
 N=${#ARMS[@]}
 
 for r in $(seq 1 "$RUNS"); do

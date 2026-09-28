@@ -972,15 +972,24 @@ static unsigned long su_read(long *viol)
 {
 	struct urcu_txn_sw_list_node *p;
 	unsigned long vis = 0;
-	int prev, steps;
-	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+	int prev;
 
+	/*
+	 * No step-count guard, here or in rl_read / rl_read_resolve /
+	 * rl_read_load.  Keys strictly increase along a forward walk and strictly
+	 * decrease along a backward one, so the order check already stops any
+	 * cycle within one lap: a cycle must revisit a node whose key is out of
+	 * order.  A guard could never fire on a walk the order check lets
+	 * through; all it did was add bookkeeping to the loop being measured,
+	 * and whether its limit sat in memory or in a register moved plain
+	 * rculist by 0.17 cycles per node, the same order as the resolve itself.
+	 */
 	rcu_read_lock();
-	prev = INT_MIN; steps = 0;
+	prev = INT_MIN;
 	for (p = urcu_txn_sw_list_next_rcu(&g_su_head.node); p != &g_su_head.node;
 			p = urcu_txn_sw_list_next_rcu(p)) {
 		int k = caa_container_of(p, struct su_elem, node)->key;
-		if (k <= prev || ++steps > slim) { (*viol)++; break; }
+		if (k <= prev) { (*viol)++; break; }
 		prev = k; vis++;
 	}
 	/*
@@ -1005,13 +1014,13 @@ static unsigned long su_read(long *viol)
 	 * offer under mutation at all; that is a separate claim and should be
 	 * argued separately rather than folded into this cost number.
 	 */
-	prev = g_su_forward ? INT_MIN : INT_MAX; steps = 0;
+	prev = g_su_forward ? INT_MIN : INT_MAX;
 	if (g_su_forward) {
 		for (p = urcu_txn_sw_list_next_rcu(&g_su_head.node);
 				p != &g_su_head.node;
 				p = urcu_txn_sw_list_next_rcu(p)) {
 			int k = caa_container_of(p, struct su_elem, node)->key;
-			if (k <= prev || ++steps > slim) { (*viol)++; break; }
+			if (k <= prev) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	} else {
@@ -1019,7 +1028,7 @@ static unsigned long su_read(long *viol)
 				p != &g_su_head.node;
 				p = urcu_txn_sw_list_prev_rcu(p)) {
 			int k = caa_container_of(p, struct su_elem, node)->key;
-			if (k >= prev || ++steps > slim) { (*viol)++; break; }
+			if (k >= prev) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	}
@@ -1548,12 +1557,11 @@ static unsigned long rl_read(long *viol)
 {
 	struct cds_list_head *p;
 	unsigned long vis = 0;
-	int pass, prev, steps;
-	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+	int pass, prev;
 
 	rcu_read_lock();
 	for (pass = 0; pass < 2; pass++) {
-		prev = INT_MIN; steps = 0;
+		prev = INT_MIN;
 		/*
 		 * BENCH_RL_REVERSE: walk the second pass BACKWARD instead of
 		 * forward.  This exists to isolate a cache asymmetry in the
@@ -1580,14 +1588,14 @@ static unsigned long rl_read(long *viol)
 			prev = INT_MAX;
 			for (p = g_rl_head.prev; p != &g_rl_head; p = p->prev) {
 				int k = caa_container_of(p, struct rl_elem, list)->key;
-				if (k >= prev || ++steps > slim) { (*viol)++; break; }
+				if (k >= prev) { (*viol)++; break; }
 				prev = k; vis++;
 			}
 			continue;
 		}
 		cds_list_for_each_rcu(p, &g_rl_head) {
 			int k = caa_container_of(p, struct rl_elem, list)->key;
-			if (k <= prev || ++steps > slim) { (*viol)++; break; }
+			if (k <= prev) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	}
@@ -1621,48 +1629,92 @@ static void rl_write(int slot)
 }
 
 /*
- * rculist_resolve: rculist with the facility's reader-side tag test added, and
- * nothing else.  A control arm for P1's read-ceiling claim.
+ * Control arms for P1's read-ceiling claim (Paul McKenney's suggestion): plain
+ * rculist -- same list, same element, same build, same writer -- with exactly
+ * one kind of per-step work added, so the facility's cost can be placed against
+ * the cost of the work it is said to avoid.
  *
- * P1 explains the parity between txn_sw_list and rculist by saying that the
- * proxy marker rides in the word the reader had to load anyway, so the only
- * residue is a predicted branch.  That is an explanation inferred from the
- * ABSENCE of a gap.  This arm tests it directly (Paul McKenney's suggestion):
- * take rculist -- same list, same element, same build, same writer -- and wrap
- * every forward dereference in urcu_txn_sw_resolve(), the exact inline the
- * facility's reader runs, with the list's own tag.  rculist never installs a
- * proxy, so the tag test is never true: what is added is the test, the
- * never-taken branch, and the cold resolve path the compiler lays out for it.
+ *   rculist_resolve  + the facility's tag test: every forward dereference goes
+ *                    through urcu_txn_sw_resolve(), the exact inline the
+ *                    facility's reader runs, with the list's own tag.  rculist
+ *                    never installs a proxy, so the test is never true; what is
+ *                    added is one test and one never-taken branch on the word
+ *                    the walk loads anyway, plus the cold resolve path.
+ *   rculist_load     + one load: the visited node's own ->prev, a word the
+ *                    forward walk does not otherwise read, on a line it has
+ *                    already fetched for ->next and ->key.  Left unconsumed, so
+ *                    the arm adds one load and nothing else: no branch, no ALU
+ *                    op, no new cache line.
+ *   rculist_loadbr   + one load and one branch on it: ->prev loaded and its tag
+ *                    bit tested, never true.  The shape of a scheme that keeps
+ *                    its marker in a per-element word of its own rather than in
+ *                    the pointer the walk follows.
  *
- * Reading the three arms together:
- *   rculist_resolve ~ rculist ~ txn_sw_fwd   the branch is free; the
- *                                            explanation holds.
- *   rculist_resolve ~ txn_sw_fwd < rculist   the branch costs something the
- *                                            parity band was hiding.
- *   rculist_resolve !~ txn_sw_fwd            the two lists differ by more than
- *                                            the branch; the explanation fails.
+ * P1 claims the facility costs the second of these and not the first.  The
+ * arms test that: txn_sw_fwd should track rculist_resolve.
  *
  * Forward twice, like rl_read and like txn_sw_list under BENCH_SU_FORWARD, so
- * the access pattern is fixed across all three.  BENCH_RL_REVERSE is not
+ * the access pattern is fixed across all arms.  BENCH_RL_REVERSE is not
  * honoured here.  Writes go through rl_write unchanged.
  */
 static unsigned long rl_read_resolve(long *viol)
 {
 	struct cds_list_head *p;
 	unsigned long vis = 0;
-	int pass, prev, steps;
-	const int slim = STEP_LIMIT;	/* hoisted; see run_deref_cost.sh */
+	int pass, prev;
 
 	rcu_read_lock();
 	for (pass = 0; pass < 2; pass++) {
-		prev = INT_MIN; steps = 0;
+		prev = INT_MIN;
 		for (p = urcu_txn_sw_resolve(rcu_dereference(g_rl_head.next),
 					     URCU_TXN_SW_LIST_PROXY_TAG);
 				p != &g_rl_head;
 				p = urcu_txn_sw_resolve(rcu_dereference(p->next),
 							URCU_TXN_SW_LIST_PROXY_TAG)) {
 			int k = caa_container_of(p, struct rl_elem, list)->key;
-			if (k <= prev || ++steps > slim) { (*viol)++; break; }
+			if (k <= prev) { (*viol)++; break; }
+			prev = k; vis++;
+		}
+	}
+	rcu_read_unlock();
+	return vis;
+}
+static unsigned long rl_read_load(long *viol)
+{
+	struct cds_list_head *p;
+	unsigned long vis = 0;
+	int pass, prev;
+
+	rcu_read_lock();
+	for (pass = 0; pass < 2; pass++) {
+		prev = INT_MIN;
+		cds_list_for_each_rcu(p, &g_rl_head) {
+			int k = caa_container_of(p, struct rl_elem, list)->key;
+			(void) CMM_LOAD_SHARED(p->prev);	/* the added load */
+			if (k <= prev) { (*viol)++; break; }
+			prev = k; vis++;
+		}
+	}
+	rcu_read_unlock();
+	return vis;
+}
+static unsigned long rl_read_loadbr(long *viol)
+{
+	struct cds_list_head *p;
+	unsigned long vis = 0;
+	int pass, prev;
+
+	rcu_read_lock();
+	for (pass = 0; pass < 2; pass++) {
+		prev = INT_MIN;
+		cds_list_for_each_rcu(p, &g_rl_head) {
+			int k = caa_container_of(p, struct rl_elem, list)->key;
+			/* the added load, and a branch on its tag bit (never set) */
+			if (caa_unlikely((uintptr_t) CMM_LOAD_SHARED(p->prev) &
+					 URCU_TXN_SW_LIST_PROXY_TAG)) {
+				(*viol)++; break;
+			}
+			if (k <= prev) { (*viol)++; break; }
 			prev = k; vis++;
 		}
 	}
@@ -2610,6 +2662,8 @@ static const struct lengine engines[] = {
 	{ "lfht",      "liburcu cds_lfht (resizable lock-free hash)", 1, lfht_build, lfht_read, lfht_write },
 	{ "rculist",   "RCU classic, forward-only (ref)",    1, rl_build,  rl_read,  rl_write  },
 	{ "rculist_resolve", "RCU classic + the facility's tag test (control)", 1, rl_build, rl_read_resolve, rl_write },
+	{ "rculist_load", "RCU classic + one load per step (control)", 1, rl_build, rl_read_load, rl_write },
+	{ "rculist_loadbr", "RCU classic + one load and a branch on it (control)", 1, rl_build, rl_read_loadbr, rl_write },
 	{ "mutex",     "pthread_mutex",                      0, mtx_build, mtx_read, mtx_write },
 	{ "fairmutex", "liburcu cds_fair_mutex (MCS/FIFO)",  0, fm_build,  fm_read,  fm_write  },
 	{ "rwlock_r",  "pthread_rwlock, reader-preferring",  0, rw_build_reader, rw_read, rw_write },
