@@ -49,10 +49,44 @@
 # removed from its csv and log.  The harness then refused that arm and had
 # su_write_nodelock zero a new element's state word (a slab-recycled element
 # would still carry its tombstone; this build allocates with calloc).  TAG=_d
-# with ...-nodelock4 re-runs the five arms on that source.  TAG=_e (default
-# here) re-takes them on urcu-txn-dev 18809ea8, P1's pin since 2026-09-29,
+# with ...-nodelock4 re-runs the five arms on that source.  TAG=_e re-takes
+# them on urcu-txn-dev 18809ea8, P1's pin since 2026-09-29,
 # with ...-18809ea8 built at bench dc08669 against urcu-txn-build-18809ea8;
-# _c and _d are on engine b3e23f9f.
+# _c and _d are on engine b3e23f9f.  TAG=_f (default here) re-takes _e with
+# MEMPLACE=socket (below) and is the batch P1's fig:writerscale plots.  TAG=_g
+# is a spot check, WRITERS="160 176 184 188 190 191 192", taken with a guest VM
+# (compudjdev, 288 vCPUs, unpinned, mostly idle) shut down: _f's 191 -> 192
+# jump (8-23% on the finer-locked arms, 192 the only tight point above 96) is the
+# same without it, and 176-191 are two-moded.
+#
+# MEMORY PLACEMENT (MEMPLACE, default "socket").  The harness pins writer i to
+# core i, so up to one socket's worth of writers all run on socket 0; by default
+# it interleaves memory across every NUMA node, i.e. half on the other socket.
+# That made the 16-128-writer points bistable: at 96 writers runs landed either
+# at ~145 Mops/s (both lists alike) or at the list's own rate, ~195 for the bit
+# lock and ~264 for rculist, at random.  With memory confined to socket 0 every
+# run landed at the latter, within ~1%.  The diagnosis (2026-09-29, 96 writers,
+# the bit-lock and rculist arms, same sizing and warm-up, alternating order),
+# one csv per question, columns cond/arm/rep/Mops/violations[/extra]:
+#   p1_writer_scaling_diag_numa.csv    harness interleave on vs off
+#                                      (BENCH_NUMA_INTERLEAVE=0), 6 reps each:
+#                                      each produced both modes -- not the
+#                                      harness policy
+#   p1_writer_scaling_diag_mode.csv    base vs MALLOC_CONF=thp:never vs
+#                                      URCU_CALL_RCU_QLEN_CAP=0, with /proc/vmstat
+#                                      THP/compaction deltas: each produced both
+#                                      modes -- not THP, not the call_rcu queue cap
+#   p1_writer_scaling_diag_socket.csv  harness default vs numactl --interleave=0-11
+#                                      + BENCH_NUMA_INTERLEAVE=0, with the share
+#                                      of the process's memory on socket 0 (numastat
+#                                      -p, sampled mid-window): ~50% bistable,
+#                                      100% tight -- cross-socket memory
+# The first two ran 2 s windows, the third 3 s.
+# MEMPLACE=socket therefore runs a point that fits on socket 0 under
+# `numactl --interleave=<socket 0's nodes>` with BENCH_NUMA_INTERLEAVE=0 (the
+# harness would otherwise override the policy), and a point that spans both
+# sockets with the default all-node interleave.  MEMPLACE=all restores the
+# harness default for every point, as batches _c-_e were taken.
 #
 # SIZING is P2's sweep A: CHURN = 64 x writers, LIST_SIZE = 2 x CHURN, writer
 # wid owns churn slots wid, wid+nw, ... after unique anchors two nodes apart, so
@@ -67,7 +101,8 @@
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
 BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-18809ea8}
-TAG=${TAG:-_e}
+TAG=${TAG:-_f}
+MEMPLACE=${MEMPLACE:-socket}
 export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
 ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
 DUR=${DUR:-2}
@@ -90,20 +125,34 @@ ldd "$BIN" | grep -q "$ENG_TREE/src/.libs/liburcu-qsbr" \
 echo "arm,writers,list_size,churn,run,write_mops,violations,retries,loadavg" > "$OUT"
 
 # label|engine|extra-env
+# Socket 0: its cores (one PU per core, as the harness pins) and NUMA nodes.
+TPC=$(lscpu | awk -F: '/Thread\(s\) per core/{gsub(/ /,"",$2); print $2}')
+SOCK0_CORES=$(( $(for c in /sys/devices/system/cpu/cpu[0-9]*; do cat $c/topology/physical_package_id; done | grep -cx 0) / TPC ))
+SOCK0_NODES=$(for n in /sys/devices/system/node/node[0-9]*; do
+  c=$(cut -d- -f1 $n/cpulist | cut -d, -f1)
+  [ "$(cat /sys/devices/system/cpu/cpu$c/topology/physical_package_id)" = 0 ] && basename $n | sed 's/node//'
+done | sort -n | paste -sd,)
+echo "# MEMPLACE=$MEMPLACE: socket 0 = $SOCK0_CORES cores, NUMA nodes $SOCK0_NODES" >> "$LOG"
+
 ARMS=("txn_sw_bitlock|txn_sw_list|BENCH_NODE_LOCKS=bit" "txn_sw_nodelock|txn_sw_list|BENCH_NODE_LOCKS=1" "rculist_nodelock|rculist|BENCH_NODE_LOCKS=1" "txn_sw_mutex|txn_sw_list|X=0" "txn_list|txn_list|X=0")
 N=${#ARMS[@]}
 
 for r in $(seq 1 "$RUNS"); do
   for w in $WRITERS; do
     ch=$((64 * w)); ls=$((2 * ch))
+    if [ "$MEMPLACE" = socket ] && [ "$w" -le "$SOCK0_CORES" ]; then
+      memplace="numactl --interleave=$SOCK0_NODES"; memenv="BENCH_NUMA_INTERLEAVE=0"; mem=socket0
+    else
+      memplace=""; memenv=""; mem=all
+    fi
     for i in $(seq 0 $((N - 1))); do
       IFS='|' read -r lbl eng extra <<<"${ARMS[$(( (i + r - 1) % N ))]}"
       la=$(cut -d' ' -f1 /proc/loadavg)
       {
-        echo "## $lbl w=$w run=$r $(date +%T) load $(cut -d' ' -f1-3 /proc/loadavg)"
+        echo "## $lbl w=$w run=$r mem=$mem $(date +%T) load $(cut -d' ' -f1-3 /proc/loadavg)"
         top -bn1 -o %CPU | sed -n '8,10p'
       } >> "$LOG"
-      out=$(setarch "$(uname -m)" -R env LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
+      out=$($memplace setarch "$(uname -m)" -R env $memenv LIST_SIZE="$ls" CHURN="$ch" DURATION_SEC="$DUR" \
             BENCH_WRITESCALE=1 BENCH_FIXED_WRITERS="$w" BENCH_READERS=0 $extra \
             timeout 600 "$BIN" "$eng" 192 2>&1)
       echo "$out" | grep -v '^[0-9]' | sed 's/^/   | /' >> "$LOG"

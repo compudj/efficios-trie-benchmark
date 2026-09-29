@@ -1,0 +1,2317 @@
+# run_p1_writer_scaling.sh  2026-09-29T13:07:43-04:00
+# bench HEAD a4f377c9; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-aligned-18809ea8 sha256 9ede752cc6f81ab6; engine 18809ea8
+# DUR=2 RUNS=5 WRITERS=160 176 184 188 190 191 192 BENCH_WARMUP_SEC=4
+# start: 7.37 21.01 30.40 2/3661 3605490
+# MEMPLACE=socket: socket 0 = 96 cores, NUMA nodes 0,1,2,3,4,5,6,7,8,9,10,11
+## txn_sw_bitlock w=160 run=1 mem=all 13:07:43 load 7.37 21.01 30.40
+3606010 efficios  20   0   17508  10040   3780 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 529900 149528 S   5.9   0.1  42:46.11 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31584 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 31584 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=160 run=1 mem=all 13:07:51 load 27.76 25.02 31.65
+3606592 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31584 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 31584 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=160 run=1 mem=all 13:07:57 load 36.46 26.88 32.18
+3607161 efficios  20   0   17688  10404   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 519736 149528 S   5.9   0.1  42:47.08 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=20480 CHURN=10240, RSS=20516 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine rculist rss_kb 20516 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=160 run=1 mem=all 13:08:04 load 48.91 29.62 33.04
+3607736 efficios  20   0   17688  10272   3716 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 527012 149528 S   5.9   0.1  42:47.53 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=160 run=1 mem=all 13:08:11 load 57.81 31.79 33.72
+3608308 efficios  20   0   17688  10408   3852 R  35.3   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=26940 kB, 2s/point
+   | engine txn_list rss_kb 26940 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=176 run=1 mem=all 13:08:17 load 62.29 33.51 34.25
+3608878 efficios  20   0   17688  10320   3876 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 521456 149528 S  11.8   0.1  42:48.39 claude
+  36491 root      20   0       0      0      0 I   5.9   0.0   0:18.14 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34512 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 34512 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=176 run=1 mem=all 13:08:25 load 76.04 36.84 35.33
+3609472 efficios  20   0   17688  10396   3844 R  38.9   0.0   0:00.14 top
+ 253993 root      20   0       0      0      0 I   5.6   0.0   0:12.84 kworker+
+3578836 root      20   0       0      0      0 I   5.6   0.0   0:00.30 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34496 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 34496 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=176 run=1 mem=all 13:08:32 load 95.71 42.35 37.14
+3610052 efficios  20   0   17688  10396   3844 R  44.4   0.0   0:00.15 top
+3035136 efficios  20   0 5642836 438540 147880 S   5.6   0.1   8:58.72 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=22528 CHURN=11264, RSS=22296 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22296 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=176 run=1 mem=all 13:08:38 load 103.58 44.86 37.98
+3610642 efficios  20   0   17688  10292   3788 R  41.2   0.0   0:00.14 top
+3597400 efficios  20   0   17976  10984   4148 S  29.4   0.0   0:20.05 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34504 kB, 2s/point
+   | engine txn_sw_list rss_kb 34504 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=176 run=1 mem=all 13:08:45 load 109.38 47.04 38.72
+3611229 efficios  20   0   17688  10304   3752 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 524100 149528 S   5.6   0.1  42:49.77 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=29344 kB, 2s/point
+   | engine txn_list rss_kb 29344 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=184 run=1 mem=all 13:08:52 load 123.27 52.08 40.45
+3611810 efficios  20   0   17688  10292   3736 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 527568 149528 S   5.9   0.1  42:50.09 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.38 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35068 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35068 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=184 run=1 mem=all 13:08:59 load 129.41 54.53 41.31
+3612412 efficios  20   0   17688  10184   3736 R  47.1   0.0   0:00.15 top
+1222314 root      20   0       0      0      0 I   5.9   0.0   4:59.17 kworker+
+1289625 efficios  20   0 5657876 526744 149528 S   5.9   0.1  42:50.43 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35116 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35116 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=184 run=1 mem=all 13:09:06 load 127.73 56.77 42.18
+3613011 efficios  20   0   17688  10300   3852 R  44.4   0.0   0:00.15 top
+3597400 efficios  20   0   17976  10984   4148 S  33.3   0.0   0:20.83 top
+      1 root      20   0   24172  15012  10656 S   5.6   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=23552 CHURN=11776, RSS=22308 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22308 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=184 run=1 mem=all 13:09:13 load 133.51 59.15 43.03
+3613630 efficios  20   0   17688  10160   3716 R  47.1   0.0   0:00.15 top
+3062328 root      20   0       0      0      0 I   5.9   0.0   0:00.07 kworker+
+3590955 root      20   0       0      0      0 I   5.9   0.0   0:00.40 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35076 kB, 2s/point
+   | engine txn_sw_list rss_kb 35076 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=184 run=1 mem=all 13:09:19 load 137.64 61.24 43.79
+3614222 efficios  20   0   17688  10212   3768 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 526672 149528 S   5.9   0.1  42:51.46 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=29676 kB, 2s/point
+   | engine txn_list rss_kb 29676 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=188 run=1 mem=all 13:09:26 load 150.65 66.53 45.70
+3614812 efficios  20   0   17688  10160   3716 R  41.2   0.0   0:00.15 top
+3035136 efficios  20   0 5642836 438684 147880 S   5.9   0.1   8:59.10 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35360 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35360 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=188 run=1 mem=all 13:09:34 load 157.96 69.45 46.76
+3615407 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:33.13 systemd+
+3597400 efficios  20   0   17976  10984   4148 R   5.9   0.0   0:21.56 top
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=188 run=1 mem=all 13:09:41 load 161.49 71.65 47.59
+3616009 efficios  20   0   17688  10316   3868 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24064 CHURN=12032, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=188 run=1 mem=all 13:09:47 load 152.12 72.49 48.12
+3616601 efficios  20   0   17688  10304   3860 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=188 run=1 mem=all 13:09:54 load 154.83 74.38 48.86
+3617195 efficios  20   0   17688  10292   3848 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 522796 149528 S   5.9   0.1  42:53.42 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=29840 kB, 2s/point
+   | engine txn_list rss_kb 29840 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=190 run=1 mem=all 13:10:01 load 145.47 75.13 49.38
+3617793 efficios  20   0   17688  10316   3868 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 523020 149528 S   5.9   0.1  42:53.75 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=190 run=1 mem=all 13:10:09 load 156.64 78.61 50.65
+3618396 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 522128 149528 S  11.8   0.1  42:54.35 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35520 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35520 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=190 run=1 mem=all 13:10:16 load 159.88 80.58 51.43
+3618992 efficios  20   0   17688  10236   3788 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 520004 149528 S   5.9   0.1  42:54.67 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24320 CHURN=12160, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=190 run=1 mem=all 13:10:22 load 151.71 81.33 51.98
+3619586 efficios  20   0   17688  10224   3780 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 522492 149528 S   5.9   0.1  42:55.11 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35500 kB, 2s/point
+   | engine txn_sw_list rss_kb 35500 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=190 run=1 mem=all 13:10:29 load 154.78 83.13 52.73
+3620180 efficios  20   0   17688  10292   3844 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 524056 149528 S   5.6   0.1  42:55.40 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=29960 kB, 2s/point
+   | engine txn_list rss_kb 29960 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=191 run=1 mem=all 13:10:36 load 147.34 84.02 53.35
+3620786 efficios  20   0   17688  10180   3736 R  41.2   0.0   0:00.15 top
+   2801 root      20   0       0      0      0 S   5.9   0.0   0:41.96 kcompac+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=191 run=1 mem=all 13:10:43 load 152.36 86.11 54.19
+3621388 efficios  20   0   17688  10324   3876 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 521908 149528 S   5.9   0.1  42:56.08 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.39 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=191 run=1 mem=all 13:10:50 load 161.38 89.08 55.32
+3621983 efficios  20   0   17688  10296   3852 R  38.9   0.0   0:00.14 top
+3035136 efficios  20   0 5642836 441488 147880 S  16.7   0.1   8:59.80 claude
+1289625 efficios  20   0 5657876 524748 149528 S   5.6   0.1  42:56.43 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24448 CHURN=12224, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=191 run=1 mem=all 13:10:57 load 153.86 89.73 55.89
+3622582 efficios  20   0   17688  10216   3768 R  35.3   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.40 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=191 run=1 mem=all 13:11:04 load 156.83 91.42 56.62
+3597400 efficios  20   0   17976  10984   4148 S  38.9   0.0   0:24.19 top
+3623179 efficios  20   0   17688  10280   3836 R  33.3   0.0   0:00.14 top
+     15 root      20   0       0      0      0 I   5.6   0.0   6:37.62 rcu_pre+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=29964 kB, 2s/point
+   | engine txn_list rss_kb 29964 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=192 run=1 mem=all 13:11:11 load 160.85 93.33 57.42
+3623784 efficios  20   0   17688  10300   3852 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 520028 149528 S   5.9   0.1  42:57.38 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.40 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=192 run=1 mem=all 13:11:18 load 152.14 93.58 57.88
+3624382 efficios  20   0   17688  10256   3808 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 520352 149528 S   5.6   0.1  42:57.79 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.40 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35636 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35636 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=192 run=1 mem=all 13:11:25 load 156.61 95.48 58.69
+3624979 efficios  20   0   17688  10288   3844 R  44.4   0.0   0:00.15 top
+3597400 efficios  20   0   17976  10984   4148 S  33.3   0.0   0:24.80 top
+      1 root      20   0   24172  15012  10656 S   5.6   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24576 CHURN=12288, RSS=22332 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22332 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=192 run=1 mem=all 13:11:32 load 170.75 100.57 60.74
+3625575 efficios  20   0   17688  10308   3860 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 520996 149528 S   5.6   0.1  42:58.44 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35636 kB, 2s/point
+   | engine txn_sw_list rss_kb 35636 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=192 run=1 mem=all 13:11:38 load 176.05 102.84 61.69
+3626181 efficios  20   0   17688  10160   3716 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=30024 kB, 2s/point
+   | engine txn_list rss_kb 30024 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_nodelock w=160 run=2 mem=all 13:11:46 load 181.49 105.18 62.67
+3626778 efficios  20   0   17688  10308   3860 R  38.9   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31584 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 31584 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=160 run=2 mem=all 13:11:53 load 166.64 104.42 62.87
+3627343 efficios  20   0   17688  10280   3836 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521924 149528 S   5.6   0.1  42:59.43 claude
+3035136 efficios  20   0 5642836 439884 147880 S   5.6   0.1   9:00.29 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=20480 CHURN=10240, RSS=20520 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine rculist rss_kb 20520 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=160 run=2 mem=all 13:11:59 load 167.95 105.73 63.52
+3627912 efficios  20   0   17688  10312   3868 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 523328 149528 S   5.6   0.1  42:59.72 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31596 kB, 2s/point
+   | engine txn_sw_list rss_kb 31596 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=160 run=2 mem=all 13:12:06 load 167.31 106.63 64.04
+3628483 efficios  20   0   17688  10192   3744 R  38.9   0.0   0:00.14 top
+3035136 efficios  20   0 5642836 439372 147880 S  22.2   0.1   9:00.43 claude
+1289625 efficios  20   0 5657876 523624 149528 S   5.6   0.1  43:00.03 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=26892 kB, 2s/point
+   | engine txn_list rss_kb 26892 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=160 run=2 mem=all 13:12:13 load 160.72 107.09 64.64
+3629047 efficios  20   0   17688  10304   3860 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 523756 149528 S   5.6   0.1  43:00.34 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=176 run=2 mem=all 13:12:20 load 161.94 108.23 65.23
+3629615 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34520 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 34520 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=176 run=2 mem=all 13:12:27 load 171.33 112.02 66.93
+3630196 efficios  20   0   17688  10220   3776 R  41.2   0.0   0:00.14 top
+ 992519 efficios  20   0   25300  13592   4192 S   5.9   0.0   2:59.86 tmux: s+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=22528 CHURN=11264, RSS=22296 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22296 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=176 run=2 mem=all 13:12:33 load 175.31 113.83 67.76
+3630776 efficios  20   0   17688  10300   3852 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 525096 149528 S   5.9   0.1  43:01.33 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34500 kB, 2s/point
+   | engine txn_sw_list rss_kb 34500 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=176 run=2 mem=all 13:12:40 load 175.29 114.85 68.33
+3631366 efficios  20   0   17688  10288   3844 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 528032 149528 S  11.8   0.1  43:01.63 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=29340 kB, 2s/point
+   | engine txn_list rss_kb 29340 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=176 run=2 mem=all 13:12:47 load 177.05 117.22 69.61
+3631954 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+   2783 root      20   0       0      0      0 S   5.9   0.0   0:41.29 kcompac+
+1289625 efficios  20   0 5657876 526060 149528 S   5.9   0.1  43:01.93 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34504 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 34504 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=184 run=2 mem=all 13:12:54 load 177.77 118.37 70.23
+3632537 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 530124 149528 S  11.8   0.1  43:02.27 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35068 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35068 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=184 run=2 mem=all 13:13:01 load 164.22 117.52 70.48
+3633127 efficios  20   0   17688  10116   3672 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 529108 149528 S  11.8   0.1  43:02.62 claude
+1084497 root      20   0       0      0      0 I   5.9   0.0   0:02.81 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=23552 CHURN=11776, RSS=22308 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22308 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=184 run=2 mem=all 13:13:08 load 167.48 118.97 71.20
+3633723 efficios  20   0   17688  10384   3876 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35104 kB, 2s/point
+   | engine txn_sw_list rss_kb 35104 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=184 run=2 mem=all 13:13:14 load 168.89 120.07 71.81
+3634320 efficios  20   0   17688  10220   3716 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 530012 149528 S   5.9   0.1  43:03.25 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=29692 kB, 2s/point
+   | engine txn_list rss_kb 29692 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=184 run=2 mem=all 13:13:22 load 174.49 122.90 73.25
+3634910 efficios  20   0   17688  10288   3736 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 533968 149528 S   5.9   0.1  43:03.60 claude
+3062328 root      20   0       0      0      0 I   5.9   0.0   0:00.11 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35064 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35064 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=188 run=2 mem=all 13:13:29 load 179.18 124.72 74.11
+3635506 efficios  20   0   17688  10160   3716 R  44.4   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=188 run=2 mem=all 13:13:36 load 184.93 126.82 75.06
+3636100 efficios  20   0   17688  10404   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 518440 149528 S   5.9   0.1  43:04.56 claude
+3035136 efficios  20   0 5642836 438576 147880 S   5.9   0.1   9:01.12 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24064 CHURN=12032, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=188 run=2 mem=all 13:13:42 load 172.27 125.92 75.31
+3636700 efficios  20   0   17688  10296   3848 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35348 kB, 2s/point
+   | engine txn_sw_list rss_kb 35348 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=188 run=2 mem=all 13:13:49 load 173.53 126.95 75.92
+3637292 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 517236 149528 S  11.8   0.1  43:05.23 claude
+3035136 efficios  20   0 5642836 439092 147880 S   5.9   0.1   9:01.23 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=29840 kB, 2s/point
+   | engine txn_list rss_kb 29840 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=188 run=2 mem=all 13:13:56 load 163.88 126.54 76.34
+3637888 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=190 run=2 mem=all 13:14:03 load 169.81 128.39 77.21
+3638481 efficios  20   0   17688  10316   3868 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 519460 149528 S   5.9   0.1  43:05.97 claude
+3035136 efficios  20   0 5642836 438580 147880 S   5.9   0.1   9:01.35 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35488 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35488 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=190 run=2 mem=all 13:14:10 load 175.03 130.16 78.05
+3639083 efficios  20   0   17688  10304   3860 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521860 149528 S   5.6   0.1  43:06.29 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24320 CHURN=12160, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=190 run=2 mem=all 13:14:17 load 170.57 130.61 78.76
+3639686 efficios  20   0   17688  10300   3852 R  44.4   0.0   0:00.15 top
+ 992519 efficios  20   0   25300  13592   4192 S   5.6   0.0   3:00.08 tmux: s+
+1289625 efficios  20   0 5657876 518492 149528 S   5.6   0.1  43:06.62 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35496 kB, 2s/point
+   | engine txn_sw_list rss_kb 35496 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=190 run=2 mem=all 13:14:24 load 172.28 131.63 79.37
+3640280 efficios  20   0   17688  10316   3868 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 520620 149528 S   5.6   0.1  43:06.98 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=29924 kB, 2s/point
+   | engine txn_list rss_kb 29924 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=190 run=2 mem=all 13:14:31 load 177.70 133.43 80.23
+3640874 efficios  20   0   17688  10292   3844 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 519876 149528 S   5.6   0.1  43:07.47 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=191 run=2 mem=all 13:14:38 load 169.60 133.02 80.66
+3641479 efficios  20   0   17688  10180   3736 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 517328 149528 S  17.6   0.1  43:08.00 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.41 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=191 run=2 mem=all 13:14:45 load 174.36 134.62 81.46
+3642081 efficios  20   0   17688  10184   3736 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.42 systemd
+1289625 efficios  20   0 5657876 517592 149528 S   5.9   0.1  43:08.45 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24448 CHURN=12224, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=191 run=2 mem=all 13:14:52 load 179.09 136.95 82.78
+3642677 efficios  20   0   17688  10168   3724 R  38.9   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=191 run=2 mem=all 13:14:58 load 182.84 138.43 83.55
+3597400 efficios  20   0   17976  10984   4148 S  44.4   0.0   0:30.89 top
+3643276 efficios  20   0   17688  10296   3852 R  44.4   0.0   0:00.15 top
+     15 root      20   0       0      0      0 I   5.6   0.0   6:37.75 rcu_pre+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=29964 kB, 2s/point
+   | engine txn_list rss_kb 29964 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=191 run=2 mem=all 13:15:06 load 183.58 139.32 84.14
+3643871 efficios  20   0   17688  10180   3732 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521312 149528 S   5.9   0.1  43:09.53 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=192 run=2 mem=all 13:15:13 load 175.93 139.00 84.62
+3644475 efficios  20   0   17688  10308   3752 R  38.9   0.0   0:00.14 top
+3810710 root      20   0       0      0      0 I   5.6   0.0   0:05.30 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35636 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35636 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=192 run=2 mem=all 13:15:20 load 179.38 140.33 85.34
+3597400 efficios  20   0   17976  10984   4148 S  41.2   0.0   0:31.50 top
+3645074 efficios  20   0   17688  10436   3884 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 517684 149528 S   5.9   0.1  43:10.24 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24576 CHURN=12288, RSS=22332 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22332 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=192 run=2 mem=all 13:15:27 load 190.24 143.98 87.12
+3645670 efficios  20   0   17688  10400   3848 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 520072 149528 S   5.6   0.1  43:10.56 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=192 run=2 mem=all 13:15:33 load 191.35 144.97 87.75
+3646266 efficios  20   0   17688  10244   3800 R  33.3   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=30004 kB, 2s/point
+   | engine txn_list rss_kb 30004 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=192 run=2 mem=all 13:15:41 load 196.36 146.78 88.64
+3646873 efficios  20   0   17688  10164   3716 R  41.2   0.0   0:00.14 top
+     15 root      20   0       0      0      0 I   5.9   0.0   6:37.77 rcu_pre+
+1289625 efficios  20   0 5657876 521812 149528 S   5.9   0.1  43:11.28 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35644 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35644 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=160 run=3 mem=all 13:15:48 load 188.43 146.56 89.18
+3647470 efficios  20   0   17688  10136   3692 R  38.9   0.0   0:00.14 top
+1245558 root      20   0       0      0      0 I   5.6   0.0   0:14.08 kworker+
+1289625 efficios  20   0 5657876 519476 149528 S   5.6   0.1  43:11.67 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=20480 CHURN=10240, RSS=20504 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine rculist rss_kb 20504 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=160 run=3 mem=all 13:15:55 load 186.63 146.89 89.59
+3648036 efficios  20   0   17688  10160   3716 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 522460 149528 S   5.9   0.1  43:11.99 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31584 kB, 2s/point
+   | engine txn_sw_list rss_kb 31584 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=160 run=3 mem=all 13:16:01 load 182.54 147.32 90.35
+3648602 efficios  20   0   17688  10312   3868 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 524108 149528 S   5.9   0.1  43:12.28 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=26892 kB, 2s/point
+   | engine txn_list rss_kb 26892 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=160 run=3 mem=all 13:16:08 load 181.61 147.71 90.78
+3649174 efficios  20   0   17688  10256   3808 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 516480 149528 S   5.9   0.1  43:12.76 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=160 run=3 mem=all 13:16:15 load 182.53 148.47 91.33
+3649738 efficios  20   0   17688  10224   3780 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521776 149528 S   5.9   0.1  43:13.09 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=176 run=3 mem=all 13:16:22 load 183.86 149.88 92.41
+3650306 efficios  20   0   17688  10296   3848 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 530208 149528 S   5.6   0.1  43:13.42 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=22528 CHURN=11264, RSS=22304 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22304 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=176 run=3 mem=all 13:16:29 load 183.96 150.46 92.90
+3650886 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 546136 149528 S   5.9   0.1  43:13.72 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34548 kB, 2s/point
+   | engine txn_sw_list rss_kb 34548 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=176 run=3 mem=all 13:16:35 load 183.24 150.87 93.35
+3651474 efficios  20   0   17688  10316   3868 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 521836 149528 S  11.1   0.1  43:14.06 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=29340 kB, 2s/point
+   | engine txn_list rss_kb 29340 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=176 run=3 mem=all 13:16:42 load 186.35 152.62 94.53
+1289625 efficios  20   0 5657876 522628 149528 S 111.1   0.1  43:14.65 claude
+3652064 efficios  20   0   17688  10216   3768 R  38.9   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34500 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 34500 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=176 run=3 mem=all 13:16:50 load 185.60 153.02 94.97
+3652645 efficios  20   0   17688  10164   3716 R  35.3   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34500 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 34500 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=184 run=3 mem=all 13:16:57 load 187.28 154.44 96.06
+3653230 efficios  20   0   17688  10288   3844 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=23552 CHURN=11776, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=184 run=3 mem=all 13:17:03 load 189.58 155.46 96.70
+3653822 efficios  20   0   17688  10300   3852 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 514352 149528 S   5.6   0.1  43:15.84 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35072 kB, 2s/point
+   | engine txn_sw_list rss_kb 35072 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=184 run=3 mem=all 13:17:10 load 189.05 155.92 97.17
+3654418 efficios  20   0   17688  10296   3848 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 518552 149528 S   5.6   0.1  43:16.11 claude
+3070507 root      20   0       0      0      0 I   5.6   0.0   0:03.09 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=29688 kB, 2s/point
+   | engine txn_list rss_kb 29688 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=184 run=3 mem=all 13:17:17 load 197.17 158.80 98.73
+3655008 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+ 660779 root      20   0       0      0      0 I   5.9   0.0   0:09.82 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35068 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35068 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=184 run=3 mem=all 13:17:24 load 196.36 159.26 99.21
+3655604 efficios  20   0   17688  10296   3848 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 522604 149528 S  16.7   0.1  43:16.78 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35092 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35092 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=188 run=3 mem=all 13:17:31 load 179.87 157.06 99.14
+3656193 efficios  20   0   17688  10312   3868 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 523192 149528 S   5.9   0.1  43:17.12 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24064 CHURN=12032, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=188 run=3 mem=all 13:17:38 load 181.89 157.85 99.71
+3656795 efficios  20   0   17688  10292   3844 R  41.2   0.0   0:00.15 top
+ 992519 efficios  20   0   25300  13592   4192 S   5.9   0.0   3:00.52 tmux: s+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35364 kB, 2s/point
+   | engine txn_sw_list rss_kb 35364 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=188 run=3 mem=all 13:17:45 load 182.30 158.34 100.18
+3657387 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:33.16 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=29844 kB, 2s/point
+   | engine txn_list rss_kb 29844 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=188 run=3 mem=all 13:17:52 load 172.62 157.19 100.43
+3657979 efficios  20   0   17688  10200   3752 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35368 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35368 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=188 run=3 mem=all 13:17:59 load 183.94 159.79 101.58
+3658577 efficios  20   0   17688  10228   3780 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.43 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35372 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35372 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=190 run=3 mem=all 13:18:06 load 184.83 160.38 102.08
+3659178 efficios  20   0   17688  10304   3860 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 526656 149528 S   5.9   0.1  43:18.98 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.43 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24320 CHURN=12160, RSS=22356 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22356 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=190 run=3 mem=all 13:18:13 load 174.98 158.95 102.24
+3659773 efficios  20   0   17688  10292   3848 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 528560 149528 S  22.2   0.1  43:19.47 claude
+      1 root      20   0   24172  15012  10656 S   5.6   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35496 kB, 2s/point
+   | engine txn_sw_list rss_kb 35496 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=190 run=3 mem=all 13:18:19 load 176.27 159.48 102.71
+3660375 efficios  20   0   17688  10228   3780 R  47.1   0.0   0:00.15 top
+3597400 efficios  20   0   17976  10984   4148 R  41.2   0.0   0:36.55 top
+1289625 efficios  20   0 5657876 534976 149528 R  23.5   0.1  43:20.12 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=29932 kB, 2s/point
+   | engine txn_list rss_kb 29932 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=190 run=3 mem=all 13:18:26 load 166.70 158.11 102.88
+3660983 efficios  20   0   17688  10248   3800 R  41.2   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:33.17 systemd+
+1289625 efficios  20   0 5657876 543040 149528 S   5.9   0.1  43:20.61 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=190 run=3 mem=all 13:18:34 load 172.41 159.44 103.61
+3661577 efficios  20   0   17688  10312   3864 R  29.4   0.0   0:00.13 top
+3035136 efficios  20   0 5642836 438592 147880 S   5.9   0.1   9:03.48 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=191 run=3 mem=all 13:18:41 load 174.38 160.06 104.11
+3662182 efficios  20   0   17688  10300   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 542376 149528 S   5.9   0.1  43:21.34 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24448 CHURN=12224, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=191 run=3 mem=all 13:18:47 load 166.54 158.73 104.27
+3662778 efficios  20   0   17688  10296   3852 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 527344 149528 S  11.1   0.1  43:22.26 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=191 run=3 mem=all 13:18:54 load 168.58 159.28 104.74
+3663379 efficios  20   0   17688  10172   3724 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=29960 kB, 2s/point
+   | engine txn_list rss_kb 29960 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=191 run=3 mem=all 13:19:01 load 170.53 159.84 105.22
+3663976 efficios  20   0   17688  10312   3868 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 524868 149528 S   5.6   0.1  43:23.21 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=191 run=3 mem=all 13:19:09 load 163.93 158.65 105.40
+3664581 efficios  20   0   17688  10248   3800 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35576 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35576 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=192 run=3 mem=all 13:19:16 load 169.63 159.91 106.10
+3665179 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5642836 439104 147880 S  17.6   0.1   9:03.84 claude
+1977058 root      20   0       0      0      0 I   5.9   0.0   0:03.87 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24576 CHURN=12288, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=192 run=3 mem=all 13:19:22 load 177.54 161.95 107.34
+3665782 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=192 run=3 mem=all 13:19:29 load 178.78 162.47 107.80
+3666380 efficios  20   0   17688  10296   3848 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 535952 149528 S   5.6   0.1  43:24.87 claude
+3035136 efficios  20   0 5642836 438596 147880 S   5.6   0.1   9:03.93 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=30004 kB, 2s/point
+   | engine txn_list rss_kb 30004 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=192 run=3 mem=all 13:19:36 load 182.08 163.42 108.40
+3666987 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 531380 149528 S   5.9   0.1  43:25.34 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35652 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35652 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=192 run=3 mem=all 13:19:43 load 171.86 161.73 108.44
+3667584 efficios  20   0   17688  10296   3848 R  41.2   0.0   0:00.14 top
+4094968 root      20   0       0      0      0 I   5.9   0.0   0:44.04 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35708 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35708 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=160 run=4 mem=all 13:19:51 load 176.03 162.76 109.06
+3668183 efficios  20   0   17688  10292   3844 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 531352 149528 S   5.9   0.1  43:26.26 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31596 kB, 2s/point
+   | engine txn_sw_list rss_kb 31596 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=160 run=4 mem=all 13:19:57 load 173.72 162.70 109.61
+3668751 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=26896 kB, 2s/point
+   | engine txn_list rss_kb 26896 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=160 run=4 mem=all 13:20:04 load 173.26 162.79 109.93
+3669316 efficios  20   0   17688  10180   3736 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 531284 149528 S   5.9   0.1  43:27.06 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=160 run=4 mem=all 13:20:11 load 174.84 163.29 110.37
+3669890 efficios  20   0   17688  10292   3844 R  38.9   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31612 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 31612 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=160 run=4 mem=all 13:20:18 load 166.37 161.74 110.43
+3670457 efficios  20   0   17688  10180   3736 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 529624 149528 S  17.6   0.1  43:27.88 claude
+   2805 root      20   0       0      0      0 S   5.9   0.0   0:29.44 kcompac+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=20480 CHURN=10240, RSS=20500 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine rculist rss_kb 20500 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=176 run=4 mem=all 13:20:25 load 166.26 161.79 110.72
+3671022 efficios  20   0   17688  10296   3852 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 531688 149528 S  11.8   0.1  43:28.26 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34512 kB, 2s/point
+   | engine txn_sw_list rss_kb 34512 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=176 run=4 mem=all 13:20:31 load 169.37 162.51 111.23
+3671605 efficios  20   0   17688  10164   3716 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 532712 149528 S   5.9   0.1  43:28.61 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=29340 kB, 2s/point
+   | engine txn_list rss_kb 29340 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=176 run=4 mem=all 13:20:38 load 159.74 160.56 111.14
+3672196 efficios  20   0   17688  10164   3716 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521420 149528 S   5.9   0.1  43:29.20 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34504 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 34504 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=176 run=4 mem=all 13:20:45 load 162.40 161.10 111.58
+3672783 efficios  20   0   17688  10320   3876 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 521672 149528 S   5.6   0.1  43:29.59 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.44 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34500 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 34500 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=176 run=4 mem=all 13:20:52 load 166.01 161.92 112.37
+3673365 efficios  20   0   17688  10324   3876 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.45 systemd
+1720767 root      20   0       0      0      0 I   5.9   0.0   0:02.42 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=22528 CHURN=11264, RSS=22296 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22296 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=184 run=4 mem=all 13:20:59 load 169.13 162.63 112.87
+3673950 efficios  20   0   17688  10316   3868 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 525576 149528 S  17.6   0.1  43:30.42 claude
+   6278 1000998   20   0   20572   5792   4380 S   5.9   0.0   0:02.16 systemd+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35092 kB, 2s/point
+   | engine txn_sw_list rss_kb 35092 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=184 run=4 mem=all 13:21:06 load 170.24 162.97 113.25
+3674538 efficios  20   0   17688  10212   3768 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 525588 149528 S   5.6   0.1  43:30.75 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=29672 kB, 2s/point
+   | engine txn_list rss_kb 29672 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=184 run=4 mem=all 13:21:13 load 175.61 164.34 114.23
+3675137 efficios  20   0   17688  10160   3716 R  35.3   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35068 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35068 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=184 run=4 mem=all 13:21:20 load 177.88 165.00 114.71
+3675727 efficios  20   0   17688  10304   3860 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 533868 149528 R   5.6   0.1  43:31.55 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35072 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35072 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=184 run=4 mem=all 13:21:27 load 184.09 166.75 115.82
+3676334 efficios  20   0   17688  10252   3808 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 549092 149528 S   5.9   0.1  43:31.95 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=23552 CHURN=11776, RSS=22308 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22308 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=188 run=4 mem=all 13:21:33 load 184.64 167.15 116.22
+3676932 efficios  20   0   17688  10168   3724 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 529156 149528 S  11.1   0.1  43:32.51 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=188 run=4 mem=all 13:21:40 load 184.83 167.48 116.60
+3677535 efficios  20   0   17688  10296   3848 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 529572 149528 S  11.1   0.1  43:32.94 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=29840 kB, 2s/point
+   | engine txn_list rss_kb 29840 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=188 run=4 mem=all 13:21:47 load 188.13 168.75 117.56
+3678128 efficios  20   0   17688  10184   3736 R  38.9   0.0   0:00.14 top
+     15 root      20   0       0      0      0 I   5.6   0.0   6:37.96 rcu_pre+
+1289625 efficios  20   0 5657876 513776 149528 S   5.6   0.1  43:33.74 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35364 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35364 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=188 run=4 mem=all 13:21:55 load 189.08 169.27 118.00
+3678724 efficios  20   0   17688  10316   3868 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 515880 149528 S   5.6   0.1  43:34.26 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=188 run=4 mem=all 13:22:02 load 175.78 167.19 117.88
+3679318 efficios  20   0   17688  10180   3736 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 515596 149528 S   5.9   0.1  43:34.71 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24064 CHURN=12032, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=190 run=4 mem=all 13:22:08 load 177.72 167.74 118.32
+3679919 efficios  20   0   17688  10200   3752 R  38.9   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.6   0.0   0:33.18 systemd+
+1289625 efficios  20   0 5657876 519432 149528 S   5.6   0.1  43:35.13 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=190 run=4 mem=all 13:22:15 load 178.79 168.12 118.71
+3680515 efficios  20   0   17688  10228   3780 R  47.1   0.0   0:00.15 top
+   2800 root      20   0       0      0      0 S   5.9   0.0   0:40.36 kcompac+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=29928 kB, 2s/point
+   | engine txn_list rss_kb 29928 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=190 run=4 mem=all 13:22:22 load 167.95 166.28 118.65
+3681118 efficios  20   0   17688  10164   3716 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 524876 149528 S   5.9   0.1  43:35.86 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35508 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35508 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=190 run=4 mem=all 13:22:29 load 173.80 167.52 119.31
+3681714 efficios  20   0   17688  10300   3852 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 525344 149528 S   5.6   0.1  43:36.26 claude
+3035136 efficios  20   0 5642836 438620 147880 S   5.6   0.1   9:05.46 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35504 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35504 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=190 run=4 mem=all 13:22:36 load 175.18 167.91 119.69
+3682318 efficios  20   0   17688  10300   3852 R  29.4   0.0   0:00.13 top
+1289625 efficios  20   0 5657876 526256 149528 S   5.9   0.1  43:36.66 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24320 CHURN=12160, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=191 run=4 mem=all 13:22:43 load 165.46 165.95 119.56
+3682913 efficios  20   0   17688  10300   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 530212 149528 S   5.9   0.1  43:37.07 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=191 run=4 mem=all 13:22:50 load 167.50 166.36 119.95
+3683517 efficios  20   0   17688  10284   3836 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 524556 149528 S   5.6   0.1  43:37.40 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=29964 kB, 2s/point
+   | engine txn_list rss_kb 29964 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=191 run=4 mem=all 13:22:57 load 157.16 164.30 119.78
+3684117 efficios  20   0   17688  10304   3860 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 524548 149528 S   5.9   0.1  43:37.82 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35564 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35564 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=191 run=4 mem=all 13:23:04 load 161.55 165.09 120.28
+3684712 efficios  20   0   17688  10296   3848 R  41.2   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35560 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35560 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=191 run=4 mem=all 13:23:11 load 164.47 165.64 120.69
+3685318 efficios  20   0   17688  10316   3868 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 526972 149528 S   5.9   0.1  43:38.65 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24448 CHURN=12224, RSS=22324 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22324 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=192 run=4 mem=all 13:23:18 load 158.80 164.25 120.72
+3685923 efficios  20   0   17688  10312   3868 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 524920 149528 S   5.9   0.1  43:39.17 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=192 run=4 mem=all 13:23:25 load 161.46 164.71 121.10
+3686519 efficios  20   0   17688  10296   3848 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 527444 149528 S   5.6   0.1  43:39.56 claude
+3035136 efficios  20   0 5642836 439132 147880 S   5.6   0.1   9:05.94 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=30008 kB, 2s/point
+   | engine txn_list rss_kb 30008 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=192 run=4 mem=all 13:23:32 load 152.19 162.73 120.93
+3687117 efficios  20   0   17688  10324   3876 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 528672 149528 S   5.9   0.1  43:39.99 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=192 run=4 mem=all 13:23:39 load 155.62 163.27 121.33
+3687724 efficios  20   0   17688  10312   3868 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 518544 149528 S   5.6   0.1  43:40.80 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35648 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35648 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=192 run=4 mem=all 13:23:46 load 160.13 164.08 121.81
+3688320 efficios  20   0   17688  10184   3736 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 517936 149528 S   5.9   0.1  43:41.46 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24576 CHURN=12288, RSS=22328 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22328 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_list w=160 run=5 mem=all 13:23:53 load 156.65 163.06 121.93
+3688919 efficios  20   0   17688  10304   3860 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 519948 149528 S  11.1   0.1  43:42.04 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=26912 kB, 2s/point
+   | engine txn_list rss_kb 26912 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=160 run=5 mem=all 13:24:00 load 157.16 163.06 122.15
+3689487 efficios  20   0   17688  10280   3832 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 523360 149528 S   5.6   0.1  43:42.52 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.45 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31596 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 31596 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=160 run=5 mem=all 13:24:07 load 152.32 161.97 122.24
+3690059 efficios  20   0   17688  10296   3852 R  41.2   0.0   0:00.14 top
+1527159 root      20   0       0      0      0 I   5.9   0.0   0:19.45 kworker+
+1731152 root      20   0       0      0      0 I   5.9   0.0   0:05.45 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31588 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 31588 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=160 run=5 mem=all 13:24:14 load 155.98 162.56 122.65
+3690625 efficios  20   0   17688  10304   3860 R  38.9   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.6   0.0   0:57.46 systemd
+1289625 efficios  20   0 5657876 539860 149528 S   5.6   0.1  43:43.58 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=20480 CHURN=10240, RSS=20504 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 131072 stripes; plan, lock, validate
+   | engine rculist rss_kb 20504 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=160 run=5 mem=all 13:24:20 load 157.02 162.67 122.90
+3691191 efficios  20   0   17688  10248   3800 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 562848 149528 S  11.1   0.1  43:44.04 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (47788 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=20480 CHURN=10240, RSS=31600 kB, 2s/point
+   | engine txn_sw_list rss_kb 31600 list_size 20480 churn 10240
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=176 run=5 mem=all 13:24:27 load 158.29 162.76 123.35
+3691769 efficios  20   0   17688  10316   3868 R  47.1   0.0   0:00.15 top
+3597400 efficios  20   0   17976  10984   4148 R  23.5   0.0   0:46.84 top
+1289625 efficios  20   0 5657876 542632 149528 S   5.9   0.1  43:44.57 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=29340 kB, 2s/point
+   | engine txn_list rss_kb 29340 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=176 run=5 mem=all 13:24:34 load 162.99 163.66 123.86
+3692372 efficios  20   0   17688  10296   3852 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 553560 149528 R   5.9   0.1  43:45.25 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34500 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 34500 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=176 run=5 mem=all 13:24:41 load 168.92 164.88 124.46
+3692972 efficios  20   0   17688  10300   3852 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34520 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 34520 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=176 run=5 mem=all 13:24:48 load 158.64 162.71 124.18
+3693574 efficios  20   0   17688  10292   3848 R  41.2   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:33.19 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=22528 CHURN=11264, RSS=22296 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22296 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=176 run=5 mem=all 13:24:55 load 163.79 163.71 124.71
+3694167 efficios  20   0   17688  10300   3856 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 548492 149528 R  23.5   0.1  43:47.48 claude
+3035136 efficios  20   0 5642836 439348 147880 S   5.9   0.1   9:06.77 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (52566 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=22528 CHURN=11264, RSS=34508 kB, 2s/point
+   | engine txn_sw_list rss_kb 34508 list_size 22528 churn 11264
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=184 run=5 mem=all 13:25:01 load 164.77 163.91 124.99
+3694760 efficios  20   0   17688  10224   3780 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 552884 149528 S  11.1   0.1  43:47.89 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=29676 kB, 2s/point
+   | engine txn_list rss_kb 29676 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=184 run=5 mem=all 13:25:08 load 157.77 162.32 124.88
+3695359 efficios  20   0   17688  10160   3716 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 532472 149528 S  11.1   0.1  43:48.56 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35064 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35064 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=184 run=5 mem=all 13:25:16 load 160.68 162.84 125.25
+3695947 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5642836 439200 147880 S  23.5   0.1   9:06.97 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35084 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35084 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=184 run=5 mem=all 13:25:23 load 173.25 165.44 126.50
+3696549 efficios  20   0   17688  10300   3852 R  41.2   0.0   0:00.14 top
+3597400 efficios  20   0   17976  10984   4148 S  35.3   0.0   0:48.46 top
+1289625 efficios  20   0 5657876 535332 149528 S  11.8   0.1  43:49.56 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=23552 CHURN=11776, RSS=22312 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22312 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=184 run=5 mem=all 13:25:29 load 174.35 165.80 126.82
+3697146 efficios  20   0   17688  10160   3716 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 532564 149528 S   5.6   0.1  43:50.37 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (54956 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=23552 CHURN=11776, RSS=35072 kB, 2s/point
+   | engine txn_sw_list rss_kb 35072 list_size 23552 churn 11776
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=188 run=5 mem=all 13:25:36 load 175.12 166.10 127.13
+3697751 efficios  20   0   17688  10312   3868 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 532560 149528 S   5.9   0.1  43:50.89 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=29840 kB, 2s/point
+   | engine txn_list rss_kb 29840 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=188 run=5 mem=all 13:25:43 load 173.71 166.04 127.53
+3698345 efficios  20   0   17688  10216   3768 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 532956 149528 R  11.1   0.1  43:51.42 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=188 run=5 mem=all 13:25:51 load 174.94 166.42 127.86
+3698940 efficios  20   0   17688  10164   3716 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 532108 149528 S   5.6   0.1  43:51.93 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=188 run=5 mem=all 13:25:58 load 185.74 169.01 129.11
+3699540 efficios  20   0   17688  10228   3784 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 537228 149528 S   5.6   0.1  43:52.33 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24064 CHURN=12032, RSS=22320 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22320 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=188 run=5 mem=all 13:26:04 load 188.48 169.86 129.60
+3700141 efficios  20   0   17688  10304   3860 R  35.3   0.0   0:00.14 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:33.20 systemd+
+1289625 efficios  20   0 5657876 536468 149528 S   5.9   0.1  43:52.76 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56150 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24064 CHURN=12032, RSS=35356 kB, 2s/point
+   | engine txn_sw_list rss_kb 35356 list_size 24064 churn 12032
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=190 run=5 mem=all 13:26:11 load 188.92 170.26 129.95
+3700745 efficios  20   0   17688  10300   3852 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=29920 kB, 2s/point
+   | engine txn_list rss_kb 29920 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=190 run=5 mem=all 13:26:18 load 196.99 172.57 131.13
+3701344 efficios  20   0   17688  10308   3860 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 536384 149528 S   5.9   0.1  43:53.53 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35512 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35512 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=190 run=5 mem=all 13:26:25 load 197.31 173.04 131.50
+3701941 efficios  20   0   17688  10228   3780 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 537540 149528 S   5.6   0.1  43:54.01 claude
+2483395 root      20   0       0      0      0 I   5.6   0.0   0:13.32 kworker+
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=190 run=5 mem=all 13:26:32 load 200.54 174.54 132.44
+3702541 efficios  20   0   17688  10312   3868 R  38.9   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 538592 149528 S   5.6   0.1  43:54.46 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.46 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24320 CHURN=12160, RSS=22316 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22316 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=190 run=5 mem=all 13:26:39 load 199.78 174.81 132.75
+3703145 efficios  20   0   17688  10300   3852 R  47.1   0.0   0:00.15 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.47 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (56748 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24320 CHURN=12160, RSS=35492 kB, 2s/point
+   | engine txn_sw_list rss_kb 35492 list_size 24320 churn 12160
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=191 run=5 mem=all 13:26:46 load 198.92 175.05 133.05
+3703742 efficios  20   0   17688  10312   3868 R  47.1   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 539208 149528 R  11.8   0.1  43:55.17 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.47 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=29972 kB, 2s/point
+   | engine txn_list rss_kb 29972 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=191 run=5 mem=all 13:26:53 load 202.09 176.54 133.99
+3704341 efficios  20   0   17688  10324   3876 R  33.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 539592 149528 S   5.6   0.1  43:55.55 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.47 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35564 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35564 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=191 run=5 mem=all 13:27:00 load 203.37 177.22 134.44
+3704948 efficios  20   0   17688  10308   3860 R  35.3   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 537436 149528 S   5.9   0.1  43:56.02 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.47 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35564 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35564 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=191 run=5 mem=all 13:27:07 load 186.84 174.66 134.07
+3705554 efficios  20   0   17688  10236   3788 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:57.48 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24448 CHURN=12224, RSS=22328 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22328 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=191 run=5 mem=all 13:27:14 load 189.09 175.33 134.51
+3706158 efficios  20   0   17688  10164   3716 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 549288 149528 S  16.7   0.1  43:57.15 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.48 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57046 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24448 CHURN=12224, RSS=35592 kB, 2s/point
+   | engine txn_sw_list rss_kb 35592 list_size 24448 churn 12224
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_list w=192 run=5 mem=all 13:27:20 load 189.25 175.59 134.81
+3706772 efficios  20   0   17688  10216   3768 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 535384 149528 S   5.6   0.1  43:58.02 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.48 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_list (RCU concurrent, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=30024 kB, 2s/point
+   | engine txn_list rss_kb 30024 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+## txn_sw_bitlock w=192 run=5 mem=all 13:27:28 load 198.68 178.04 136.05
+3707390 efficios  20   0   17688  10304   3860 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.48 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.87 kthreadd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35656 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS=bit), a bit spinlock per node; plan, lock, validate
+   | engine txn_sw_list rss_kb 35656 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_nodelock w=192 run=5 mem=all 13:27:35 load 198.95 178.44 136.40
+3707995 efficios  20   0   17688  10296   3852 R  44.4   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 544496 149528 S   5.6   0.1  43:59.31 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.48 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35636 kB, 2s/point
+   | txn_sw_list: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine txn_sw_list rss_kb 35636 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## rculist_nodelock w=192 run=5 mem=all 13:27:42 load 190.03 177.36 136.51
+3708605 efficios  20   0   17688  10296   3848 R  41.2   0.0   0:00.14 top
+   2798 root      20   0       0      0      0 S   5.9   0.0   0:42.75 kcompac+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:57.48 systemd
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | rculist: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | rculist (RCU classic, forward-only (ref)): LIST_SIZE=24576 CHURN=12288, RSS=22348 kB, 2s/point
+   | rculist: fine-grained writer locks (BENCH_NODE_LOCKS), 262144 stripes; plan, lock, validate
+   | engine rculist rss_kb 22348 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+   | node locks: plan revalidation retries = 0
+## txn_sw_mutex w=192 run=5 mem=all 13:27:49 load 192.59 178.10 136.97
+3709203 efficios  20   0   17688  10312   3868 R  41.2   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 541424 149528 S  11.8   0.1  44:00.18 claude
+3035136 efficios  20   0 5642836 439240 147880 S   5.9   0.1   9:08.15 claude
+   | bench: hwloc pinning -- 192 cores, 384 PUs, one PU per core first
+   | NUMA: interleaving allocations across all nodes
+   | reclaim worker domain: hwthread (384) | slab domain: hwthread (384) / 384 CPUs
+   | per-domain call_rcu workers enabled (domain=hwthread; BENCH_RECLAIM_DOMAIN=hwthread|core|l3|single, BENCH_NO_PERCPU_CALLRCU)
+   | txn_sw_list: self-check OK (57344 nodes visited fwd+rev, sorted both ways)
+   | txn_sw_list (RCU single-updater, coherent bidir): LIST_SIZE=24576 CHURN=12288, RSS=35640 kB, 2s/point
+   | engine txn_sw_list rss_kb 35640 list_size 24576 churn 12288
+   | # writers read_mvisits write_mops violations (readers=0, distinct cores)
+# end: 2026-09-29T13:27:55-04:00 192.38 178.30 137.25 1/3709 3709803
