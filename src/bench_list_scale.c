@@ -3066,6 +3066,41 @@ static const struct lengine engines[] = {
 
 static const struct lengine *g_eng;
 
+/*
+ * main's RCU state while a point runs.  Default: OFFLINE from the prime wait
+ * through the join.  main only waits and times, and under QSBR a registered
+ * thread that is online and not quiescing holds up every grace period.  Before
+ * this, main was offline only for the prime wait and the join, and stayed
+ * online across the warm-up and the timed window, sleeping 2 ms between
+ * quiescent states -- so every grace period could wait up to ~2 ms for it.
+ * BENCH_MAIN_ONLINE=1 restores that behaviour, which every measurement up to
+ * bench 6bfac1a (writer-scaling batch _d and the scale profile included) was
+ * taken with.
+ */
+static int g_main_online;
+
+static void main_offline(void)		/* from the prime wait on */
+{
+	if (g_eng->uses_rcu)
+		rcu_thread_offline();
+}
+static void main_primed(void)		/* old mode: back online for the run */
+{
+	if (g_eng->uses_rcu && g_main_online)
+		rcu_thread_online();
+}
+static void main_wait_2ms(void)
+{
+	usleep(2000);
+	if (g_eng->uses_rcu && g_main_online)
+		rcu_quiescent_state();
+}
+static void main_offline_for_join(void)
+{
+	if (g_eng->uses_rcu && g_main_online)
+		rcu_thread_offline();	/* default mode: offline already */
+}
+
 /* ── Worker threads ───────────────────────────────────────────── */
 struct reader_arg { unsigned long visits; long viol; int cpu; };
 struct writer_arg { unsigned long writes; int wid; int nwriters; int cpu;
@@ -3267,52 +3302,42 @@ static void run_point(int nr_readers, int nr_writers,
 		pthread_create(&th[nr_readers + i], NULL, writer_thread, &wa[i]);
 	}
 
-	/* Wait until readers finished priming and are spinning on start_flag.
-	 * main blocks here, so it must be RCU-offline: an online thread that
-	 * stops quiescing stalls every grace period (and thus call_rcu reclaim
-	 * AND any writer's commit-time synchronize_rcu) for the whole wait. */
-	if (g_eng->uses_rcu)
-		rcu_thread_offline();
+	/*
+	 * main stays RCU-OFFLINE from the prime wait through the join (see
+	 * g_main_online): it only waits and times, and an online QSBR thread that
+	 * is not quiescing holds up every grace period -- call_rcu reclaim and any
+	 * writer's commit-time synchronize_rcu alike.
+	 */
+	main_offline();
 	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nr_readers)
 		usleep(1000);
-	if (g_eng->uses_rcu)
-		rcu_thread_online();
+	main_primed();
 
 	t0 = mono_ns();
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
 
 	if (g_warmup_sec > 0) {
-		/* Untimed warm-up, quiescing as below; then restart the clock and
-		 * have every thread zero its count. */
+		/* Untimed warm-up; then restart the clock and have every thread
+		 * zero its count. */
 		uint64_t wend = t0 + (uint64_t) g_warmup_sec * 1000000000ULL;
 
-		while (mono_ns() < wend) {
-			usleep(2000);
-			if (g_eng->uses_rcu)
-				rcu_quiescent_state();
-		}
+		while (mono_ns() < wend)
+			main_wait_2ms();
 		t0 = mono_ns();
 		uatomic_inc(&g_warm_epoch);
 	}
 
-	/* Keep main online but quiescing so call_rcu grace periods advance and
-	 * deferred frees stay bounded during the timed window. */
 	{
 		uint64_t end = t0 + (uint64_t) DURATION_SEC * 1000000000ULL;
-		while (mono_ns() < end) {
-			usleep(2000);
-			if (g_eng->uses_rcu)
-				rcu_quiescent_state();
-		}
+		while (mono_ns() < end)
+			main_wait_2ms();
 	}
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
 
 	/* main blocks in join while workers drain their last ops -- some of which
-	 * are committing through synchronize_rcu.  Stay RCU-offline across the join
-	 * so those grace periods can complete; otherwise main (online, no longer
-	 * quiescing) deadlocks the writers waiting on it. */
-	if (g_eng->uses_rcu)
-		rcu_thread_offline();
+	 * are committing through synchronize_rcu -- so it must be offline here in
+	 * either mode, or it deadlocks the writers waiting on it. */
+	main_offline_for_join();
 	for (i = 0; i < total; i++)
 		pthread_join(th[i], NULL);
 	if (g_eng->uses_rcu)
@@ -3438,28 +3463,22 @@ static void run_point_mixed(int nthreads, double *ops_mps, double *upd_mops,
 		pthread_create(&th[i], NULL, mixed_thread, &ma[i]);
 	}
 
-	/* Stay RCU-offline while blocking on prime / join (see run_point rationale). */
-	if (g_eng->uses_rcu)
-		rcu_thread_offline();
+	/* RCU-offline from the prime wait through the join (see run_point). */
+	main_offline();
 	while (__atomic_load_n(&prime_done_count, __ATOMIC_ACQUIRE) < nthreads)
 		usleep(1000);
-	if (g_eng->uses_rcu)
-		rcu_thread_online();
+	main_primed();
 
 	t0 = mono_ns();
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
 	{
 		uint64_t end = t0 + (uint64_t) DURATION_SEC * 1000000000ULL;
-		while (mono_ns() < end) {
-			usleep(2000);
-			if (g_eng->uses_rcu)
-				rcu_quiescent_state();
-		}
+		while (mono_ns() < end)
+			main_wait_2ms();
 	}
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
 
-	if (g_eng->uses_rcu)
-		rcu_thread_offline();
+	main_offline_for_join();
 	for (i = 0; i < nthreads; i++)
 		pthread_join(th[i], NULL);
 	if (g_eng->uses_rcu)
@@ -3664,6 +3683,7 @@ int main(int argc, char **argv)
 	g_rl_nolock = getenv("BENCH_RL_NOLOCK") != NULL;
 	if (getenv("BENCH_WARMUP_SEC"))
 		g_warmup_sec = atoi(getenv("BENCH_WARMUP_SEC"));
+	g_main_online = getenv("BENCH_MAIN_ONLINE") != NULL;
 	if (getenv("BENCH_NODE_LOCKS")) {
 		unsigned long n = 1;
 
