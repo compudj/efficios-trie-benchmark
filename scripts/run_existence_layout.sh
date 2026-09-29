@@ -28,13 +28,23 @@
 #
 # Writes scripts/existence_layout.csv:
 #   layout,engine,run,readers,read_mvisits,viol
+# RE-PINNED 2026-09-28 at urcu-txn-dev 18809ea8, P1's new pin: packed
+# binaries arms-p1/bench_list_scale.pin-packed-18809ea8 (and -rawcmp), built at
+# bench 974609c against urcu-txn-build-18809ea8 with the flags described here.
+# The results taken on b3e23f9f are in this file's and its outputs' git history.
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
+# WARM-UP: every point runs BENCH_WARMUP_SEC (default 4) seconds untimed before
+# its timed window -- the rule for every paper benchmark (2026-09-29), the same
+# 4 s as the writer-scaling sweep.  A process's first point otherwise times its
+# own cold start: slab carving, page faults, call_rcu's pipeline filling.
+export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
 export DURATION_SEC=${DURATION_SEC:-3}
 export LIST_SIZE=${LIST_SIZE:-10000} CHURN=${CHURN:-200}
 RUNS=${RUNS:-2}
 MAXT=${MAXT:-192}
 OUT=scripts/existence_layout.csv
+ENG=${ENG:-$PWD/urcu-txn-build-18809ea8}
 
 echo "layout,engine,run,readers,read_mvisits,viol" > "$OUT"
 
@@ -46,7 +56,7 @@ for conf in perfbook packed split; do
   # script measured, producing three identical columns.
   echo ">> building EXIST_CONF=$conf (forced clean) ..." >&2
   rm -f bench_list_scale src/bench_existence_list.o
-  make bench_list_scale JEMALLOC=1 EXIST_CONF="$conf" >/dev/null 2>&1 \
+  make bench_list_scale JEMALLOC=1 URCU_TXN_BUILD="$ENG" EXIST_CONF="$conf" >/dev/null 2>&1 \
     || { echo "BUILD FAILED ($conf)" >&2; exit 1; }
   # Sanity: the three layouts must not produce identical columns.  If they do,
   # the rebuild silently did not happen and the run is worthless -- checked
@@ -68,7 +78,7 @@ for conf in perfbook packed split; do
 done
 
 # Leave the tree on the canonical build.
-make bench_list_scale JEMALLOC=1 >/dev/null 2>&1
+make bench_list_scale JEMALLOC=1 URCU_TXN_BUILD="$ENG" >/dev/null 2>&1
 
 echo ">> done -> $OUT" >&2
 if awk -F, 'NR>1 && $6+0>0{f=1} END{exit f?0:1}' "$OUT"; then

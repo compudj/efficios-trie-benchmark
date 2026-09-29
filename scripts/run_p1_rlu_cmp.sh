@@ -19,12 +19,21 @@
 # as the baseline; counters differenced 8 s - 2 s as in run_deref_cost.sh.
 #
 # Writes scripts/p1_rlu_cmp.csv  build,engine,run,seconds,mvisits_per_s,instructions,branches,loads
+# RE-PINNED 2026-09-28 at urcu-txn-dev 18809ea8, P1's new pin: packed
+# binaries arms-p1/bench_list_scale.pin-packed-18809ea8 (and -rawcmp), built at
+# bench 974609c against urcu-txn-build-18809ea8 with the flags described here.
+# The results taken on b3e23f9f are in this file's and its outputs' git history.
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
+# WARM-UP: every point runs BENCH_WARMUP_SEC (default 4) seconds untimed before
+# its timed window -- the rule for every paper benchmark (2026-09-29), the same
+# 4 s as the writer-scaling sweep.  A process's first point otherwise times its
+# own cold start: slab carving, page faults, call_rcu's pipeline filling.
+export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
 RUNS=${RUNS:-2}
 OUT=scripts/p1_rlu_cmp.csv
 export LIST_SIZE=10000 CHURN=200
-BUILDS=("samecmp|./arms-p1/bench_list_scale.pin-packed-readclass" "rawcmp|./arms-p1/bench_list_scale.pin-packed-rawcmp")
+BUILDS=("samecmp|./arms-p1/bench_list_scale.pin-packed-18809ea8" "rawcmp|./arms-p1/bench_list_scale.pin-packed-18809ea8-rawcmp")
 
 for b in "${BUILDS[@]}"; do
   IFS='|' read -r bname bin <<<"$b"

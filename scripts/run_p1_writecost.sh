@@ -22,15 +22,25 @@
 #
 # Writes scripts/p1_writecost.csv  layout,mode,engine,run,x,read_mvisits,write_mops,viol
 #        scripts/p1_writecost.log  provenance + per-invocation machine state
+# RE-PINNED 2026-09-28 at urcu-txn-dev 18809ea8, P1's new pin: packed
+# binaries arms-p1/bench_list_scale.pin-packed-18809ea8 (and -rawcmp), built at
+# bench 974609c against urcu-txn-build-18809ea8 with the flags described here.
+# The results taken on b3e23f9f are in this file's and its outputs' git history.
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-readclass}
-ENG_TREE=urcu-txn-build-b3e23f9f
+# WARM-UP: every point runs BENCH_WARMUP_SEC (default 4) seconds untimed before
+# its timed window -- the rule for every paper benchmark (2026-09-29), the same
+# 4 s as the writer-scaling sweep.  A process's first point otherwise times its
+# own cold start: slab carving, page faults, call_rcu's pipeline filling.
+export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-18809ea8}
+ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
 export LIST_SIZE=${LIST_SIZE:-10000} CHURN=${CHURN:-200} DURATION_SEC=${DURATION_SEC:-3}
 RUNS=${RUNS:-5}
 MAXT=${MAXT:-192}
-OUT=scripts/p1_writecost.csv
-LOG=scripts/p1_writecost.log
+TAG=${TAG:-}
+OUT=scripts/p1_writecost$TAG.csv
+LOG=scripts/p1_writecost$TAG.log
 
 [ -x "$BIN" ] || { echo "missing $BIN" >&2; exit 1; }
 ldd "$BIN" | grep -q "$ENG_TREE/src/.libs/liburcu-qsbr" \
@@ -42,7 +52,7 @@ ldd "$BIN" | grep -qi jemalloc \
   echo "# run_p1_writecost.sh  $(date -Is)"
   echo "# bench HEAD $(git rev-parse --short=8 HEAD); bench_list_scale.c sha256 $(sha256sum src/bench_list_scale.c | cut -c1-16)"
   echo "# binary $BIN sha256 $(sha256sum "$BIN" | cut -c1-16); engine $(git -C "$ENG_TREE" rev-parse --short=8 HEAD)"
-  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT"
+  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT BENCH_WARMUP_SEC=$BENCH_WARMUP_SEC"
   echo "# start: $(cat /proc/loadavg)"
 } > "$LOG"
 echo "layout,mode,engine,run,x,read_mvisits,write_mops,viol" > "$OUT"

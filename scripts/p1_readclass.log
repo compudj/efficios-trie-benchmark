@@ -1,166 +1,166 @@
-# run_p1_readclass.sh  2026-09-28T10:13:39-04:00
-# bench HEAD 44cd6389; sha256 bench_list_scale.c 63e75dcf19efae8b bench_existence_list.c 906b8e39718ec82d bench_mvrlu_list.c 80bd34fac63c6c7e
-# binary ./arms-p1/bench_list_scale.pin-packed-readclass sha256 020d2e59167aa79e; engine b3e23f9f
-# LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=5 MAXT=192
-# start: 0.02 0.08 1.78 3/3908 1410858
-## walk txn_sw_list run=1 10:13:39 load 0.02 0.08 1.78
-1410863 efficios  20   0   17508  10180   3860 R  47.1   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.35 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## walk existence run=1 10:14:16 load 38.90 8.76 4.57
-1412168 efficios  20   0   17508  10164   3868 R  35.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 481024 145576 S   5.9   0.1   4:27.57 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.35 systemd
-## walk rlu run=1 10:14:53 load 55.63 15.30 6.85
-1413473 man       39  19   16272   9560   5228 R  64.7   0.0   0:00.11 mandb
-1413469 efficios  20   0   17508  10152   3860 R  47.1   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:54.36 systemd
-## walk mvrlu run=1 10:15:29 load 73.08 23.43 9.87
-1414398 efficios  20   0   17508  10156   3860 R  35.3   0.0   0:00.13 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## shuffled txn_sw_list run=1 10:16:06 load 79.70 29.55 12.36
-1415331 efficios  20   0   17508  10120   3824 R  41.2   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 472864 145576 S  11.8   0.1   4:34.46 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-## shuffled existence run=1 10:16:43 load 78.37 33.79 14.36
-1416632 efficios  20   0   17508  10024   3732 R  38.9   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 492224 145576 S   5.6   0.1   4:37.42 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-## shuffled rlu run=1 10:17:20 load 82.42 39.08 16.88
-1417953 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.13 top
-1019738 root      20   0       0      0      0 I   5.9   0.0   0:01.92 kworker+
-3810710 root      20   0       0      0      0 I   5.9   0.0   0:03.08 kworker+
-## shuffled mvrlu run=1 10:17:56 load 84.95 43.48 19.12
-1418878 efficios  20   0   17508  10172   3852 R  47.1   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## walk existence run=2 10:18:33 load 81.35 46.20 20.87
-1419796 efficios  20   0   17508  10128   3836 R  33.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 474956 145640 S   5.6   0.1   4:45.62 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-## walk rlu run=2 10:19:10 load 72.23 47.34 22.27
-1421097 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-1289625 efficios  20   0 5645436 479992 145640 S   5.9   0.1   4:47.78 claude
-## walk mvrlu run=2 10:19:46 load 79.23 50.81 24.31
-1422012 efficios  20   0   17508  10060   3768 R  35.3   0.0   0:00.13 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:03.33 rcu_pre+
- 992519 efficios  20   0   25300  12892   4152 S   5.9   0.0   2:04.65 tmux: s+
-## walk txn_sw_list run=2 10:20:23 load 78.28 52.73 25.87
-1422933 efficios  20   0   17508  10032   3736 R  38.9   0.0   0:00.13 top
-   5061 root      20   0   18600   8244   7080 S   5.6   0.0   0:31.71 systemd+
-1050392 root      20   0       0      0      0 I   5.6   0.0   0:01.37 kworker+
-## shuffled existence run=2 10:21:00 load 84.71 56.18 28.08
-1424236 efficios  20   0   17508  10148   3852 R  47.1   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-1289240 efficios  20   0   19932   7464   5392 S   5.9   0.0   0:05.05 sshd-se+
-## shuffled rlu run=2 10:21:36 load 86.11 58.66 29.90
-1425535 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 482468 145640 S   5.9   0.1   4:56.71 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.36 systemd
-## shuffled mvrlu run=2 10:22:13 load 82.01 59.69 31.25
-1426456 efficios  20   0   17508  10148   3856 R  33.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 486040 145640 S   5.6   0.1   4:58.78 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.37 systemd
-## shuffled txn_sw_list run=2 10:22:50 load 86.57 62.25 33.23
-1427373 efficios  20   0   17508  10136   3844 R  47.1   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+10h qemu-sy+
-1289625 efficios  20   0 5645436 484004 145640 S   5.9   0.1   5:00.92 claude
-## walk rlu run=3 10:23:26 load 87.15 64.05 34.85
-1428675 efficios  20   0   17508  10092   3800 R  35.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 476832 145640 S  17.6   0.1   5:03.27 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.37 systemd
-## walk mvrlu run=3 10:24:03 load 82.53 64.48 36.02
-1429601 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-   6306 1000990   20   0  380432   5596   4568 S   5.9   0.0   0:21.44 polkitd
-1289625 efficios  20   0 5645436 482108 145640 S   5.9   0.1   5:06.02 claude
-## walk txn_sw_list run=3 10:24:40 load 86.93 66.46 37.81
-1430520 efficios  20   0   17508  10144   3852 R  35.3   0.0   0:00.13 top
-   5139 root      20   0   11.5g 200728  38668 S  23.5   0.0   5:00.17 incusd
- 992519 efficios  20   0   25300  12892   4152 S   5.9   0.0   2:05.29 tmux: s+
-## walk existence run=3 10:25:17 load 87.35 67.80 39.26
-1431825 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-1289625 efficios  20   0 5645436 502940 145640 S   5.9   0.1   5:10.60 claude
-## shuffled rlu run=3 10:25:53 load 82.94 67.89 40.29
-1433126 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.37 systemd
-## shuffled mvrlu run=3 10:26:30 load 85.87 69.16 41.80
-1434047 efficios  20   0   17508  10172   3876 R  38.9   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+10h qemu-sy+
-1046838 root      20   0       0      0      0 I   5.6   0.0   0:00.03 kworker+
-## shuffled txn_sw_list run=3 10:27:07 load 86.84 70.21 43.11
-1434972 efficios  20   0   17508  10032   3736 R  41.2   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 479436 145640 S  11.8   0.1   5:17.51 claude
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-## shuffled existence run=3 10:27:43 load 82.35 69.96 43.97
-1436271 efficios  20   0   17508  10072   3780 R  41.2   0.0   0:00.13 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:54.38 systemd
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-## walk mvrlu run=4 10:28:20 load 84.46 70.72 45.25
-1437576 efficios  20   0   17508  10152   3860 R  38.9   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+10h qemu-sy+
-1215497 root      20   0       0      0      0 I   5.6   0.0   0:04.70 kworker+
-## walk txn_sw_list run=4 10:28:57 load 86.03 71.60 46.43
-1438502 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+10h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## walk existence run=4 10:29:34 load 81.91 71.19 47.17
-1439808 efficios  20   0   17508  10136   3840 R  44.4   0.0   0:00.14 top
-   5061 root      20   0   18600   8244   7080 S   5.6   0.0   0:31.72 systemd+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+10h qemu-sy+
-## walk rlu run=4 10:30:10 load 83.31 71.55 48.22
-1441121 efficios  20   0   17508   9988   3696 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## shuffled mvrlu run=4 10:30:47 load 85.33 72.33 49.29
-1442038 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
-   6306 1000990   20   0  380432   5596   4568 S   5.9   0.0   0:21.45 polkitd
-1289625 efficios  20   0 5645436 482316 145640 S   5.9   0.1   5:31.02 claude
-## shuffled txn_sw_list run=4 10:31:24 load 81.57 71.85 49.93
-1442956 efficios  20   0   17508  10036   3716 R  44.4   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## shuffled existence run=4 10:32:00 load 83.42 72.20 50.89
-1444260 efficios  20   0   17508  10076   3780 R  38.9   0.0   0:00.14 top
-1222314 root      20   0       0      0      0 I   5.6   0.0   2:13.07 kworker+
-1289625 efficios  20   0 5645436 477616 145640 S   5.6   0.1   5:35.49 claude
-## shuffled rlu run=4 10:32:37 load 85.39 72.91 51.86
-1445562 efficios  20   0   17508  10176   3852 R  35.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 475164 145640 S   5.9   0.1   5:37.55 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## walk txn_sw_list run=5 10:33:14 load 81.69 72.39 52.41
-1446487 efficios  20   0   17508   9992   3696 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+10h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## walk existence run=5 10:33:51 load 83.26 72.61 53.25
-1447805 efficios  20   0   17508  10152   3860 R  44.4   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+10h qemu-sy+
-1289625 efficios  20   0 5645436 481576 145640 S   5.6   0.1   5:42.90 claude
-## walk rlu run=5 10:34:27 load 85.30 73.27 54.13
-1449115 efficios  20   0   17508  10072   3780 R  38.9   0.0   0:00.13 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-## walk mvrlu run=5 10:35:04 load 81.50 72.67 54.58
-1450038 efficios  20   0   17508  10160   3868 R  41.2   0.0   0:00.13 top
-   2808 root      39  19       0      0      0 S   5.9   0.0   1:37.92 khugepa+
-1289625 efficios  20   0 5645436 472696 145640 S   5.9   0.1   5:47.94 claude
-## shuffled txn_sw_list run=5 10:35:41 load 83.17 72.86 55.33
-1450964 efficios  20   0   17508  10156   3860 R  47.1   0.0   0:00.14 top
-1229875 root      20   0       0      0      0 I   5.9   0.0   0:00.14 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## shuffled existence run=5 10:36:17 load 85.17 73.48 56.13
-1452266 efficios  20   0   17508  10008   3716 R  33.3   0.0   0:00.13 top
-1289625 efficios  20   0 5645436 501140 145640 S   5.6   0.1   5:53.01 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## shuffled rlu run=5 10:36:54 load 81.64 72.91 56.53
-1453584 efficios  20   0   17508  10152   3828 R  38.9   0.0   0:00.14 top
-1289625 efficios  20   0 5645436 473668 145640 S  11.1   0.1   5:55.43 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:54.38 systemd
-## shuffled mvrlu run=5 10:37:31 load 83.31 73.08 57.20
-1454500 efficios  20   0   17508  10152   3856 R  47.1   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:54.39 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.65 kthreadd
-# end: 2026-09-28T10:39:52-04:00 13.09 49.99 50.95 1/3916 1460303
+# run_p1_readclass.sh  2026-09-29T08:14:46-04:00
+# bench HEAD 974609c7; sha256 bench_list_scale.c 185e8564e6d75719 bench_existence_list.c 906b8e39718ec82d bench_mvrlu_list.c 80bd34fac63c6c7e
+# binary ./arms-p1/bench_list_scale.pin-packed-18809ea8 sha256 9c3459468c666ebd; engine 18809ea8
+# LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=5 MAXT=192 BENCH_WARMUP_SEC=4
+# start: 1.72 3.43 24.30 2/3910 3034675
+## walk txn_sw_list run=1 08:14:46 load 1.72 3.43 24.30
+3034606 efficios  20   0 5639644   1.1g 821956 R 100.0   0.1   0:12.32 git
+3034680 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
+   3766 root      20   0       0      0      0 S  11.8   0.0   0:28.99 jbd2/md+
+## walk existence run=1 08:16:11 load 73.73 21.05 28.37
+3036189 efficios  20   0   17508  10032   3736 R  41.2   0.0   0:00.14 top
+3031336 efficios  20   0   19932   7584   5432 S   5.9   0.0   0:00.43 sshd-se+
+3035136 efficios  20   0 5622204 341204 138936 S   5.9   0.0   0:04.95 claude
+## walk rlu run=1 08:17:36 load 91.73 34.51 32.16
+3037568 efficios  20   0   17508  10080   3784 R  35.3   0.0   0:00.13 top
+3035136 efficios  20   0 5622204 360200 139960 R  23.5   0.0   0:09.51 claude
+ 213401 root      20   0       0      0      0 I   5.9   0.0   0:08.56 kworker+
+## walk mvrlu run=1 08:19:01 load 98.56 45.22 35.80
+3038564 efficios  20   0   17508  10028   3736 R  35.3   0.0   0:00.13 top
+3035136 efficios  20   0 5622204 413756 140088 S   5.9   0.1   0:12.74 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.65 systemd
+## shuffled txn_sw_list run=1 08:20:25 load 99.94 53.25 39.13
+3039617 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## shuffled existence run=1 08:21:50 load 102.06 59.80 42.34
+3041052 efficios  20   0   17508  10160   3868 R  47.1   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+1483634 root      20   0       0      0      0 I   5.9   0.0   0:05.11 kworker+
+## shuffled rlu run=1 08:23:15 load 102.69 64.76 45.27
+3033816 efficios  20   0   17636  11044   4356 S  47.1   0.0   0:13.47 top
+3042438 efficios  20   0   17508  10144   3848 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+## shuffled mvrlu run=1 08:24:39 load 102.59 68.42 47.93
+3043489 efficios  20   0   17508  10060   3768 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5622220 432888 141368 S   5.9   0.1   0:28.54 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+## walk existence run=2 08:26:04 load 104.05 71.68 50.53
+3044454 efficios  20   0   17508  10144   3848 R  33.3   0.0   0:00.13 top
+   2787 root      20   0       0      0      0 S   5.6   0.0   0:30.84 kcompac+
+   5061 root      20   0   18600   8244   7080 S   5.6   0.0   0:32.75 systemd+
+## walk rlu run=2 08:27:29 load 104.43 74.15 52.91
+3045791 efficios  20   0   17508  10104   3808 R  35.3   0.0   0:00.13 top
+ 213401 root      20   0       0      0      0 I   5.9   0.0   0:08.57 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+## walk mvrlu run=2 08:28:54 load 104.50 76.00 55.08
+3046748 efficios  20   0   17508  10008   3716 R  35.3   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## walk txn_sw_list run=2 08:30:18 load 106.68 78.02 57.28
+3047732 efficios  20   0   17508  10080   3788 R  35.3   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## shuffled existence run=2 08:31:43 load 107.06 79.50 59.26
+3049056 efficios  20   0   17508  10032   3736 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+3035136 efficios  20   0 5626372 399444 142016 S   5.9   0.1   0:38.36 claude
+## shuffled rlu run=2 08:33:08 load 107.15 80.60 61.08
+3050391 efficios  20   0   17508  10168   3876 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+## shuffled mvrlu run=2 08:34:32 load 101.49 80.11 62.22
+3051399 efficios  20   0   17508  10040   3748 R  38.9   0.0   0:00.14 top
+3033816 efficios  20   0   17636  11076   4356 R  16.7   0.0   0:30.45 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
+## shuffled txn_sw_list run=2 08:35:57 load 97.90 78.73 62.97
+3052431 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## walk rlu run=3 08:37:22 load 96.42 77.47 63.57
+3053795 efficios  20   0   17508  10028   3736 R  44.4   0.0   0:00.15 top
+3033816 efficios  20   0   17636  11108   4356 S  38.9   0.0   0:34.75 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
+## walk mvrlu run=3 08:38:47 load 99.32 77.45 64.44
+3054804 efficios  20   0   17508  10096   3800 R  35.3   0.0   0:00.13 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+3035136 efficios  20   0 5626372 423332 142336 S   5.9   0.1   0:56.75 claude
+## walk txn_sw_list run=3 08:40:11 load 100.23 77.49 65.25
+3055839 efficios  20   0   17508  10200   3876 R  35.3   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## walk existence run=3 08:41:36 load 102.11 78.02 66.17
+3057167 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 432040 143104 S   5.9   0.1   1:08.95 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.68 systemd
+## shuffled rlu run=3 08:43:01 load 102.55 78.42 67.01
+3033816 efficios  20   0   17784  11144   4356 S  47.1   0.0   0:43.33 top
+3058538 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.14 top
+1289625 efficios  20   0 5657876 456924 149164 S   5.9   0.1  34:44.88 claude
+## shuffled mvrlu run=3 08:44:25 load 102.63 78.71 67.76
+3059522 efficios  20   0   17508  10032   3736 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 456656 143296 S  11.8   0.1   1:21.49 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.68 systemd
+## shuffled txn_sw_list run=3 08:45:50 load 104.23 79.49 68.65
+3060557 efficios  20   0   17508  10156   3860 R  38.9   0.0   0:00.14 top
+     15 root      20   0       0      0      0 I   5.6   0.0   6:30.97 rcu_pre+
+    763 root      rt   0       0      0      0 S   5.6   0.0   0:02.90 migrati+
+## shuffled existence run=3 08:47:15 load 104.50 80.03 69.45
+3061905 efficios  20   0   17508  10144   3848 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.69 systemd
+## walk mvrlu run=4 08:48:40 load 104.55 80.44 70.17
+3063292 efficios  20   0   17508  10020   3728 R  38.9   0.0   0:00.15 top
+1289625 efficios  20   0 5657876 456592 149164 S  22.2   0.1  34:48.90 claude
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
+## walk txn_sw_list run=4 08:50:04 load 106.96 81.44 71.08
+3064361 efficios  20   0   17508  10136   3840 R  33.3   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
+1289625 efficios  20   0 5657876 456596 149164 S   5.6   0.1  34:49.79 claude
+## walk existence run=4 08:51:29 load 107.29 82.13 71.88
+3065824 efficios  20   0   17508  10140   3844 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+1273775 root      20   0       0      0      0 I   5.9   0.0   0:03.84 kworker+
+## walk rlu run=4 08:52:54 load 107.29 82.61 72.60
+3067225 efficios  20   0   17508  10180   3884 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+3035136 efficios  20   0 5626372 479416 143752 S   5.9   0.1   1:56.88 claude
+## shuffled mvrlu run=4 08:54:19 load 107.40 83.01 73.27
+3068268 efficios  20   0   17508   9992   3696 R  38.9   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 465708 143880 R  16.7   0.1   2:03.22 claude
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
+## shuffled txn_sw_list run=4 08:55:43 load 102.22 82.14 73.47
+3068475 efficios  39  19   89996  15532   1856 R  94.1   0.0   0:55.05 m_mark
+3069376 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+## shuffled existence run=4 08:57:08 load 98.77 80.49 73.32
+3070317 efficios  39  19   87932  13460   1836 R  94.1   0.0   0:18.62 m_bl
+3070718 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 479404 144136 S  11.8   0.1   2:14.72 claude
+## shuffled rlu run=4 08:58:33 load 97.39 79.07 73.11
+3072230 efficios  20   0   17508  10140   3848 R  38.9   0.0   0:00.14 top
+ 611596 root      20   0       0      0      0 I   5.6   0.0   0:10.51 kworker+
+1222314 root      20   0       0      0      0 I   5.6   0.0   4:26.84 kworker+
+## walk txn_sw_list run=5 08:59:58 load 99.63 78.69 73.16
+3073310 efficios  20   0   17508  10072   3780 R  35.3   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.70 systemd
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
+## walk existence run=5 09:01:22 load 100.25 78.44 73.22
+3075168 efficios  20   0   17508  10160   3868 R  44.4   0.0   0:00.15 top
+3035136 efficios  20   0 5626372 505928 144456 S   5.6   0.1   2:35.36 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.70 systemd
+## walk rlu run=5 09:02:47 load 100.34 78.21 73.26
+3076835 efficios  20   0   17508  10060   3736 R  38.9   0.0   0:00.14 top
+3031336 efficios  20   0   19932   7584   5432 S   5.6   0.0   0:02.68 sshd-se+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.70 systemd
+## walk mvrlu run=5 09:04:12 load 102.28 78.61 73.49
+3077975 efficios  20   0   17508  10172   3876 R  35.3   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 483900 144712 S   5.9   0.1   2:47.53 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.70 systemd
+## shuffled txn_sw_list run=5 09:05:36 load 102.54 78.85 73.68
+3078991 efficios  20   0   17508  10092   3800 R  41.2   0.0   0:00.14 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
+## shuffled existence run=5 09:07:01 load 101.26 78.57 73.69
+3080415 efficios  20   0   17508  10164   3868 R  35.3   0.0   0:00.14 top
+3035136 efficios  20   0 5626372 498600 145024 S   5.9   0.1   2:56.00 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.71 systemd
+## shuffled rlu run=5 09:08:26 load 103.79 79.33 74.04
+3033816 efficios  20   0   17784  11268   4356 S  44.4   0.0   1:22.10 top
+3081879 efficios  20   0   17508  10172   3852 R  33.3   0.0   0:00.14 top
+  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.1   2.6    5d+11h qemu-sy+
+## shuffled mvrlu run=5 09:09:51 load 104.27 79.87 74.35
+3082964 efficios  20   0   17508  10136   3844 R  33.3   0.0   0:00.14 top
+3035136 efficios  20   0 5626436 496960 145272 S  16.7   0.1   3:01.36 claude
+3031336 efficios  20   0   19932   7584   5432 S   5.6   0.0   0:02.85 sshd-se+
+# end: 2026-09-29T09:14:20-04:00 5.82 44.01 61.50 1/3936 3089078

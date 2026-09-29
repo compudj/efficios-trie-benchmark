@@ -12,8 +12,9 @@ the one running reclaim callbacks.
 
 Categories:
   commit               urcu_txn_sw_commit_flavor
-  list_op_and_staging  the write function and its loop; for txn_sw_list this
-                       includes the staging the engine inlines into it
+  list_op_and_staging  the write function and its loop, and the engine's
+                       staging and list calls (inlined into it, or out of
+                       line as urcu_txn_sw_record_chain / _list_*)
   descriptor_slab      the engine's per-CPU descriptor slab (txn_sw_list only):
                        urcu_slab_alloc, its free-list pop lock, the reclaim
                        callback that returns the block (urcu_txn_sw_free_rcu),
@@ -52,6 +53,11 @@ def cat(dso, sym, role):
     if 'commit_flavor' in sym:
         return [('commit', 1.0)]
     if sym in ('su_write', 'rl_write', 'writer_thread'):
+        return [('list_op_and_staging', 1.0)]
+    # The engine's out-of-line staging and list calls (on 18809ea8 the edges
+    # are recorded in urcu_txn_sw_record_chain, no longer inlined).
+    if (sym.startswith('urcu_txn_sw_record') or sym.startswith('urcu_txn_sw__find')
+            or sym.startswith('urcu_txn_sw_list_')):
         return [('list_op_and_staging', 1.0)]
     if sym.startswith('urcu_slab_') or sym == 'urcu_txn_sw_free_rcu':
         return [('descriptor_slab', 1.0)]

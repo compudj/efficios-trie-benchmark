@@ -59,11 +59,20 @@
 #   scripts/p1_resolve_control$TAG.csv  mode,engine,run,x,read_mvisits,write_mops,viol
 #   scripts/p1_resolve_deref$TAG.csv    engine,run,seconds,mvisits_per_s,instructions,branches,loads
 #   scripts/p1_resolve_control$TAG.log  provenance + per-invocation machine state
+# RE-PINNED 2026-09-28 at urcu-txn-dev 18809ea8, P1's new pin: packed
+# binaries arms-p1/bench_list_scale.pin-packed-18809ea8 (and -rawcmp), built at
+# bench 974609c against urcu-txn-build-18809ea8 with the flags described here.
+# The results taken on b3e23f9f are in this file's and its outputs' git history.
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed}
+# WARM-UP: every point runs BENCH_WARMUP_SEC (default 4) seconds untimed before
+# its timed window -- the rule for every paper benchmark (2026-09-29), the same
+# 4 s as the writer-scaling sweep.  A process's first point otherwise times its
+# own cold start: slab carving, page faults, call_rcu's pipeline filling.
+export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-18809ea8}
 TAG=${TAG:-}
-ENG_TREE=urcu-txn-build-b3e23f9f
+ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
 export DURATION_SEC=${DURATION_SEC:-3}
 export LIST_SIZE=${LIST_SIZE:-10000} CHURN=${CHURN:-200}
 RUNS=${RUNS:-5}
@@ -74,8 +83,9 @@ DOUT=scripts/p1_resolve_deref$TAG.csv
 LOG=scripts/p1_resolve_control$TAG.log
 
 [ -x "$BIN" ] || { echo "missing $BIN (see header to build it)" >&2; exit 1; }
-[ "$(git -C "$ENG_TREE" rev-parse --short=8 HEAD)" = b3e23f9f ] \
-  || { echo "ERROR: $ENG_TREE is not at b3e23f9f" >&2; exit 1; }
+ENG_COMMIT=${ENG_COMMIT:-18809ea8}
+[ "$(git -C "$ENG_TREE" rev-parse --short=8 HEAD)" = "$ENG_COMMIT" ] \
+  || { echo "ERROR: $ENG_TREE is not at $ENG_COMMIT" >&2; exit 1; }
 ldd "$BIN" | grep -q "$ENG_TREE/src/.libs/liburcu-qsbr" \
   || { echo "ERROR: $BIN does not load liburcu from $ENG_TREE" >&2; exit 1; }
 ldd "$BIN" | grep -qi jemalloc \
@@ -88,7 +98,7 @@ ldd "$BIN" | grep -qi jemalloc \
   echo "# bench HEAD $(git rev-parse --short=8 HEAD); bench_list_scale.c sha256 $(sha256sum src/bench_list_scale.c | cut -c1-16)"
   echo "# binary $BIN"
   echo "# binary sha256 $(sha256sum "$BIN" | cut -c1-16); engine $(git -C "$ENG_TREE" rev-parse --short=8 HEAD)"
-  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT BENCH_SHUFFLE=${BENCH_SHUFFLE:-unset}"
+  echo "# LIST_SIZE=$LIST_SIZE CHURN=$CHURN DURATION_SEC=$DURATION_SEC RUNS=$RUNS MAXT=$MAXT BENCH_SHUFFLE=${BENCH_SHUFFLE:-unset} BENCH_WARMUP_SEC=$BENCH_WARMUP_SEC"
   echo "# start: $(cat /proc/loadavg)"
 } > "$LOG"
 
