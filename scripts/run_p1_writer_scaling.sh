@@ -24,7 +24,7 @@
 # tail-padding state word.  Either way locks are taken in ascending lock-address
 # order.
 #
-# ARMS (one binary, engine b3e23f9f, 64-byte-aligned nodes as in P2's sweep A,
+# ARMS (one binary, engine per batch -- see BATCHES -- 64-byte-aligned nodes as in P2's sweep A,
 # jemalloc):
 #   txn_sw_bitlock    txn_sw_list, BENCH_NODE_LOCKS=bit  P1 in use, per-node lock
 #   txn_sw_nodelock   txn_sw_list, BENCH_NODE_LOCKS=1    P1 in use, striped locks
@@ -49,7 +49,10 @@
 # removed from its csv and log.  The harness then refused that arm and had
 # su_write_nodelock zero a new element's state word (a slab-recycled element
 # would still carry its tombstone; this build allocates with calloc).  TAG=_d
-# with ...-nodelock4 (default here) re-runs the five arms on that source.
+# with ...-nodelock4 re-runs the five arms on that source.  TAG=_e (default
+# here) re-takes them on urcu-txn-dev 18809ea8, P1's pin since 2026-09-29,
+# with ...-18809ea8 built at bench dc08669 against urcu-txn-build-18809ea8;
+# _c and _d are on engine b3e23f9f.
 #
 # SIZING is P2's sweep A: CHURN = 64 x writers, LIST_SIZE = 2 x CHURN, writer
 # wid owns churn slots wid, wid+nw, ... after unique anchors two nodes apart, so
@@ -63,10 +66,10 @@
 # the harness's stderr).
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-nodelock4}
-TAG=${TAG:-_d}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-18809ea8}
+TAG=${TAG:-_e}
 export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
-ENG_TREE=urcu-txn-build-b3e23f9f
+ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
 DUR=${DUR:-2}
 RUNS=${RUNS:-5}
 WRITERS=${WRITERS:-"1 2 4 8 16 32 64 96 128 160 191 192"}
