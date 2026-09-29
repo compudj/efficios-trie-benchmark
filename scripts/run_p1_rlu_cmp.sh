@@ -48,7 +48,12 @@ for r in $(seq 1 "$RUNS"); do
       for d in 2 8; do
         echo ">> $bname $eng ${d}s run=$r" >&2
         tmp=$(mktemp)
-        env DURATION_SEC="$d" BENCH_NO_WRITER=1 $extra \
+        # COUNTER PAIRS RUN WITHOUT WARM-UP.  The per-visit counts difference a
+        # 2 s and an 8 s run, which cancels the process's start-up cost -- the
+        # 2 s run is the warm-up.  A BENCH_WARMUP_SEC phase would add work perf
+        # counts but that varies run to run, so the difference would not cancel
+        # it (measured: +load read 8.47 instructions/visit instead of 9.01).
+        env DURATION_SEC="$d" BENCH_WARMUP_SEC=0 BENCH_NO_WRITER=1 $extra \
           perf stat -x, -e instructions,branches,L1-dcache-loads \
           "$bin" "$eng" 1 >"$tmp" 2>"$tmp.perf"
         rate=$(awk '/^[0-9]/{print $2; exit}' "$tmp")

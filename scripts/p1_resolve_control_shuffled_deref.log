@@ -1,0 +1,7 @@
+# run_p1_resolve_control.sh  2026-09-29T10:12:44-04:00
+# bench HEAD 08b23598; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-packed-18809ea8
+# binary sha256 9c3459468c666ebd; engine 18809ea8
+# LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=0 MAXT=192 BENCH_SHUFFLE=1 BENCH_WARMUP_SEC=4
+# start: 0.99 10.88 35.00 2/3944 3168404
+# end: 2026-09-29T10:14:29-04:00 1.13 8.00 31.38 1/3947 3176360

@@ -1,0 +1,6 @@
+# run_p1_readclass.sh  2026-09-29T10:14:29-04:00
+# bench HEAD 08b23598; sha256 bench_list_scale.c 185e8564e6d75719 bench_existence_list.c 906b8e39718ec82d bench_mvrlu_list.c 80bd34fac63c6c7e
+# binary ./arms-p1/bench_list_scale.pin-packed-18809ea8 sha256 9c3459468c666ebd; engine 18809ea8
+# LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=0 MAXT=192 BENCH_WARMUP_SEC=4
+# start: 1.13 8.00 31.38 1/3947 3176395
+# end: 2026-09-29T10:16:13-04:00 1.11 5.97 28.14 3/3933 3181278
