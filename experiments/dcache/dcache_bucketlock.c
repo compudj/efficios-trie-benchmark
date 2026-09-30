@@ -282,7 +282,8 @@ struct dentry {
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
 	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
 	 * readers following a chain -- via bl_read(), since it can briefly
-	 * hold a commit descriptor; d_back is read only by fold workers.  Both NULL
+	 * hold a commit descriptor; d_back is read by fold workers and by the
+	 * reverse walk (dc_dentry_path's named_top_rcu).  Both NULL
 	 * in steady state (settled content host = its own top, no chain).
 	 */
 	struct dentry *d_fwd;			/* down toward content host; NULL at host */
@@ -1136,6 +1137,12 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 #undef DCACHE_LRU_TYPES
 
 
+/*
+ * Placement mirrors dcache_seqlock's (and the kernel's): the read-mostly geometry
+ * every hop reads on a line no writer touches, each written word on its own line
+ * (the domain is live under DC_CHAIN_SWMW's escalations; rename_gen is written
+ * by the counter arms).  dc_create allocates the struct 64-byte aligned.
+ */
 struct dcache {
 	struct dc_lru_shard *lru;		/* nlru shards; see lru_shard_index */
 	unsigned int nlru;
@@ -1150,7 +1157,7 @@ struct dcache {
 	 * they run the full begin/commit/end retry loop against this domain and
 	 * re-inherit the fair-mutex escalation discipline.
 	 */
-	dc_domain_t domain;
+	dc_domain_t domain __attribute__((aligned(64)));
 #if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU)
 	/*
 	 * A SEPARATE domain for the LRU, and the separation is load-bearing.
@@ -1167,7 +1174,7 @@ struct dcache {
 	 * the whole domain -- worth 2.65x at 192 writers.  Widening a domain to
 	 * cover unrelated structures is the same mistake with extra steps.
 	 */
-	dc_domain_t lru_domain;
+	dc_domain_t lru_domain __attribute__((aligned(64)));
 #endif
 
 	/*
@@ -1180,7 +1187,7 @@ struct dcache {
 	 * with bl_read().  Kept EVEN (stepped by 2) so bit 0 -- the
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
-	void *rename_gen;
+	void *rename_gen __attribute__((aligned(64)));
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
@@ -1359,12 +1366,14 @@ static int lru_alive_hint(struct dentry *d)
 
 struct dcache *dc_create(unsigned int nbuckets)
 {
-	struct dcache *dc = calloc(1, sizeof(*dc));
+	struct dcache *dc;
 	unsigned int n = 1, i;
 	struct qstr rootname;
 
-	if (!dc)
+	/* 64-byte aligned, or struct dcache's per-line placement is fiction. */
+	if (posix_memalign((void **) &dc, 64, sizeof(*dc)) != 0)
 		return NULL;
+	memset(dc, 0, sizeof(*dc));
 	while (n < nbuckets)
 		n <<= 1;
 	dc->buckets = calloc(n, sizeof(*dc->buckets));
@@ -2424,6 +2433,50 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 					  DC_PARENT_TAG);
 }
 
+/*
+ * The rename's destination, re-checked UNDER new_bucket and new_parent's child
+ * head -- the caller's __child_lookup() is a check-then-act holding nothing, so
+ * two renames to one name, or a rename racing a dc_add of it, would otherwise
+ * both publish and leave two dentries spelled alike in one bucket.
+ *
+ * A NEGATIVE, settled (no shell chain) FILE occupant is REPLACED, as the
+ * kernel's d_move drops a negative target: it is removed from both indexes
+ * here, with the same marked stores dc_unlink uses, and handed back in *@neg
+ * for the caller to reclaim after a grace period.  It is removed just before
+ * the commit that publishes the shell rather than inside it, so a lockless
+ * reader of this name in between sees ABSENT where it saw NEGATIVE -- the same
+ * answer (the name does not exist), at the miss path's cost.  Holding
+ * new_bucket excludes dc_instantiate of the occupant (it takes the named top's
+ * bucket), so the state judged here cannot change under us.  Files only, which
+ * every negative is: no child can be added under a file, so the freed node
+ * needs no child-head seal.  Any other occupant: -EEXIST.
+ */
+#ifndef DC_NO_RENAME_DEST_RECHECK
+static int dest_claim_locked(struct dcache *dc, struct dentry *new_parent,
+			     const struct qstr *new_name, struct dentry *self,
+			     struct dentry **neg)
+{
+	struct dentry *cur = find_top_rcu(dc, new_parent, new_name);
+
+	if (!cur)
+		return 0;
+	if (cur == self || host_of_rcu(cur) != cur || DC_IS_POSITIVE(cur) ||
+	    cur->d_isdir)
+		return -EEXIST;
+	bl_hlist_del_locked(&cur->d_hash);
+	bl_hlist_del_locked(&cur->d_sib);
+	*neg = cur;
+	return 0;
+}
+#endif
+
+/* Reclaim a negative dest_claim_locked() dropped (dc_unlink's settled tail). */
+static void dest_reclaim(struct dcache *dc, struct dentry *neg)
+{
+	if (neg && lru_del_can_free(dc, neg, 1))
+		call_rcu(&neg->d_rcu, dentry_free_cb);
+}
+
 #ifndef DC_CHAIN_MIXED	/* ===== default: per-host chain lock + plain demote ===== */
 
 /*
@@ -2461,7 +2514,7 @@ static int stack_shell(struct dcache *dc,
 	struct urcu_txn_sw_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
-	struct dentry *top = NULL, *host = NULL;
+	struct dentry *top = NULL, *host = NULL, *neg = NULL;
 	int ret;
 
 	if (!shell)
@@ -2577,9 +2630,9 @@ static int stack_shell(struct dcache *dc,
 		 * the publish below are atomic against every racer for this
 		 * name -- same (parent, name) hashes to the same bucket.  The
 		 * caller's unlocked check stays as the cheap reject that avoids
-		 * allocating a shell.
+		 * allocating a shell.  A negative occupant is replaced (d_move).
 		 */
-		if (find_top_rcu(dc, new_parent, new_name)) {
+		if (dest_claim_locked(dc, new_parent, new_name, top, &neg)) {
 			bl_unlock_n(heads, 4);
 			fold_unlock(host);
 			if (cross_parent)
@@ -2609,12 +2662,14 @@ static int stack_shell(struct dcache *dc,
 		break;				/* committed: entry now named anew */
 	}
 	rcu_read_unlock();
+	dest_reclaim(dc, neg);
 	*out_shell = shell;
 	if (out_host)
 		*out_host = host;
 	return 0;
 out_free:
 	rcu_read_unlock();
+	dest_reclaim(dc, neg);		/* dropped before an OOM commit */
 	free(shell);
 	return ret;
 }
@@ -2675,7 +2730,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 		 * not a shared-slot CAS -- keeps a concurrent fold of a neighbour from
 		 * racing this rewrite. */
 		uatomic_store(&back->d_fwd, fwd, CMM_RELEASE);	/* reader-visible skip */
-		uatomic_store(&fwd->d_back, back, CMM_RELAXED);	/* fold-only backptr */
+		uatomic_store(&fwd->d_back, back, CMM_RELEASE);	/* reverse walk reads it */
 		goto done;
 	}
 
@@ -2798,7 +2853,7 @@ static int stack_shell(struct dcache *dc,
 	struct urcu_txn_sw_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
-	struct dentry *top = NULL, *host = NULL;
+	struct dentry *top = NULL, *host = NULL, *neg = NULL;
 	struct urcu_txn txn;
 	int ret;
 
@@ -2905,6 +2960,19 @@ static int stack_shell(struct dcache *dc,
 			ret = -ENOENT;
 			goto out_free;
 		}
+#ifndef DC_NO_RENAME_DEST_RECHECK
+		/* The destination re-check under new_bucket (this variant had
+		 * none: see dest_claim_locked), replacing a negative occupant. */
+		if (dest_claim_locked(dc, new_parent, new_name, top, &neg)) {
+			bl_unlock_n(heads, 4);
+			if (cross_parent)
+				uatomic_and(&host->d_moving, ~1UL);
+			urcu_txn_abandon(&txn);
+			urcu_txn_end(&txn);
+			ret = -EEXIST;
+			goto out_free;
+		}
+#endif
 
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent);
@@ -2923,12 +2991,14 @@ static int stack_shell(struct dcache *dc,
 		break;				/* committed: entry now named anew */
 	}
 	rcu_read_unlock();
+	dest_reclaim(dc, neg);
 	*out_shell = shell;
 	if (out_host)
 		*out_host = host;
 	return 0;
 out_free:
 	rcu_read_unlock();
+	dest_reclaim(dc, neg);		/* dropped before an OOM commit */
 	free(shell);
 	return ret;
 }
@@ -3171,7 +3241,7 @@ static void fold(struct dcache *dc, struct dentry *n)
 		if (back != NULL) {
 			/* SPLICE: n is a relay; back/fwd stable under the fold lock. */
 			uatomic_store(&back->d_fwd, fwd, CMM_RELEASE);	/* reader-visible skip */
-			uatomic_store(&fwd->d_back, back, CMM_RELAXED);	/* fold-only backptr */
+			uatomic_store(&fwd->d_back, back, CMM_RELEASE);	/* reverse walk reads it */
 			break;
 		}
 
@@ -3303,8 +3373,13 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	if (!to_parent)
 		return -ENOENT;
 	to_name = &to->comp[to->ndepth - 1];
-	if (__child_lookup(dc, to_parent, to_name))
-		return -EEXIST;
+	{
+		struct dentry *dest = __child_lookup(dc, to_parent, to_name);
+
+		/* a negative is replaced (d_move); itself is not a target */
+		if (dest && (dest == victim || DC_IS_POSITIVE(dest)))
+			return -EEXIST;
+	}
 	/*
 	 * dc_add is NOT the only way a directory gains a child -- a rename INTO
 	 * it is the other, and a NEGATIVE directory must refuse both (see
@@ -3948,4 +4023,116 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 	}
 	rcu_read_unlock();
 	return count;
+}
+
+/* ---- reverse walk (dentry_path_raw) ------------------------------------- */
+
+/*
+ * The object behind @p, as a handle for dc_dentry_path(): its content HOST, the
+ * node a rename never relocates.  Resolved the way the mutators locate their
+ * target (the soft per-component resolve), under one read-side section.
+ */
+struct dentry *dc_lookup_dentry(struct dcache *dc, const struct dc_path *p)
+{
+	struct dentry *d = dc->root;
+	uint32_t i;
+
+	rcu_read_lock();
+	for (i = 0; i < p->ndepth && d; i++)
+		d = txn_child_lookup_rcu(dc, d, &p->comp[i]);
+	if (d && !DC_IS_POSITIVE(d))
+		d = NULL;
+	rcu_read_unlock();
+	return d;
+}
+
+/*
+ * The node that currently NAMES @host: climb d_back to the top (NULL).  The
+ * default build plain-stores the links under the per-host chain lock (release);
+ * DC_CHAIN_SWMW transacts them, so each read resolves through bl_read.  Call
+ * under rcu_read_lock: a shell is freed a grace period after the fold that
+ * unlinks it.  A name read off the returned top is never mid-TRANSFER, for the
+ * reason given in dcache_txn.c's named_top_rcu (the fold is call_rcu-deferred
+ * past the demoting rename, here too).
+ */
+static inline struct dentry *named_top_rcu(struct dentry *host)
+{
+	struct dentry *n = host, *b;
+
+	while ((b = bl_read((void **) &n->d_back, DC_FWD_TAG)) != NULL)
+		n = b;
+	return n;
+}
+
+/*
+ * dentry_path_raw, with this engine's walk causality -- the MARK double collect
+ * its forward reader runs: each component's (name, parent) read off its named
+ * top, the top confirmed still unmarked on the way up and re-tested on the way
+ * back.  Marks are monotone, so every top named its host across the turnaround
+ * and the path existed then.  See dcache_txn.c's dc_dentry_path for the arms.
+ */
+int dc_dentry_path(struct dcache *dc, const struct dentry *d,
+		   struct dc_path *out)
+{
+	struct dentry *handle = (struct dentry *) (uintptr_t) d;
+#ifdef DC_MARK_GEN
+	struct dentry *latch[DC_PATH_MAX];
+#endif
+	uint32_t n, k;
+	int ret;
+
+	rcu_read_lock();
+	for (;;) {
+		struct dentry *host = handle;
+		int stale = 0;
+#ifndef DC_MARK_GEN
+		void *g0 = bl_read(&dc->rename_gen, DC_GEN_TAG);
+#endif
+
+		n = 0;
+		ret = 0;
+		while (host != dc->root) {
+			struct dentry *top;
+
+			if (n == DC_PATH_MAX) {
+				ret = -ENAMETOOLONG;
+				break;
+			}
+			top = named_top_rcu(host);
+			DC_INAME_COPY(&out->comp[DC_PATH_MAX - 1 - n], top);
+#ifdef DC_MARK_GEN
+			cmm_smp_rmb();		/* identity before the confirm */
+			if (top_unhashed_rcu(top)) {
+				stale = 1;	/* demoted under us: re-climb */
+				break;
+			}
+			latch[n] = top;
+#endif
+			host = DC_IPARENT(top);
+			n++;
+		}
+		if (ret)
+			break;
+		if (stale)
+			continue;
+		cmm_smp_rmb();			/* the climb before the check */
+#ifdef DC_MARK_GEN
+		for (k = 0; k < n; k++)
+			if (top_unhashed_rcu(latch[k]))
+				stale = 1;
+		if (!stale)
+			break;
+#else
+		if (bl_read(&dc->rename_gen, DC_GEN_TAG) == g0)
+			break;
+#endif
+	}
+	rcu_read_unlock();
+	if (ret)
+		return ret;
+	(void) k;
+	memmove(&out->comp[0], &out->comp[DC_PATH_MAX - n],
+		n * sizeof(out->comp[0]));
+	out->ndepth = n;
+	return 0;
 }

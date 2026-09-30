@@ -12,12 +12,11 @@
  *
  * WHAT THE ARMS SHOULD DO, so the numbers can be read as confirmation or not:
  *
- *   dc_add   touches NO walk-causality version in any arm, and commits TWICE
- *            (urcu_txn_hlist_add_rcu for the name hash, then children_add for
- *            the parent's child list).  Expect insert to be arm-INDEPENDENT.
- *            Note the two commits also mean an insert is not atomic across the
- *            two indexes: a dentry is briefly in the name hash and not yet in
- *            its parent's child list.
+ *   dc_add   touches NO walk-causality version in any arm, and on the txn
+ *            engines is ONE composed commit publishing the name hash and the
+ *            parent's child list together (it used to be two, briefly leaving
+ *            a dentry hash-visible and not child-visible).  Expect insert to be
+ *            arm-INDEPENDENT.
  *   dc_unlink bumps the version inside its single commit.  So it is where the
  *            arms diverge: the GLOBAL arm bumps dc->rename_gen (a whole-tree
  *            cacheline every reader brackets on), DC_PER_NODE_GEN bumps the
@@ -88,6 +87,8 @@
 #include <urcu-qsbr.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
+#include "dcache_bench_pace.h"
 
 extern const int dc_lookup_id_is_address __attribute__((weak));
 static inline int id_is_address(void)
@@ -114,7 +115,32 @@ static int readdir_mode = 0;		/* --readdir: readers list a dir vs look up */
  * real getdents(), which does copy every name out.
  */
 static int readdir_names = 0;
+/*
+ * --in-place: toggle a slot the way the KERNEL does for a name that is removed
+ * and created again.  unlink(2) ends in d_delete(), which turns a dentry whose
+ * only user is the caller NEGATIVE IN PLACE (fs.dentry-negative = 0, the
+ * default): still hashed, still on the LRU, nothing freed.  A later create of
+ * the same name finds that negative and d_instantiate()s it: nothing
+ * allocated, no LRU operation, no hash-chain edit.  So each slot is created
+ * once (a file, or a negative for a slot that starts absent) and then toggles
+ * with dc_delete / dc_instantiate.
+ *
+ * The default mode (dc_add / dc_unlink per toggle) instead allocates, links,
+ * enqueues on the LRU, dequeues and frees on every pair -- the path of a
+ * workload creating ever-NEW names, or of a kernel whose dentry-negative
+ * policy drops negatives.  Measured 2026-09-29, that mode spends 39-57% of its
+ * cycles on ONE per-node LRU lock, which the kernel's same-name churn never
+ * takes; it stays for the questions only it can answer (descriptor retirement,
+ * child-list contention) and is no longer the churn figure's headline.
+ */
+static int in_place = 0;
 static int nwriters = 8;
+/*
+ * --churn-rate R: hold the writers to R adds+unlinks/s in aggregate
+ * (dcache_bench_pace.h), so readers on every engine face one offered churn
+ * load instead of whatever rate that engine's writers reach.  0 = flat out.
+ */
+static double churn_rate = 0.0;
 static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
 static long duration_ms = 1000;
@@ -232,14 +258,6 @@ static void pin_thread(int idx)
 
 	if (c >= 0)
 		pin_cpu(c);
-}
-
-static uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-	return *s = x;
 }
 
 /* /p0/../d{dir}/S{gid} */
@@ -371,6 +389,7 @@ static void *writer_fn(void *arg)
 	uint64_t s = me->seed;
 	struct call_rcu_data *crdp = NULL;
 	int cpu = thread_cpu(me->idx);
+	struct pace pace;
 
 	dc_register_thread();
 	pin_thread(me->idx);
@@ -402,16 +421,19 @@ static void *writer_fn(void *arg)
 		if (crdp)
 			set_thread_call_rcu_data(crdp);
 	}
+	pace_init(&pace, churn_rate, nwriters);
 	wait_go();
 	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
-		int j = (int) (xrand(&s) % (uint64_t) slots);
+		if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
+			break;			/* window closed while paced */
+		int j = (int) xrange(&s, (uint32_t) slots);
 		int gid = me->base + j;
 		struct dc_path p;
 		int ret;
 
 		mk_slot_path(&p, me->dir[j], gid);
 		if (me->present[j]) {
-			ret = dc_unlink(g_dc, &p);
+			ret = in_place ? dc_delete(g_dc, &p) : dc_unlink(g_dc, &p);
 			me->last_op[j] = 2; me->last_ret[j] = ret;
 			if (ret == 0) { me->present[j] = 0; me->nunlinks++; }
 			/*
@@ -426,7 +448,14 @@ static void *writer_fn(void *arg)
 				me->nlost++;
 			} else { me->errs++; err_note(me, 2, ret); }
 		} else {
-			ret = dc_add(g_dc, &p, (uint64_t) gid);
+			if (in_place) {
+				ret = dc_instantiate(g_dc, &p, (uint64_t) gid);
+				/* the shrinker took the negative: create it anew,
+				 * as a kernel lookup miss would (evict only) */
+				if (ret == -ENOENT && evict_cap)
+					ret = dc_add_file(g_dc, &p, (uint64_t) gid);
+			} else
+				ret = dc_add(g_dc, &p, (uint64_t) gid);
 			me->last_op[j] = 1; me->last_ret[j] = ret;
 			if (ret == 0) { me->present[j] = 1; me->nadds++; }
 			/*
@@ -444,7 +473,8 @@ static void *writer_fn(void *arg)
 				me->last_op[j] = 3;
 				rr = rebuild_prefix(me->dir[j]);
 				if (rr == 0)
-					rr = dc_add(g_dc, &p, (uint64_t) gid);
+					rr = (in_place ? dc_add_file : dc_add)(g_dc,
+						&p, (uint64_t) gid);
 				me->last_ret[j] = rr;
 				if (rr == 0) {
 					me->present[j] = 1;
@@ -547,7 +577,7 @@ static void *reader_fn(void *arg)
 	pin_thread(me->idx);
 	wait_go();
 	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
-		int dr = (int) (xrand(&s) % (uint64_t) ndirs);
+		int dr = (int) xrange(&s, (uint32_t) ndirs);
 		struct dc_path p;
 
 		if (readdir_mode) {
@@ -568,7 +598,7 @@ static void *reader_fn(void *arg)
 				me->ndirents += n;
 			}
 		} else {
-			int gid = (int) (xrand(&s) % (uint64_t) total_slots);
+			int gid = (int) xrange(&s, (uint32_t) total_slots);
 			uint64_t id = ~0ULL;
 
 			mk_slot_path(&p, dr, gid);
@@ -809,9 +839,14 @@ static void usage(const char *p)
 	fprintf(stderr,
 	    "usage: %s [--readers R] [--writers W] [--ndirs N] [--slots S]\n"
 	    "          [--duration MS] [--prefix-depth D] [--nbuckets N]\n"
-	    "          [--cpulist c0,c1,...]\n"
+	    "          [--cpulist c0,c1,...] [--churn-rate R]\n"
 	    "  writers TOGGLE their own slots (present -> unlink, absent -> add);\n"
-	    "  readers look up random slots and must tolerate ABSENT.\n", p);
+	    "  readers look up random slots and must tolerate ABSENT.\n"
+	    "  --in-place     => toggle with dc_delete / dc_instantiate (the kernel's\n"
+	    "                    d_delete to negative + d_instantiate) instead of\n"
+	    "                    dc_unlink / dc_add: no allocation, no LRU traffic.\n"
+	    "  --churn-rate R => pace the writers to R adds+unlinks/s in aggregate\n"
+	    "                    (\"250k\", \"1M\"); default flat out.\n", p);
 	exit(2);
 }
 
@@ -851,6 +886,14 @@ int main(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--readers"))            nreaders = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--writers"))       nwriters = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--churn-rate")) {
+			churn_rate = pace_parse_rate(argv[++i]);
+			if (churn_rate < 0.0) {
+				fprintf(stderr, "--churn-rate: bad rate '%s'\n",
+					argv[i]);
+				exit(2);
+			}
+		}
 		else if (!strcmp(argv[i], "--ndirs"))         ndirs = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--slots"))         slots = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = atol(argv[++i]);
@@ -869,6 +912,7 @@ int main(int argc, char **argv)
 			else { fprintf(stderr, "--evict continuous|bursty|off\n"); return 2; }
 		}
 		else if (!strcmp(argv[i], "--readdir"))       readdir_mode = 1;
+		else if (!strcmp(argv[i], "--in-place"))      in_place = 1;
 		else if (!strcmp(argv[i], "--readdir-names")) { readdir_mode = 1;
 							       readdir_names = 1; }
 		else usage(argv[0]);
@@ -886,6 +930,9 @@ int main(int argc, char **argv)
 	}
 	build_tree();
 	printf("== bench_dcache_churn (engine: %s) ==\n", dc_engine_name());
+	printf("toggle: %s\n", in_place
+	       ? "in place (dc_delete to negative / dc_instantiate)"
+	       : "allocating (dc_unlink / dc_add)");
 	printf("readers=%d writers=%d ndirs=%d slots/writer=%d total_slots=%d "
 	       "duration_ms=%ld\n", nreaders, nwriters, ndirs, slots,
 	       total_slots, duration_ms);
@@ -909,10 +956,18 @@ int main(int argc, char **argv)
 			struct dc_path p;
 
 			wa[i].dir[j] = (wa[i].base + j) % ndirs;
-			if ((j & 1) == 0)
-				continue;		/* leave absent */
 			mk_slot_path(&p, wa[i].dir[j], wa[i].base + j);
-			if (dc_add(g_dc, &p, (uint64_t) (wa[i].base + j))) {
+			if ((j & 1) == 0) {		/* starts absent */
+				/* in place, an absent name is a cached negative,
+				 * as it is after the first lookup or unlink */
+				if (in_place && dc_add_negative(g_dc, &p)) {
+					fprintf(stderr, "setup: slot seed failed\n");
+					return 2;
+				}
+				continue;
+			}
+			if ((in_place ? dc_add_file : dc_add)(g_dc, &p,
+					(uint64_t) (wa[i].base + j))) {
 				fprintf(stderr, "setup: slot seed failed\n");
 				return 2;
 			}
@@ -1169,6 +1224,10 @@ int main(int argc, char **argv)
 	printf("CHURN   adds: %lld  unlinks: %lld  errors: %lld\n",
 	       adds, unl, errs);
 	printf("Mchurn/s: %g\n", (double) (adds + unl) / secs / 1e6);
+	if (churn_rate > 0.0)
+		printf("PACE    target Mchurn/s: %g  achieved: %.1f%%\n",
+		       churn_rate / 1e6,
+		       100.0 * (double) (adds + unl) / secs / churn_rate);
 	if (evict_cap) {
 		long long lost = 0, rebuilt = 0;
 		unsigned long pop = dc_lru_count(g_dc);

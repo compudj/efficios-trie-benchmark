@@ -55,7 +55,11 @@ LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) $(SLAB_LD)
 # (rseq_current_node_id) -- a plain load, no syscall and no libnuma.  Linked
 # unconditionally because every engine now carries the LRU or its stub; build
 # with -DDC_NO_LRU to drop both the field and this dependency.
-LDLIBS   := -lurcu-qsbr -lurcu-common $(SLAB_LIB) -lrseq -lpthread
+# The seqlock engine's per-directory lock is the vendored kernel rw_semaphore
+# by default (dcache_seqlock.c).  A static archive: only the binaries that
+# reference it pull it in.
+KRWSEM_LIB := krwsem/libkrwsem.a
+LDLIBS   := -lurcu-qsbr -lurcu-common $(SLAB_LIB) $(KRWSEM_LIB) -lrseq -lpthread
 
 # Rebuild when the LIBRARY changes, not only when our sources do.  Without this
 # every binary here silently survives a liburcu rebuild: the prerequisites are
@@ -74,13 +78,16 @@ HCPP     := $(KEEPID) $(CPPFLAGS)
 ENGINE   ?= seqlock
 # $(URCU_DEP) rides in HDRS because nearly every target here already lists HDRS,
 # so one line makes a liburcu rebuild invalidate every binary that links it.
-HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h $(URCU_DEP)
+HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_rand.h dcache_node.h \
+	    dcache_bench_pace.h $(URCU_DEP)
 
 .PHONY: check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
-	stress-dirs-tsan xchg xchg-asan xchg-tsan bench bench-check bench-asan \
+	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
+	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan check-bucketlock-swmw check-bucketlock-swmw-tsan \
 	check-bucketlock-chainlock check-bucketlock-chainlock-tsan \
 	check-filetype repro-samedir churn check-churn check-churn-evict \
+	check-seqlock-arms stress-seqlock-build \
 	check-deque check-deque-tsan \
 	clean check-lib
 
@@ -90,7 +97,10 @@ TSANFLAGS := -O1 -g -pthread -fsanitize=thread -fno-omit-frame-pointer
 
 all: test_dcache
 
-check-lib:
+$(KRWSEM_LIB): krwsem/krwsem.c krwsem/rwsem.c krwsem/kcompat.c krwsem/krwsem.h krwsem/kcompat.h
+	$(MAKE) -C krwsem libkrwsem.a
+
+check-lib: $(KRWSEM_LIB)
 	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
 	  echo "ERROR: urcu-txn engine not built at $(URCU_TXN_LIB)"; \
 	  echo "       Run 'make urcu-txn' at the repo root first."; exit 1; }
@@ -254,14 +264,74 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_tsan 4 4 6 8 15000
 
+# An exchange's two names exist before AND after its commit, so a lockless
+# lookup of either must never come back ABSENT.  Two detectors, because each is
+# blind where the other is not:
+#   stress_dcache_xchg at 16 buckets (a name can only be missed when its node is
+#   NOT first in its chain, so the default 4096 buckets made the assertion
+#   nearly vacuous), with directory AND file slots (the global arm brackets on
+#   rename_gen, but bumps it only for a directory); and
+#   bench_dcache_height's `absent:` count (every digit path exists at every
+#   instant) -- the only one that caught the mark arm, and only reliably with
+#   one thread pinned per core (hwloc, when present): ~2000 per run pinned,
+#   1-11 floating.
+# Every engine, including the ones that never failed: the gate is the
+# invariant, not the engine that broke it.  Found 2026-09-29: the MW engine's
+# exchange was two del + insert-at-head moves, so both localized arms, and the
+# global arm on files, reported existing paths ABSENT; see exchange_prepare.
+XCHG_ABSENT_ENGINES := txn:dcache_txn.c: \
+	txn_pernode:dcache_txn.c:-DDC_PER_NODE_GEN \
+	txn_mark:dcache_txn.c:-DDC_MARK_GEN \
+	bucketlock:dcache_bucketlock.c:-DDC_MARK_GEN \
+	seqlock:dcache_seqlock.c:
+check-xchg-absent: stress_dcache_xchg.c dcache_txn.c dcache_bucketlock.c \
+		dcache_seqlock.c $(HDRS) height | check-lib
+	@set -e; cpul=$$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null || true); \
+	pin=$${cpul:+--cpulist $$cpul}; \
+	for spec in $(XCHG_ABSENT_ENGINES); do \
+	  e=$${spec%%:*}; rest=$${spec#*:}; src=$${rest%%:*}; def=$${rest#*:}; \
+	  $(CC) $(CFLAGS) $$def $(HCPP) -o stress_dcache_xchg_$$e \
+	    stress_dcache_xchg.c $$src $(LDFLAGS) $(LDLIBS); \
+	  for files in 0 1; do \
+	    echo "== xchg $$e slots=$$([ $$files = 1 ] && echo files || echo dirs) nbuckets=16"; \
+	    out=$$(./stress_dcache_xchg_$$e 4 16 8 16 50000 16 $$files); \
+	    echo "$$out" | grep -E 'ABSENT|RESULT'; \
+	    echo "$$out" | grep -q 'RESULT: PASS'; \
+	  done; \
+	  for h in 0 2; do \
+	    a=$$(./bench_dcache_height_$$e --nthreads 40 --writers 8 --branch 2 \
+	      --tree-depth 8 --move-height $$h --duration 1000 $$pin \
+	      | awk '/Mlookups/ { print $$NF }'); \
+	    echo "== height $$e H=$$h absent: $$a (expect 0)"; \
+	    test "$$a" = 0; \
+	  done; \
+	done
+	@echo "check-xchg-absent: PASS"
+
+# Two renames to ONE destination name must not both publish (see the repro's
+# header).  The control build drops the in-transaction destination re-check and
+# MUST report duplicates, or the repro proves nothing about the fixed one.  Not
+# in any target until 2026-09-29, which is how a harness hang (main registered
+# with RCU twice) went unnoticed.
+repro-rename-dup: repro_rename_dup.c dcache_txn.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -o repro_rename_dup \
+	  repro_rename_dup.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
+	./repro_rename_dup
+	$(CC) $(CFLAGS) -DDC_NO_RENAME_DEST_RECHECK $(HCPP) \
+	  -o repro_rename_dup_control repro_rename_dup.c dcache_txn.c \
+	  $(LDFLAGS) $(LDLIBS)
+	@if ./repro_rename_dup_control > /dev/null; then \
+	  echo "repro-rename-dup: CONTROL PASSED -- the repro is vacuous"; exit 1; \
+	else echo "repro-rename-dup: control fails as it must"; fi
+
 # S3 throughput sweep: the engine-agnostic bench, one binary PER arm (built
 # straight from source so they never share a stale .o).  Three arms: the seqlock
 # baseline, the txn engine on its GLOBAL rename_gen, and the txn engine on the
 # PER-NODE host generation (-DDC_PER_NODE_GEN -- a rename only invalidates walks
 # that pass through the moved entry).  scripts/run_dcache.sh drives all three;
 # plot_dcache.py charts them.
-bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
-       bench_dcache_txn_mark bench_dcache_bucketlock churn
+bench: bench_dcache_seqlock bench_dcache_seqlock_snapshot bench_dcache_txn \
+       bench_dcache_txn_pernode bench_dcache_txn_mark bench_dcache_bucketlock churn
 
 # The seqlock baseline builds the DEFAULT layout too: the fair 1-CL split hot
 # line (d_parent tags + d_seq on CL0, d_id cold) returning the dentry ADDRESS as
@@ -270,6 +340,15 @@ bench: bench_dcache_seqlock bench_dcache_txn bench_dcache_txn_pernode \
 bench_dcache_seqlock: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache.c dcache_seqlock.c \
 	  $(LDFLAGS) $(LDLIBS)
+
+# The seqlock SNAPSHOT arm (see dcache_seqlock.c): dc_lookup brackets the whole
+# forward walk on rename_lock with the kernel's bounded read_seqbegin_or_lock --
+# the guarantee every txn arm gives, priced with the kernel's own tool.  The
+# default bench_dcache_seqlock is the kernel's forward fast path (no whole-walk
+# rename_lock check on a hit).
+bench_dcache_seqlock_snapshot: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_SEQ_SNAPSHOT $(CPPFLAGS) -o $@ bench_dcache.c \
+	  dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
 
 bench_dcache_seqlock_nosplit: bench_dcache.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
@@ -365,6 +444,14 @@ check-churn: churn
 	./bench_dcache_churn_txn_mark --writers 6 --readers 6 --duration 1500
 	./bench_dcache_churn_txn_pernode --writers 6 --readers 6 --duration 1500
 	./bench_dcache_churn_seqlock --writers 6 --readers 6 --duration 1500
+	@# --in-place: the kernel's same-name churn (d_delete to negative +
+	@# d_instantiate) -- a live node changing kind under readers, on every
+	@# engine, with the same state + census + id invariant.
+	for e in $(CHURN_ENGINES); do \
+	  ./bench_dcache_churn_$$e --writers 6 --readers 6 --duration 1500 --in-place \
+	    | grep -q 'conservation: OK' || { echo "check-churn: $$e --in-place FAILED"; exit 1; }; \
+	done
+	@echo "check-churn: --in-place PASS on $(CHURN_ENGINES)"
 
 # The EVICTION arms -- and they are a different gate, not a longer one.
 #
@@ -521,12 +608,10 @@ bench_dcache_bucketlock_swmw_pad: bench_dcache.c dcache_bucketlock.c $(HDRS) | c
 	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_SWMW_PAD $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
-# Per-node A/B partners: legacy 3-CL baseline, and the split layout that keeps
-# the cold d_id read (logical id, 2-CL) to isolate the d_id-elision gain.
-bench_dcache_txn_pernode_nosplit: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
-	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o $@ \
-	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
-
+# Per-node A/B partner: the split layout that keeps the cold d_id read (logical
+# id, 2-CL) to isolate the d_id-elision gain.  (There is no legacy-layout
+# per-node arm: dcache_txn.c refuses DC_PER_NODE_GEN without the tag-encoded
+# layout, where it used to build a reader with no causality check at all.)
 bench_dcache_txn_pernode_keepid: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(KEEPID) $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
@@ -540,13 +625,17 @@ bench_dcache_txn_hot1cl: bench_dcache.c dcache_txn.c $(HDRS) | check-lib
 # a balanced B-ary band; readers walk full leaf paths.  Bounds the per-node arm
 # (leaf case H=0 is its best case; near-root moves degenerate to the global
 # counter).  Same three arms as `bench`; scripts/run_dcache_height.sh drives them.
-height: bench_dcache_height_seqlock bench_dcache_height_txn \
-	bench_dcache_height_txn_pernode bench_dcache_height_txn_mark \
-	bench_dcache_height_bucketlock
+height: bench_dcache_height_seqlock bench_dcache_height_seqlock_snapshot \
+	bench_dcache_height_txn bench_dcache_height_txn_pernode \
+	bench_dcache_height_txn_mark bench_dcache_height_bucketlock
 
 bench_dcache_height_seqlock: bench_dcache_height.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_seqlock.c \
 	  $(LDFLAGS) $(LDLIBS)
+
+bench_dcache_height_seqlock_snapshot: bench_dcache_height.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_SEQ_SNAPSHOT $(CPPFLAGS) -o $@ \
+	  bench_dcache_height.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
 
 bench_dcache_height_txn: bench_dcache_height.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ bench_dcache_height.c dcache_txn.c \
@@ -605,6 +694,27 @@ repro-samedir: repro_dcache_samedir.c dcache_txn.c $(HDRS) | check-lib
 # stays write-once and d_seq is gone (DC_NAME_MAX 40).
 # File/directory type: ENOTDIR enforcement + file-rename bump-skip soundness.
 # Runs on all three txn arms and the seqlock baseline.
+# The seqlock baseline's two lookup arms through the single-thread suite, and
+# (build only -- run them when the machine is free) the engine-agnostic stress
+# harnesses against both, so the baseline gets the concurrent coverage the txn
+# engines have.
+check-seqlock-arms: test_dcache.c dcache_seqlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(HCPP) -o test_dcache_seqlock test_dcache.c \
+	  dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CFLAGS) -DDC_SEQ_SNAPSHOT $(HCPP) -o test_dcache_seqlock_snapshot \
+	  test_dcache.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_seqlock
+	./test_dcache_seqlock_snapshot
+
+SEQ_STRESS := stress_dcache stress_dcache_dirs stress_dcache_xchg
+stress-seqlock-build: $(addsuffix .c,$(SEQ_STRESS)) dcache_seqlock.c $(HDRS) | check-lib
+	for h in $(SEQ_STRESS); do \
+	  $(CC) $(CFLAGS) $(HCPP) -o $${h}_seqlock $$h.c dcache_seqlock.c \
+	    $(LDFLAGS) $(LDLIBS) || exit 1; \
+	  $(CC) $(CFLAGS) -DDC_SEQ_SNAPSHOT $(HCPP) -o $${h}_seqlock_snapshot \
+	    $$h.c dcache_seqlock.c $(LDFLAGS) $(LDLIBS) || exit 1; \
+	done
+
 check-filetype: test_file_type.c dcache_txn.c dcache_seqlock.c $(HDRS) | check-lib
 	@for a in "" "-DDC_PER_NODE_GEN" "-DDC_MARK_GEN"; do \
 	  $(CC) $(CFLAGS) $$a $(HCPP) -o test_file_type_txn test_file_type.c \
@@ -1050,10 +1160,6 @@ check-layouts: test_dcache.c dcache_txn.c dcache_seqlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) -o test_dcache_txn_nosplit \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_txn_nosplit
-	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN -DDC_NO_HOT1CL_SPLIT $(CPPFLAGS) \
-	  -o test_dcache_pernode_nosplit test_dcache.c dcache_txn.c \
-	  $(LDFLAGS) $(LDLIBS)
-	./test_dcache_pernode_nosplit
 	$(CC) $(CFLAGS) -DDC_HOT1CL $(CPPFLAGS) -o test_dcache_txn_hot1cl \
 	  test_dcache.c dcache_txn.c $(LDFLAGS) $(LDLIBS)
 	./test_dcache_txn_hot1cl
@@ -1080,8 +1186,12 @@ bench-asan: bench_dcache.c dcache_seqlock.c dcache_txn.c $(HDRS) | check-lib
 clean:
 	rm -f *.o test_dcache test_dcache_asan repro_dcache repro_dcache_asan \
 	  bench_dcache_seqlock bench_dcache_seqlock_nosplit \
+	  bench_dcache_seqlock_snapshot bench_dcache_height_seqlock_snapshot \
+	  test_dcache_seqlock test_dcache_seqlock_snapshot \
+	  $(addsuffix _seqlock,$(SEQ_STRESS)) \
+	  $(addsuffix _seqlock_snapshot,$(SEQ_STRESS)) \
 	  bench_dcache_txn bench_dcache_txn_nosplit \
-	  bench_dcache_txn_pernode bench_dcache_txn_pernode_nosplit \
+	  bench_dcache_txn_pernode test_dcache_pernode_nosplit \
 	  bench_dcache_txn_pernode_keepid bench_dcache_txn_hot1cl \
 	  test_dcache_hot1cl test_dcache_hot1cl_asan \
 	  bench_dcache_seqlock_asan bench_dcache_txn_asan \

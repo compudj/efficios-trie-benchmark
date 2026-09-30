@@ -3,18 +3,45 @@
  * dcache_seqlock.c -- faithful kernel-style userspace dentry cache.
  *
  * This is the BASELINE the urcu-txn port (dcache_txn, S2) must beat and simplify.
- * It reproduces the kernel's actual RCU-walk consistency scheme:
+ * It reproduces the kernel's actual RCU-walk consistency scheme (checked against
+ * Linux v7.3 fs/namei.c + fs/dcache.c):
  *
  *   - a (parent, name-hash) hash table of RCU hlists (the dentry_hashtable /
  *     hlist_bl analog); lockless readers traverse a bucket with rcu_dereference;
- *   - a GLOBAL rename_lock seqlock, bumped by every d_move, that brackets the
- *     whole multi-component walk: any rename anywhere forces the walk to retry;
- *   - a per-dentry d_seq seqcount, validated as the walk steps from a dentry to
- *     its child, so a single-component match (parent + name) is self-consistent
- *     even while that dentry is being renamed.
+ *   - a per-dentry d_seq seqcount, validated HAND-OVER-HAND: the child's d_seq
+ *     is sampled (odd bit masked) before its name/parent compare, the parent's
+ *     is re-checked once the child is found (lookup_fast) and the child's once
+ *     more before stepping into it (step_into).  That is the fast path's ONLY
+ *     per-hop validation;
+ *   - a GLOBAL rename_lock seqlock, bumped by every d_move.  The fast path does
+ *     NOT validate it on a hit ("Rename seqlock is not required here", lookup_
+ *     fast): path_init only SAMPLES it (waiting out an in-flight d_move), and a
+ *     MISS falls back to d_lookup, which retries while it moved -- a rename can
+ *     make the lockless chain scan miss a dentry that is there.
  *
- * The mechanism the txn port deletes is exactly (rename_lock + d_seq): global +
- * per-object sequence counters read on the fast path.
+ * So a kernel walk guarantees that consecutive components overlapped in time,
+ * NOT that the whole path existed at one instant.  That stronger SNAPSHOT
+ * guarantee is what the kernel reserves for its reverse walks (d_path,
+ * dentry_path_raw, d_walk, is_subdir), which bracket the whole walk on
+ * rename_lock with read_seqbegin_or_lock -- lockless first, then a retry that
+ * takes rename_lock and so cannot fail again.
+ *
+ * Two build arms, because the txn engines give the snapshot guarantee on every
+ * lookup and a fair comparison needs both anchors:
+ *
+ *   default            the kernel's forward fast path, as above.  Pairs with
+ *                      the txn per-node / mark arms (which give MORE: a
+ *                      snapshot) and is the "versus the kernel's lookup" line.
+ *   -DDC_SEQ_SNAPSHOT  dc_lookup brackets the whole forward walk on rename_lock
+ *                      the way the kernel's reverse walks do (bounded retry),
+ *                      on top of the per-component d_seq check.  Same guarantee
+ *                      as every txn arm; pairs with txn-global.  No kernel
+ *                      operation does a forward walk this way -- it prices the
+ *                      snapshot guarantee using the kernel's own tool for it.
+ *
+ * Writers and readdir resolve their paths with the kernel's fast-path walk in
+ * BOTH arms: the snapshot arm is about the lookup, not the writers.  dc_dentry_
+ * path() is the reverse walk (dentry_path_raw), the same in both arms.
  *
  * Kernel-faithful write-side locking (see README): the write path mirrors the
  * kernel's granularity so writer THROUGHPUT is a fair comparison too, not only
@@ -24,13 +51,18 @@
  * it edits (an hlist_bl bit lock in bit 0 of the bucket head word, guarding each
  * hash chain) -- NOT one global lock, so add/unlink in different dirs and buckets
  * proceed in parallel exactly as they do in the kernel.  Every rename / exchange
- * takes rename_lock (the seqlock the reader validates on); a CROSS-directory one
- * additionally takes a single global s_vfs_rename_mutex, as the kernel's
- * lock_rename does for p1 != p2, making the loop check atomic with the reparent
- * (a same-dir rename takes neither the mutex nor the loop check).  Lock ordering,
- * outermost first: vfs_rename_mutex -> rename_lock -> dir rwsems (address-ordered)
- * -> bucket locks (address-ordered); no mutator takes a dir lock while already
- * holding a bucket lock, so the two-level hierarchy cannot cycle.  d_seq is written under the bucket lock
+ * takes rename_lock's write side around the move itself (d_move); a CROSS-
+ * directory one additionally takes a single global s_vfs_rename_mutex, as the
+ * kernel's lock_rename does for p1 != p2, making the loop check atomic with the
+ * reparent (a same-dir rename takes neither the mutex nor the loop check).  Lock
+ * ordering, outermost first: vfs_rename_mutex -> dir rwsems (address-ordered)
+ * -> rename_lock -> bucket locks (address-ordered).  The dir rwsems are taken
+ * BEFORE rename_lock, as the kernel's lock_rename takes i_rwsem before vfs_rename
+ * reaches d_move: rename_lock's write section -- the window in which every new
+ * walk waits in path_init -- then covers only the hash/name/parent edit, never a
+ * sleeping-lock acquisition behind a readdir or an add.  No mutator takes a dir
+ * lock while already holding rename_lock or a bucket lock, so the hierarchy
+ * cannot cycle.  d_seq is written under the bucket lock
  * of the dentry's own chain.  Refcounting is omitted: a walk lives entirely in
  * one RCU read-side section and retains nothing (the kernel's LOOKUP_RCU fast
  * path), unlink RCU-defers the free, and every mutator brackets its resolve +
@@ -53,6 +85,7 @@
 #include <urcu-call-rcu.h>
 #ifndef DC_NO_LRU
 #include <rseq/rseq.h>			/* phase 3: NUMA node id (list_lru sharding) */
+#include "dcache_node.h"		/* phase 3: this CPU's node, rseq or getcpu */
 #endif
 
 #include "dcache.h"
@@ -60,12 +93,23 @@
 #include "seqcount.h"
 
 /*
- * Per-directory lock TYPE.  Default is the glibc pthread_rwlock (reader- or
- * writer-preferring, see dir_lock_init below).  -DDC_DIR_LOCK_KRWSEM swaps in
- * the VENDORED Linux kernel rw_semaphore (krwsem/, GPL-2.0) -- the FAITHFUL
- * fair/writer-non-starving lock the kernel actually uses for inode->i_rwsem --
- * sized (56 B) to match pthread_rwlock_t so the dentry footprint is unchanged.
+ * Per-directory lock TYPE.  DEFAULT: the VENDORED Linux kernel rw_semaphore
+ * (krwsem/, GPL-2.0) -- the FAITHFUL fair/writer-non-starving lock the kernel
+ * actually uses for inode->i_rwsem -- sized (56 B) to match pthread_rwlock_t so
+ * the dentry footprint is unchanged.  -DDC_DIR_LOCK_PTHREAD selects the glibc
+ * pthread_rwlock instead (reader-preferring; -DDC_DIR_LOCK_WRITER_PREF, which
+ * implies it, makes it writer-preferring -- see dir_lock_init below).
+ *
+ * The kernel rwsem became the default on 2026-09-29: this lock is part of what
+ * the txn engines dissolve (their readdir takes no lock, so no writer need
+ * exclude a reader), and that axis has to be measured against the kernel's own
+ * lock.  glibc's cost 1.13-1.16x more in-place churn throughput at 16-48
+ * writers than the kernel's, which had inflated the axis.
  */
+#if !defined(DC_DIR_LOCK_PTHREAD) && !defined(DC_DIR_LOCK_WRITER_PREF) && \
+    !defined(DC_DIR_LOCK_KRWSEM)
+#define DC_DIR_LOCK_KRWSEM 1
+#endif
 #ifdef DC_DIR_LOCK_KRWSEM
 #include "krwsem/krwsem.h"
 typedef struct krwsem dc_dirlock_t;
@@ -84,13 +128,22 @@ typedef pthread_rwlock_t dc_dirlock_t;
 #endif
 
 /*
- * Total lookup-walk restarts forced by a concurrent rename (global rename_lock
- * or a stepped-into d_seq).  The benchmark reads this via a WEAK reference so it
+ * Total dc_lookup walk restarts: a failed d_seq check on a component the walk
+ * used (both arms), or -- DC_SEQ_SNAPSHOT only -- a rename ANYWHERE during the
+ * walk (rename_lock moved).  The benchmark reads this via a WEAK reference so it
  * stays engine-agnostic: the txn engine, which never retries a walk, simply does
  * not define the symbol and the harness reports it as N/A.  Only touched on the
  * retry slow path (zero cost at rename-fraction 0).
  */
 unsigned long dc_seq_walk_retries;
+
+/*
+ * Restarts are counted per thread and folded into dc_seq_walk_retries when the
+ * thread unregisters (the harnesses read it after joining).  A shared counter
+ * bumped on every restart would be a contended line of the HARNESS's making,
+ * charged to exactly the arm and the moment -- a retry storm -- being measured.
+ */
+static __thread unsigned long walk_retries_tls;
 
 /* ---- structures --------------------------------------------------------- */
 
@@ -138,6 +191,7 @@ struct dentry {
 	uint64_t d_id;			/* identity artifact; census/readdir/KEEPID */
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
+	struct dentry **d_sib_pprev;	/* slot naming this node (O(1) del) */
 	dc_dirlock_t     d_lock;	/* per-dir readdir/child-list exclusion */
 	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
 					 * Kernel-faithful: tracked for -ENOTDIR
@@ -174,6 +228,7 @@ struct dentry {
 
 	struct dentry *d_children;	/* head of children (verify/-ENOTEMPTY) */
 	struct dentry *d_sib;		/* next sibling under d_parent */
+	struct dentry **d_sib_pprev;	/* slot naming this node (O(1) del) */
 	dc_dirlock_t     d_lock;	/* per-dir readdir/child-list exclusion */
 	unsigned char d_isdir;		/* file vs directory (dc_add ENOTDIR).
 					 * Kernel-faithful: tracked for -ENOTDIR
@@ -224,13 +279,27 @@ struct dc_lru_one {			/* struct list_lru_one */
 	char pad[64 - (2 * sizeof(unsigned long) + 2 * sizeof(void *)) % 64];
 };
 
+/*
+ * Field placement follows the kernel's, because it decides what a rename costs
+ * every concurrent walk.  The hash-table geometry and the root are read on every
+ * hop and never written after dc_create -- the kernel keeps dentry_hashtable /
+ * d_hash_shift __ro_after_init -- so they get a line no writer touches.
+ * rename_lock is written by every d_move, and the kernel makes it
+ * __cacheline_aligned_in_smp; s_vfs_rename_mutex lives in the superblock, near
+ * neither.  Packed together (as this struct once was), every rename invalidates
+ * the line every walk reads on every hop: a false-sharing tax the kernel does
+ * not pay.  dc_create allocates the struct 64-byte aligned so these hold.
+ */
 struct dcache {
-	struct dc_lru_one s_dentry_lru[DC_LRU_NODES];
 	struct dc_bucket *buckets;	/* each head word carries its own bit lock */
 	unsigned long mask;		/* nbuckets - 1 (power of two) */
 	struct dentry *root;
-	seqlock_t rename_lock;		/* GLOBAL: the walk's consistency anchor */
-	pthread_mutex_t vfs_rename_mutex; /* s_vfs_rename_mutex: cross-dir moves only */
+	seqlock_t rename_lock		/* GLOBAL: bumped by every d_move */
+		__attribute__((aligned(64)));
+	pthread_mutex_t vfs_rename_mutex /* s_vfs_rename_mutex: cross-dir moves */
+		__attribute__((aligned(64)));
+	struct dc_lru_one s_dentry_lru[DC_LRU_NODES]
+		__attribute__((aligned(64)));
 };
 
 #define hnode_dentry(n) caa_container_of((n), struct dentry, d_hash)
@@ -436,14 +505,17 @@ static inline void lru_unlock(struct dc_lru_one *l)
 
 /*
  * The shard: the NUMA node, exactly as the kernel indexes `lru->node[nid]`.
- * Read from the rseq ABI page -- a plain load, no syscall.  The kernel derives
- * nid from the OBJECT's memory (page_to_nid); under first-touch the enqueueing
- * thread's node is that same node, and it is captured once and remembered so a
- * later del from another node still finds the list the dentry is actually on.
+ * Read by dc_current_node() -- the rseq ABI page when it exposes node ids (a
+ * plain load, no syscall), else getcpu() from the vDSO; never a default of
+ * node 0, which on this 24-node machine is one lock across every CCD (see
+ * dcache_node.h).  The kernel derives nid from the OBJECT's memory
+ * (page_to_nid); under first-touch the enqueueing thread's node is that same
+ * node, and it is captured once and remembered so a later del from another
+ * node still finds the list the dentry is actually on.
  */
 static inline unsigned int lru_nid(void)
 {
-	unsigned int nid = rseq_node_id_available() ? rseq_current_node_id() : 0u;
+	unsigned int nid = dc_current_node();
 
 	return nid < DC_LRU_NODES ? nid : nid % DC_LRU_NODES;
 }
@@ -549,21 +621,32 @@ const char *dc_lru_arm(void) { return "none"; }
 const int dc_lru_inuse_is_removed = 1;
 #endif	/* DC_NO_LRU */
 
+/*
+ * The child list is the kernel's d_children / d_sib hlist: a pprev back-link
+ * makes removal O(1).  A singly linked list here made every cross-directory
+ * move and exchange walk the old parent's children INSIDE rename_lock's write
+ * section -- holding it odd, and so every new walk waiting in path_init, for
+ * O(fanout) -- which the kernel's __hlist_del(&dentry->d_sib) never does.
+ * Plain stores: the list is only read under the parent's dir lock (readdir,
+ * the -ENOTEMPTY checks) or quiescent (dc_walk, dc_destroy).
+ */
 static void children_add(struct dentry *parent, struct dentry *child)
 {
 	child->d_sib = parent->d_children;
+	child->d_sib_pprev = &parent->d_children;
+	if (parent->d_children)
+		parent->d_children->d_sib_pprev = &child->d_sib;
 	parent->d_children = child;
 }
 
 static void children_remove(struct dentry *parent, struct dentry *child)
 {
-	struct dentry **pp = &parent->d_children;
-
-	while (*pp && *pp != child)
-		pp = &(*pp)->d_sib;
-	if (*pp == child)
-		*pp = child->d_sib;
+	(void) parent;
+	*child->d_sib_pprev = child->d_sib;
+	if (child->d_sib)
+		child->d_sib->d_sib_pprev = child->d_sib_pprev;
 	child->d_sib = NULL;
+	child->d_sib_pprev = NULL;
 }
 
 /*
@@ -572,11 +655,13 @@ static void children_remove(struct dentry *parent, struct dentry *child)
  * place (name change under the same parent) -- write-locks that dir.  Concurrent
  * readdirs of a dir thus share, and a readdir of one dir never serializes against
  * a rename of another: the honest per-directory-inode-rwsem analogue, not one
- * global lock.  Writer-vs-writer cannot deadlock because the two-dir case is
- * address-ordered (dirs_wlock2) and multi-dir mutators are serialized by
- * rename_lock, so at most one holds two dir locks at a time; readdir takes only a
- * read lock, so there is no cycle either.  Ordering, outermost first:
- * rename_lock -> these dir rwsems -> bucket bit locks.
+ * global lock.  Writer-vs-writer cannot deadlock because EVERY two-dir
+ * acquisition (rename, exchange, rmdir-to-negative) goes through dirs_wlock2's
+ * address order, a total order over all dir locks; several renamers may each
+ * hold two dir locks while they queue on rename_lock, which is fine for the same
+ * reason.  readdir takes only a read lock, so there is no cycle either.
+ * Ordering, outermost first: vfs_rename_mutex -> these dir rwsems -> rename_lock
+ * -> bucket bit locks.
  */
 /*
  * Per-directory lock BIAS -- a fidelity knob, because it decides who wins the
@@ -677,7 +762,11 @@ static void bl_unlock2(struct dc_bucket *x, struct dc_bucket *y)
 
 const char *dc_engine_name(void)
 {
+#ifdef DC_SEQ_SNAPSHOT
+	return "seqlock-snapshot";
+#else
 	return "seqlock";
+#endif
 }
 
 static struct dentry *dentry_alloc(const struct qstr *name,
@@ -712,6 +801,7 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 	seqcount_init(&d->d_seq);
 	d->d_children = NULL;
 	d->d_sib = NULL;
+	d->d_sib_pprev = NULL;
 	d->d_isdir = (unsigned char) (isdir != 0);
 	dir_lock_init(&d->d_lock);
 	return d;
@@ -719,12 +809,14 @@ static struct dentry *dentry_alloc(const struct qstr *name,
 
 struct dcache *dc_create(unsigned int nbuckets)
 {
-	struct dcache *dc = calloc(1, sizeof(*dc));
+	struct dcache *dc;
 	unsigned int n = 1;
 	struct qstr rootname;
 
-	if (!dc)
+	/* 64-byte aligned, or struct dcache's per-line placement is fiction. */
+	if (posix_memalign((void **) &dc, 64, sizeof(*dc)) != 0)
 		return NULL;
+	memset(dc, 0, sizeof(*dc));
 	while (n < nbuckets)		/* round up to a power of two */
 		n <<= 1;
 	dc->buckets = calloc(n, sizeof(*dc->buckets));
@@ -776,6 +868,11 @@ void dc_register_thread(void)
 
 void dc_unregister_thread(void)
 {
+	if (walk_retries_tls) {
+		__atomic_fetch_add(&dc_seq_walk_retries, walk_retries_tls,
+				   __ATOMIC_RELAXED);
+		walk_retries_tls = 0;
+	}
 	rcu_unregister_thread();
 }
 
@@ -786,12 +883,19 @@ void dc_quiescent(void)
 
 /* ---- lockless lookup (the RCU-walk fast path) --------------------------- */
 
+static inline void walk_retry_count(void)
+{
+	walk_retries_tls++;
+}
+
 /*
  * __d_lookup_rcu: find parent's child named `name` in the hash, lockless.  Fills
- * *seqp with the dentry's d_seq sampled BEFORE the parent/name compare; the
- * caller re-validates it (read_seqcount_retry) before trusting the dentry to
- * step to the next component.  A mismatch just `continue`s: if the miss is due to
- * an in-flight rename, the outer rename_lock check forces a full retry.
+ * *seqp with the dentry's d_seq sampled BEFORE the parent/name compare, odd bit
+ * masked (raw_seqcount_begin), so a compare that overlapped an in-flight
+ * __d_move can never validate; the caller re-validates it (read_seqcount_retry)
+ * before trusting the dentry.  A rename can move a chain neighbour to another
+ * bucket mid-scan and make this MISS a dentry that is there -- a false negative
+ * the caller must not trust (kernel: lookup_fast falls back to d_lookup).
  */
 static struct dentry *__d_lookup_rcu(struct dcache *dc, struct dentry *parent,
 				     const struct qstr *name,
@@ -806,7 +910,7 @@ static struct dentry *__d_lookup_rcu(struct dcache *dc, struct dentry *parent,
 
 		if (CMM_LOAD_SHARED(d->d_name.hash) != name->hash)
 			continue;
-		seq = raw_read_seqcount(&d->d_seq);
+		seq = raw_seqcount_begin(&d->d_seq);
 #if defined(DC_HOT1CL_SPLIT)
 		{
 			/* one load of the CL0 parent word: mask for the parent
@@ -839,79 +943,238 @@ static struct dentry *__d_lookup_rcu(struct dcache *dc, struct dentry *parent,
 	return NULL;
 }
 
+/*
+ * d_lookup (fs/dcache.c): the non-racy single-component lookup a fast-path MISS
+ * falls back to.  It retries the lockless scan only while rename_lock moved
+ * underneath a MISS; a hit is returned as is, for the caller to validate.  The
+ * kernel gets here through try_to_unlazy + lookup_slow (d_alloc_parallel has
+ * the same rename_lock-on-miss bracket) and carries on in ref-walk; this port
+ * stays lockless, which can only flatter the baseline.
+ */
+static struct dentry *d_lookup_rcu(struct dcache *dc, struct dentry *parent,
+				   const struct qstr *name, unsigned long *seqp)
+{
+	struct dentry *d;
+	unsigned long r_seq;
+
+	do {
+		r_seq = read_seqbegin(&dc->rename_lock);
+		d = __d_lookup_rcu(dc, parent, name, seqp);
+		if (d)
+			break;
+	} while (read_seqretry(&dc->rename_lock, r_seq));
+	return d;
+}
+
+/* Outcome of one walk attempt. */
+enum walk_ret {
+	WALK_DONE,		/* *dp / *resp / *idp hold the answer */
+	WALK_RESTART,		/* a d_seq check failed: walk again from the root */
+};
+
+/*
+ * The kernel's RCU path walk -- path_init, then per component link_path_walk ->
+ * walk_component -> lookup_fast -> step_into, then complete_walk -- over the
+ * first @depth components of @p.  Per hop, exactly the kernel's d_seq touches:
+ *
+ *   __d_lookup_rcu  samples the child's d_seq (odd masked) before its compare;
+ *   lookup_fast     re-checks the PARENT's d_seq: it did not move while we
+ *                   looked up its child (a miss legitimizes it the same way,
+ *                   in try_to_unlazy);
+ *   step_into       re-checks the CHILD's d_seq before stepping into it.
+ *
+ * rename_lock is SAMPLED once, as path_init does -- which waits out a d_move in
+ * flight, the one way a rename that does not touch the path still delays a
+ * kernel walk -- and read again only on a MISS (d_lookup_rcu).  A rename
+ * elsewhere in the tree does not restart this walk; one that moves a component
+ * it is using does, through that component's d_seq.
+ *
+ * On a failed check the kernel drops to ref-walk and redoes the path with
+ * references and locks; this port restarts the lockless walk, which is cheaper
+ * and so, again, only flatters the baseline.  Mounts are not modelled, so
+ * path_init's mount_lock sample and legitimize_mnt's check have no analogue.
+ * @writer marks each component referenced for the LRU (lru_retain): the writer
+ * resolve stands in for a ref-walk's dget/dput, while dc_lookup passes 0 and,
+ * like __d_lookup_rcu, touches the LRU zero times.  Call under rcu_read_lock.
+ */
+static inline enum walk_ret path_walk_rcu(struct dcache *dc,
+					  const struct dc_path *p,
+					  uint32_t depth, int writer,
+					  struct dentry **dp,
+					  enum dc_result *resp, uint64_t *idp)
+{
+	struct dentry *cur = dc->root;
+	enum dc_result res = DC_POSITIVE;
+	unsigned long seq, next_seq;
+	uint64_t id;
+	uint32_t i;
+
+	(void) read_seqbegin(&dc->rename_lock);		/* path_init: nd->r_seq */
+	seq = read_seqcount_begin(&cur->d_seq);		/* set_root: root_seq */
+	for (i = 0; i < depth; i++) {
+		struct dentry *d = __d_lookup_rcu(dc, cur, &p->comp[i],
+						  &next_seq);
+
+		/* lookup_fast / try_to_unlazy: the parent held still */
+		if (read_seqcount_retry(&cur->d_seq, seq))
+			return WALK_RESTART;
+		if (!d) {
+			d = d_lookup_rcu(dc, cur, &p->comp[i], &next_seq);
+			if (!d) {
+				*dp = NULL;
+				*resp = DC_ABSENT;
+				return WALK_DONE;
+			}
+		}
+		res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
+		/* step_into: the child is still the one we matched */
+		if (read_seqcount_retry(&d->d_seq, next_seq))
+			return WALK_RESTART;
+		if (writer)
+			lru_retain(dc, d);
+		cur = d;
+		seq = next_seq;
+	}
+	id = DC_FAST_ID(cur);
+	/*
+	 * complete_walk -> legitimize_path: the terminal once more.  The kernel
+	 * takes its reference (lockref) between step_into and this check; this
+	 * port takes none, so the two are back to back -- kept so the state and
+	 * the (KEEPID) id read just above are covered even at depth 0.
+	 */
+	if (read_seqcount_retry(&cur->d_seq, seq))
+		return WALK_RESTART;
+	*dp = cur;
+	*resp = res;
+	*idp = id;
+	return WALK_DONE;
+}
+
+#ifdef DC_SEQ_SNAPSHOT
+/*
+ * The SNAPSHOT arm's lookup: the kernel's forward walk -- the same per-hop
+ * d_seq checks as path_walk_rcu() -- bracketed on rename_lock the way the
+ * kernel brackets its REVERSE walks (__dentry_path, prepend_path, d_walk):
+ * read_seqbegin_or_lock, one lockless pass and, if a rename ran during it, a
+ * second pass HOLDING rename_lock, which no rename can then disturb.  A miss
+ * needs no d_lookup fallback: the bracket covers the false negative a rename
+ * can cause.
+ *
+ * A d_seq failure escalates to the locked pass only if rename_lock moved too,
+ * as the kernel escalates only on need_seqretry(); otherwise it came from a
+ * non-rename d_seq writer (unlink, delete, instantiate) and the lockless pass
+ * simply re-runs.  The d_seq checks stay in the locked pass: rename_lock does
+ * not exclude those writers, and they change the state (and, KEEPID, the id)
+ * this lookup returns.  A failure there re-walks without dropping the lock --
+ * it lasts only as long as one such writer's d_seq section.
+ */
+static inline void path_walk_snapshot(struct dcache *dc,
+				      const struct dc_path *p,
+				      enum dc_result *resp, uint64_t *idp)
+{
+	unsigned long seq = 0;			/* even: lockless first pass */
+	unsigned long cseq, dseq;
+	struct dentry *cur;
+	enum dc_result res;
+	uint64_t id;
+	uint32_t i;
+
+	rcu_read_lock();
+restart:
+	read_seqbegin_or_lock(&dc->rename_lock, &seq);
+rewalk:
+	cur = dc->root;
+	res = DC_POSITIVE;
+	id = DC_FAST_ID(cur);
+	cseq = read_seqcount_begin(&cur->d_seq);	/* set_root */
+	for (i = 0; i < p->ndepth; i++) {
+		struct dentry *d = __d_lookup_rcu(dc, cur, &p->comp[i],
+						  &dseq);
+
+		if (read_seqcount_retry(&cur->d_seq, cseq))	/* lookup_fast */
+			goto dseq_fail;
+		if (!d) {
+			res = DC_ABSENT;
+			break;
+		}
+		res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
+		id = DC_FAST_ID(d);
+		if (read_seqcount_retry(&d->d_seq, dseq))	/* step_into */
+			goto dseq_fail;
+		cur = d;
+		cseq = dseq;
+	}
+	/* complete_walk -> legitimize_path (see path_walk_rcu) */
+	if (res != DC_ABSENT && read_seqcount_retry(&cur->d_seq, cseq))
+		goto dseq_fail;
+	if (need_seqretry(&dc->rename_lock, seq)) {
+		walk_retry_count();
+		seq = 1;			/* a rename ran: take the lock */
+		goto restart;
+	}
+	done_seqretry(&dc->rename_lock, seq);
+	rcu_read_unlock();
+	*resp = res;
+	*idp = id;
+	return;
+
+dseq_fail:
+	walk_retry_count();
+	if (seq & 1UL)
+		goto rewalk;			/* locked: a non-rename writer */
+	if (read_seqretry(&dc->rename_lock, seq))
+		seq = 1;			/* a rename ran: take the lock */
+	goto restart;				/* else lockless again */
+}
+#endif
+
 enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			 uint64_t *out_id)
 {
-	unsigned long m_seq;
+	enum dc_result res;
+	uint64_t id;
+
+#ifdef DC_SEQ_SNAPSHOT
+	path_walk_snapshot(dc, p, &res, &id);
+#else
 	unsigned long retries = 0;
 
-retry:
-	rcu_read_lock();
-	m_seq = read_seqbegin(&dc->rename_lock);	/* global walk anchor */
-	{
-		struct dentry *cur = dc->root;
-		enum dc_result res = DC_POSITIVE;
-		uint64_t id = DC_FAST_ID(cur);
-		uint32_t i;
+	for (;;) {
+		struct dentry *d;
+		enum walk_ret w;
 
-		for (i = 0; i < p->ndepth; i++) {
-			unsigned long seq;
-			struct dentry *d = __d_lookup_rcu(dc, cur, &p->comp[i],
-							  &seq);
-
-			if (!d) {
-				res = DC_ABSENT;
-				break;
-			}
-			/* Validate this component before stepping into it. */
-			if (read_seqcount_retry(&d->d_seq, seq)) {
-				rcu_read_unlock();
-				goto retry_check;
-			}
-			cur = d;
-			id = DC_FAST_ID(d);
-			res = DC_IS_POSITIVE(d) ? DC_POSITIVE : DC_NEGATIVE;
-		}
-
-		/* Global anchor: any rename during the walk => redo it. */
-		if (read_seqretry(&dc->rename_lock, m_seq)) {
-			rcu_read_unlock();
-			goto retry_check;
-		}
+		rcu_read_lock();
+		w = path_walk_rcu(dc, p, p->ndepth, 0, &d, &res, &id);
 		rcu_read_unlock();
-		if (res == DC_POSITIVE && out_id)
-			*out_id = id;
-		return res;
+		if (caa_likely(w == WALK_DONE))
+			break;
+		/*
+		 * Slow path: a d_seq check failed on a component this walk used,
+		 * so it fires only for a rename (or unlink / state change) ON the
+		 * path, never for one elsewhere -- zero cost at rename-fraction 0.
+		 * A runaway count signals a livelock, not a hot workload; keep
+		 * retrying but leave a tap for debug builds.
+		 */
+		walk_retry_count();
+		if (++retries == (1UL << 24))
+			__asm__ __volatile__("" ::: "memory");	/* placeholder tap */
+		rcu_quiescent_state();
 	}
-
-retry_check:
-	/*
-	 * Bounded-retry guard: normal contention resolves in a handful of
-	 * spins.  A runaway count signals a livelock/bug, not a hot workload;
-	 * we keep retrying but make it loud in debug builds.
-	 */
-	if (++retries == (1UL << 24))
-		__asm__ __volatile__("" ::: "memory");	/* placeholder tap */
-	/*
-	 * Walk-retry accounting -- the mechanism the benchmark charts against
-	 * the txn engine (which never retries a walk).  This is the SLOW path:
-	 * it fires only when a concurrent rename bumped the global rename_lock
-	 * or the stepped-into dentry's d_seq, so at rename-fraction 0 it costs
-	 * nothing.  A relaxed add is enough (a diagnostic total, not ordering).
-	 */
-	__atomic_fetch_add(&dc_seq_walk_retries, 1, __ATOMIC_RELAXED);
-	rcu_quiescent_state();
-	goto retry;
+#endif
+	if (res == DC_POSITIVE && out_id)
+		*out_id = id;
+	return res;
 }
 
 /*
- * Lock-free resolve of `path`'s first `depth` components to its dentry.  The
- * caller holds rcu_read_lock, so the returned dentry cannot be freed under it.
- * Mirrors dc_lookup's d_seq + rename_lock discipline but returns the dentry
- * rather than an id, and retries internally (bounded) on a racing rename -- so a
- * concurrent rename of ANOTHER node in a chain the walk crosses forces a re-walk
- * instead of a spurious miss.  Used by readdir and by every writer to locate its
- * target(s); NULL if genuinely absent.
+ * Lock-free resolve of `path`'s first `depth` components to its dentry, with the
+ * kernel's fast-path walk in BOTH arms: a writer (or readdir) resolves its
+ * targets the way the kernel's filename_parentat does, and the snapshot arm is
+ * a statement about the lookup, not about the writers.  A rename of ANOTHER
+ * node in a chain the walk crosses cannot produce a spurious miss here -- the
+ * miss falls back to d_lookup_rcu's rename_lock retry -- and a rename of a
+ * component it uses restarts it.  Caller holds rcu_read_lock, so the returned
+ * dentry cannot be freed under it.  NULL if genuinely absent.
  */
 static struct dentry *resolve_dentry_rcu(struct dcache *dc,
 					 const struct dc_path *p, uint32_t depth)
@@ -919,36 +1182,12 @@ static struct dentry *resolve_dentry_rcu(struct dcache *dc,
 	unsigned long retries = 0;
 
 	for (;;) {
-		unsigned long m_seq = read_seqbegin(&dc->rename_lock);
-		struct dentry *cur = dc->root;
-		uint32_t i;
-		int ok = 1;
+		struct dentry *d;
+		enum dc_result res;
+		uint64_t id;
 
-		for (i = 0; i < depth; i++) {
-			unsigned long seq;
-			struct dentry *d = __d_lookup_rcu(dc, cur, &p->comp[i],
-							  &seq);
-
-			if (!d) {
-				if (!read_seqretry(&dc->rename_lock, m_seq))
-					return NULL;	/* genuine miss */
-				ok = 0;			/* racing miss -> retry */
-				break;
-			}
-			if (read_seqcount_retry(&d->d_seq, seq)) {
-				ok = 0;			/* identity moved -> retry */
-				break;
-			}
-			cur = d;
-			/* retain_dentry: this is the WRITER-side walk (dc_lookup
-			 * does not come through here), so it stands in for the
-			 * ref-walk's dget/dput of each component.  __d_lookup_rcu
-			 * takes no reference and so marks nothing -- which is
-			 * exactly why the reader costs the LRU nothing. */
-			lru_retain(dc, cur);
-		}
-		if (ok && !read_seqretry(&dc->rename_lock, m_seq))
-			return cur;			/* clean walk */
+		if (path_walk_rcu(dc, p, depth, 1, &d, &res, &id) == WALK_DONE)
+			return d;
 		if (++retries >= (1UL << 24))
 			return NULL;			/* livelock guard */
 	}
@@ -1305,40 +1544,35 @@ unlock:
 
 /*
  * __d_move: relocate `victim` so its parent becomes `new_parent` and its name
- * becomes `new_name`.  Runs inside write_seqlock(&rename_lock) so the whole move
- * is one even->odd->even transition to lockless walkers, and bumps the victim's
- * own d_seq so a walker mid-compare on it retries.
+ * becomes `new_name`.  The caller holds both dirs' rwsems (lock_rename) and
+ * rename_lock's write side (d_move), so the whole move is one even->odd->even
+ * transition to lockless walkers; this takes the two bucket locks and bumps the
+ * victim's own d_seq so a walker mid-compare on it retries.
+ *
+ * `target` is a NEGATIVE dentry already holding (new_parent, new_name), or
+ * NULL.  As in the kernel's __d_move, it is dropped from the hash inside the
+ * same write sections (its own d_seq bracketed, as the kernel's
+ * write_seqcount_begin_nested(&target->d_seq) does) and off its parent's child
+ * list; the caller frees it after a grace period.  It sits in `nb`.
  */
-static int __d_move(struct dcache *dc, struct dentry *victim,
-		     struct dentry *new_parent, const struct qstr *new_name)
+static void __d_move(struct dcache *dc, struct dentry *victim,
+		     struct dentry *new_parent, const struct qstr *new_name,
+		     struct dentry *target)
 {
 	struct dentry *old_parent = DC_DPARENT(victim);
 	struct dc_bucket *ob = bucket_of(dc, old_parent, victim->d_name.hash);
 	struct dc_bucket *nb = bucket_of(dc, new_parent, new_name->hash);
 
-	/*
-	 * Write-lock both affected dirs (one if unchanged) for the whole identity
-	 * change: excludes concurrent readdir of the old dir (child leaving), the
-	 * new dir (child arriving), AND the same-dir case where only the child's
-	 * name changes in place -- a readdir of that dir must not see a torn name.
-	 * Then both hash buckets (the old chain it leaves, the new it enters) so
-	 * the del + add is atomic against a concurrent add/unlink on either chain.
-	 */
-	dirs_wlock2(old_parent, new_parent);
-	/*
-	 * A NEGATIVE destination directory must not gain a child, and a rename
-	 * INTO it is the SECOND way that can happen -- dc_add is the first, and
-	 * guarding only dc_add left this hole.  Checked under new_parent's OWN
-	 * dir lock, which is the lock dc_delete holds while it verifies
-	 * d_children and flips the state; that is what makes the two atomic.
-	 * Only cross-parent can hit it: a negative directory has no children, so
-	 * a same-dir rename under one has nothing to rename.
-	 */
-	if (old_parent != new_parent && !DC_IS_POSITIVE(new_parent)) {
-		dirs_wunlock2(old_parent, new_parent);
-		return -ENOENT;
-	}
+	/* Both hash buckets (the old chain it leaves, the new it enters), so the
+	 * del + add is atomic against a concurrent add/unlink on either chain. */
 	bl_lock2(ob, nb);
+	if (target) {
+		write_seqcount_begin(&target->d_seq);
+		DC_SET_UNHASHED(target);
+		hlist_del_rcu(&target->d_hash);
+		children_remove(new_parent, target);
+		write_seqcount_end(&target->d_seq);
+	}
 	write_seqcount_begin(&victim->d_seq);
 	hlist_del_rcu(&victim->d_hash);			/* leave old bucket */
 	if (old_parent != new_parent)
@@ -1360,14 +1594,12 @@ static int __d_move(struct dcache *dc, struct dentry *victim,
 		children_add(new_parent, victim);
 	write_seqcount_end(&victim->d_seq);
 	bl_unlock2(ob, nb);
-	dirs_wunlock2(old_parent, new_parent);
-	return 0;
 }
 
 int dc_rename(struct dcache *dc, const struct dc_path *from,
 	      const struct dc_path *to)
 {
-	struct dentry *victim, *to_parent;
+	struct dentry *victim, *to_parent, *from_parent, *target = NULL;
 	const struct qstr *to_name;
 	int cross, ret = 0;
 
@@ -1393,7 +1625,8 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	 * is_subdir and splice a cycle -- and it is the kernel-faithful cost of any
 	 * cross-directory rename (file or directory alike).
 	 */
-	cross = (DC_DPARENT(victim) != to_parent);
+	from_parent = DC_DPARENT(victim);
+	cross = (from_parent != to_parent);
 	if (cross)
 		pthread_mutex_lock(&dc->vfs_rename_mutex);
 	to_name = &to->comp[to->ndepth - 1];
@@ -1402,30 +1635,63 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	if (__child_lookup(dc, to_parent, to_name)) {
-		ret = -EEXIST;			/* phase 1: no replace */
-		goto out_unlock;
-	}
 	if (cross && is_subdir(to_parent, victim)) {
 		ret = -EINVAL;			/* would create a loop */
 		goto out_unlock;
 	}
 	/*
-	 * __d_move takes the dir rwsems and both bucket locks; rename_lock seals
-	 * the whole move for the reader seqbracket and serializes it against other
-	 * renames.  For a same-dir rename the EXISTS check is not under the target
-	 * bucket lock, so it races a concurrent add of the same (to_parent, to_name)
-	 * -- which the benchmark's disjoint-slot ownership precludes (a writer owns
-	 * its target slot), the same ownership resolve's returned nodes rely on.
+	 * lock_rename: write-lock both affected dirs (one if unchanged) BEFORE
+	 * rename_lock, as the kernel takes i_rwsem long before vfs_rename reaches
+	 * d_move.  They exclude a concurrent readdir of the old dir (child
+	 * leaving), of the new dir (child arriving), AND of the same dir when only
+	 * the name changes in place -- a readdir must not see a torn name.  Taken
+	 * inside rename_lock instead, they would hold rename_lock odd -- stalling
+	 * every new walk in path_init -- for as long as a readdir or an add held
+	 * either dir.
 	 */
+	dirs_wlock2(from_parent, to_parent);
+	/*
+	 * A NEGATIVE destination directory must not gain a child, and a rename
+	 * INTO it is the SECOND way that can happen -- dc_add is the first, and
+	 * guarding only dc_add left this hole.  Checked under to_parent's OWN dir
+	 * lock, which is the lock dc_delete holds while it verifies d_children
+	 * and flips the state; that is what makes the two atomic.  Only cross-
+	 * parent can hit it: a negative directory has no children, so a same-dir
+	 * rename under one has nothing to rename.
+	 */
+	if (cross && !DC_IS_POSITIVE(to_parent)) {
+		ret = -ENOENT;
+		goto out_dirs;
+	}
+	/*
+	 * The destination, looked up UNDER to_parent's dir lock -- as the
+	 * kernel looks the target up under i_rwsem after lock_rename -- so no
+	 * add or rename can change it before the move.  A positive occupant is
+	 * -EEXIST (no rename-over-positive in this model); a NEGATIVE one is
+	 * replaced, as d_move drops a negative target.
+	 */
+	target = __child_lookup(dc, to_parent, to_name);
+	if (target && (target == victim || DC_IS_POSITIVE(target))) {
+		ret = -EEXIST;
+		target = NULL;
+		goto out_dirs;
+	}
+	/* d_move: rename_lock seals the move for the lockless walkers and
+	 * serializes it against every other rename. */
 	write_seqlock(&dc->rename_lock);
-	ret = __d_move(dc, victim, to_parent, to_name);
+	__d_move(dc, victim, to_parent, to_name, target);
 	write_sequnlock(&dc->rename_lock);
+out_dirs:
+	dirs_wunlock2(from_parent, to_parent);
 out_unlock:
 	if (cross)
 		pthread_mutex_unlock(&dc->vfs_rename_mutex);
 out:
 	rcu_read_unlock();
+	if (target) {			/* the dropped negative: dc_unlink's tail */
+		lru_del(dc, target);
+		call_rcu(&target->d_rcu, dentry_free_cb);
+	}
 	return ret;
 }
 
@@ -1466,8 +1732,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 
 	ba = bucket_of(dc, pa, na.hash);	/* da leaves here, db enters */
 	bb = bucket_of(dc, pb, nb.hash);	/* db leaves here, da enters */
+	dirs_wlock2(pa, pb);			/* lock_rename, BEFORE d_exchange */
 	write_seqlock(&dc->rename_lock);
-	dirs_wlock2(pa, pb);
 	bl_lock2(ba, bb);
 	/*
 	 * Drop both, then re-add both at swapped positions -- one rename_lock
@@ -1484,8 +1750,14 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 	}
 	da->d_name = nb;
 	db->d_name = na;
-	rcu_assign_pointer(da->d_parent, pb);
-	rcu_assign_pointer(db->d_parent, pa);
+	/* Keep each node's own low-bit tags (unhashed / negative), as __d_move
+	 * does: an exchange trades positions, never inode-ness. */
+	rcu_assign_pointer(da->d_parent, (struct dentry *)
+			   ((uintptr_t) pb |
+			    ((uintptr_t) da->d_parent & DC_TAG_MASK)));
+	rcu_assign_pointer(db->d_parent, (struct dentry *)
+			   ((uintptr_t) pa |
+			    ((uintptr_t) db->d_parent & DC_TAG_MASK)));
 	hlist_add_head_rcu(bb, &da->d_hash);		/* da enters pb's bucket */
 	hlist_add_head_rcu(ba, &db->d_hash);		/* db enters pa's bucket */
 	if (pa != pb) {
@@ -1495,8 +1767,8 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 	write_seqcount_end(&db->d_seq);
 	write_seqcount_end(&da->d_seq);
 	bl_unlock2(ba, bb);
-	dirs_wunlock2(pa, pb);
 	write_sequnlock(&dc->rename_lock);
+	dirs_wunlock2(pa, pb);
 out_unlock:
 	if (cross)
 		pthread_mutex_unlock(&dc->vfs_rename_mutex);
@@ -1541,6 +1813,96 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 	dir_runlock(dir);
 	rcu_read_unlock();
 	return count;
+}
+
+/* ---- reverse walk (dentry_path_raw) ------------------------------------- */
+
+struct dentry *dc_lookup_dentry(struct dcache *dc, const struct dc_path *p)
+{
+	struct dentry *d;
+	enum dc_result res;
+	uint64_t id;
+
+	for (;;) {
+		enum walk_ret w;
+
+		rcu_read_lock();
+		w = path_walk_rcu(dc, p, p->ndepth, 0, &d, &res, &id);
+		rcu_read_unlock();
+		if (w == WALK_DONE)
+			break;
+		rcu_quiescent_state();
+	}
+	return res == DC_POSITIVE ? d : NULL;
+}
+
+/*
+ * dentry_path_raw (fs/d_path.c __dentry_path), step for step: climb d_parent
+ * from @d to the root copying each name, bracketed on rename_lock with
+ * read_seqbegin_or_lock -- one lockless pass, and if a rename ran during it, a
+ * second pass holding rename_lock, which cannot fail.  No d_seq is consulted,
+ * on the kernel's own argument (prepend_path): every change that could tear
+ * this climb -- a name or parent change, i.e. a __d_move -- happens inside
+ * rename_lock's write section.  An unlink / delete / instantiate changes
+ * neither.  Ancestors of a live object cannot be unlinked (they are not empty),
+ * so the climb never reaches freed memory.
+ *
+ * The name copy is optimistic, as prepend_name's is: a racing __d_move may tear
+ * it, and the rename_lock retry discards that pass.  The length is clamped so a
+ * torn one can never over-read the inline buffer.  Components are filled from
+ * the END of @out (the climb meets them leaf first, as the kernel's prepend
+ * buffer does) and moved to the front once the snapshot is known good.
+ */
+int dc_dentry_path(struct dcache *dc, const struct dentry *d,
+		   struct dc_path *out)
+{
+	unsigned long seq = 0;			/* even: lockless first pass */
+	const struct dentry *cur;
+	uint32_t n;
+	int ret;
+
+	rcu_read_lock();
+restart:
+	n = 0;
+	ret = 0;
+	read_seqbegin_or_lock(&dc->rename_lock, &seq);
+	for (cur = d;;) {
+		const struct dentry *parent = (const struct dentry *)
+			((uintptr_t) CMM_LOAD_SHARED(cur->d_parent) &
+			 ~DC_TAG_MASK);
+		struct qstr *q;
+		uint32_t len;
+
+		if (parent == cur)
+			break;				/* IS_ROOT */
+		if (n == DC_PATH_MAX) {
+			ret = -ENAMETOOLONG;
+			break;
+		}
+		q = &out->comp[DC_PATH_MAX - 1 - n];
+		len = CMM_LOAD_SHARED(cur->d_name.len);
+		if (len > DC_NAME_MAX - 1)
+			len = DC_NAME_MAX - 1;
+		q->hash = CMM_LOAD_SHARED(cur->d_name.hash);
+		q->len = len;
+		memcpy(q->name, cur->d_name.name, len);
+		q->name[len] = '\0';
+		n++;
+		cur = parent;
+	}
+	if (need_seqretry(&dc->rename_lock, seq)) {
+		walk_retry_count();
+		seq = 1;
+		goto restart;
+	}
+	done_seqretry(&dc->rename_lock, seq);
+	rcu_read_unlock();
+	if (ret)
+		return ret;
+	memmove(&out->comp[0], &out->comp[DC_PATH_MAX - n],
+		n * sizeof(out->comp[0]));
+	out->ndepth = n;
+	return 0;
 }
 
 /* ---- verification walk (quiescent) ------------------------------------- */

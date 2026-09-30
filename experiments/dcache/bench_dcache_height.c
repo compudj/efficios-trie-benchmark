@@ -113,6 +113,8 @@
 #include <urcu-call-rcu.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
+#include "dcache_bench_pace.h"
 
 extern unsigned long dc_seq_walk_retries __attribute__((weak));
 
@@ -137,8 +139,15 @@ static unsigned int quiesce_mask = 15;
  * memory bandwidth -- so a reader-throughput comparison across engine variants is
  * only honest at a MATCHED rename rate.  This knob pins churn independently of
  * how fast the write path happens to be.  0 = flat out (the legacy behaviour).
+ *
+ * A delay does not MATCH rates, though: a writer's rate is 1 / (op + delay), so
+ * engines with different op costs still run at different rates, and usleep's
+ * timer slack makes the delay itself coarse.  --rename-rate R holds the writers
+ * to R ops/s in aggregate on an absolute schedule (dcache_bench_pace.h) and is
+ * what the sweeps use; the delay stays for the experiments that used it.
  */
 static unsigned long writer_delay_us = 0;
+static double rename_rate = 0.0;
 
 /*
  * The op under test.  DC_OP_EXCHANGE/_EXCHANGE_CROSS are two-way and
@@ -212,14 +221,6 @@ static void parse_cpulist(const char *s)
 	}
 }
 
-static inline uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-	return (*s = x);
-}
-
 /* ---- path construction (from precomputed qstrs) ------------------------- */
 
 /* Full leaf path for band w, leaf index x in [0, B^D): /b{w}/g1/.../gD, digits
@@ -267,7 +268,7 @@ static void draw_digits(uint64_t *s, int *digs, int plen, const int *avoid)
 	int k, same = (avoid != NULL);
 
 	for (k = 0; k < plen; k++) {
-		digs[k] = (int) (xrand(s) % (uint64_t) branch);
+		digs[k] = (int) xrange(s, (uint32_t) branch);
 		if (avoid && digs[k] != avoid[k])
 			same = 0;
 	}
@@ -306,7 +307,9 @@ static void *worker(void *arg)
 	int *sp_digs = calloc((size_t) (plen > 0 ? plen : 1), sizeof(*sp_digs));
 	int sp_slot = 0;
 	long long ops = 0;
+	struct pace pace;
 
+	pace_init(&pace, is_writer ? rename_rate : 0.0, nwriters);
 	pin_cpu(me->cpu);
 	dc_register_thread();
 	crdp = create_call_rcu_data(URCU_CALL_RCU_RT, me->cpu);
@@ -324,6 +327,8 @@ static void *worker(void *arg)
 			struct dc_path a, b;
 			int ca = 0, cb = 0, ok;
 
+			if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
+				break;			/* window closed while paced */
 			switch (op) {
 			case DC_OP_EXCHANGE:
 				/* DIRECTORY RENAME: exchange two sibling height-H
@@ -331,8 +336,8 @@ static void *worker(void *arg)
 				 * `plen`, inside this writer's band.  Same parent
 				 * both sides => no cross_parent work. */
 				draw_digits(&s, digs, plen, NULL);
-				ca = (int) (xrand(&s) % (uint64_t) branch);
-				cb = (int) (xrand(&s) % (uint64_t) (branch - 1));
+				ca = (int) xrange(&s, (uint32_t) branch);
+				cb = (int) xrange(&s, (uint32_t) (branch - 1));
 				if (cb >= ca)
 					cb++;		/* cb != ca, uniform */
 				mk_parent_path(&a, wband, digs, plen);
@@ -350,8 +355,8 @@ static void *worker(void *arg)
 				 * passes -- what it costs is what we are pricing. */
 				draw_digits(&s, digs, plen, NULL);
 				draw_digits(&s, digs2, plen, digs);
-				ca = (int) (xrand(&s) % (uint64_t) branch);
-				cb = (int) (xrand(&s) % (uint64_t) branch);
+				ca = (int) xrange(&s, (uint32_t) branch);
+				cb = (int) xrange(&s, (uint32_t) branch);
 				mk_parent_path(&a, wband, digs, plen);
 				a.comp[a.ndepth++] = g_digit_q[ca];
 				mk_parent_path(&b, wband, digs2, plen);
@@ -402,8 +407,8 @@ static void *worker(void *arg)
 			}
 		} else {
 			/* Full-depth walk to a random leaf in a random band. */
-			int w = (int) (xrand(&s) % (uint64_t) nwriters);
-			long x = (long) (xrand(&s) % (uint64_t) g_bandleaves);
+			int w = (int) xrange(&s, (uint32_t) nwriters);
+			long x = (long) xrange(&s, (uint32_t) g_bandleaves);
 			struct dc_path p;
 			uint64_t id = 0;
 
@@ -571,7 +576,9 @@ static void usage(const char *p)
 	    "   never go ABSENT) and what they price is the op itself.\n"
 	    "  --writer-delay U => writer idles U us between exchanges, pinning churn\n"
 	    "                     so reader throughput is comparable across engines\n"
-	    "                     whose write paths differ in speed (0 = flat out).\n", p);
+	    "                     whose write paths differ in speed (0 = flat out).\n"
+	    "  --rename-rate R => pace the writers to R ops/s in aggregate (\"250k\",\n"
+	    "                     \"1M\") on an absolute schedule: MATCHED rates.\n", p);
 	exit(2);
 }
 
@@ -598,6 +605,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--writer-delay"))
 			writer_delay_us = strtoul(argv[++i], NULL, 10);
+		else if (!strcmp(argv[i], "--rename-rate")) {
+			rename_rate = pace_parse_rate(argv[++i]);
+			if (rename_rate < 0.0) {
+				fprintf(stderr, "--rename-rate: bad rate '%s'\n",
+					argv[i]);
+				exit(2);
+			}
+		}
 		else if (!strcmp(argv[i], "--op")) {
 			const char *o = argv[++i];
 
@@ -730,6 +745,9 @@ int main(int argc, char **argv)
 	       total_lk, mlk_s, total_absent);
 	printf("RENAME  ops: %lld  Mrenames/s: %g  errors: %lld\n",
 	       total_rn, mrn_s, total_err);
+	if (rename_rate > 0.0)
+		printf("PACE    target Mrenames/s: %g  achieved: %.1f%%\n",
+		       rename_rate / 1e6, 100.0 * mrn_s * 1e6 / rename_rate);
 	if (&dc_seq_walk_retries) {
 		unsigned long dr = retries1 - retries0;
 

@@ -281,15 +281,18 @@ static void lru_assert_not_queued(struct dentry *d);
 #else	/* the implementation */
 
 #ifndef DC_NO_LRU
+#include "dcache_node.h"		/* the shard axis: this CPU's NUMA node */
+
 /* ---- PHASE 3: the sharded LRU ------------------------------------------ */
 /* ---- shard AXIS: chosen independently of the mechanism below ----------- */
 /*
  * Pick a shard: the NUMA NODE, exactly the axis the kernel shards on
  * (`lru->node[nid]`, one list + one lock per node).
  *
- * Read from the RSEQ ABI page -- rseq_current_node_id() is a plain load of a
- * field the kernel maintains in thread-local memory, so it costs a load and no
- * syscall, no vDSO call, and no libnuma.
+ * Read by dc_current_node() (dcache_node.h): from the RSEQ ABI page when it
+ * exposes node ids -- a plain load of a field the kernel maintains in
+ * thread-local memory, no syscall and no libnuma -- else from getcpu(), which
+ * glibc serves from the vDSO.
  *
  * WHICH node, though, is worth stating, because the kernel and this differ in
  * derivation and agree in effect.  The kernel takes the node of the OBJECT'S
@@ -305,11 +308,14 @@ static void lru_assert_not_queued(struct dentry *d);
  * not the caller's.  The kernel gets that property for free by recomputing from
  * the object; we get it by remembering.
  *
- * Without rseq node ids (old kernel, or rseq unavailable) everything lands on
- * shard 0.  That is honest rather than degraded-but-plausible: we genuinely do
- * not know the node, and pretending otherwise -- sharding by CPU, say -- would
- * silently make this arm FINER-grained than the kernel's and flatter it in
- * exactly the comparison it exists to inform.
+ * It used to put everything on shard 0 when rseq exposed no node ids, on the
+ * grounds that we "do not know the node".  We do: getcpu() says, at vDSO cost.
+ * Shard 0 was not honest but a different, far COARSER lock than the kernel's
+ * -- on this 24-node machine one lock across every CCD -- and it collapsed
+ * seqlock churn 20-60x on the rseq slab routes, whose librseq reports node ids
+ * unavailable to threads it did not register (see dcache_node.h).  Sharding by
+ * CPU would still be wrong in the other direction (finer than the kernel);
+ * the node is the axis, read whichever way works.
  */
 static inline unsigned int lru_shard_index(const struct dcache *dc)
 {
@@ -322,7 +328,7 @@ static inline unsigned int lru_shard_index(const struct dcache *dc)
 #elif defined(DC_LRU_MM_CID)
 	id = rseq_mm_cid_available() ? rseq_current_mm_cid() : 0u;
 #else
-	id = rseq_node_id_available() ? rseq_current_node_id() : 0u;
+	id = dc_current_node();
 #endif
 	return id < dc->nlru ? id : id % dc->nlru;
 }

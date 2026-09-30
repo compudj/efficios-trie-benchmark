@@ -55,6 +55,7 @@
 #include <urcu-qsbr.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
 
 /*
  * Defaults sit in the reliable regime.  Cranking the write pressure far past it
@@ -82,14 +83,6 @@ static struct dcache *g_dc;
 static int *g_final_anchor;		/* [W*Me] recorded final anchor of each mover */
 static long g_einval;			/* total loop-check rejections (must be > 0) */
 static long g_cycle_detected;		/* checker: X or Y ever vanished (must be 0) */
-
-static inline uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-	return (*s = x);
-}
 
 static struct dc_path *mkp(struct dc_path *p, const char *s)
 {
@@ -120,9 +113,9 @@ static void *mover(void *arg)
 	for (it = 0; it < ITERS; it++) {
 		struct dc_path from, to;
 		char fb[64], tb[64];
-		int i = (int) (xrand(&s) % (uint64_t) Me);
+		int i = (int) xrange(&s, (uint32_t) Me);
 		int gid = base + i;
-		int nd = (int) (xrand(&s) % (uint64_t) K);
+		int nd = (int) xrange(&s, (uint32_t) K);
 		int ret;
 
 		if (nd == pos[i])

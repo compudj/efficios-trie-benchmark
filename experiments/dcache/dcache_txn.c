@@ -338,6 +338,17 @@ static inline void dc_lane_giveback(struct urcu_txn *txn)
 #define DC_HOT1CL 1		/* SPLIT reuses all the HOT1CL tag machinery */
 #endif
 
+/*
+ * The localized walk-causality arms (DC_LOCALIZED_GEN, below) are only defined
+ * on the tag-encoded layouts.  Built on the legacy layout, a per-node or mark
+ * arm silently fell back to the GLOBAL reader -- which brackets on rename_gen,
+ * a counter those arms never bump -- so its walks had no causality check at
+ * all, and a single-threaded test could not tell.  Refuse the combination.
+ */
+#if (defined(DC_PER_NODE_GEN) || defined(DC_MARK_GEN)) && !defined(DC_HOT1CL)
+#error "DC_PER_NODE_GEN / DC_MARK_GEN need a tag-encoded layout (not DC_NO_HOT1CL_SPLIT)"
+#endif
+
 struct dentry {
 	/* reader hot line: inline identity (+ payload under DC_HOT1CL) */
 #ifndef DC_HOT1CL
@@ -382,7 +393,8 @@ struct dentry {
 	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
 	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
 	 * readers following a chain -- via urcu_txn_read(), since it can briefly
-	 * hold a commit descriptor; d_back is read only by fold workers.  Both NULL
+	 * hold a commit descriptor; d_back is read by fold workers and by the
+	 * reverse walk (dc_dentry_path's named_top_rcu).  Both NULL
 	 * in steady state (settled content host = its own top, no chain).
 	 */
 	struct dentry *d_fwd;			/* down toward content host; NULL at host */
@@ -674,11 +686,24 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 #include "dcache_state.h"
 #undef DCACHE_LRU_TYPES
 
+/*
+ * Placement mirrors dcache_seqlock's (and the kernel's): the read-mostly geometry
+ * every hop reads -- buckets, mask, root, the LRU shard table -- on a line no
+ * writer touches, and each written word on its own line.  The escalation domain
+ * is written whenever a commit escalates, and the global arm's rename_gen by
+ * every directory move; packed next to the geometry (as they once were, all in
+ * the first 64 bytes), each such write invalidated the line every walk reads on
+ * every hop.  dc_create allocates the struct 64-byte aligned so these hold.
+ */
 struct dcache {
 	struct urcu_txn_hlist_head *buckets;
 	unsigned long mask;			/* nbuckets - 1 (power of two) */
 	struct dentry *root;
-	struct urcu_txn_domain domain;
+#ifndef DC_NO_LRU
+	struct dc_lru_shard *lru;		/* phase 3; see dcache_lru.h */
+	unsigned int nlru;
+#endif
+	struct urcu_txn_domain domain __attribute__((aligned(64)));
 
 	/*
 	 * Walk-causality generation (rename_lock's job, NOT d_seq's -- see
@@ -690,15 +715,13 @@ struct dcache {
 	 * with urcu_txn_read().  Kept EVEN (stepped by 2) so bit 0 -- the
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
-	void *rename_gen;
+	void *rename_gen __attribute__((aligned(64)));
 #ifndef DC_NO_LRU
-	struct dc_lru_shard *lru;		/* phase 3; see dcache_lru.h */
-	unsigned int nlru;
 #ifdef DC_LRU_MCAS
 	/* SEPARATE from the index domain: the LRU is not part of the namespace
 	 * index, and sharing a fair-mutex lane would let an escalation raised by
 	 * a rename capture every concurrent LRU commit. */
-	struct urcu_txn_domain lru_domain;
+	struct urcu_txn_domain lru_domain __attribute__((aligned(64)));
 #endif
 #endif
 };
@@ -833,12 +856,14 @@ static int lru_shards_init(struct dcache *dc);
 
 struct dcache *dc_create(unsigned int nbuckets)
 {
-	struct dcache *dc = calloc(1, sizeof(*dc));
+	struct dcache *dc;
 	unsigned int n = 1, i;
 	struct qstr rootname;
 
-	if (!dc)
+	/* 64-byte aligned, or struct dcache's per-line placement is fiction. */
+	if (posix_memalign((void **) &dc, 64, sizeof(*dc)) != 0)
 		return NULL;
+	memset(dc, 0, sizeof(*dc));
 	while (n < nbuckets)
 		n <<= 1;
 	dc->buckets = calloc(n, sizeof(*dc->buckets));
@@ -2441,26 +2466,106 @@ out:
 #define DC_DEST_GONE	(-ESTALE)
 #endif
 
+/*
+ * A destination the rename may REPLACE rather than refuse: a NEGATIVE, settled
+ * (no shell chain: the top is its own host) FILE -- the kernel's d_move onto a
+ * negative target, which drops the target in the same critical section.  A
+ * positive occupant stays -EEXIST (no rename-over-positive in this model), and
+ * so does a negative mid-transition (its pending fold owns its chain).  Files
+ * only, which every negative is (dc_add_negative): d_isdir is write-once and
+ * dc_add refuses a child under a file, so no child can land under a node this
+ * commit is about to free, and it needs no child-head seal.
+ */
+static inline int dest_is_replaceable_negative(struct dentry *top)
+{
+	return host_of_rcu(top) == top && !DC_IS_POSITIVE(top) && !top->d_isdir;
+}
+
+/*
+ * Record the removal of the replaceable negative @neg from both indexes, into
+ * the rename's own commit.  CONCURRENT dc_instantiate: under DC_IPARENT_TXN the
+ * state flip is itself transacted, so validating the word we judged makes the
+ * two commits conflict.  The other arms flip it with a bare cmpxchg nothing can
+ * conflict with -- the same contract dc_unlink of a negative already has there
+ * (the kernel excludes both by the target directory's i_rwsem, which these
+ * engines do not model); no benchmark instantiates concurrently.
+ */
+static inline int replace_negative_prepare(struct urcu_txn *txn,
+					   struct dentry *neg)
+{
+	int p;
+
+#ifdef DC_IPARENT_TXN
+	urcu_txn_validate(txn, (void **) &neg->d_iparent,
+			  (void *) iparent_raw(neg), DC_IPARENT_TAG);
+#endif
+	p = urcu_txn_hlist_del_prepare(txn, &neg->d_hash);
+	if (!p)
+		p = urcu_txn_hlist_del_prepare(txn, &neg->d_sib);
+	return p;
+}
+
+/*
+ * Cross-parent half of a move, recorded into @txn: reject a directory cycle,
+ * then reparent @host under @new_parent.  Shared by the single move
+ * (stack_one_prepare) and both halves of an exchange (exchange_prepare).
+ *
+ * The root anchors every path, so relocating it under ANY destination makes it
+ * its own descendant -- a guaranteed cycle regardless of where it lands, so no
+ * walk is needed.  This is also load-bearing, not just a shortcut: the ancestry
+ * walk below is bounded `cur != dc->root` and so exits BEFORE its `cur == host`
+ * test could fire on the root, so a root-as-host would slip through uncaught.
+ * (Unreachable in normal use -- the root is never a named entry -- but cheap
+ * insurance against a caller that builds one.)
+ *
+ * Cross-dir cycle check via the move-in-progress flag (struct dentry
+ * d_moving).  Moving @host under @new_parent loops iff @host is an ancestor of
+ * @new_parent, so walk @new_parent -> root looking for @host.  The reads are
+ * PLAIN resolving loads (parent_of_rcu), NOT the proxy-installing load_validate
+ * that pinned the shared spine (perf c2c: those proxy writes were the
+ * cross-CCD ping-pong).  Concurrency safety comes from the flag instead: the
+ * caller set host->d_moving with a fenced RMW BEFORE this walk, and if any
+ * ancestor carries the flag a concurrent move is in flight on this ancestry ->
+ * retry.  Dekker set-before-check: two moves that would jointly form a cycle
+ * cannot both pass, because at least one sees the other's flag (else the
+ * happens-before order is cyclic).  A committed concurrent move is instead
+ * caught by the plain read of its new edge + the cur == host test.  The
+ * reparent stays transacted.
+ */
+static int reparent_prepare(struct urcu_txn *txn, struct dcache *dc,
+			    struct dentry *host, struct dentry *new_parent)
+{
+	void *oldp;
+	struct dentry *cur = new_parent;
+	int hops = 0;
+
+	if (host == dc->root)
+		return -EINVAL;
+	oldp = urcu_txn_load(txn, (void **) &host->d_parent, DC_PARENT_TAG);
+	while (cur != dc->root) {
+		if (cur == host)		/* committed ancestry cycle */
+			return -EINVAL;
+		if (uatomic_load(&cur->d_moving, CMM_RELAXED))
+			return -EAGAIN;		/* concurrent move on the ancestry */
+		if (++hops > DC_LOOP_MAX)
+			return -EAGAIN;		/* transient cycle: re-walk */
+		cur = parent_of_rcu(cur);	/* plain resolving load, no validate */
+	}
+	(void) urcu_txn_store_mw(txn, (void **) &host->d_parent, oldp,
+			      new_parent, DC_PARENT_TAG);
+	return 0;
+}
+
 static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 			     struct dentry *top, struct dentry *host,
 			     struct dentry *new_parent,
 			     struct urcu_txn_hlist_head *new_bucket,
 			     struct dentry *shell, int cross_parent,
-			     struct dentry *expect_dest)
+			     struct dentry **replaced_neg)
 {
 	int p;
 
-	/*
-	 * The root anchors every path, so relocating it under ANY destination
-	 * makes it its own descendant -- a guaranteed cycle regardless of where
-	 * it lands, so no walk is needed.  This is also load-bearing, not just a
-	 * shortcut: the ancestry walk below is bounded `cur != dc->root` and so
-	 * exits BEFORE its `cur == host` test could fire on the root, so a
-	 * root-as-host would slip through uncaught.  Reject up front, before
-	 * recording anything.  (Unreachable in normal use -- the root is never a
-	 * named entry -- but cheap insurance against a caller that builds one.)
-	 */
-	if (cross_parent && host == dc->root)
+	if (cross_parent && host == dc->root)	/* see reparent_prepare */
 		return -EINVAL;
 
 #ifdef DC_IPARENT_TXN
@@ -2502,17 +2607,9 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	 * is the point -- it does its own load, and a scan placed before that
 	 * load only NARROWS the window.
 	 *
-	 * ⛔⭐⭐ @expect_dest IS LOAD-BEARING, and omitting it was a LIVELOCK, not
-	 * a missing check.  An EXCHANGE moves A onto B's name and B onto A's, so
-	 * the destination name is OCCUPIED BY DESIGN -- by the counterpart.  A
-	 * bare "the name exists -> -EEXIST" therefore fires on every exchange,
-	 * every retry, for ever; dc_rename_exchange treats only -EINVAL as
-	 * terminal, so it span in conflict-and-continue inside the escalation
-	 * lane and parked every other writer behind it (deterministic hang in
-	 * test_midtransition).  So the question is not "is the name taken" but
-	 * "is it taken by someone OTHER than the entry I am swapping with":
-	 * @expect_dest is NULL for a rename (any occupant is a duplicate) and the
-	 * counterpart's current top for an exchange.
+	 * A rename only: any occupant is a duplicate (or a negative to drop).
+	 * An exchange, whose destination name is OCCUPIED BY DESIGN by the
+	 * counterpart, does not come through here -- see exchange_prepare.
 	 */
 	{
 		void *fn = urcu_txn_load(txn, (void **) &new_bucket->first,
@@ -2522,8 +2619,26 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 		if (urcu_txn_hlist_is_marked(fn))
 			return DC_DEST_GONE;	/* destination bucket sealed */
 		cur = find_top_rcu(dc, new_parent, &shell->d_iname);
-		if (cur && cur != expect_dest)
-			return -EEXIST;		/* the name appeared under us */
+		if (cur) {
+			/*
+			 * d_move onto a NEGATIVE target: drop it in this same
+			 * commit.  The target shares the bucket, so re-read the
+			 * head AFTER its del, through read-your-own-writes: were
+			 * it the bucket's first, the shell must link behind its
+			 * successor, not behind the node being removed.  The
+			 * install still checks the COMMITTED head (the del's
+			 * record keeps it), so a peer's publish still aborts us.
+			 */
+			if (!replaced_neg || cur == top ||
+			    !dest_is_replaceable_negative(cur))
+				return -EEXIST;	/* the name appeared under us */
+			p = replace_negative_prepare(txn, cur);
+			if (p)
+				return p;	/* -ENOENT/-EAGAIN: retry */
+			*replaced_neg = cur;
+			fn = urcu_txn_load(txn, (void **) &new_bucket->first,
+					   URCU_TXN_HLIST_TAG);
+		}
 		p = urcu_txn_hlist_insert_at_slot_prepare(txn, &shell->d_hash,
 				&new_bucket->first,
 				(struct urcu_txn_hlist_node *) fn);
@@ -2531,6 +2646,7 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 			p = DC_DEST_GONE;
 	}
 #else
+	(void) replaced_neg;		/* mutation arm: no re-check, no replace */
 	p = urcu_txn_hlist_insert_head_prepare(txn, &shell->d_hash, new_bucket);
 	if (p == -ENOENT)
 		p = DC_DEST_GONE;
@@ -2547,41 +2663,7 @@ static int stack_one_prepare(struct urcu_txn *txn, struct dcache *dc,
 	/* Demote the old top atomically with its removal (d_back: NULL -> shell). */
 	(void) urcu_txn_store_mw(txn, (void **) &top->d_back, NULL, shell,
 			      DC_FWD_TAG);
-	if (cross_parent) {
-		void *oldp = urcu_txn_load(txn, (void **) &host->d_parent,
-					   DC_PARENT_TAG);
-		struct dentry *cur = new_parent;
-		int hops = 0;
-
-		/*
-		 * Cross-dir cycle check via the move-in-progress flag (struct
-		 * dentry d_moving).  Moving @host under @new_parent loops iff @host
-		 * is an ancestor of @new_parent, so walk @new_parent -> root looking
-		 * for @host.  The reads are PLAIN resolving loads (parent_of_rcu),
-		 * NOT the proxy-installing load_validate that pinned the shared
-		 * spine (perf c2c: those proxy writes were the cross-CCD ping-pong).
-		 * Concurrency safety comes from the flag instead: the caller set
-		 * host->d_moving with a fenced RMW BEFORE this walk, and if any
-		 * ancestor carries the flag a concurrent move is in flight on this
-		 * ancestry -> retry.  Dekker set-before-check: two moves that would
-		 * jointly form a cycle cannot both pass, because at least one sees
-		 * the other's flag (else the happens-before order is cyclic).  A
-		 * committed concurrent move is instead caught by the plain read of
-		 * its new edge + the cur == host test.  The reparent stays transacted.
-		 */
-		while (cur != dc->root) {
-			if (cur == host)		/* committed ancestry cycle */
-				return -EINVAL;
-			if (uatomic_load(&cur->d_moving, CMM_RELAXED))
-				return -EAGAIN;		/* concurrent move on the ancestry */
-			if (++hops > DC_LOOP_MAX)
-				return -EAGAIN;		/* transient cycle: re-walk */
-			cur = parent_of_rcu(cur);	/* plain resolving load, no validate */
-		}
-		(void) urcu_txn_store_mw(txn, (void **) &host->d_parent, oldp,
-				      new_parent, DC_PARENT_TAG);
-	}
-	return 0;
+	return cross_parent ? reparent_prepare(txn, dc, host, new_parent) : 0;
 }
 
 /*
@@ -2611,7 +2693,7 @@ static int stack_shell(struct dcache *dc,
 	struct urcu_txn_hlist_head *new_bucket =
 		bucket_of(dc, new_parent, new_name->hash);
 	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
-	struct dentry *top = NULL, *host = NULL;
+	struct dentry *top = NULL, *host = NULL, *neg = NULL;
 	struct urcu_txn txn;
 	int ret;
 
@@ -2637,6 +2719,7 @@ static int stack_shell(struct dcache *dc,
 		 * (see urcu_txn_abandon).  Each terminal path here pairs abandon+end.
 		 */
 		urcu_txn_begin(&txn);
+		neg = NULL;			/* this attempt's replaced negative */
 #ifdef DC_IPARENT_TXN
 		/* A NEGATIVE destination directory refuses the move outright --
 		 * the decision, as opposed to the guard inside the commit. */
@@ -2703,7 +2786,7 @@ static int stack_shell(struct dcache *dc,
 		if (host->d_isdir)
 			txn_bump_gen(&txn, dc, host);	/* dir move: host gen */
 		p = stack_one_prepare(&txn, dc, top, host, new_parent, new_bucket,
-				      shell, cross_parent, NULL);
+				      shell, cross_parent, &neg);
 		if (p) {
 			/*
 			 * ⚠ -EEXIST IS TERMINAL, and getting that wrong is a
@@ -2742,13 +2825,29 @@ static int stack_shell(struct dcache *dc,
 		break;				/* committed: entry now named anew */
 	}
 	/*
-	 * Relief valve: if the host-walk above found the chain already deep (the
-	 * async fold worker is behind -- GPs stalled), splice its middle in-line
-	 * so the chain stays bounded.  @depth is the pre-stack length; the new
-	 * shell makes it depth + 1, so trip at depth >= HI.  Still under the RCU
-	 * read lock; reuses the walk we already paid for.
+	 * No in-line compression here: the synchronous fold-ahead relief valve
+	 * is retired (see the file header), and every fold runs from the
+	 * call_rcu the caller queues -- which dc_dentry_path's reverse walk
+	 * relies on (a TRANSFER never races a reader that saw the host as top).
+	 *
+	 * A replaced negative target is reclaimed exactly as dc_unlink reclaims
+	 * a settled node: off the LRU now (unless the shrinker holds it and
+	 * takes the free), then freed after a grace period.
 	 */
-	rcu_read_unlock();
+	if (neg) {
+		int can_free;
+
+		DC_LC_SET(neg, DC_LC_M(DC_LC_NEW) | DC_LC_M(DC_LC_LIVE),
+			  DC_LC_DYING);
+		can_free = lru_del_can_free(dc, neg, 1);
+		rcu_read_unlock();
+		if (can_free) {
+			DC_LC_TO_DEAD(neg);
+			call_rcu(&neg->d_rcu, dentry_free_cb);
+		}
+	} else {
+		rcu_read_unlock();
+	}
 	*out_shell = shell;
 	if (out_host)
 		*out_host = host;
@@ -3064,8 +3163,13 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	if (!to_parent)
 		return -ENOENT;
 	to_name = &to->comp[to->ndepth - 1];
-	if (__child_lookup(dc, to_parent, to_name))
-		return -EEXIST;
+	{
+		struct dentry *dest = __child_lookup(dc, to_parent, to_name);
+
+		/* a negative is replaced (d_move); itself is not a target */
+		if (dest && (dest == victim || DC_IS_POSITIVE(dest)))
+			return -EEXIST;
+	}
 
 	rcu_read_lock();
 	cross = parent_of_rcu(victim) != to_parent;
@@ -3089,19 +3193,93 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_renames);
 #endif
-	call_rcu(&shell->d_rcu, fold_cb);	/* fold-ahead already ran in stack_shell */
+	call_rcu(&shell->d_rcu, fold_cb);	/* the only way a fold runs */
 	return 0;
 }
 
 /*
+ * EXCHANGE's index edits, recorded into @txn: each (parent, name) SLOT is taken
+ * over IN PLACE by the other entry's shell.  @sb (B's new top, named (pa, na))
+ * replaces @topa in its hash bucket and in pa's child list; @sa (A's new top,
+ * named (pb, nb)) replaces @topb.  Then both old tops are demoted and, cross-
+ * parent, both hosts reparented.
+ *
+ * ⛔⭐⭐ NOT a pair of stack_one_prepare()s.  A move there deletes its top from
+ * wherever it sits in the chain and inserts the new shell at the bucket HEAD --
+ * right for a rename, whose old name disappears and whose new name appears.
+ * But both names of an exchange exist before AND after the commit, and moving a
+ * name's node from mid-chain to the head lets a lockless reader standing
+ * between the two positions miss it altogether: it read the head before the
+ * commit and reaches the predecessor after it, which now skips the old top.
+ * The kernel absorbs that hash-chain false negative by retrying a d_lookup miss
+ * under rename_lock; the global arm's rename_gen bracket absorbs it too, but
+ * only for a directory (a file exchange owes no bump); the localized readers
+ * have no bracket at all and reported ABSENT for a path that existed at every
+ * instant (bench_dcache_height, stress_dcache_xchg with few buckets).  A
+ * replace keeps the name at its chain position: a reader finds the old top
+ * (then sees its deletion mark and re-walks) or the shell, never neither.
+ * The bucket-lock engine's exchange is built the same way.
+ *
+ * Adjacent tops (a same-dir exchange's child list, or a hash collision) compose
+ * through read-your-own-writes: the second replace loads the first one's
+ * pprev swing, so it links behind the first shell rather than the node that
+ * shell replaced.
+ *
+ * Returns 0, -ENOENT (a top was demoted or replaced since the caller found it:
+ * re-find), -EAGAIN (a neighbour is mid-deletion, or a concurrent move on an
+ * ancestry: retry) or -EINVAL (the swap would form a directory cycle).
+ */
+static int exchange_prepare(struct urcu_txn *txn, struct dcache *dc,
+			    struct dentry *topa, struct dentry *hosta,
+			    struct dentry *pa, struct dentry *sb,
+			    struct dentry *topb, struct dentry *hostb,
+			    struct dentry *pb, struct dentry *sa, int cross)
+{
+	int p;
+
+#ifdef DC_IPARENT_TXN
+	/* the guard stack_one_prepare carries, for each parent gaining a shell:
+	 * a concurrent d_delete of it must conflict with this commit. */
+	urcu_txn_validate(txn, (void **) &pa->d_iparent,
+			  (void *) iparent_raw(pa), DC_IPARENT_TAG);
+	if (pb != pa)
+		urcu_txn_validate(txn, (void **) &pb->d_iparent,
+				  (void *) iparent_raw(pb), DC_IPARENT_TAG);
+#endif
+	p = urcu_txn_hlist_replace_prepare(txn, &topa->d_hash, &sb->d_hash);
+	if (!p)
+		p = urcu_txn_hlist_replace_prepare(txn, &topb->d_hash,
+						   &sa->d_hash);
+	if (!p)
+		p = urcu_txn_hlist_replace_prepare(txn, &topa->d_sib, &sb->d_sib);
+	if (!p)
+		p = urcu_txn_hlist_replace_prepare(txn, &topb->d_sib, &sa->d_sib);
+	if (p)
+		return p;
+	/* Demote each old top atomically with its removal (d_back: NULL ->
+	 * its own entry's new top). */
+	(void) urcu_txn_store_mw(txn, (void **) &topa->d_back, NULL, sa,
+			      DC_FWD_TAG);
+	(void) urcu_txn_store_mw(txn, (void **) &topb->d_back, NULL, sb,
+			      DC_FWD_TAG);
+	if (cross) {
+		p = reparent_prepare(txn, dc, hosta, pb);	/* A -> (pb, nb) */
+		if (!p)
+			p = reparent_prepare(txn, dc, hostb, pa); /* B -> (pa, na) */
+	}
+	return p;
+}
+
+/*
  * EXCHANGE.  Atomically swap the entries named (pa, na) and (pb, nb): A moves to
- * B's slot, B moves to A's slot.  Both shell stacks (stack_one_prepare) ride ONE
- * MCAS commit -- both index del/insert pairs, both demotes, both reparents, the
- * gen bumps -- so no concurrent walker ever observes only half the swap.
+ * B's slot, B moves to A's slot.  ONE MCAS commit carries all four in-place
+ * index replaces (exchange_prepare), both demotes, both reparents and the gen
+ * bumps, so no concurrent walker ever observes only half the swap -- and
+ * neither name is ever missing from its chain.
  *
  * A cycle-forming exchange (one host an ancestor of the other) is rejected
  * -EINVAL by the SAME move-in-progress flag protocol the single move uses
- * (stack_one_prepare): each move's plain-read walk over the CURRENT tree finds
+ * (reparent_prepare): each move's plain-read walk over the CURRENT tree finds
  * its own host on its new_parent -> root path (cur == host).  This needs no
  * read-your-own-writes, because a swap cycles iff one host is ALREADY an ancestor
  * of the other in the pre-swap tree -- "A under B" is caught by B's walk, "B
@@ -3118,7 +3296,6 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		       const struct dc_path *bp)
 {
 	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
-	struct urcu_txn_hlist_head *bucket_a, *bucket_b;
 	const struct qstr *na, *nb;
 	struct urcu_txn txn;
 	int cross, ret;
@@ -3145,8 +3322,6 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		return 0;
 
 	cross = pa != pb;
-	bucket_a = bucket_of(dc, pa, na->hash);
-	bucket_b = bucket_of(dc, pb, nb->hash);
 	sa = dentry_alloc(dc, pb, nb, 0, 0, 1); /* A's new top */
 	sb = dentry_alloc(dc, pa, na, 0, 0, 1); /* B's new top */
 	if (!sa || !sb) {
@@ -3223,24 +3398,19 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			txn_bump_gen(&txn, dc, hosta);
 		if (hostb->d_isdir)
 			txn_bump_gen(&txn, dc, hostb);
-		p = stack_one_prepare(&txn, dc, topa, hosta, pb, bucket_b, sa,
-				      cross, topb);	/* A -> (pb, nb) */
-		if (!p)
-			p = stack_one_prepare(&txn, dc, topb, hostb, pa, bucket_a,
-					      sb, cross, topa); /* B -> (pa, na) */
+		p = exchange_prepare(&txn, dc, topa, hosta, pa, sb,
+				     topb, hostb, pb, sa, cross);
 		if (p) {
-			/* Terminal, both of them: a cycle and an occupant that is
-			 * not the counterpart are STATES, not races, so retrying
-			 * re-derives the same answer for ever.  See the
-			 * @expect_dest note in stack_one_prepare. */
-			if (p == -EINVAL || p == -EEXIST || p == -ESTALE) {
+			/* Terminal: a cycle is a STATE, not a race, so retrying
+			 * re-derives the same answer for ever. */
+			if (p == -EINVAL) {
 				urcu_txn_abandon(&txn);
 				urcu_txn_end(&txn);
 				if (cross) {
 					uatomic_and(&hosta->d_moving, ~1UL);
 					uatomic_and(&hostb->d_moving, ~1UL);
 				}
-				ret = (p == -ESTALE) ? -ENOENT : p;
+				ret = p;
 				goto out_free;
 			}
 			urcu_txn_conflict(&txn);	/* -ENOENT/-EAGAIN: keep the turn */
@@ -3378,4 +3548,171 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 	}
 	rcu_read_unlock();
 	return count;
+}
+
+/* ---- reverse walk (dentry_path_raw) ------------------------------------- */
+
+/* Which validation the reverse walk runs: the SAME one this build's forward
+ * reader runs (DC_LOCALIZED_GEN is only defined on the tag-encoded layouts). */
+#if defined(DC_LOCALIZED_GEN) && defined(DC_PER_NODE_GEN)
+#define DC_RW_PERNODE 1
+#elif defined(DC_LOCALIZED_GEN) && defined(DC_MARK_GEN)
+#define DC_RW_MARK 1
+#endif
+
+/*
+ * The object behind @p, as a handle for dc_dentry_path(): its content HOST, the
+ * node a rename never relocates (the shell carries the new name; children key on
+ * the host's address).  Resolved the way every txn mutator locates its target
+ * (the soft per-component resolve), under one read-side section.
+ */
+struct dentry *dc_lookup_dentry(struct dcache *dc, const struct dc_path *p)
+{
+	struct dentry *d = dc->root;
+	uint32_t i;
+
+	rcu_read_lock();
+	for (i = 0; i < p->ndepth && d; i++)
+		d = txn_child_lookup_rcu(dc, d, &p->comp[i]);
+	if (d && !DC_IS_POSITIVE(d))
+		d = NULL;
+	rcu_read_unlock();
+	return d;
+}
+
+/*
+ * The node that currently NAMES @host: climb the transition chain's back links
+ * to the top (d_back == NULL).  A settled host is its own top, one load.  The
+ * links are transacted (a stack or splice parks a descriptor there), so each
+ * read resolves.  Call under rcu_read_lock: a shell is freed a grace period
+ * after the fold that unlinks it, so a stale link still leads somewhere valid.
+ *
+ * The name read off the top this returns is never mid-TRANSFER: a TRANSFER
+ * rewrites a HOST's identity only while that host is unindexed, from a call_rcu
+ * fold a grace period after the rename that demoted it -- so a reader that saw
+ * the host as top (d_back == NULL) inside this read-side section finishes before
+ * any TRANSFER into it can start, and a reader that sees it promoted again reads
+ * d_back == NULL through the acquire the promote released.
+ */
+static inline struct dentry *named_top_rcu(struct dentry *host)
+{
+	struct dentry *n = host, *b;
+
+	while ((b = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG)) != NULL)
+		n = b;
+	return n;
+}
+
+/*
+ * dentry_path_raw: climb from the handle to the root, reading each component's
+ * (name, parent) off its named top, and give the kernel's guarantee -- the
+ * reported path existed at ONE instant -- with each arm's own mechanism, the
+ * same one its forward reader uses:
+ *
+ *   global     the rename_gen bracket over the whole climb.  Every DIRECTORY
+ *              move bumps it, so every ancestor held still throughout; the leaf
+ *              holds still at the instant its top was seen (a file move bumps
+ *              nothing, but the leaf is read inside the bracket), so the path
+ *              existed then.
+ *   per-node   each host's gen, sampled BEFORE its top is climbed to (the
+ *              reverse walk has the pre-navigation point the forward one lacks)
+ *              and re-read on the way back.  A file's moves bump no gen, and in
+ *              a REVERSE walk the file is the FIRST hop -- its window would end
+ *              before any ancestor's begins -- so the leaf's top is also
+ *              re-tested for the deletion mark on the way back (monotone: still
+ *              unmarked => it named the leaf throughout).  Every component is
+ *              then valid across the turnaround.
+ *   mark       each top latched and confirmed unmarked on the way up, re-tested
+ *              on the way back: the forward mark reader's double collect.
+ *
+ * No lock is taken and nothing bounds the retry, exactly as for the forward
+ * readers of these arms: the txn engines have no rename lock to fall back on.
+ */
+int dc_dentry_path(struct dcache *dc, const struct dentry *d,
+		   struct dc_path *out)
+{
+	struct dentry *handle = (struct dentry *) (uintptr_t) d;
+#ifdef DC_LOCALIZED_GEN
+	struct dentry *latch[DC_PATH_MAX];	/* per hop: host (per-node) / top (mark) */
+	dc_stamp_t     seqs[DC_PATH_MAX];
+#endif
+#ifdef DC_RW_PERNODE
+	struct dentry *leaf_top = NULL;
+#endif
+	uint32_t n, k;
+	int ret;
+
+	rcu_read_lock();
+	for (;;) {
+		struct dentry *host = handle;
+		int stale = 0;
+#ifndef DC_LOCALIZED_GEN
+		void *g0 = urcu_txn_read(&dc->rename_gen, DC_GEN_TAG);
+#endif
+
+		n = 0;
+		ret = 0;
+		while (host != dc->root) {
+			struct dentry *top;
+#ifdef DC_RW_PERNODE
+			dc_stamp_t s;
+#endif
+
+			if (n == DC_PATH_MAX) {
+				ret = -ENAMETOOLONG;
+				break;
+			}
+#ifdef DC_RW_PERNODE
+			s = (uintptr_t) urcu_txn_read(&host->d_seq, DC_GEN_TAG);
+			cmm_smp_rmb();		/* sample before navigating */
+#endif
+			top = named_top_rcu(host);
+			DC_INAME_COPY(&out->comp[DC_PATH_MAX - 1 - n], top);
+#ifdef DC_RW_PERNODE
+			if (n == 0)
+				leaf_top = top;
+#endif
+#ifdef DC_RW_MARK
+			cmm_smp_rmb();		/* identity before the confirm */
+			if (top_unhashed_rcu(top)) {
+				stale = 1;	/* demoted under us: re-climb */
+				break;
+			}
+			latch[n] = top;
+			seqs[n] = (uintptr_t) top;
+#elif defined(DC_RW_PERNODE)
+			latch[n] = host;
+			seqs[n] = s;
+#endif
+			host = DC_IPARENT(top);
+			n++;
+		}
+		if (ret)
+			break;
+		if (stale)
+			continue;
+		cmm_smp_rmb();			/* the climb before the check */
+#ifndef DC_LOCALIZED_GEN
+		if (urcu_txn_read(&dc->rename_gen, DC_GEN_TAG) == g0)
+			break;
+#else
+		for (k = 0; k < n; k++)
+			if (dc_stamp_reread(latch[k]) != seqs[k])
+				stale = 1;
+#ifdef DC_RW_PERNODE
+		if (!stale && n && top_unhashed_rcu(leaf_top))
+			stale = 1;		/* the leaf: see above */
+#endif
+		if (!stale)
+			break;
+#endif
+	}
+	rcu_read_unlock();
+	if (ret)
+		return ret;
+	(void) k;
+	memmove(&out->comp[0], &out->comp[DC_PATH_MAX - n],
+		n * sizeof(out->comp[0]));
+	out->ndepth = n;
+	return 0;
 }

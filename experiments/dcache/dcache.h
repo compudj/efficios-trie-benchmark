@@ -447,10 +447,15 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path);
 
 /*
  * Move the node at `from` to `to`: its new parent is to's parent (must exist),
- * its new name is to's last component (must not already exist).  Same-parent
- * moves are a pure rename; cross-parent moves take the cache rename mutex and
- * reject moving a directory into its own descendant (the s_vfs_rename_mutex /
- * loop-prevention analog).  0 on success, -ENOENT, -EEXIST, -EINVAL (loop).
+ * its new name is to's last component.  That name must not be held by a
+ * POSITIVE entry (-EEXIST: no rename-over-positive in this model); a NEGATIVE
+ * entry holding it is REPLACED -- dropped by the move itself, under its locks
+ * or in its commit, as the kernel's d_move drops a negative target (a reader
+ * may see the name ABSENT for that instant: the same answer as NEGATIVE) --
+ * and the vacated source name is then absent.  Same-parent moves are a pure rename; cross-parent moves take
+ * the cache rename mutex and reject moving a directory into its own descendant
+ * (the s_vfs_rename_mutex / loop-prevention analog).  0 on success, -ENOENT,
+ * -EEXIST, -EINVAL (loop).
  */
 int dc_rename(struct dcache *dc, const struct dc_path *from,
 	      const struct dc_path *to);
@@ -471,6 +476,34 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *a,
 typedef void (*dc_dirent_fn)(uint64_t id, const struct qstr *name, void *arg);
 long dc_readdir(struct dcache *dc, const struct dc_path *path,
 		dc_dirent_fn fn, void *arg);
+
+/*
+ * ---- the reverse walk: the current path of an object the caller holds ----
+ *
+ * The kernel's dentry_path_raw() (fs/d_path.c, __dentry_path): given a dentry
+ * the caller keeps alive, climb its parents to the root and report where it is
+ * NOW.  The operation behind getcwd, readlink of /proc/PID/fd/N and audit/LSM
+ * path reporting -- and the one place the kernel pays for a SNAPSHOT: the path
+ * reported must have existed at one instant even with renames running, so the
+ * kernel brackets the whole climb on rename_lock (read_seqbegin_or_lock: a
+ * lockless pass, then a retry holding rename_lock).  Every engine must give the
+ * same guarantee, each with its own mechanism.
+ *
+ * dc_lookup_dentry() resolves @p and returns the object as an opaque handle, or
+ * NULL if absent or negative.  There is no refcounting in this port: the handle
+ * stays valid for as long as the CALLER guarantees the object is not unlinked,
+ * deleted or evicted, which stands in for the reference an open file or a cwd
+ * holds.  Renames and exchanges do not invalidate it -- it names the OBJECT,
+ * which keeps its handle wherever it moves (on the txn engines, the content
+ * host, which a rename never relocates).
+ *
+ * dc_dentry_path() fills @out with the handle's current path from the root.
+ * 0, or -ENAMETOOLONG if deeper than DC_PATH_MAX.
+ */
+struct dentry;				/* opaque; defined per engine */
+struct dentry *dc_lookup_dentry(struct dcache *dc, const struct dc_path *p);
+int dc_dentry_path(struct dcache *dc, const struct dentry *d,
+		   struct dc_path *out);
 
 /* ---- verification ------------------------------------------------------- */
 

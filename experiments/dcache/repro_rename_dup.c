@@ -45,6 +45,7 @@
 #include <urcu-call-rcu.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
 
 #ifndef NWRITERS
 #define NWRITERS	8
@@ -98,14 +99,6 @@ static int count_named(const char *dirname, const char *name)
 	return c.n;
 }
 
-static uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-	return *s = x;
-}
-
 /*
  * NO BARRIER, deliberately.  An earlier cut synchronised the writers per round
  * with pthread_barrier_wait(), which parks threads RCU-ONLINE and stalls every
@@ -130,7 +123,7 @@ static void *writer(void *arg)
 		(void) dc_add(g_dc, &from, (uint64_t) (1000 + me->idx));
 
 		snprintf(dest, sizeof(dest), "X%u",
-			 (unsigned) (xrand(&s) % NDEST));
+			 (unsigned) xrange(&s, NDEST));
 		mk2(&to, "d1", dest);
 		r = dc_rename(g_dc, &from, &to);
 		if (r == 0) {
@@ -168,10 +161,15 @@ int main(void)
 	struct timespec ts = { RUNSECS, 0 };
 	int i;
 
-	rcu_register_thread();
+	rcu_register_thread();		/* ONCE: dc_register_thread() is the same
+					 * call, and a second registration links
+					 * this thread's reader node to itself --
+					 * the next synchronize_rcu() then walks a
+					 * cycle for ever holding the registry
+					 * lock (every writer's registration
+					 * blocks behind it) */
 	g_dc = dc_create(4096);
 	if (!g_dc) { fprintf(stderr, "dc_create\n"); return 2; }
-	dc_register_thread();
 
 	dc_path_reset(&p); dc_path_push(&p, "d0");
 	if (dc_add(g_dc, &p, 1000000ULL)) { fprintf(stderr, "mkdir d0\n"); return 2; }

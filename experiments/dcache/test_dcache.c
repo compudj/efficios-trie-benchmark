@@ -855,6 +855,164 @@ static void test_lru_shrinker(void)
 	printf("  ok: LRU + CLOCK shrinker\n");
 }
 
+/*
+ * dc_dentry_path: the reverse walk (dentry_path_raw).  A handle pinned before
+ * the renames must report where its object is NOW -- after a same-dir rename, a
+ * cross-dir move, two renames stacked before any fold, a move of an ANCESTOR
+ * (the subtree follows) and an exchange.  On the txn engines each is checked
+ * twice: with the rename's shell still stacked (this thread has announced no
+ * quiescent state, so no fold has run) and after the folds have drained -- the
+ * name then comes off the promoted host instead of the shell.  Every reported
+ * path must also resolve back to the same handle.
+ */
+static void expect_dpath(struct dcache *dc, const struct dentry *h,
+			 const char *want)
+{
+	struct dc_path out;
+	char got[256];
+	int r = dc_dentry_path(dc, h, &out);
+
+	CHECK(r == 0, "dpath(%s): returned %d", want, r);
+	if (r)
+		return;
+	path_to_str(&out, got, sizeof(got));
+	CHECK(strcmp(got, want) == 0, "dpath: got '%s' expected '%s'", got, want);
+	CHECK(dc_lookup_dentry(dc, &out) == h,
+	      "dpath: '%s' does not resolve back to its handle", got);
+}
+
+/*
+ * Leave no callback pending.  The txn engines chain call_rcu two deep: a rename
+ * queues its fold (call_rcu), and the fold, running as that callback, queues the
+ * folded shell's free (call_rcu again).  rcu_barrier() waits only for callbacks
+ * queued BEFORE it, not for those they queue while it waits -- so the first one
+ * runs the folds (the TRANSFER has copied the name into the host and promoted
+ * it: the state the "after" checks want) and the second runs the frees they
+ * queued.  rcu_barrier() takes this QSBR thread offline itself, so no
+ * synchronize_rcu() is needed around it.  A no-op for the seqlock engine, which
+ * renames in place.
+ */
+static void drain_folds(void)
+{
+	rcu_barrier();			/* the folds the renames queued */
+	rcu_barrier();			/* the frees the folds queued */
+}
+
+static void test_reverse_walk(void)
+{
+	struct dcache *dc = dc_create(1024);
+	struct dentry *root, *hf, *hd, *hk, *hx, *hy;
+
+	CHECK(dc_add(dc, P("/a"), 1) == 0, "rw: add /a");
+	CHECK(dc_add(dc, P("/a/b"), 2) == 0, "rw: add /a/b");
+	CHECK(dc_add_file(dc, P("/a/b/f"), 3) == 0, "rw: add /a/b/f");
+	CHECK(dc_add_file(dc, P("/a/b/k"), 4) == 0, "rw: add /a/b/k");
+	CHECK(dc_add(dc, P("/c"), 5) == 0, "rw: add /c");
+	CHECK(dc_add_file(dc, P("/c/x"), 6) == 0, "rw: add /c/x");
+	CHECK(dc_add_file(dc, P("/a/y"), 7) == 0, "rw: add /a/y");
+	CHECK(dc_add_negative(dc, P("/a/neg")) == 0, "rw: add negative /a/neg");
+
+	root = dc_lookup_dentry(dc, P("/"));
+	hf = dc_lookup_dentry(dc, P("/a/b/f"));
+	hd = dc_lookup_dentry(dc, P("/a/b"));
+	hk = dc_lookup_dentry(dc, P("/a/b/k"));
+	hx = dc_lookup_dentry(dc, P("/c/x"));
+	hy = dc_lookup_dentry(dc, P("/a/y"));
+	CHECK(root && hf && hd && hk && hx && hy, "rw: handles pinned");
+	CHECK(dc_lookup_dentry(dc, P("/a/nope")) == NULL, "rw: absent -> NULL");
+	CHECK(dc_lookup_dentry(dc, P("/a/neg")) == NULL, "rw: negative -> NULL");
+	if (!(root && hf && hd && hk && hx && hy)) {
+		dc_destroy(dc);
+		return;
+	}
+	expect_dpath(dc, root, "/");
+	expect_dpath(dc, hf, "/a/b/f");
+
+	/* rename (same dir) */
+	CHECK(dc_rename(dc, P("/a/b/f"), P("/a/b/g")) == 0, "rw: rename f->g");
+	expect_dpath(dc, hf, "/a/b/g");
+	drain_folds();
+	expect_dpath(dc, hf, "/a/b/g");
+
+	/* file move, then a rename stacked on it before the fold runs */
+	CHECK(dc_rename(dc, P("/a/b/g"), P("/c/g")) == 0, "rw: move g -> /c");
+	expect_dpath(dc, hf, "/c/g");
+	CHECK(dc_rename(dc, P("/c/g"), P("/c/h")) == 0, "rw: rename g->h");
+	expect_dpath(dc, hf, "/c/h");
+	drain_folds();
+	expect_dpath(dc, hf, "/c/h");
+
+	/* directory move: the leaf under it reports the new ancestry */
+	CHECK(dc_rename(dc, P("/a/b"), P("/c/b")) == 0, "rw: move dir /a/b");
+	expect_dpath(dc, hd, "/c/b");
+	expect_dpath(dc, hk, "/c/b/k");
+	drain_folds();
+	expect_dpath(dc, hd, "/c/b");
+	expect_dpath(dc, hk, "/c/b/k");
+
+	/* exchange: the two objects trade positions */
+	CHECK(dc_rename_exchange(dc, P("/c/x"), P("/a/y")) == 0,
+	      "rw: exchange x<->y");
+	expect_dpath(dc, hx, "/a/y");
+	expect_dpath(dc, hy, "/c/x");
+	drain_folds();
+	expect_dpath(dc, hx, "/a/y");
+	expect_dpath(dc, hy, "/c/x");
+
+	dc_destroy(dc);
+}
+
+/*
+ * Rename onto a NEGATIVE target replaces it, as the kernel's d_move drops a
+ * negative target; the vacated source name is then absent (the kernel caches a
+ * negative there only once a lookup misses on it).  A positive target is still
+ * -EEXIST, and so is renaming a negative onto its own name.
+ */
+static void test_rename_over_negative(void)
+{
+	struct dcache *dc = dc_create(1024);
+	struct dentry *hx;
+
+	CHECK(dc_add(dc, P("/a"), 1) == 0, "ron: add /a");
+	CHECK(dc_add(dc, P("/b"), 2) == 0, "ron: add /b");
+	CHECK(dc_add_file(dc, P("/a/x"), 3) == 0, "ron: add /a/x");
+	CHECK(dc_add_negative(dc, P("/a/y")) == 0, "ron: negative /a/y");
+	CHECK(dc_add_negative(dc, P("/b/x")) == 0, "ron: negative /b/x");
+	hx = dc_lookup_dentry(dc, P("/a/x"));
+
+	/* same-dir rename onto a negative */
+	CHECK(dc_rename(dc, P("/a/x"), P("/a/y")) == 0, "ron: rename onto negative");
+	expect_positive(dc, "/a/y", 3);
+	expect_absent(dc, "/a/x");
+	/* cross-dir move onto a negative, before any fold ran */
+	CHECK(dc_rename(dc, P("/a/y"), P("/b/x")) == 0, "ron: move onto negative");
+	expect_positive(dc, "/b/x", 3);
+	expect_absent(dc, "/a/y");
+	if (hx)
+		expect_dpath(dc, hx, "/b/x");
+
+	/* a positive target still refuses; a negative is not its own target */
+	CHECK(dc_add_file(dc, P("/a/z"), 4) == 0, "ron: add /a/z");
+	CHECK(dc_rename(dc, P("/a/z"), P("/b/x")) == -EEXIST,
+	      "ron: rename onto positive -EEXIST");
+	CHECK(dc_add_negative(dc, P("/a/n")) == 0, "ron: negative /a/n");
+	CHECK(dc_rename(dc, P("/a/n"), P("/a/n")) == -EEXIST,
+	      "ron: negative onto itself -EEXIST");
+	expect_negative(dc, "/a/n");
+
+	drain_folds();
+	expect_positive(dc, "/b/x", 3);
+	expect_positive(dc, "/a/z", 4);
+	expect_absent(dc, "/a/y");
+	{
+		static const char *const paths[] = { "/a", "/b", "/b/x", "/a/z" };
+		static const uint64_t ids[] = { 1, 2, 3, 4 };
+
+		expect_namespace(dc, paths, ids, 4);
+	}
+	dc_destroy(dc);
+}
+
 int main(void)
 {
 	struct dcache *dc;
@@ -869,6 +1027,8 @@ int main(void)
 	test_delete_to_negative();	/* phase 2: positive -> negative in place */
 	test_recreate_over_moved_dir();	/* same name, old location, fold in flight */
 	test_lru_shrinker();		/* phase 3: LRU + CLOCK shrinker */
+	test_reverse_walk();		/* dc_dentry_path (dentry_path_raw) */
+	test_rename_over_negative();	/* d_move drops a negative target */
 
 	/* Build a small tree.
 	 *   /a(1) /a/b(2) /a/b/c(3) /a/x(4) /d(5) /d/e(6)

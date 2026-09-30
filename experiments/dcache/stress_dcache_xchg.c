@@ -27,7 +27,16 @@
  * slot returns the owner-recorded final perm[k] -- conservation across both
  * indexes and a correct permutation.
  *
- * Usage: ./stress_dcache_xchg [writers [readers [dirs [slots_per_writer [iters]]]]]
+ * The bucket count matters.  A lockless lookup can only miss a name whose node
+ * is NOT first in its hash chain (a reader standing between the head and that
+ * node), so with one bucket per few names the assertion above is nearly
+ * vacuous.  [nbuckets] shrinks the table so slots share chains; 1 puts every
+ * name in ONE chain.  [file] seeds the slots as FILES: the global arm bumps its
+ * rename_gen only for a directory, so a file exchange runs its lookups with no
+ * bracket to hide a miss -- the same exposure the localized arms always have.
+ *
+ * Usage: ./stress_dcache_xchg [writers [readers [dirs [slots_per_writer [iters
+ *                             [nbuckets [file]]]]]]]
  * Exit 0 = conserved and race-clean (per the sanitizer); 1 = anomaly.
  */
 
@@ -44,6 +53,7 @@
 #include <urcu-qsbr.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
 
 /* ---- config (argv-overridable) ----------------------------------------- */
 static int W = 4;			/* writer threads */
@@ -51,20 +61,12 @@ static int R = 4;			/* reader threads */
 static int D = 8;			/* directories /d0../d(D-1) */
 static int M = 16;			/* slots per writer */
 static long ITERS = 50000;		/* ops per thread */
+static unsigned int NBUCKETS = 4096;	/* hash buckets (see the header) */
+static int FILES = 0;			/* 1 = seed the slots as files */
 
 static struct dcache *g_dc;
 static int *g_final_perm;		/* [W*M]: owner-recorded final id at each slot */
 static uint64_t g_seed_base = 0x9e3779b97f4a7c15ULL;
-
-static inline uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13;
-	x ^= x >> 7;
-	x ^= x << 17;
-	return (*s = x);
-}
 
 /* Slot k lives at the fixed path /d{k%D}/S{k}. */
 static void slotpath(struct dc_path *p, int k)
@@ -97,8 +99,8 @@ static void *writer(void *arg)
 
 	for (it = 0; it < ITERS; it++) {
 		struct dc_path pa, pb;
-		int a = (int) (xrand(&s) % (uint64_t) M);
-		int b = (int) (xrand(&s) % (uint64_t) M);
+		int a = (int) xrange(&s, (uint32_t) M);
+		int b = (int) xrange(&s, (uint32_t) M);
 		int tmp;
 
 		if (a == b) {
@@ -144,14 +146,14 @@ static void *reader(void *arg)
 
 	dc_register_thread();
 	for (it = 0; it < ITERS; it++) {
-		if (xrand(&s) & 1) {
+		if (xtop(&s, 1)) {
 			/*
 			 * A valid slot is NEVER empty under atomic exchange: the
 			 * swap is one commit, so the slot path always holds exactly
 			 * one entry.  POSITIVE with id in range is required; ABSENT
 			 * would mean a non-atomic (torn) exchange.
 			 */
-			int k = (int) (xrand(&s) % (uint64_t) total);
+			int k = (int) xrange(&s, (uint32_t) total);
 			struct dc_path p;
 			uint64_t id = ~0ULL;
 			enum dc_result res;
@@ -166,7 +168,7 @@ static void *reader(void *arg)
 				ra->absent++;		/* atomicity violation */
 			}
 		} else {
-			int dir = (int) (xrand(&s) % (uint64_t) D);
+			int dir = (int) xrange(&s, (uint32_t) D);
 			struct dc_path p;
 			char buf[DC_NAME_MAX];
 			long n;
@@ -221,6 +223,8 @@ int main(int argc, char **argv)
 	if (argc > 3) D = atoi(argv[3]);
 	if (argc > 4) M = atoi(argv[4]);
 	if (argc > 5) ITERS = atol(argv[5]);
+	if (argc > 6) NBUCKETS = (unsigned int) atoi(argv[6]);
+	if (argc > 7) FILES = atoi(argv[7]);
 	if (W < 1 || R < 0 || D < 2 || M < 2) {
 		fprintf(stderr, "bad config (need W>=1 R>=0 D>=2 slots/writer>=2)\n");
 		return 2;
@@ -228,11 +232,12 @@ int main(int argc, char **argv)
 	total = W * M;
 
 	rcu_register_thread();
-	g_dc = dc_create(4096);
+	g_dc = dc_create(NBUCKETS);
 	g_final_perm = calloc(total, sizeof(*g_final_perm));
 	printf("== stress_dcache_xchg (engine: %s) ==\n", dc_engine_name());
-	printf("writers=%d readers=%d dirs=%d slots/writer=%d iters=%ld total_slots=%d\n",
-	       W, R, D, M, ITERS, total);
+	printf("writers=%d readers=%d dirs=%d slots/writer=%d iters=%ld total_slots=%d "
+	       "nbuckets=%u slots=%s\n",
+	       W, R, D, M, ITERS, total, NBUCKETS, FILES ? "files" : "dirs");
 
 	/* Build the fixed directories, then seed the identity permutation. */
 	for (i = 0; i < D; i++) {
@@ -250,7 +255,7 @@ int main(int argc, char **argv)
 		struct dc_path p;
 
 		slotpath(&p, i);
-		if (dc_add(g_dc, &p, (uint64_t) i)) {
+		if ((FILES ? dc_add_file : dc_add)(g_dc, &p, (uint64_t) i)) {
 			fprintf(stderr, "seed slot %d failed\n", i);
 			return 2;
 		}

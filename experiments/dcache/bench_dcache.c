@@ -63,7 +63,16 @@
  * CONSERVATION FAILED and exits nonzero, so a corrupt run can't masquerade as a
  * fast one (same discipline as bench_txn_3skiplist).
  *
+ * Reverse walk (--dpath): the readers ask the kernel's dentry_path_raw question
+ * instead -- "where is this object NOW?" -- of a handle pinned at seed time
+ * (dc_lookup_dentry), while the writers rename.  That is the one operation the
+ * kernel itself serves with a whole-path SNAPSHOT (a rename_lock bracket), so it
+ * is the like-for-like reader for engines that give every walk a snapshot.
+ * Whatever the reader op, every run ends by checking each handle's reported path
+ * against the name its owner last gave it, exactly.
+ *
  * Usage: bench_dcache [--nthreads N] [--rename-frac F] [--writers K] [--readdir]
+ *                     [--dpath]
  *                     [--op-mix rename=A,move=B,exchange=C]
  *                     [--ndirs N] [--depth N] [--leaves N] [--duration MS]
  *                     [--cpustride N] [--cpulist c0,c1,...] [--nbuckets N]
@@ -92,6 +101,8 @@
 #include <urcu-call-rcu.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
+#include "dcache_bench_pace.h"
 
 /*
  * Weak ref: defined by the seqlock engine, absent from the txn engine.  Reading
@@ -186,6 +197,17 @@ static unsigned int quiesce_mask = 15;
  */
 static int    nwriters     = -1;
 /*
+ * --rename-rate R (role-split only): hold the writers to R renames/s in
+ * aggregate, R/nwriters each (dcache_bench_pace.h).  Unpaced (0, the default)
+ * each engine's readers face the rate its OWN writers reach, which differs by
+ * up to two orders of magnitude between engines -- and fewer renames means
+ * fewer invalidations of the lines the readers share, so the engine with the
+ * slower writer gets the quieter reader measurement.  Paced, every engine's
+ * readers face one offered load; the RENAME line reports the achieved rate
+ * against the target, and an engine that cannot keep up shows it there.
+ */
+static double rename_rate  = 0.0;
+/*
  * --readdir (split mode only): the reader threads enumerate a random target dir
  * (dc_readdir of /pfx/d{k}) instead of a full-path leaf lookup.  To keep the
  * directory size -- and thus the per-readdir cost -- INDEPENDENT of the reader
@@ -193,10 +215,52 @@ static int    nwriters     = -1;
  * leaves total, so scaling the readers does not grow the dirs they list.
  */
 static int    readdir_mode = 0;
+/*
+ * --dpath: the reader threads call dc_dentry_path() on a random leaf's HANDLE
+ * (pinned once at seed time) instead of looking its path up -- the reverse walk
+ * behind getcwd / readlink(/proc/PID/fd/N).  Works in split or homogeneous mode.
+ */
+static int    dpath_mode   = 0;
+/*
+ * Negative dentries (default ON for lookup readers; --no-negatives restores the
+ * legacy workload).  A reader asks for a leaf name in a RANDOM dir, and a leaf
+ * lives in exactly one, so almost every lookup names something that does not
+ * exist.  A kernel answers the first such lookup through lookup_slow, which
+ * caches a NEGATIVE dentry, and every later one as a negative HIT on the RCU
+ * fast path.  Without negatives this bench measured the MISS path instead --
+ * ~99% of lookups, on every engine.  So: a PRIMING phase before the timed
+ * window looks up every (dir, name) a reader can ask for and caches a negative
+ * on each miss, and a reader that misses during the window (only at a name a
+ * rename just vacated) caches one the same way.  Renames onto a negative
+ * replace it, as d_move does.  readdir / dpath readers look nothing up, so a
+ * kernel would hold no such negatives for them: no priming there.
+ */
+static int    negatives    = 1;
+/*
+ * --hit-current: the POSITIVE-hit reader.  Each owner publishes every token's
+ * CURRENT (dir, name) in g_cur[] after each successful move or same-dir
+ * rename (an exchange trades the objects behind two names, not the names), and
+ * a reader looks up a random token's current path.  So nearly every lookup is a
+ * positive hit on an object the writers are moving right now -- the dense
+ * reader/rename interaction the probing workload (1-2% of lookups on a moving
+ * leaf) only grazes: d_seq retries on seqlock, shell resolution on txn.  The
+ * read of g_cur[] is racy by design; a stale one names a vacated path, misses,
+ * and caches a negative there as lookup_slow would.  No priming: these readers
+ * do not probe.
+ */
+static int    hit_mode     = 0;
+static uint32_t *g_cur;			/* [total] token -> (dir << 1) | alt */
 static int    g_nnames     = 0;		/* effective leaf namespace size */
+/*
+ * Names [0, g_static_names) are owned by readers, which never rename, so after
+ * priming a lookup of one can only miss if priming left a hole or something
+ * dropped the negative: the miss counter for them should read 0.
+ */
+static int    g_static_names = 0;
 
 static unsigned int rename_thr;		/* rename_frac scaled into [0,1<<20) */
-#define FRAC_ONE (1u << 20)
+#define FRAC_BITS 20
+#define FRAC_ONE (1u << FRAC_BITS)
 
 /*
  * Leaf op mix, as cumulative thresholds over one FRAC_ONE die: [0,exch_thr) =
@@ -204,12 +268,11 @@ static unsigned int rename_thr;		/* rename_frac scaled into [0,1<<20) */
  * move.  The defaults are the historical hardcoded mix: 1/8 exchange, no same-dir
  * rename.
  *
- * The draw order below (j0 first, then the op die) is the historical one too, and
- * an unmixed run consumes the same draws in the same order as the published runs
- * -- so the stream stays ALIGNED and no later decision is shifted.  The predicate
- * reads different bits of that die than the old `(xrand & 7) == 0` did, so which
- * individual ops fire differs; what is preserved is the distribution and the
- * alignment, not the exact op sequence.
+ * The draw order below (j0 first, then the op die) is the historical one.  The
+ * generator itself changed (dcache_bench_rand.h: plain xorshift64 correlated the
+ * low bits of consecutive draws), so no run reproduces an older op sequence;
+ * what the order preserves is that an unmixed run makes the same draws as a
+ * mixed one, so adding a weight shifts no later decision.
  */
 static unsigned int exch_thr    = FRAC_ONE / 8;
 static unsigned int samedir_thr = FRAC_ONE / 8;	/* == exch_thr => zero rename */
@@ -278,6 +341,12 @@ static uint64_t *g_final_id;		/* [nthreads*leaves] final id per name */
  * logical id.  NULL on logical-id builds.
  */
 static uintptr_t *g_leaf_addr;		/* [nthreads*leaves] seed-time host addr */
+/*
+ * Each leaf id's HANDLE for the reverse walk, pinned at seed time (before any
+ * rename) with dc_lookup_dentry().  Valid for the whole run: this bench renames
+ * and exchanges but never unlinks, which is the reference an open file holds.
+ */
+static struct dentry **g_leaf_dentry;
 static char  g_prefix[DC_PATH_MAX][DC_NAME_MAX];	/* spine component names */
 static int   g_prefix_len;		/* = depth - 2 */
 
@@ -330,14 +399,6 @@ static void parse_cpulist(const char *s)
 		while (*s == ',' || *s == ' ')
 			s++;
 	}
-}
-
-static inline uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-	return (*s = x);
 }
 
 /* ---- path construction -------------------------------------------------- */
@@ -433,8 +494,32 @@ struct warg {
 	long long nexch;
 	long long nsamedir;	/* of those, same-dir renames (--op-mix rename=) */
 	long long lk_wrong;	/* POSITIVE hit whose id left its owner's range */
+	long long npos, nneg, nabs;	/* lookup outcomes */
+	long long nnegadd;	/* negatives cached by readers on a miss */
+	long long nabs_static;	/* of nabs, misses on a name no writer moves */
+	long long nprimed, nprime_fail;	/* priming: negatives cached / refused */
 	long long errs;		/* single-owner rename/exchange failures */
 };
+
+/*
+ * Report the FIRST failed mutation of the run, with its return code: a single
+ * owner's rename cannot legitimately fail, so the count alone (which fails the
+ * gate) says something broke but not what.  Error path only.
+ */
+static int first_err_reported;
+
+static void report_err(const char *op, int rc, const struct dc_path *a,
+		       const struct dc_path *b)
+{
+	if (uatomic_xchg(&first_err_reported, 1))
+		return;
+	fprintf(stderr, "first mutation error: %s rc=%d (%s)  %s/%s -> %s/%s\n",
+		op, rc, strerror(-rc),
+		a->ndepth > 1 ? a->comp[a->ndepth - 2].name : "",
+		a->ndepth ? a->comp[a->ndepth - 1].name : "",
+		b->ndepth > 1 ? b->comp[b->ndepth - 2].name : "",
+		b->ndepth ? b->comp[b->ndepth - 1].name : "");
+}
 
 static void *worker(void *arg)
 {
@@ -473,8 +558,10 @@ static void *worker(void *arg)
 	int base = readdir_mode ? (me->id - (nthreads - nwriters)) * leaves
 				: me->id * leaves;
 	long long ops = 0;
+	struct pace pace;
 	int i;
 
+	pace_init(&pace, role == 1 ? rename_rate : 0.0, nwriters);
 	pin_cpu(me->cpu);
 	dc_register_thread();
 	/* Per-worker RT call_rcu worker pinned to this CPU, as bench_txn_3skiplist
@@ -491,6 +578,34 @@ static void *worker(void *arg)
 			who[i] = (uint64_t) (base + i);	/* name L{base+i} starts on base+i */
 		}
 
+	/*
+	 * PRIMING (lookup readers only; see `negatives`): this worker's share of
+	 * the directories, every name a reader can ask for there, looked up once
+	 * and a negative cached on each miss -- the lookup_slow a kernel would
+	 * have run on first use.  Split by directory so workers take disjoint dir
+	 * locks, and done by EVERY engine the same way before the timed window.
+	 */
+	if (negatives && !readdir_mode && !dpath_mode && !hit_mode) {
+		long long n = 0;
+		int k, g, a;
+
+		for (k = me->id; k < ndirs; k += nthreads)
+			for (g = 0; g < total; g++)
+				for (a = 0; a <= (int) g_alt_mask; a++) {
+					struct dc_path p;
+
+					mk_leaf_path_alt(&p, k, g, a);
+					if (dc_lookup(g_dc, &p, NULL) == DC_ABSENT) {
+						if (dc_add_negative(g_dc, &p) == 0)
+							me->nprimed++;
+						else
+							me->nprime_fail++;
+					}
+					if ((++n & quiesce_mask) == 0)
+						dc_quiescent();
+				}
+	}
+
 	uatomic_inc(&nthreads_running);
 	rcu_thread_offline();			/* don't stall GPs while parked */
 	while (uatomic_read(&goflag) == GOFLAG_INIT)
@@ -499,13 +614,14 @@ static void *worker(void *arg)
 
 	while (uatomic_read(&goflag) == GOFLAG_RUN) {
 		int do_rename = (role < 0)
-			? ((int) ((xrand(&s) & (FRAC_ONE - 1)) < rename_thr))
+			? ((int) (xtop(&s, FRAC_BITS) < rename_thr))
 			: role;
 
 		if (do_rename) {
-			int j0 = (int) (xrand(&s) % (uint64_t) leaves);
-			unsigned int die = (unsigned int)
-				(xrand(&s) & (uint64_t) (FRAC_ONE - 1));
+			if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
+				break;			/* window closed while paced */
+			int j0 = (int) xrange(&s, (uint32_t) leaves);
+			unsigned int die = xtop(&s, FRAC_BITS);
 			int j1 = -1;
 
 			/* [0,exch_thr): RENAME_EXCHANGE of two of my own tokens
@@ -513,7 +629,7 @@ static void *worker(void *arg)
 			 * two-shells-in-one-commit path).  Both names always
 			 * exist, so a single owner never fails. */
 			if (leaves >= 2 && die < exch_thr) {
-				j1 = (int) (xrand(&s) % (uint64_t) leaves);
+				j1 = (int) xrange(&s, (uint32_t) leaves);
 				if (j1 == j0)
 					j1 = (j1 + 1) % leaves;
 			}
@@ -523,7 +639,9 @@ static void *worker(void *arg)
 
 				mk_leaf_path_alt(&a, dir[j0], base + j0, alt[j0]);
 				mk_leaf_path_alt(&b, dir[j1], base + j1, alt[j1]);
-				if (dc_rename_exchange(g_dc, &a, &b) == 0) {
+				int rc = dc_rename_exchange(g_dc, &a, &b);
+
+				if (rc == 0) {
 					uint64_t t = who[j0];
 					who[j0] = who[j1]; who[j1] = t;
 					/* the NAMES stay put; the ids trade, so
@@ -531,6 +649,7 @@ static void *worker(void *arg)
 					me->nrenames++;
 					me->nexch++;
 				} else {
+					report_err("exchange", rc, &a, &b);
 					me->errs++;
 				}
 			} else if (die < samedir_thr) {
@@ -546,11 +665,18 @@ static void *worker(void *arg)
 
 				mk_leaf_path_alt(&from, dir[j0], base + j0, alt[j0]);
 				mk_leaf_path_alt(&to, dir[j0], base + j0, !alt[j0]);
-				if (dc_rename(g_dc, &from, &to) == 0) {
+				int rc = dc_rename(g_dc, &from, &to);
+
+				if (rc == 0) {
 					alt[j0] = !alt[j0];
+					if (hit_mode)
+						uatomic_store(&g_cur[base + j0],
+							(uint32_t) ((dir[j0] << 1) | alt[j0]),
+							CMM_RELAXED);
 					me->nrenames++;
 					me->nsamedir++;
 				} else {
+					report_err("rename", rc, &from, &to);
 					me->errs++;
 				}
 			} else {
@@ -559,16 +685,23 @@ static void *worker(void *arg)
 				 * that name, so no -EEXIST; a single owner never
 				 * sees -ENOENT). */
 				struct dc_path from, to;
-				int nd = (int) (xrand(&s) % (uint64_t) ndirs);
+				int nd = (int) xrange(&s, (uint32_t) ndirs);
 
 				if (nd == dir[j0])
 					nd = (nd + 1) % ndirs;
 				mk_leaf_path_alt(&from, dir[j0], base + j0, alt[j0]);
 				mk_leaf_path_alt(&to, nd, base + j0, alt[j0]);
-				if (dc_rename(g_dc, &from, &to) == 0) {
+				int rc = dc_rename(g_dc, &from, &to);
+
+				if (rc == 0) {
 					dir[j0] = nd;
+					if (hit_mode)
+						uatomic_store(&g_cur[base + j0],
+							(uint32_t) ((nd << 1) | alt[j0]),
+							CMM_RELAXED);
 					me->nrenames++;
 				} else {
+					report_err("move", rc, &from, &to);
 					me->errs++;
 				}
 			}
@@ -578,7 +711,7 @@ static void *worker(void *arg)
 			 * rename may or may not appear -- but it must never tear or
 			 * crash.  dir size is fixed (writers own the namespace), so
 			 * readdir cost is independent of the reader count. */
-			int k = (int) (xrand(&s) % (uint64_t) ndirs);
+			int k = (int) xrange(&s, (uint32_t) ndirs);
 			struct dc_path p;
 			long n;
 
@@ -590,6 +723,20 @@ static void *worker(void *arg)
 				me->nlookups++;
 				me->ndirents += n;
 			}
+		} else if (dpath_mode) {
+			/* REVERSE WALK: where is leaf i NOW?  Every leaf sits at
+			 * exactly `depth` below the root whatever its renames did, so
+			 * any other depth is wrong.  That is ALL this per-op check can
+			 * see: an answer mixing two instants (old name + new dir) has
+			 * the right depth and passes.  The exact path is checked for
+			 * every handle after the run, i.e. only for permanent damage. */
+			int li = (int) xrange(&s, (uint32_t) total);
+			struct dc_path out;
+
+			if (dc_dentry_path(g_dc, g_leaf_dentry[li], &out) != 0 ||
+			    out.ndepth != (uint32_t) depth)
+				me->lk_wrong++;
+			me->nlookups++;
 		} else {
 			/* LOOKUP a random full leaf path.  A POSITIVE hit for name
 			 * L{g} must carry an id in g's owner range -- a worker only
@@ -600,28 +747,51 @@ static void *worker(void *arg)
 			 * pointer per op (an exchange moves L{g} to another host's
 			 * address), so it relies on the census + the exact post-run
 			 * g_leaf_addr[g_final_id] check below. */
-			int g = (int) (xrand(&s) % (uint64_t) total);
+			int g = (int) xrange(&s, (uint32_t) total);
 			uint64_t r = xrand(&s);
-			int dr = (int) (r % (uint64_t) ndirs);
+			int dr = (int) (((r >> 32) * (uint64_t) ndirs) >> 32);
 			/* Which of the token's two names to ask for.  Taken from
-			 * a HIGH bit of the dir draw rather than a fresh one: an
-			 * extra xrand on the reader's hot loop is exactly the
-			 * harness ALU that hid the 1-CL layout win once already.
-			 * g_alt_mask is 0 unless --op-mix, so a legacy run asks
-			 * for L{g} and consumes the identical RNG stream.  Asking
+			 * a bit of the dir draw BELOW the 32 the dir used, rather
+			 * than a fresh draw: an extra xrand on the reader's hot
+			 * loop is exactly the harness ALU that hid the 1-CL
+			 * layout win once already.  g_alt_mask is 0 unless
+			 * --op-mix, so a legacy run always asks for L{g}.  Asking
 			 * for both names keeps the reader's hit rate independent
 			 * of the rename weight (a renamed token wears M). */
-			int ra = (int) ((r >> 40) & g_alt_mask);
+			int ra = (int) ((r >> 20) & g_alt_mask);
+
+			if (hit_mode) {		/* the token's CURRENT path (racy) */
+				uint32_t v = uatomic_load(&g_cur[g], CMM_RELAXED);
+
+				dr = (int) (v >> 1);
+				ra = (int) (v & 1);
+			}
 			int owner_base = (g / leaves) * leaves;
 			struct dc_path p;
 			uint64_t id = ~0ULL;
 
 			mk_leaf_path_alt(&p, dr, g, ra);
-			if (dc_lookup(g_dc, &p, &id) == DC_POSITIVE &&
-			    !id_is_address() &&
-			    (id < (uint64_t) owner_base ||
-			     id >= (uint64_t) (owner_base + leaves)))
-				me->lk_wrong++;
+			switch (dc_lookup(g_dc, &p, &id)) {
+			case DC_POSITIVE:
+				me->npos++;
+				if (!id_is_address() &&
+				    (id < (uint64_t) owner_base ||
+				     id >= (uint64_t) (owner_base + leaves)))
+					me->lk_wrong++;
+				break;
+			case DC_NEGATIVE:
+				me->nneg++;
+				break;
+			default:
+				/* lookup_slow: cache the absence (-EEXIST if a
+				 * racing rename or reader got there first). */
+				me->nabs++;
+				if (g < g_static_names)
+					me->nabs_static++;
+				if (negatives && dc_add_negative(g_dc, &p) == 0)
+					me->nnegadd++;
+				break;
+			}
 			me->nlookups++;
 		}
 		if (pollute) {			/* co-tenant: touch app cachelines */
@@ -756,6 +926,16 @@ static void usage(const char *p)
 	    "  --readdir       => (split mode) readers enumerate a random dir instead\n"
 	    "                     of a leaf lookup; only writers own the namespace so\n"
 	    "                     dir size is fixed as readers scale.\n"
+	    "  --rename-rate R => (split mode) pace the writers to R renames/s in\n"
+	    "                     aggregate (\"250k\", \"1M\"); default unpaced.\n"
+	    "  --hit-current   => readers look up each leaf's CURRENT path (published\n"
+	    "                     by its owner): positive hits on moving objects.\n"
+	    "  --no-negatives  => (lookup readers) skip the negative-dentry priming\n"
+	    "                     and the cache-on-miss: the legacy workload, whose\n"
+	    "                     lookups are ~99%% misses.\n"
+	    "  --dpath         => readers report a random leaf's CURRENT path from a\n"
+	    "                     handle pinned at seed time (dc_dentry_path: the\n"
+	    "                     kernel's dentry_path_raw) instead of a lookup.\n"
 	    "  --op-mix rename=A,move=B,exchange=C\n"
 	    "                  => weight the leaf ops of the taxonomy.  `rename` is\n"
 	    "                     SAME-dir (the token flips between its two reserved\n"
@@ -782,7 +962,10 @@ int main(int argc, char **argv)
 	struct census c;
 	long long t0, t1, total_lk = 0, total_rn = 0, total_ex = 0, total_sd = 0;
 	long long total_wrong = 0, total_err = 0, total_dirents = 0;
+	long long total_pos = 0, total_neg = 0, total_abs = 0, total_negadd = 0;
+	long long total_abs_static = 0, total_primed = 0, total_prime_fail = 0;
 	unsigned long retries0 = 0, retries1 = 0;
+	long dpath_bad = 0;
 	double secs, mlk_s, mrn_s, mdir_s;
 	int total, i, anomaly = 0;
 
@@ -802,6 +985,17 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--no-precomp"))  precomp = 0;
 		else if (!strcmp(argv[i], "--writers"))     nwriters = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--readdir"))     readdir_mode = 1;
+		else if (!strcmp(argv[i], "--dpath"))       dpath_mode = 1;
+		else if (!strcmp(argv[i], "--no-negatives")) negatives = 0;
+		else if (!strcmp(argv[i], "--hit-current")) hit_mode = 1;
+		else if (!strcmp(argv[i], "--rename-rate")) {
+			rename_rate = pace_parse_rate(argv[++i]);
+			if (rename_rate < 0.0) {
+				fprintf(stderr, "--rename-rate: bad rate '%s'\n",
+					argv[i]);
+				exit(2);
+			}
+		}
 		else if (!strcmp(argv[i], "--op-mix"))      parse_op_mix(argv[++i]);
 		else if (!strcmp(argv[i], "--quiesce")) {
 			int q = atoi(argv[++i]);
@@ -816,6 +1010,20 @@ int main(int argc, char **argv)
 	if (nthreads < 1 || ndirs < 2 || depth < 2 || leaves < 1 ||
 	    rename_frac < 0.0 || rename_frac > 1.0 || nwriters > nthreads)
 		usage(argv[0]);
+	if (hit_mode && (readdir_mode || dpath_mode)) {
+		fprintf(stderr, "--hit-current selects the lookup reader; it "
+			"excludes --readdir and --dpath\n");
+		exit(2);
+	}
+	if (readdir_mode && dpath_mode) {
+		fprintf(stderr, "--readdir and --dpath are exclusive reader ops\n");
+		exit(2);
+	}
+	if (rename_rate > 0.0 && nwriters < 1) {
+		fprintf(stderr, "--rename-rate paces the dedicated writers: it "
+			"requires role-split with --writers >= 1\n");
+		exit(2);
+	}
 	if (readdir_mode && nwriters < 1) {
 		fprintf(stderr, "--readdir requires role-split with --writers >= 1 "
 			"(the writers own the fixed namespace the readers list)\n");
@@ -833,6 +1041,8 @@ int main(int argc, char **argv)
 	/* In --readdir mode only the writers own leaves, so the namespace (and the
 	 * dirs the readers list) stays fixed as the reader count scales. */
 	g_nnames = readdir_mode ? nwriters * leaves : nthreads * leaves;
+	g_static_names = (nwriters >= 0 && !readdir_mode)
+		? (nthreads - nwriters) * leaves : 0;
 	total = g_nnames;
 
 	rcu_register_thread();
@@ -840,6 +1050,9 @@ int main(int argc, char **argv)
 	g_final_dir = calloc(total, sizeof(*g_final_dir));
 	g_final_alt = calloc(total, sizeof(*g_final_alt));
 	g_final_id = calloc(total, sizeof(*g_final_id));
+	g_cur = calloc(total, sizeof(*g_cur));
+	for (i = 0; i < total; i++)		/* seeded at L{i} in dir i % ndirs */
+		g_cur[i] = (uint32_t) ((i % ndirs) << 1);
 
 	printf("== bench_dcache (engine: %s) ==\n", dc_engine_name());
 	if (g_two_names)
@@ -858,12 +1071,16 @@ int main(int argc, char **argv)
 		       "depth=%d leaves/thr=%d duration_ms=%ld total_leaves=%d "
 		       "children/dir~%d\n",
 		       nthreads, nwriters, nthreads - nwriters,
-		       readdir_mode ? "readdir" : "lookup", ndirs, depth,
+		       readdir_mode ? "readdir" : dpath_mode ? "dpath" :
+		       hit_mode ? "lookup-current" : "lookup",
+		       ndirs, depth,
 		       leaves, duration_ms, total, ndirs ? total / ndirs : 0);
 	else
-		printf("threads=%d rename_frac=%.4f ndirs=%d depth=%d leaves/thr=%d "
-		       "duration_ms=%ld total_leaves=%d\n",
-		       nthreads, rename_frac, ndirs, depth, leaves, duration_ms, total);
+		printf("threads=%d rename_frac=%.4f reader-op=%s ndirs=%d depth=%d "
+		       "leaves/thr=%d duration_ms=%ld total_leaves=%d\n",
+		       nthreads, rename_frac, dpath_mode ? "dpath" :
+		       hit_mode ? "lookup-current" : "lookup",
+		       ndirs, depth, leaves, duration_ms, total);
 
 	build_tree();
 	if (precomp)
@@ -887,6 +1104,19 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Pin every leaf's handle for the reverse walk, also before any rename. */
+	g_leaf_dentry = calloc(total, sizeof(*g_leaf_dentry));
+	for (i = 0; i < total; i++) {
+		struct dc_path p;
+
+		mk_leaf_path(&p, i % ndirs, i);
+		g_leaf_dentry[i] = dc_lookup_dentry(g_dc, &p);
+		if (!g_leaf_dentry[i]) {
+			fprintf(stderr, "seed handle capture: leaf %d missing\n", i);
+			exit(2);
+		}
+	}
+
 	tid = calloc(nthreads, sizeof(*tid));
 	wa = calloc(nthreads, sizeof(*wa));
 	for (i = 0; i < nthreads; i++) {
@@ -894,8 +1124,10 @@ int main(int argc, char **argv)
 		wa[i].cpu = cpulist ? cpulist[i] : i * cpustride;
 		pthread_create(&tid[i], NULL, worker, &wa[i]);
 	}
+	rcu_thread_offline();	/* workers prime for a while: do not stall GPs */
 	while (uatomic_read(&nthreads_running) < nthreads)
 		(void) poll(NULL, 0, 1);
+	rcu_thread_online();
 	cmm_smp_mb();
 
 	/*
@@ -922,6 +1154,13 @@ int main(int argc, char **argv)
 		total_ex    += wa[i].nexch;
 		total_sd    += wa[i].nsamedir;
 		total_wrong += wa[i].lk_wrong;
+		total_pos   += wa[i].npos;
+		total_neg   += wa[i].nneg;
+		total_abs   += wa[i].nabs;
+		total_negadd += wa[i].nnegadd;
+		total_abs_static += wa[i].nabs_static;
+		total_primed += wa[i].nprimed;
+		total_prime_fail += wa[i].nprime_fail;
 		total_err   += wa[i].errs;
 		total_dirents += wa[i].ndirents;
 	}
@@ -962,18 +1201,54 @@ int main(int argc, char **argv)
 			 ? (id != (uint64_t) g_leaf_addr[g_final_id[i]])
 			 : (id != g_final_id[i])))
 			anomaly++;
+		/* Reverse: the object now carrying name L{i} (id g_final_id[i])
+		 * must report exactly that path from its seed-time handle. */
+		{
+			struct dc_path out;
+			uint32_t k;
+			int bad;
+
+			bad = dc_dentry_path(g_dc, g_leaf_dentry[g_final_id[i]],
+					     &out) != 0 || out.ndepth != p.ndepth;
+			for (k = 0; !bad && k < p.ndepth; k++)
+				bad = !dc_qstr_eq(&out.comp[k], &p.comp[k]);
+			if (bad) {
+				dpath_bad++;
+				anomaly++;
+			}
+		}
 	}
 
 	printf("duration (s): %g\n", secs);
-	/* In --readdir mode Mlookups/s is the readdir CALL rate (kept under the
-	 * same field name so the sweep harness parses one column); the READDIR line
-	 * adds the enumerated-children rate and the average dir size actually seen. */
+	/* In --readdir / --dpath mode Mlookups/s is the readdir / reverse-walk
+	 * CALL rate (kept under the same field name so the sweep harness parses one
+	 * column); the READDIR line adds the enumerated-children rate and the
+	 * average dir size actually seen, the DPATH line the torn-answer count. */
 	printf("LOOKUP  lookups: %lld  Mlookups/s: %g  wrong-id: %lld\n",
 	       total_lk, mlk_s, total_wrong);
+	if (!readdir_mode && !dpath_mode) {
+		long long n = total_pos + total_neg + total_abs;
+
+		/* What the reader panel actually measured: the terminal
+		 * outcome mix (a hit is POSITIVE or NEGATIVE; ABSENT is the
+		 * miss path, where the reader also caches a negative). */
+		printf("LOOKUP  mix: positive %.2f%%  negative %.2f%%  absent %.2f%%"
+		       "  (negatives cached by readers: %lld%s)\n",
+		       n ? 100.0 * total_pos / n : 0.0,
+		       n ? 100.0 * total_neg / n : 0.0,
+		       n ? 100.0 * total_abs / n : 0.0, total_negadd,
+		       negatives ? "" : "; --no-negatives");
+		printf("LOOKUP  primed: %lld negatives (%lld refused)  "
+		       "misses on never-moved names: %lld\n",
+		       total_primed, total_prime_fail, total_abs_static);
+	}
 	if (readdir_mode)
 		printf("READDIR dirents: %lld  Mdirents/s: %g  children/readdir~%g\n",
 		       total_dirents, mdir_s,
 		       total_lk ? (double) total_dirents / (double) total_lk : 0.0);
+	if (dpath_mode)
+		printf("DPATH   reverse walks: %lld  Mdpaths/s: %g  depth-mismatch: %lld\n",
+		       total_lk, mlk_s, total_wrong);
 	/* renames = every mutation; the breakdown names the taxonomy cells --
 	 * same-dir = `rename`, exchange = the two-shell commit, and the balance
 	 * (renames - same-dir - exchanges) = cross-dir `file move`. */
@@ -981,6 +1256,9 @@ int main(int argc, char **argv)
 	       "cross-dir: %lld  Mrenames/s: %g  errors: %lld\n",
 	       total_rn, total_ex, total_sd, total_rn - total_ex - total_sd,
 	       mrn_s, total_err);
+	if (rename_rate > 0.0)
+		printf("PACE    target Mrenames/s: %g  achieved: %.1f%%\n",
+		       rename_rate / 1e6, 100.0 * mrn_s * 1e6 / rename_rate);
 	printf("OPS     Mops/s: %g\n",
 	       secs > 0 ? (double) (total_lk + total_rn) / secs / 1e6 : 0.0);
 	if (&dc_seq_walk_retries) {
@@ -995,8 +1273,9 @@ int main(int argc, char **argv)
 	anomaly += (total_wrong != 0) + (total_err != 0) + (c.stray != 0);
 	if (anomaly)
 		printf("CONSERVATION FAILED: %d anomalies (stray/dup %ld, wrong-id %lld, "
-		       "rename-err %lld) -- run is CORRUPT, ignore the numbers above\n",
-		       anomaly, c.stray, total_wrong, total_err);
+		       "rename-err %lld, dpath-mismatch %ld) -- run is CORRUPT, ignore "
+		       "the numbers above\n",
+		       anomaly, c.stray, total_wrong, total_err, dpath_bad);
 	else
 		printf("CHECK   conservation: OK (all %d leaves accounted for)\n", total);
 
@@ -1004,6 +1283,8 @@ int main(int argc, char **argv)
 	free(tid); free(wa);
 	dc_destroy(g_dc);
 	free(g_final_dir); free(g_final_alt); free(g_final_id); free(g_leaf_addr);
+	free(g_leaf_dentry);
+	free(g_cur);
 	rcu_unregister_thread();
 	return anomaly ? 1 : 0;
 }

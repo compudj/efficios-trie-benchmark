@@ -71,6 +71,7 @@
 #include <urcu-qsbr.h>
 
 #include "dcache.h"
+#include "dcache_bench_rand.h"
 
 /* ---- config (argv-overridable) ----------------------------------------- */
 static int W = 4;			/* writer threads */
@@ -84,16 +85,6 @@ static int *g_final_pos;		/* [W*L]: owner-recorded final dir of each leaf */
 static uint64_t g_seed_base = 0x9e3779b97f4a7c15ULL;
 
 /* Per-thread xorshift so we need no Math.random-style shared state. */
-static inline uint64_t xrand(uint64_t *s)
-{
-	uint64_t x = *s;
-
-	x ^= x << 13;
-	x ^= x >> 7;
-	x ^= x << 17;
-	return (*s = x);
-}
-
 static void mkpath(struct dc_path *p, int dir, int gid)
 {
 	char buf[DC_NAME_MAX * 2];
@@ -220,9 +211,9 @@ static void *writer(void *arg)
 
 	for (it = 0; it < ITERS; it++) {
 		struct dc_path from, to;
-		int i = (int) (xrand(&s) % (uint64_t) L);
+		int i = (int) xrange(&s, (uint32_t) L);
 		int gid = base + i;
-		int nd = (int) (xrand(&s) % (uint64_t) D);
+		int nd = (int) xrange(&s, (uint32_t) D);
 		int ret;
 
 		if (nd == pos[i])
@@ -230,7 +221,7 @@ static void *writer(void *arg)
 		mkpath(&from, pos[i], gid);
 		mkpath(&to, nd, gid);
 
-		if ((xrand(&s) & 3) == 0) {
+		if (xtop(&s, 2) == 0) {
 			/*
 			 * MID-TRANSITION UNLINK: the rename builds a shell, then the
 			 * unlink lands ON it (top != host) with no quiesce between,
@@ -286,10 +277,10 @@ static void *reader(void *arg)
 
 	dc_register_thread();
 	for (it = 0; it < ITERS; it++) {
-		if (xrand(&s) & 1) {
+		if (xtop(&s, 1)) {
 			/* lookup a random leaf at a random dir: POSITIVE => id==gid */
-			int gid = (int) (xrand(&s) % (uint64_t) total);
-			int dir = (int) (xrand(&s) % (uint64_t) D);
+			int gid = (int) xrange(&s, (uint32_t) total);
+			int dir = (int) xrange(&s, (uint32_t) D);
 			struct dc_path p;
 			uint64_t id = ~0ULL;
 
@@ -301,7 +292,7 @@ static void *reader(void *arg)
 			}
 		} else {
 			/* readdir a random dir: soft, just must not tear/crash */
-			int dir = (int) (xrand(&s) % (uint64_t) D);
+			int dir = (int) xrange(&s, (uint32_t) D);
 			struct dc_path p;
 			char buf[DC_NAME_MAX];
 			long n;
