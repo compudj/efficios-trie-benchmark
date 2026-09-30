@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Plot the descriptor-slab ROUTE axis -> figures/dcache_slabroute.png.
 
-Every dcache mutation allocates one transaction descriptor, so past a few
-writers this experiment measures liburcu's descriptor slab as much as the
-dcache.  This is the figure for that axis: the same nine sweeps were run against
-four slab routes, and these are the churn (add/unlink) curves, the workload that
-is actually allocation-bound.
+Every commit of the MW txn engines allocates one transaction descriptor
+(bucketlock's add/unlink and seqlock's commit none), so this figure asks how
+much of their ALLOCATING churn -- dc_unlink + dc_add per toggle -- is the
+descriptor slab.  The churn sweep was run against four slab routes, writers
+only, allocating mode:
 
   scripts/dcache_churn.csv             default -- one call_rcu per descriptor
   scripts/dcache_churn_rseq.csv        + rseq per-cpu local lists
@@ -21,9 +21,17 @@ secondary-encoding floor).  seqlock and bucket-lock are context, in recessive
 grey: neither touches this slab, so they are the "did the machine move" control.
 
 LEFT panel is throughput.  RIGHT is the speedup of each route over the default,
-for the three txn engines, which is where the consistency shows -- a real effect
-holds across all three engines and all writer counts, and the control band says
-what "no effect" looks like on the same axes.
+for the three txn engines, and the control band says what "no effect" looks
+like on the same axes.
+
+Measured 2026-09-30: batch retirement lifts the txn engines 1.10-1.26x at 1-4
+writers and does nothing from 8 up (0.98-1.03x); rseq local lists add a few
+percent on top.  So the descriptor slab is a low-concurrency cost; the
+allocating path's cost at scale is the per-node LRU lock every engine takes
+(dcache_churn.png).  The control band is tight (seqlock and bucketlock stay
+within 4% across routes) -- it was not before 2026-09-29, when the rseq routes'
+librseq reported no NUMA node ids to seqlock's threads and its LRU collapsed
+onto one shard (fixed: dcache_node.h falls back to getcpu()).
 
 NOT a dual-axis chart: footprint is a different measure on a different scale and
 belongs in its own figure, not on a second y-axis here.
@@ -60,7 +68,10 @@ def load(suffix):
     except FileNotFoundError:
         return d
     for r in rows:
-        if r.get("conserved") != "OK" or r.get("panel") != "churn_w":
+        # allocating toggles only (older CSVs have no mode column): in-place
+        # toggles commit no descriptor on the lock engines
+        if r.get("conserved") != "OK" or r.get("panel") != "churn_w" or \
+           r.get("mode", "alloc") != "alloc":
             continue
         if not r.get("mchurn_s"):
             continue

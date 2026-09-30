@@ -29,9 +29,28 @@
 # Every run is gated on the churn invariant (state + census + ids agree); a
 # failing run is flagged and its numbers dropped.
 #
+# PACING.  churn_w measures the writers, so they run flat out.  churn_rd and
+# churn_scale measure READERS under churn, so their writers are held to PER_W
+# adds+unlinks/s each (bench --churn-rate): flat out, each engine's readers
+# would face the rate its OWN writers reach, and the engine with the slower
+# writers gets its readers measured on a quieter machine (see run_dcache.sh).
+# Columns rate_target (0 = flat out) and paced (OK >= 95% of target, SHORT
+# below, - unpaced) record it; best-of-RUNS reports ONE run's numbers
+# (scripts/dcache_pick_run.sh).
+#
+# TOGGLE MODES.  Every panel runs twice (column `mode`): `inplace` toggles a
+# name the way the kernel does when it is removed and created again (d_delete
+# to a negative in place, then d_instantiate: no allocation, no LRU traffic),
+# `alloc` unlinks and re-adds it (allocation + LRU enqueue/dequeue + a free on
+# every pair -- the ever-new-names path).  Measured 2026-09-29, alloc spends
+# 39-57% of its cycles on ONE per-node LRU lock the kernel's same-name churn
+# never takes, so `inplace` is the churn figure's headline.
+#
 # Output: scripts/dcache_churn.csv  (plot with scripts/plot_dcache_churn.py)
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "${URCU_TXN_BUILD:-$REPO/urcu-txn-build}")
 BIN=$REPO/experiments/dcache
 CSV=${CSV:-$REPO/scripts/dcache_churn.csv}
 
@@ -39,6 +58,7 @@ SLOTS=32
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 DUR=${DUR:-1000}
 RUNS=${RUNS:-5}
+PER_W=${PER_W:-12500}		# paced adds+unlinks/s per writer (reader panels)
 
 NCORE=$(nproc)
 CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
@@ -62,7 +82,7 @@ declare -A BINOF=( [seqlock]=bench_dcache_churn_seqlock \
                    [txn-pernode]=bench_dcache_churn_txn_pernode \
                    [txn-mark]=bench_dcache_churn_txn_mark \
                    [bucketlock]=bench_dcache_churn_bucketlock )
-ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
+ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock"}
 
 for e in $ENGINES; do
   test -x "$BIN/${BINOF[$e]}" || {
@@ -71,6 +91,7 @@ for e in $ENGINES; do
 done
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
+. "$REPO/scripts/dcache_pick_run.sh"
 
 # PANELS (env): space-separated subset to (re)run.  Empty => all, fresh CSV.
 # Non-empty => keep the CSV and re-run ONLY those panels, dropping their old
@@ -78,37 +99,58 @@ field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< 
 # RUNS) without disturbing the others.
 PANELS="${PANELS:-}"
 want() { [[ -z "$PANELS" || " $PANELS " == *" $1 "* ]]; }
-HDR="panel,engine,readers,writers,mchurn_s,mlookups_s,conserved"
+HDR="panel,mode,engine,readers,writers,rate_target,mchurn_s,mlookups_s,paced,conserved,src"
 if [[ -z "$PANELS" ]]; then
   echo "$HDR" > "$CSV"
 else
+  # A CSV with another column layout cannot take new rows: set it aside whole.
+  if [[ -f "$CSV" && "$(head -1 "$CSV")" != "$HDR" ]]; then
+    mv "$CSV" "$CSV.prev"
+    echo ">> $CSV had another column layout: moved to $CSV.prev" >&2
+  fi
   [[ -f "$CSV" ]] || echo "$HDR" > "$CSV"
   for p in $PANELS; do grep -v "^$p," "$CSV" > "$CSV.tmp" && mv "$CSV.tmp" "$CSV"; done
 fi
 
-# run <panel> <engine> <readers> <writers> -> best-of-RUNS, appends a CSV row
+# run <panel> <engine> <readers> <writers> [rate] -> best-of-RUNS, appends a
+# CSV row.  [rate] (adds+unlinks/s, aggregate) paces the writers; omitted or 0
+# runs them flat out.  With no readers the writers ARE the measurement, so the
+# best run is the best writer run.
 run() {
-  local panel=$1 eng=$2 rd=$3 w=$4
-  local bin=$BIN/${BINOF[$eng]} r out cons=OK
-  local best_ch=0 best_lk=0
+  local panel=$1 eng=$2 rd=$3 w=$4 rate=${5:-0}
+  local bin=$BIN/${BINOF[$eng]} r out cons=OK runs="" pace="" how=""
+  local key best_ch best_lk paced
+  [[ "$rate" != 0 ]] && pace="--churn-rate $rate"
+  [[ "$MODE" == inplace ]] && how="--in-place"
   for r in $(seq 1 $RUNS); do
     local nd=$(( 16 * (w < 1 ? 1 : w) ))
     out=$(cd "$BIN" && env LD_PRELOAD="$JE" ./"$(basename "$bin")" \
-          --readers "$rd" --writers "$w" --ndirs "$nd" $COMMON 2>/dev/null)
+          --readers "$rd" --writers "$w" --ndirs "$nd" $how $pace $COMMON 2>/dev/null)
     if ! grep -q "conservation: OK" <<< "$out"; then
       cons=FAIL
-      echo "!! $panel/$eng rd=$rd w=$w CHURN INVARIANT FAILED" >&2
+      echo "!! $panel/$MODE/$eng rd=$rd w=$w rate=$rate CHURN INVARIANT FAILED" >&2
       continue
     fi
     local ch lk
     ch=$(field "$out" "Mchurn/s:"); lk=$(field "$out" "Mlookups/s:")
-    awk -v v="${ch:-0}" -v b="$best_ch" 'BEGIN{exit !(v>b)}' && best_ch=$ch
-    awk -v v="${lk:-0}" -v b="$best_lk" 'BEGIN{exit !(v>b)}' && best_lk=$lk
+    if (( rd == 0 )); then runs+="$ch $ch $lk"$'\n'; else runs+="$lk $ch $lk"$'\n'; fi
   done
-  echo "$panel,$eng,$rd,$w,${best_ch:-0},${best_lk:-0},$cons" >> "$CSV"
-  printf "  %-12s %-11s rd=%-4s w=%-3s  churn=%8s Mops/s  rd=%8s Mlk/s  %s\n" \
-    "$panel" "$eng" "$rd" "$w" "$best_ch" "$best_lk" "$cons" >&2
+  read -r key best_ch best_lk paced < <(pick_run "$rate" <<< "$runs")
+  [[ "$paced" == "" ]] && { paced=$best_lk; best_lk=0; }	# no conserved run
+  echo "$panel,$MODE,$eng,$rd,$w,$rate,$best_ch,$best_lk,$paced,$cons,$SRC_ID" >> "$CSV"
+  printf "  %-12s %-8s %-11s rd=%-4s w=%-3s rate=%-7s churn=%8s Mops/s  rd=%8s Mlk/s  %-5s %s\n" \
+    "$panel" "$MODE" "$eng" "$rd" "$w" "$rate" "$best_ch" "$best_lk" "$paced" "$cons" >&2
 }
+
+# MODES (env): which toggle each panel runs.  inplace = the kernel's same-name
+# churn (bench --in-place: d_delete to negative + d_instantiate -- no
+# allocation, no LRU traffic); alloc = dc_unlink + dc_add per toggle (ever-new
+# names, or a dropping dentry-negative policy: allocation + LRU on every pair).
+# The slab-route runs set MODES=alloc: in-place toggles commit no descriptor on
+# the lock engines, so only the allocating path asks their question.
+MODES=${MODES:-"inplace alloc"}
+for MODE in $MODES; do
+echo ">> toggle mode: $MODE" >&2
 
 WPTS="1 2 4 8 16 32 48"
 
@@ -120,9 +162,9 @@ done
 fi
 
 if want churn_rd; then
-echo ">> churn_rd panel: 32 readers + W churn writers, reader Mlookups/s vs W" >&2
+echo ">> churn_rd panel: 32 readers + W churn writers at $PER_W ops/s each, reader Mlookups/s vs W" >&2
 for w in $WPTS; do
-  for e in $ENGINES; do run churn_rd "$e" 32 "$w"; done
+  for e in $ENGINES; do run churn_rd "$e" 32 "$w" $((w * PER_W)); done
 done
 fi
 
@@ -131,10 +173,11 @@ RMAX=$((NCORE - WFIX))
 RDPTS=$(for rd in 2 4 8 16 32 48 64 96 128 160 $RMAX; do
           (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
 if want churn_scale; then
-echo ">> churn_scale panel: $WFIX churn writers, sweep readers to $RMAX" >&2
+echo ">> churn_scale panel: $WFIX churn writers at $((WFIX * PER_W)) ops/s, sweep readers to $RMAX" >&2
 for rd in $RDPTS; do
-  for e in $ENGINES; do run churn_scale "$e" "$rd" "$WFIX"; done
+  for e in $ENGINES; do run churn_scale "$e" "$rd" "$WFIX" $((WFIX * PER_W)); done
 done
 fi
+done	# MODE
 
 echo ">> DONE: $(( $(wc -l < "$CSV") - 1 )) rows -> $CSV" >&2

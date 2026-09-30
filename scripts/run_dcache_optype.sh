@@ -21,6 +21,13 @@
 # Fixed at the split_scale headline point: 8 writers, rename-frac 1.0, sweep
 # readers to fill the machine; jemalloc; ndirs = 16*writers (decontended).
 #
+# The writers are paced to PER_W renames/s each (bench --rename-rate), so every
+# engine's readers face one offered load: flat out, each engine's readers faced
+# its own writers' rate, and the engine with the slower writers got the quieter
+# reader measurement (see run_dcache.sh).  rate_target and paced (OK >= 95%,
+# SHORT below) are recorded per row; best-of-RUNS reports ONE run's numbers
+# (scripts/dcache_pick_run.sh).
+#
 # Output: scripts/dcache_optype.csv  (plot with scripts/plot_dcache_optype.py)
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
@@ -29,6 +36,8 @@ CSV=${CSV:-$REPO/scripts/dcache_optype.csv}
 
 WRITERS=8
 NDIRS=$((16 * WRITERS))
+PER_W=${PER_W:-12500}		# paced renames/s per writer
+RATE=$((WRITERS * PER_W))
 DUR=${DUR:-1000}
 RUNS=${RUNS:-5}
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
@@ -37,6 +46,8 @@ JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 # freelist changed wfstack -> lfstack and retirement became batched in 0d83f466,
 # so arms from different commits are not an A/B of the rseq flag.
 Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 # URCU_SLAB_RSEQ is header-inline and rcu-txn-slab.h requires it IDENTICAL in
 # every TU of the process, so it must be repeated on these compiles.  Derive it
 # from the build being linked (from its CPPFLAGS -- configure appends the flag
@@ -58,11 +69,16 @@ if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null
   SLABMODE="$SLABMODE + batch retirement"
 fi
 INC="-I$Bd/include -I$BIN $SLABDEF $SLABINC"
-LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread $SLABLIB"
+LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread $SLABLIB"
 printf '>> liburcu %s (%s)  slab: %s\n' \
   "$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)" "$Bd" "$SLABMODE" >&2
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native"
+# seqlock's per-directory lock is the vendored kernel rwsem by default
+# (dcache_seqlock.c); link its archive (ignored by the engines that do not
+# reference it).
+make -C "$BIN/krwsem" libkrwsem.a >/dev/null 2>&1 || { echo "krwsem build failed"; exit 1; }
+LIB="$LIB $BIN/krwsem/libkrwsem.a"
 
 CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 [[ -n "$CPULIST" ]] && PIN="--cpulist $CPULIST" && \
@@ -75,7 +91,8 @@ declare -A EDEF=( [seqlock]="" [txn-global]="" [txn-pernode]="-DDC_PER_NODE_GEN"
 declare -A ESRC=( [seqlock]="dcache_seqlock.c" [txn-global]="dcache_txn.c" \
                   [txn-pernode]="dcache_txn.c" [txn-mark]="dcache_txn.c" \
                   [bucketlock]="dcache_bucketlock.c" )
-ENGINES="seqlock txn-global txn-pernode txn-mark bucketlock"
+ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock"}
+. "$REPO/scripts/dcache_pick_run.sh"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -90,22 +107,25 @@ RMAX=$((NCORE - WRITERS))
 RDPTS=$(for rd in 2 4 8 16 32 48 64 96 128 160 $RMAX; do
           (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
 
-echo "leaftype,engine,readers,writers,mlookups_s,conserved" > "$CSV"
+echo "leaftype,engine,readers,writers,rate_target,mlookups_s,mrenames_s,paced,conserved,src" > "$CSV"
 for e in $ENGINES; do
   for lt in file dir; do
     build "$e" "$lt"
     for rd in $RDPTS; do
-      best=0 cons=OK
+      cons=OK; runs=""
+      # --nbuckets 1048576 as run_dcache.sh: priming caches a negative for every
+      # (dir, name) a reader can ask for (~800k at 192 threads), which the 4096-bucket
+      # default turns into ~200-deep hash chains.
       for r in $(seq 1 $RUNS); do
         out=$(env LD_PRELOAD="$JE" "$TMP/${e}_${lt}" --nthreads $((WRITERS+rd)) \
               --writers $WRITERS --rename-frac 1.0 --ndirs $NDIRS --depth 4 \
-              --leaves 32 --duration $DUR $PIN 2>/dev/null)
+              --leaves 32 --nbuckets 1048576 --rename-rate $RATE --duration $DUR $PIN 2>/dev/null)
         grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
-        local_lk=$(grep -oP 'Mlookups/s: \K[0-9.]+' <<< "$out")
-        awk -v v="${local_lk:-0}" -v b="$best" 'BEGIN{exit !(v>b)}' && best=$local_lk
+        runs+="$(grep -oP 'Mlookups/s: \K[0-9.]+' <<< "$out") $(grep -oP 'Mrenames/s: \K[0-9.]+' <<< "$out" | head -1)"$'\n'
       done
-      echo "$lt,$e,$rd,$WRITERS,${best:-0},$cons" >> "$CSV"
-      printf "  %-4s %-11s rd=%-4s %8s Mlk/s  %s\n" "$lt" "$e" "$rd" "$best" "$cons" >&2
+      read -r best best_rn paced < <(pick_run "$RATE" <<< "$runs")
+      echo "$lt,$e,$rd,$WRITERS,$RATE,$best,$best_rn,$paced,$cons,$SRC_ID" >> "$CSV"
+      printf "  %-4s %-11s rd=%-4s %8s Mlk/s %8s Mrn/s %-5s %s\n" "$lt" "$e" "$rd" "$best" "$best_rn" "$paced" "$cons" >&2
     done
   done
 done

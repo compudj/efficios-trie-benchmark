@@ -19,6 +19,7 @@ thread per core, jemalloc, dirs decontended to 16/writer.
 """
 import csv, os
 from collections import defaultdict
+import dcache_plotlib as dp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -130,20 +131,25 @@ def main():
     a1.legend(fontsize=8, loc="upper left", framealpha=0.9)
 
     # -- Panel 2: rd_w -- reader Mlookups/s vs writers (must be a WASH) ------
-    wk = sorted({x for e in ORDER for x in rows["rd_w"].get(e, {})})
+    # The writers are PACED here (PER_W renames/s each), so every arm's readers
+    # face one offered load; hollow = that arm's writers fell short of it.
+    raw = dp.load(CSV)
+    wk = sorted({int(r["writers"]) for r in raw
+                 if r["panel"] == "rd_w" and r["conserved"] == "OK"})
     for e in ORDER:
-        xs, ys = series(rows, "rd_w", e, 0)
-        if xs:
-            a2.plot(xs, ys, marker=MARKER[e], color=COLOR[e], lw=2, ms=6,
-                    label=LABEL[e].split("\n")[0])
+        dp.plot_series(a2, dp.series(raw, "writers", "mlookups_s", panel="rd_w",
+                                     engine=e),
+                       COLOR[e], MARKER[e], LABEL[e].split("\n")[0], lw=2,
+                       ms=6, alpha=1.0)
     if wk:
         plain_thread_x(a2, wk)
     plain_y(a2)
     a2.set_xlabel("writers  (32 dedicated readers)")
     a2.set_ylabel("reader Mlookups / s")
-    a2.set_title("Reader path vs writer (rename) load\n(identical reader code — expect a wash)")
+    a2.set_title("Reader path vs writer (rename) load, writers PACED to\n"
+                 "12.5k renames/s each (identical reader code — expect a wash)")
     a2.grid(True, which="both", ls=":", alpha=0.4)
-    a2.legend(fontsize=8, loc="lower left", framealpha=0.9)
+    dp.legend(a2, fontsize=8, loc="lower left", framealpha=0.9)
 
     fig.suptitle("bucket lock+SW dentry cache — transition-chain serialization: chain lock vs "
                  "mixed SW/MW vs the FOLD LOCK default (2×96 EPYC, 1 hw thread/core, jemalloc)",

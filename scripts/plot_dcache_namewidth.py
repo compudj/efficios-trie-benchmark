@@ -23,6 +23,11 @@ the REVIEW caveat retires with evidence.  A visible gap => the published mark
 reader numbers were paying a harness tax and the S3/S4 tables need this column.
 The readdir panel is the sensitive one -- dc_readdir hands out a qstr per DIRENT
 rather than per path component.
+
+The writers are PACED (run_dcache_namewidth.sh, 12.5k ops/s each), so every arm's
+readers face one offered load.  This figure plots every run's spread, so a run
+whose writers fell short of the rate (paced = SHORT: its readers had a lighter
+load) is left out rather than widening the band, and the count is printed.
 """
 import csv, collections, os, statistics
 import matplotlib
@@ -45,7 +50,11 @@ STYLE = {  # arm -> (color, linestyle, label)
     "bucketlock-w32-shrink": ("#000000", ":",  "bucket lock w32, no pad"),
 }
 
-rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
+allrows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
+rows = [r for r in allrows if r.get("paced") != "SHORT"]
+if len(rows) != len(allrows):
+    print(f"note: {len(allrows) - len(rows)} of {len(allrows)} runs left out: "
+          "writers short of the offered rate")
 lk = collections.defaultdict(lambda: collections.defaultdict(list))
 rdd = collections.defaultdict(list)
 for r in rows:

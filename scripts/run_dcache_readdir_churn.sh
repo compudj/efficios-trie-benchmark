@@ -41,6 +41,8 @@ JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 # freelist changed wfstack -> lfstack and retirement became batched in 0d83f466,
 # so arms from different commits are not an A/B of the rseq flag.
 Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 # URCU_SLAB_RSEQ is header-inline and rcu-txn-slab.h requires it IDENTICAL in
 # every TU of the process, so it must be repeated on these compiles.  Derive it
 # from the build being linked (from its CPPFLAGS -- configure appends the flag
@@ -62,7 +64,7 @@ if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null
   SLABMODE="$SLABMODE + batch retirement"
 fi
 INC="-I$Bd/include -I$BIN $SLABDEF $SLABINC"
-LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread $SLABLIB"
+LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread $SLABLIB"
 printf '>> liburcu %s (%s)  slab: %s\n' \
   "$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)" "$Bd" "$SLABMODE" >&2
 CC=${CC:-gcc}
@@ -76,7 +78,9 @@ else PIN=""; NCORE=$(nproc); echo ">> hwloc-calc unavailable; unpinned" >&2; fi
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE (set JE=)"; exit 1; }
 
 # engine ; extra defines ; source ; extra link objects
-declare -A EDEF=( [seqlock-rp]="" [seqlock-wp]="-DDC_DIR_LOCK_WRITER_PREF" \
+# seqlock's DEFAULT dir lock is the vendored kernel rwsem; the two glibc biases
+# must be asked for (DC_DIR_LOCK_WRITER_PREF implies DC_DIR_LOCK_PTHREAD).
+declare -A EDEF=( [seqlock-rp]="-DDC_DIR_LOCK_PTHREAD" [seqlock-wp]="-DDC_DIR_LOCK_WRITER_PREF" \
                   [seqlock-krwsem]="-DDC_DIR_LOCK_KRWSEM" \
                   [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" )
 declare -A ESRC=( [seqlock-rp]="dcache_seqlock.c" [seqlock-wp]="dcache_seqlock.c" \
@@ -84,7 +88,8 @@ declare -A ESRC=( [seqlock-rp]="dcache_seqlock.c" [seqlock-wp]="dcache_seqlock.c
                   [txn-mark]="dcache_txn.c" [bucketlock]="dcache_bucketlock.c" )
 # seqlock-krwsem links the vendored Linux kernel rw_semaphore (GPL-2.0).
 declare -A EXTRA=( [seqlock-krwsem]="krwsem/libkrwsem.a" )
-ENGINES="seqlock-rp seqlock-wp seqlock-krwsem txn-mark bucketlock"
+ENGINES=${ENGINES:-"seqlock-rp seqlock-wp seqlock-krwsem txn-mark bucketlock"}
+PER_W=${PER_W:-12500}		# paced adds+unlinks/s per writer (list_vs_churn)
 
 make -C "$BIN/krwsem" libkrwsem.a >/dev/null 2>&1 || { echo "krwsem build failed"; exit 1; }
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -94,29 +99,42 @@ for e in $ENGINES; do
 done
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
+. "$REPO/scripts/dcache_pick_run.sh"
 
-# run <panel> <engine> <readers> <writers> -> best-of-RUNS, appends a CSV row
+# run <panel> <engine> <readers> <writers> <key: list|churn> [rate]
+# -> best-of-RUNS, appends a CSV row.  <key> says which side the panel measures
+# (the best run is the best of THAT column); [rate] (adds+unlinks/s, aggregate)
+# paces the churn writers, omitted or 0 runs them flat out.
+#
+# list_vs_churn measures the LISTING under churn, so its writers are paced to
+# PER_W ops/s each: flat out, each engine's listers would face its own
+# writers' rate (see run_dcache.sh).  churn_vs_list measures the WRITERS, so
+# they run flat out.  rate_target / paced (OK >= 95%, SHORT, - unpaced) record
+# which; best-of-RUNS reports ONE run's numbers (scripts/dcache_pick_run.sh).
 run() {
-  local panel=$1 e=$2 rd=$3 w=$4 r out cons=OK best_ch=0 best_dr=0
+  local panel=$1 e=$2 rd=$3 w=$4 key=$5 rate=${6:-0} r out cons=OK runs="" pace=""
+  local k best_ch best_dr paced
+  [[ "$rate" != 0 ]] && pace="--churn-rate $rate"
   for r in $(seq 1 $RUNS); do
     out=$(env LD_PRELOAD="$JE" "$TMP/$e" --readers "$rd" --writers "$w" \
           --ndirs "$NDIRS" --slots $SLOTS --nbuckets 1048576 --readdir \
-          --duration $DUR $PIN 2>/dev/null)
+          $pace --duration $DUR $PIN 2>/dev/null)
     grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
     local ch dr; ch=$(field "$out" "Mchurn/s:"); dr=$(field "$out" "Mdirents/s:")
-    awk -v v="${ch:-0}" -v b="$best_ch" 'BEGIN{exit !(v>b)}' && best_ch=$ch
-    awk -v v="${dr:-0}" -v b="$best_dr" 'BEGIN{exit !(v>b)}' && best_dr=$dr
+    if [[ $key == list ]]; then runs+="$dr $ch $dr"$'\n'; else runs+="$ch $ch $dr"$'\n'; fi
   done
-  echo "$panel,$e,$rd,$w,${best_ch:-0},${best_dr:-0},$cons" >> "$CSV"
-  printf "  %-14s %-11s rd=%-4s w=%-3s  churn=%8s Mops/s  readdir=%9s Mdirents/s  %s\n" \
-    "$panel" "$e" "$rd" "$w" "$best_ch" "$best_dr" "$cons" >&2
+  read -r k best_ch best_dr paced < <(pick_run "$rate" <<< "$runs")
+  [[ "$paced" == "" ]] && { paced=$best_dr; best_dr=0; }	# no conserved run
+  echo "$panel,$e,$rd,$w,$rate,$best_ch,$best_dr,$paced,$cons,$SRC_ID" >> "$CSV"
+  printf "  %-14s %-14s rd=%-4s w=%-3s rate=%-7s churn=%8s Mops/s  readdir=%9s Mdirents/s  %-5s %s\n" \
+    "$panel" "$e" "$rd" "$w" "$rate" "$best_ch" "$best_dr" "$paced" "$cons" >&2
 }
 
-echo "panel,engine,readers,writers,mchurn_s,mreaddir_s,conserved" > "$CSV"
+echo "panel,engine,readers,writers,rate_target,mchurn_s,mreaddir_s,paced,conserved,src" > "$CSV"
 
-echo ">> list_vs_churn: 32 readdir readers, sweep churn writers" >&2
+echo ">> list_vs_churn: 32 readdir readers, sweep churn writers at $PER_W ops/s each" >&2
 for w in 1 2 4 8 16 32 48; do
-  for e in $ENGINES; do run list_vs_churn "$e" 32 "$w"; done
+  for e in $ENGINES; do run list_vs_churn "$e" 32 "$w" list $((w * PER_W)); done
 done
 
 WFIX=8
@@ -125,7 +143,7 @@ RDPTS=$(for rd in 2 4 8 16 32 64 96 128 160 $RMAX; do
           (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)
 echo ">> churn_vs_list: $WFIX churn writers, sweep readdir readers to $RMAX" >&2
 for rd in $RDPTS; do
-  for e in $ENGINES; do run churn_vs_list "$e" "$rd" "$WFIX"; done
+  for e in $ENGINES; do run churn_vs_list "$e" "$rd" "$WFIX" churn; done
 done
 
 echo ">> DONE: $(( $(wc -l < "$CSV") - 1 )) rows -> $CSV" >&2

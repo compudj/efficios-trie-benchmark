@@ -32,6 +32,15 @@
 # Read the two panels together: leaf/ says what the cross_parent branch costs a
 # writer, dir/ says what it costs when the moved node also dominates a subtree.
 #
+# Every point runs TWICE, because its two columns need opposite conditions:
+#   rate_target 0     writers flat out -- Mrenames/s is what the op COSTS a
+#                     writer (the reader number of these rows is not a
+#                     comparison: each engine's readers face its own rate);
+#   rate_target RATE  writers paced to PER_W ops/s each -- Mlookups/s is what
+#                     the op costs the READERS at one offered load for every
+#                     engine (paced: OK >= 95% of target, SHORT below).
+# Best-of-RUNS reports ONE run's numbers (scripts/dcache_pick_run.sh).
+#
 # Output: scripts/dcache_optaxonomy.csv (plot with plot_dcache_optaxonomy.py)
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
@@ -42,6 +51,8 @@ CSV=${CSV:-$REPO/scripts/dcache_optaxonomy.csv}
 
 WRITERS=${WRITERS:-8}
 NDIRS=$((16 * WRITERS))
+PER_W=${PER_W:-12500}		# paced ops/s per writer (the reader rows)
+RATE=$((WRITERS * PER_W))
 DUR=${DUR:-1000}
 RUNS=${RUNS:-5}
 HEIGHT=${HEIGHT:-2}		# move height for the directory panel (needs <= D-2)
@@ -54,10 +65,17 @@ JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 # A/B; the engine under the engine changed (wfstack -> lfstack + batch
 # retirement landed in 0d83f466), so pin the commit and vary one flag.
 Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 INC="-I$Bd/include -I$BIN"
-LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread"
+LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread"
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native"
+# seqlock's per-directory lock is the vendored kernel rwsem by default
+# (dcache_seqlock.c); link its archive (ignored by the engines that do not
+# reference it).
+make -C "$BIN/krwsem" libkrwsem.a >/dev/null 2>&1 || { echo "krwsem build failed"; exit 1; }
+LIB="$LIB $BIN/krwsem/libkrwsem.a"
 
 # URCU_SLAB_RSEQ is a HEADER-inline switch, not a library one: rcu-txn-slab.h is
 # static inline, and it states that the macro must be IDENTICAL across every TU
@@ -190,8 +208,9 @@ CHK
 fi
 
 field() { grep -oP "$2 \K[0-9.]+" <<< "$1" | head -1; }
+. "$REPO/scripts/dcache_pick_run.sh"
 
-echo "panel,engine,op,leaftype,readers,writers,mlookups_s,mrenames_s,conserved" > "$CSV"
+echo "panel,engine,op,leaftype,readers,writers,rate_target,mlookups_s,mrenames_s,paced,conserved,src" > "$CSV"
 
 # ---- panel 1: leaf ops (bench_dcache) ------------------------------------
 # Role-split at the S3 headline point: writers do nothing but the op under test,
@@ -206,19 +225,24 @@ HTHREADS=${HTHREADS:-$NCORE}
     build "$e" bench_dcache.c "$def" "leaf_$lt"
     for spec in $LEAF_OPS; do
       op=${spec%%:*}; mix=${spec#*:}
-      best_lk=0 best_rn=0 cons=OK
-      for r in $(seq 1 $RUNS); do
-        out=$(env LD_PRELOAD="$JE" "$TMP/${e}_leaf_$lt" --nthreads $((WRITERS+RD)) \
-              --writers $WRITERS --op-mix "$mix" --ndirs $NDIRS --depth 4 \
-              --leaves 32 --duration $DUR $PIN 2>/dev/null)
-        grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
-        lk=$(field "$out" "Mlookups/s:"); rn=$(field "$out" "Mrenames/s:")
-        awk -v v="${lk:-0}" -v b="$best_lk" 'BEGIN{exit !(v>b)}' && best_lk=$lk
-        awk -v v="${rn:-0}" -v b="$best_rn" 'BEGIN{exit !(v>b)}' && best_rn=$rn
+      for rate in 0 $RATE; do
+        pace=""; [[ $rate != 0 ]] && pace="--rename-rate $rate"
+        cons=OK; runs=""
+        # --nbuckets 1048576 as run_dcache.sh: priming caches a negative for every
+        # (dir, name) a reader can ask for (~800k at 192 threads), which the 4096-bucket
+        # default turns into ~200-deep hash chains.
+        for r in $(seq 1 $RUNS); do
+          out=$(env LD_PRELOAD="$JE" "$TMP/${e}_leaf_$lt" --nthreads $((WRITERS+RD)) \
+                --writers $WRITERS --op-mix "$mix" --ndirs $NDIRS --depth 4 \
+                --leaves 32 --nbuckets 1048576 $pace --duration $DUR $PIN 2>/dev/null)
+          grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
+          runs+="$(field "$out" "Mlookups/s:") $(field "$out" "Mrenames/s:")"$'\n'
+        done
+        read -r best_lk best_rn paced < <(pick_run "$rate" <<< "$runs")
+        echo "leaf,$e,$op,$lt,$RD,$WRITERS,$rate,$best_lk,$best_rn,$paced,$cons,$SRC_ID" >> "$CSV"
+        printf "  leaf %-11s %-9s %-4s rd=%-4s rate=%-7s %8s Mlk/s %8s Mrn/s %-5s %s\n" \
+          "$e" "$op" "$lt" "$RD" "$rate" "$best_lk" "$best_rn" "$paced" "$cons" >&2
       done
-      echo "leaf,$e,$op,$lt,$RD,$WRITERS,${best_lk:-0},${best_rn:-0},$cons" >> "$CSV"
-      printf "  leaf %-11s %-9s %-4s rd=%-4s %8s Mlk/s %8s Mrn/s %s\n" \
-        "$e" "$op" "$lt" "$RD" "$best_lk" "$best_rn" "$cons" >&2
     done
   done
 done
@@ -230,19 +254,21 @@ done
 [[ " $PANELS " == *" dir "* ]] && for e in $ENGINES; do
   build "$e" bench_dcache_height.c "" "height"
   for op in $DIR_OPS; do
-    best_lk=0 best_rn=0 cons=OK
-    for r in $(seq 1 $RUNS); do
-      out=$(env LD_PRELOAD="$JE" "$TMP/${e}_height" --writers $WRITERS \
-            --nthreads "$HTHREADS" --move-height $HEIGHT --branch $BRANCH \
-            --tree-depth $TREE_DEPTH --op "$op" --duration $DUR $PIN 2>/dev/null)
-      grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
-      lk=$(field "$out" "Mlookups/s:"); rn=$(field "$out" "Mrenames/s:")
-      awk -v v="${lk:-0}" -v b="$best_lk" 'BEGIN{exit !(v>b)}' && best_lk=$lk
-      awk -v v="${rn:-0}" -v b="$best_rn" 'BEGIN{exit !(v>b)}' && best_rn=$rn
+    for rate in 0 $RATE; do
+      pace=""; [[ $rate != 0 ]] && pace="--rename-rate $rate"
+      cons=OK; runs=""
+      for r in $(seq 1 $RUNS); do
+        out=$(env LD_PRELOAD="$JE" "$TMP/${e}_height" --writers $WRITERS \
+              --nthreads "$HTHREADS" --move-height $HEIGHT --branch $BRANCH \
+              --tree-depth $TREE_DEPTH --op "$op" $pace --duration $DUR $PIN 2>/dev/null)
+        grep -q "conservation: OK" <<< "$out" || { cons=FAIL; continue; }
+        runs+="$(field "$out" "Mlookups/s:") $(field "$out" "Mrenames/s:")"$'\n'
+      done
+      read -r best_lk best_rn paced < <(pick_run "$rate" <<< "$runs")
+      echo "dir,$e,$op,directory,$((HTHREADS-WRITERS)),$WRITERS,$rate,$best_lk,$best_rn,$paced,$cons,$SRC_ID" >> "$CSV"
+      printf "  dir  %-11s %-15s H=%-2s rate=%-7s %8s Mlk/s %8s Mrn/s %-5s %s\n" \
+        "$e" "$op" "$HEIGHT" "$rate" "$best_lk" "$best_rn" "$paced" "$cons" >&2
     done
-    echo "dir,$e,$op,directory,$((HTHREADS-WRITERS)),$WRITERS,${best_lk:-0},${best_rn:-0},$cons" >> "$CSV"
-    printf "  dir  %-11s %-15s H=%-2s %8s Mlk/s %8s Mrn/s %s\n" \
-      "$e" "$op" "$HEIGHT" "$best_lk" "$best_rn" "$cons" >&2
   done
 done
 

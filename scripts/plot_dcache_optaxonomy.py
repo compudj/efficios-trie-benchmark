@@ -20,8 +20,18 @@ itself; the two EXCHANGE arms keep the moved subtree on reader paths, so they
 also carry the B^H walk invalidation.  Reading a one-way bar against its
 exchange counterpart separates the two costs.
 
-TOP row is the writer (Mrenames/s), BOTTOM row the reader (Mlookups/s) measured
-concurrently.  Linear axes.
+TOP row is the writer (Mrenames/s) with writers FLAT OUT -- what the op costs a
+writer.  BOTTOM row is the reader (Mlookups/s) from a SECOND run with the
+writers PACED to one offered rate for every engine -- what the op costs the
+readers.  (Taken from one flat-out run, the reader row compared each engine's
+readers under its own writers' rate.)  Hatched: the writers could not sustain
+the offered rate.  Linear axes.
+
+Measured 2026-09-30: flat out, the bucket lock renames 3.8-26x the seqlock
+baseline (7-26x on the leaf ops, 3.8-5.6x on the directory ops) and txn-mark
+2.2-4.7x; paced to 100k/s, the txn readers run 1.04-1.16x seqlock's.  Part of the writer gap is the per-directory
+rwsem and cross-dir rename mutex the seqlock baseline takes (the kernel's
+i_rwsem and s_vfs_rename_mutex) and the txn designs do not need.
 """
 import csv, collections, os
 import matplotlib
@@ -64,12 +74,24 @@ DIR_OPS = [("rename", "directory rename\n(one-way)"),
            ("exchange-cross", "directory move\n(exchange)")]
 
 rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
-val = collections.defaultdict(dict)          # (panel, op) -> engine -> (lk, rn)
+# Each point was run twice (run_dcache_optaxonomy.sh): writers FLAT OUT for the
+# writer row (what the op costs a writer), writers PACED for the reader row
+# (what it costs the readers at one offered load for every engine).  So the two
+# rows of a column come from different runs by design.
+# (panel, op) -> engine -> [paced lk, flat-out rn, paced run SHORT?]
+val = collections.defaultdict(dict)
+paced_rate = None
 for r in rows:
     if r["panel"] == "leaf" and r["leaftype"] != "file":
         continue
-    val[(r["panel"], r["op"])][r["engine"]] = (float(r["mlookups_s"]),
-                                               float(r["mrenames_s"]))
+    v = val[(r["panel"], r["op"])].setdefault(r["engine"],
+                                              [np.nan, np.nan, False])
+    if float(r.get("rate_target") or 0) > 0:
+        v[0] = float(r["mlookups_s"])
+        v[2] = r.get("paced") == "SHORT"
+        paced_rate = float(r["rate_target"])
+    else:
+        v[1] = float(r["mrenames_s"])
 # sharey="row": both panels of a row carry ONE scale, so bar height means the
 # same number left and right.  Without it each subplot auto-scales and a taller
 # directory-panel bar can stand for a smaller throughput than a shorter leaf-panel
@@ -79,6 +101,7 @@ for r in rows:
 # trade.
 fig, axes = plt.subplots(2, 2, figsize=(15.5, 9.0), sharey="row")
 handles = {}                                 # label -> bar handle, for one legend
+short_seen = False
 for col, (panel, ops, title) in enumerate((
         ("leaf", LEAF_OPS, "Leaf operations — bench_dcache (file leaves)"),
         ("dir", DIR_OPS, "Directory operations — bench_dcache_height"))):
@@ -90,17 +113,30 @@ for col, (panel, ops, title) in enumerate((
                if any(e in val[(panel, op)] for op, _ in present)]
     x = np.arange(len(present))
     w = 0.8 / max(len(engines), 1)
-    for row, (metric, ylab) in enumerate(((1, "writer  Mrenames/s"),
-                                          (0, "reader  Mlookups/s"))):
+    rl = f"{paced_rate / 1e3:g}k" if paced_rate else "?"
+    for row, (metric, ylab) in enumerate((
+            (1, "writer  Mrenames/s\n(writers flat out)"),
+            (0, f"reader  Mlookups/s\n(writers paced to {rl}/s)"))):
         ax = axes[row][col]
         for i, e in enumerate(engines):
             # nan (not 0) for an op an engine has no OK row for -- a dropped
             # run must leave a gap, never a bar that reads as a measurement.
-            ys = [val[(panel, op)].get(e, (np.nan, np.nan))[metric]
+            vs = [val[(panel, op)].get(e, [np.nan, np.nan, False])
                   for op, _ in present]
+            ys = [v[metric] for v in vs]
             b = ax.bar(x + i * w - 0.4 + w / 2, ys, w, color=COLOR[e],
                        edgecolor="white", linewidth=0.6)
             handles.setdefault(ELAB[e], b)
+            # a reader bar whose writers could not sustain the offered rate
+            # was measured under a LIGHTER load: hatch it rather than let it
+            # stand as comparable.
+            if metric == 0:
+                for patch, v in zip(b.patches, vs):
+                    if v[2]:
+                        patch.set_hatch("///")
+                        patch.set_edgecolor("0.25")
+                        patch.set_alpha(0.55)
+                        short_seen = True
         ax.set_xticks(x)
         ax.set_xticklabels([lab for _, lab in present], fontsize=9)
         if col == 0:                 # shared row scale -> one label, on the left
@@ -110,7 +146,6 @@ for col, (panel, ops, title) in enumerate((
         # the reader has to take on trust instead of something they can check.
         # Put them back: the redundancy is the point.
         ax.tick_params(labelleft=True)
-        ax.set_ylim(bottom=0)
         ax.grid(axis="y", alpha=0.25)
         ax.set_axisbelow(True)
         if row == 0:
@@ -118,6 +153,17 @@ for col, (panel, ops, title) in enumerate((
 
 fig.suptitle("dcache op taxonomy: all four mutating operations, per engine",
              fontsize=13)
+# The shared row scale is set once BOTH columns are drawn: fixing it on the
+# first column (set_ylim(bottom=0) freezes the top too) clipped every taller bar
+# in the second.
+for row in axes:
+    top = max(np.nanmax([p.get_height() for p in a.patches] or [0])
+              for a in row)
+    row[0].set_ylim(0, top * 1.08 if top > 0 else 1)
+if short_seen:
+    import matplotlib.patches as mpatches
+    k = "hatched: writers could not sustain the offered rate"
+    handles[k] = mpatches.Patch(facecolor="0.8", edgecolor="0.25", hatch="///")
 fig.legend([handles[k] for k in handles], list(handles),
            loc="lower center", ncol=min(len(handles), 4), frameon=False,
            fontsize=9)

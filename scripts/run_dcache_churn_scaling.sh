@@ -22,6 +22,8 @@
 # Output: scripts/dcache_churn_scaling.csv
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "${URCU_TXN_BUILD:-$REPO/urcu-txn-build}")
 BIN=$REPO/experiments/dcache
 CSV=${CSV:-$REPO/scripts/dcache_churn_scaling.csv}
 
@@ -46,7 +48,7 @@ for e in $ENGINES; do
     exit 1; }
 done
 
-echo "engine,dirmul,writers,ndirs,mchurn_s,conserved" > "$CSV"
+echo "engine,dirmul,writers,ndirs,mchurn_s,conserved,src" > "$CSV"
 
 run() {
   local eng=$1 dm=$2 nd=$3 w=$4 r out best=0 cons=OK
@@ -58,7 +60,7 @@ run() {
     local c; c=$(awk '/Mchurn\/s:/{print $2}' <<< "$out")
     awk -v v="${c:-0}" -v b="$best" 'BEGIN{exit !(v>b)}' && best=$c
   done
-  echo "$eng,$dm,$w,$nd,${best:-0},$cons" >> "$CSV"
+  echo "$eng,$dm,$w,$nd,${best:-0},$cons,$SRC_ID" >> "$CSV"
   printf "  %-11s %-10s w=%-4s nd=%-6s %8s Mchurn/s  %s\n" \
     "$eng" "$dm" "$w" "$nd" "$best" "$cons" >&2
 }

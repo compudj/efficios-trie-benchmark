@@ -28,6 +28,11 @@
 # published mark reader numbers were paying a harness tax and the S3/S4 tables
 # need the control column beside them.
 #
+# The writers are paced to PER_W ops/s each (bench --rename-rate / --churn-rate),
+# so every arm's readers face one offered load; each row records rate_target
+# and whether that run's writers sustained it (paced: OK >= 95%, SHORT below).
+# See run_dcache.sh for why flat-out writers confound a reader comparison.
+#
 # Output: scripts/dcache_namewidth.csv (plot with plot_dcache_namewidth.py)
 set -u
 REPO=/mnt/data/efficios/git/efficios-trie-benchmark
@@ -37,6 +42,8 @@ BIN=$REPO/experiments/dcache
 CSV=${CSV:-$REPO/scripts/dcache_namewidth.csv}
 
 WRITERS=${WRITERS:-8}
+PER_W=${PER_W:-12500}		# paced ops/s per writer
+RATE=$((WRITERS * PER_W))
 NDIRS=$((16 * WRITERS))
 DUR=${DUR:-1000}
 RUNS=${RUNS:-7}		# more than the usual 5: this is a null-result test, and
@@ -47,8 +54,10 @@ JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 # freelist changed wfstack -> lfstack in 0d83f466, so arms from different
 # commits are not an A/B of the flag.
 Bd=${URCU_BUILD:-$REPO/urcu-txn-build}
+# Provenance stamped on every row (scripts/dcache_src_id.sh).
+SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 INC="-I$Bd/include -I$BIN"
-LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lpthread"
+LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread"
 CC=${CC:-gcc}
 CFLAGS="-O2 -g -pthread -march=native"
 
@@ -110,12 +119,14 @@ NWPANELS=${NWPANELS:-"lookup readdir"}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 field() { grep -oP "$2 \K[0-9.]+" <<< "$1" | head -1; }
+# paced_verdict <writer M ops/s>: OK if it sustained >= 95% of $RATE, else SHORT
+paced_verdict() { awk -v v="${1:-0}" -v t="$RATE" 'BEGIN { print (v * 1e6 >= 0.95 * t) ? "OK" : "SHORT" }'; }
 
 RMAX=$((NCORE - WRITERS))
 RDPTS=${RDPTS:-$(for rd in 8 32 64 128 $RMAX; do
           (( rd >= 1 && rd <= RMAX )) && echo "$rd"; done | sort -n -u)}
 
-echo "arm,panel,readers,writers,run,mlookups_s,mrenames_s,conserved" > "$CSV"
+echo "arm,panel,readers,writers,run,rate_target,mlookups_s,mrenames_s,paced,conserved,src" > "$CSV"
 for a in $ARMS; do
   (cd "$BIN" && $CC $CFLAGS ${ADEF[$a]} $INC -o "$TMP/lookup_$a" \
       bench_dcache.c "${ASRC[$a]}" $LIB) || { echo "build $a failed"; exit 1; }
@@ -136,12 +147,16 @@ for a in $ARMS; do
   [[ " $NWPANELS " == *" lookup "* ]] && for rd in $RDPTS; do
     # Every run is recorded, not just the best: the question is whether two arms
     # differ, and that needs the spread, not a max.
+    # --nbuckets 1048576 as run_dcache.sh: priming caches a negative for every
+    # (dir, name) a reader can ask for (~800k at 192 threads), which the 4096-bucket
+    # default turns into ~200-deep hash chains.
     for r in $(seq 1 $RUNS); do
       out=$(env LD_PRELOAD="$JE" "$TMP/lookup_$a" --nthreads $((WRITERS+rd)) \
             --writers $WRITERS --rename-frac 1.0 --ndirs $NDIRS --depth 4 \
-            --leaves 32 --duration $DUR $PIN 2>/dev/null)
+            --leaves 32 --nbuckets 1048576 --rename-rate $RATE --duration $DUR $PIN 2>/dev/null)
       cons=OK; grep -q "conservation: OK" <<< "$out" || cons=FAIL
-      echo "$a,lookup,$rd,$WRITERS,$r,$(field "$out" 'Mlookups/s:'),$(field "$out" 'Mrenames/s:'),$cons" >> "$CSV"
+      rn=$(field "$out" 'Mrenames/s:')
+      echo "$a,lookup,$rd,$WRITERS,$r,$RATE,$(field "$out" 'Mlookups/s:'),$rn,$(paced_verdict "$rn"),$cons,$SRC_ID" >> "$CSV"
     done
     printf "  %-22s lookup  rd=%-4s done\n" "$a" "$rd" >&2
   done
@@ -157,12 +172,12 @@ for a in $ARMS; do
   # it got the mode it asked for rather than trusting the flag.
   [[ " $NWPANELS " == *" readdir "* ]] && for r in $(seq 1 $RUNS); do
     out=$(env LD_PRELOAD="$JE" "$TMP/readdir_$a" --writers $WRITERS \
-          --readers "$RMAX" --readdir-names --duration $DUR $PIN 2>/dev/null)
+          --readers "$RMAX" --readdir-names --churn-rate $RATE --duration $DUR $PIN 2>/dev/null)
     grep -q "READDIR names: 1" <<< "$out" || {
       echo "FATAL: $a readdir ran WITHOUT the name callback -- the panel would"
       echo "       be vacuous (see the --readdir-names comment).  Aborting."; exit 1; }
     cons=OK; grep -q "conservation: OK" <<< "$out" || cons=FAIL
-    echo "$a,readdir,$RMAX,$WRITERS,$r,$(field "$out" 'Mlookups/s:'),$(field "$out" 'Mdirents/s:'),$cons" >> "$CSV"
+    echo "$a,readdir,$RMAX,$WRITERS,$r,$RATE,$(field "$out" 'Mlookups/s:'),$(field "$out" 'Mdirents/s:'),$(paced_verdict "$(field "$out" 'Mchurn/s:')"),$cons,$SRC_ID" >> "$CSV"
   done
   printf "  %-22s readdir rd=%-4s done\n" "$a" "$RMAX" >&2
 done

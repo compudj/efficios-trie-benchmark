@@ -15,23 +15,21 @@ the shared child-hlist HEADS.  Linear axes.
 
 Left panel: one engine (the seqlock baseline) across three ndirs -- how much
 decontention buys (matched ndirs=writers is child-hlist-head bound; 16*writers
-lifts it ~6x at the top).  Right panel: the widest ndirs (16*writers), four
-engines -- who scales.  Churn is BUMP-FREE (add never bumped; unlink no longer
-does), so the three txn arms are indistinguishable.  The result inverts the old
-figure: the faithful bit-lock baseline is the FASTEST here, ahead of the
-transactional engine across the range.
+lifts it ~6x at the top).  Right panel: the widest ndirs (16*writers), every engine -- who scales, on the
+ALLOCATING path (dc_unlink + dc_add per toggle).  Churn is BUMP-FREE (add never
+bumped; unlink no longer does), so the three txn arms are indistinguishable.
+The seqlock baseline leads here.
 
-Read that with the DESCRIPTOR SLAB in mind, though, because most of the gap is
-not the engine.  A churn op allocates a transaction descriptor, and on the
-default retirement route -- one call_rcu per descriptor -- the slab spills to
-posix_memalign under load.  Retiring by the batch instead
-(URCU_TXN_SLAB_BATCH) is worth 3.0-3.5x on the same engines, closing most of
-the distance to the bit-lock; what remains after that is the genuine per-op
-MCAS cost (two commits + a descriptor per churn op).  See
-figures/dcache_slabroute.png and REVIEW.md section 6.
-
-The txn engine still earns its keep on the READ path and on renames (see
-dcache_churn.png / dcache_s3.png) rather than on pure insert/remove.
+Read that as a statement about the allocating path, not about create/delete in
+general.  Profiled 2026-09-29, this path spends 39-57% of its cycles on the
+per-NUMA-node LRU shard lock (one list per node, as the kernel's list_lru; 24
+nodes on this machine), which every engine takes on each add and unlink.  The
+MW txn engines additionally pay a descriptor per commit: batch retirement
+(URCU_TXN_SLAB_BATCH, figures/dcache_slabroute.png) recovers part of that at
+1-4 writers and nothing from 8 up.  On the path a kernel takes when a name is
+removed and created again -- d_delete to a negative, then d_instantiate, no
+allocation and no LRU operation -- the order reverses: every txn arm and the
+bucket lock beat seqlock, by up to 2.4x (dcache_churn.png, top row).
 
 Env: ENGINES / OUT overrides as usual.
 """
@@ -39,6 +37,7 @@ import csv, collections, os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import dcache_plotlib as dp
 from matplotlib.ticker import FixedLocator, FixedFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +76,7 @@ def linx(ax):
     ax.xaxis.set_major_formatter(FixedFormatter([str(t) for t in ticks]))
 
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6.2))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7.6))
 
 for dm in ("writers/16", "writers", "16*writers"):
     ys = [d[(dm, w)][DECON_ENGINE] for w in Ws]
@@ -98,24 +97,19 @@ for e in ("seqlock", "txn-mark", "bucketlock", "txn-pernode", "txn-global"):
     ys = [d[("16*writers", w)][e] for w in Ws]
     ax2.plot(Ws, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6.5,
              label=ELAB[e])
-# annotate the seqlock lead over the (indistinguishable) txn arms
-for w in Ws:
-    s = d[("16*writers", w)].get("seqlock")
-    t = d[("16*writers", w)].get("txn-mark")
-    if s and t and w in (1, 8, 32, 96, 160):
-        ax2.annotate(f"{s / t:.1f}×", (w, s), textcoords="offset points",
-                     xytext=(0, 8), ha="center", fontsize=8,
-                     color=COLOR["seqlock"], fontweight="bold")
 linx(ax2)
 ax2.set_title("Decontended (ndirs = 16×writers, jemalloc) — who scales\n"
               "insert+remove Mops/s vs writers.  Churn is BUMP-FREE, so the\n"
-              "three txn arms coincide; the bit-lock baseline leads — but most\n"
-              "of the gap is the descriptor slab, not MCAS (× = seqlock ÷ txn)",
-              fontsize=9.5)
+              "three txn arms coincide; the bit-lock baseline leads on this\n"
+              "ALLOCATING path, LRU-lock bound -- in place it reverses (strip: every engine\n"
+              "÷ seqlock; dashed = parity)", fontsize=9.5)
 ax2.set_xlabel("writer threads")
 ax2.set_ylabel("insert+remove Mops/s   (higher is better)")
 ax2.grid(alpha=0.3, ls=":")
 ax2.legend(fontsize=9, loc="upper left")
+dp.ratio_strip(ax2, rows, "writers", "mchurn_s",
+               ("seqlock", "txn-mark", "bucketlock", "txn-pernode", "txn-global"),
+               COLOR, MARK, dirmul="16*writers")
 
 fig.suptitle("Userspace dcache — INSERT/REMOVE writer scaling to 192 "
              "(default jemalloc, linear axes)   ·   2×96-core EPYC", fontsize=12)
