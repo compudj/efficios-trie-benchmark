@@ -1,6 +1,8 @@
 # dcache-in-userspace: can urcu-txn dissolve `rename_lock`?
 
-Status: **S1–S4 done** (2026-08-01). Three engines behind one interface —
+Status: **S1–S4 done** (2026-08-01); **every figure re-swept 2026-09-30** on
+the corrected methodology — see [Results](#results-re-swept-2026-09-30). Three
+engines behind one interface —
 the kernel-style `seqlock` baseline, `dcache_txn` (global / per-node / mark
 causality arms) and `dcache_bucketlock` (per-bucket lock + SW txn, the winner on
 writes) — all at 103/103 with ASan- and TSAN-clean stress. The txn rename
@@ -23,7 +25,9 @@ nothing, not from an engine that was slow.
 | `dcache_seqlock.c` | faithful kernel-style baseline (RCU hlist + global `rename_lock` + per-dentry `d_seq`) |
 | `dcache_txn.c` | urcu-txn engine; `-DDC_PER_NODE_GEN` / `-DDC_MARK_GEN` select the causality arm |
 | `dcache_bucketlock.c` | per-bucket lock + SW txn; `-DDC_CHAIN_LOCK` / `-DDC_CHAIN_SWMW` select the chain strategy |
-| `krwsem/` | vendored Linux `rw_semaphore` (GPL-2.0), the exact-fair dir-lock arm |
+| `krwsem/` | vendored Linux `rw_semaphore` (GPL-2.0): the seqlock baseline's default per-directory lock (`i_rwsem`) |
+| `dcache_node.h` | LRU shard axis: this CPU's NUMA node (rseq, else `getcpu()`) |
+| `dcache_bench_rand.h` / `dcache_bench_pace.h` | the harnesses' PRNG (xorshift64* + multiply-shift) and writer pacer (`--rename-rate` / `--churn-rate`) |
 | `rename-shell-transition.md` | the lock-free rename design: shell-stacking + fold cascade + ancestor-validate loop check |
 | `simplification-s4.md` | S4: LOC + invariant-surface analysis, the 1-cacheline hot line, S3 scaling curves |
 | `REVIEW.md` | retrospective: verdict, design rules, **methodology rules**, open items |
@@ -43,15 +47,35 @@ repo root once).
 The Linux dentry cache is the hardest RCU user in the kernel, and the thing that
 makes it hard is *rename*. A `d_move()` can relocate a live dentry to an
 arbitrary point in the namespace tree while lockless path walks are mid-flight
-through it. The kernel copes with a **global** consistency scheme:
+through it. The kernel copes with two sequence counters (checked against Linux
+v7.3 `fs/namei.c` / `fs/dcache.c`):
 
-- a system-wide `seqlock_t rename_lock` that every RCU path walk brackets with
-  `read_seqbegin()` / `read_seqretry()` — *any* rename *anywhere* forces the
-  walk to retry from the top; and
-- a per-dentry `seqcount_spinlock_t d_seq` that `__d_lookup_rcu()` validates so a
-  single-component match is coherent (name vs parent vs hash-bucket membership).
+- a per-dentry `seqcount_spinlock_t d_seq`, validated **hand-over-hand** by the
+  RCU walk: `__d_lookup_rcu()` samples the child's before its name/parent
+  compare, `lookup_fast()` re-checks the parent's once the child is found, and
+  `step_into()` re-checks the child's before stepping into it.  That is the
+  fast path's only per-hop validation; and
+- a system-wide `seqlock_t rename_lock`, bumped by every `d_move()`.  The fast
+  path does **not** validate it on a hit (`lookup_fast`: *"Rename seqlock is not
+  required here"*; unchanged since rcu-walk landed in 2.6.38): `path_init()`
+  only samples it, which waits out a `d_move` in flight, and a *miss* falls back
+  to `d_lookup()`, which retries while it moved.  The kernel brackets a whole
+  walk on `rename_lock` only for its **reverse** walks — `d_path` /
+  `dentry_path_raw`, `d_walk`, `is_subdir` — with the bounded
+  `read_seqbegin_or_lock()` (lockless, then a retry holding the lock).
 
-Both are **global-or-per-object sequence counters read on the fast path**. This
+So a kernel lookup guarantees that consecutive components overlapped in time,
+not that the whole path existed at one instant; that **snapshot** guarantee is
+what the reverse walks pay `rename_lock` for.  ⚠ An earlier version of this
+note, and of the `dcache_seqlock` baseline, had every RCU walk bracket on
+`rename_lock` and retry on *any* rename *anywhere*.  The kernel does not do
+that; every rename-concurrent reader ratio measured against that baseline
+(including the "~25×" headline) is void.  The figures were re-swept on
+2026-09-30 against the kernel-faithful baseline — [Results](#results-re-swept-2026-09-30)
+— and `scripts/check_dcache_figures.sh` verifies each one carries data from the
+current sources.
+
+Both are **global-or-per-object sequence counters** the kernel keeps. This
 experiment asks whether an urcu-txn (rcu-mcas) formulation — where a rename is a
 single multi-slot commit and a lookup validates only *the slots it actually
 consumed* (the engine's "help iff the slot is in the txn's own read/write set"
@@ -79,11 +103,12 @@ MCAS validate set (a concurrent reparent of any target-ancestor aborts the
 commit and forces a re-check). See `rename-shell-transition.md`. So the txn
 engine takes **no rename lock at all** and wins on *both* axes:
 
-- **Reader side.** The seqlock engine bumps the *global* `rename_lock` on *every*
-  rename — even a same-directory name change — so every in-flight walk
-  *everywhere* retries, and each lookup validates a per-dentry `d_seq`. The txn
-  reader does an inline name compare and never touches a sequence counter; a
-  rename is atomic to it via the MCAS commit alone.
+- **Reader side.** The kernel's lookup validates per-dentry `d_seq`s
+  hand-over-hand and samples the global `rename_lock` once per walk (waiting
+  out a `d_move` in flight); every rename writes that line.  The txn reader
+  does an inline name compare, touches no `d_seq`, and — on the per-node and
+  mark arms — gives every lookup the whole-path snapshot the kernel reserves
+  for its reverse walks.
 - **Writer side.** The seqlock engine serializes *all* renames on the
   `rename_lock` seqlock (plus an `s_vfs_rename_mutex`-analog for cross-dir loop
   safety). The txn engine's renames are lock-free — one MCAS to stack a shell,
@@ -95,6 +120,62 @@ fully-lock-free txn**. Headline axis stays rename fraction: as it rises, the
 seqlock engine degrades on *both* the reader path (global-retry storms) and the
 writer path (serialized renames), while the txn engine stays local and
 lock-free on both.
+
+## Results (re-swept 2026-09-30)
+
+Every `figures/dcache_*.png` comes from one sweep of the current code
+(provenance id in each CSV row's `src`; `scripts/check_dcache_figures.sh`
+checks it).  Ratios are an engine's throughput ÷ the seqlock baseline's at the
+same point; every comparison figure draws that ratio for every engine in a
+strip under its panel.
+
+**How the methodology changed, because each change moved a conclusion:**
+- the baseline's lookup is the kernel's RCU walk (hand-over-hand `d_seq`,
+  `rename_lock` only at `path_init` and on a miss); the whole-walk bracket is a
+  separate `seqlock-snapshot` arm;
+- **writers are paced** wherever readers are compared (`--rename-rate`,
+  `--churn-rate`; 12.5k ops/s per writer): flat out, each engine's readers
+  faced its own writers' rate, which differed by up to 260×;
+- the harness PRNG no longer correlates consecutive draws (plain xorshift64 +
+  `%` made each name visit 4 of 128 directories at 128 threads);
+- churn has a kernel-faithful **in-place** mode (`d_delete` to a negative +
+  `d_instantiate`, no allocation, no LRU traffic) beside the allocating one;
+- the baseline's per-directory lock is the vendored kernel `rw_semaphore`.
+
+**Readers** (184 readers, 8 writers, `dcache_s3.png`): at a realistic 10k
+renames/s every arm is at parity (1.00–1.02×).  The localized arms (per-node,
+mark, bucket lock) pull ahead as the rename rate climbs — 1.16–1.18× at 100k/s,
+1.64–1.71× at 300k/s — and seqlock's writers cannot carry 1M/s at all.  At a
+fixed 100k/s the localized arms lead 1.04–1.22× from 8 readers up.  Where
+seqlock still LEADS: positive hits on objects being renamed up to 32 readers
+(txn 0.76–0.90×, `dcache_hit.png`) and the reverse walk at 2–8 readers
+(0.62–0.93×, `dcache_dpath.png`).  readdir: txn 1.1–1.4× at 2–8 readers, 3.6× at
+32; beyond that seqlock's renamers cannot keep up (`dcache_readdir.png`).
+Directory exchanges at every height: within 0.81–1.17× at 100k/s
+(`dcache_height.png`).
+
+**Writers**: flat out, the bucket lock renames 3.8–26× the seqlock baseline
+(7–26× on file ops, 3.8–5.6× on directory ops) and txn-mark 2.2–4.7×
+(`dcache_optaxonomy.png`; exchanges at height 4.8–10× and 2.3–5.0×).  Part of that gap is the per-directory rwsem and cross-directory
+rename mutex the baseline takes (the kernel's `i_rwsem`, `s_vfs_rename_mutex`)
+and the txn designs do not need: their readdir is lock-free, so no writer has a
+reader to exclude — a legitimate improvement axis, not an accounting artifact.
+
+**Create/delete** (`dcache_churn.png`): in place — the kernel's path for a name
+removed and created again — txn-global/per-node 1.19–2.37×, bucket lock
+1.20–2.16×, txn-mark 0.98–1.78× the baseline, growing with writers; the rwsem
+is ~80% of the bucket lock's lead at 16–48 writers.  Allocating, the baseline
+leads (txn 0.60–0.87×): that path spends 39–57% of its cycles on the per-node
+LRU lock, and the MW txn engines add a descriptor per commit, which batch
+retirement recovers only at 1–4 writers (`dcache_slabroute.png`).  Readers
+under churn: within ±10% in both modes.
+
+**Controls**: the chain-strategy readers are a wash (±6%, `dcache_swmw.png`);
+the matched-name-width controls sit within ±1% (`dcache_namewidth.png`).
+
+⚠ seqlock's churn throughput swings ~25% between sessions (a contended
+sleeping lock); the lock-free engines reproduce within 1%.  Quote churn ratios
+against seqlock only from repeated runs.
 
 ## What we actually port (the RCU-relevant core)
 
@@ -127,10 +208,22 @@ Both satisfy the same `dcache.h` API (`dc_lookup_path`, `dc_add`, `dc_unlink`,
 `dc_rename`, `dc_rename_exchange`), so the harness is engine-agnostic:
 
 - **`dcache_seqlock`** — faithful kernel-style port: `hlist_bl`-equivalent
-  buckets, global `rename_lock` seqcount, per-dentry `d_seq`, RCU-walk with
-  retry + ref-walk fallback. This is the **baseline we are trying to beat and
+  buckets, global `rename_lock` seqcount, per-dentry `d_seq`, the kernel's
+  RCU-walk (hand-over-hand `d_seq`, `rename_lock` sampled at walk start and
+  consulted only on a miss).  This is the **baseline we are trying to beat and
   simplify** — the honest comparison is "can txn beat the kernel's own scheme,"
-  not "can txn beat a coarse mutex."
+  not "can txn beat a coarse mutex."  Two lookup arms, because the txn arms
+  give a stronger guarantee than the kernel's lookup: the default is the
+  kernel's fast path (pair it with txn per-node / mark, and say the txn arms
+  give more); `-DDC_SEQ_SNAPSHOT` brackets the whole forward walk on
+  `rename_lock` with the kernel's `read_seqbegin_or_lock` (same guarantee as
+  every txn arm; pair it with txn-global).  `dc_dentry_path()` is the reverse
+  walk: a line-for-line `dentry_path_raw()` port here, and the same
+  snapshot guarantee built from each txn arm's own causality mechanism there.
+  Parity is of guarantee, not of cost: the seqlock arms bump `rename_lock` on
+  every rename, file or directory, as the kernel does, while txn-global bumps
+  `rename_gen` only for directory moves -- so with file leaves the snapshot
+  arm pays for renames txn-global does not.
 - **`dcache_txn`** — **lock-free** urcu-txn port (full design:
   `rename-shell-transition.md`). Names stay **inline** on the dentry (kernel
   `d_iname` locality); the reader is a plain RCU walk with an inline name compare
@@ -152,14 +245,27 @@ Modeled on `bench_txn_3skiplist` / the `scripts/run_*.sh` + `plot_*.py` +
 
 - Build a synthetic namespace tree (fixed fan-out × depth) and warm every engine
   uniformly (warm-vs-warm — see the "prime all engines" project rule).
+- **Negative dentries (2026-09-29).**  A reader asks for a leaf name in a
+  *random* directory and each leaf lives in one, so ~99% of lookups name
+  something absent.  Until this date the bench served those as MISSES on every
+  engine — the S3 reader panels measured the miss path.  A kernel serves the
+  first one through `lookup_slow`, which caches a negative dentry, and every
+  later one as a negative HIT on the RCU fast path.  The bench now does the
+  same: a priming phase looks up every (dir, name) a reader can ask for and
+  caches a negative on each miss, a reader that misses during the run caches
+  one, and a rename onto a negative replaces it (`d_move`).  Each run prints
+  its positive / negative / absent mix; `--no-negatives` restores the legacy
+  workload.
 - `--nthreads` workers each running a mix: `--rename-frac` of ops are renames
   (disjoint subtree moves + a slice of `RENAME_EXCHANGE`), the rest are
   full-path lookups of depth `--depth`.
-- **Headline independent variable: rename fraction.** The seqlock baseline
-  should be flat-and-fast at 0% rename and fall off as rename fraction climbs —
-  on *both* the reader path (walks retry the global `rename_lock`) and the writer
-  path (renames serialize on it); the txn engine should localize both. Secondary
-  axis: core count at a fixed rename fraction.
+- **Headline independent variable: rename fraction.** The seqlock baseline's
+  writers serialize on `rename_lock`; its readers retry only when a rename
+  touches a component they use (default arm) — or any rename at all, bounded to
+  one locked retry (snapshot arm) — and pay one read of the `rename_lock` line
+  per walk.  Secondary axis: core count at a fixed rename fraction.  The
+  reverse walk (`--dpath`) is the like-for-like reader: the one operation the
+  kernel itself serves with a whole-path snapshot.
 - Metric: lookup throughput **and rename throughput** (Mops/s), plus walk-retry
   rate and rename-serialization for the seqlock engine (the mechanism behind any
   gap). Rename throughput is now a co-headline, not a footnote — the txn engine's
@@ -305,9 +411,11 @@ contended sweep. A race we can't trigger on demand we don't claim to have fixed.
 2. **Baseline** — **faithful `rename_lock` seqcount + per-dentry `d_seq` port**.
    The honest "can txn beat the kernel's actual design" comparison. A coarse
    rwlock engine may be added later only to anchor the low end of the plot.
-3. **Headline axis** — **rename fraction** at fixed cores (seqlock reader path
-   should fall off under global-retry storms; txn stays local), with core-count
-   as the secondary axis.
+   The kernel's lookup does not validate `rename_lock` on a hit; the snapshot
+   arm (`-DDC_SEQ_SNAPSHOT`) is the guarantee-matched partner, not the default.
+3. **Headline axis** — **rename fraction** at fixed cores, with core-count as
+   the secondary axis, and the reverse walk (`--dpath`) as the reader whose
+   kernel guarantee matches the txn engines'.
 
 ## References
 

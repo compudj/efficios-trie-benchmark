@@ -406,6 +406,8 @@ results below.
 
 ### S3 results (`figures/dcache_s3.png`, 2×96-core EPYC, best-of-5, conserved)
 
+> ⚠ **Superseded numbers (2026-09-30):** the numbers in this text were measured against a seqlock baseline whose lookup bracketed the whole walk on `rename_lock` — which the kernel's lookup does not do — with writers flat out, and before the `struct dcache` false-sharing fix in every engine.  The figures it references were re-swept on 2026-09-30 on the corrected methodology; for current numbers see README.md "Results" and REVIEW.md §1 "Re-swept verdict".
+
 `bench_dcache` runs the three arms — `seqlock`, `txn` (global `rename_gen`), `txn`
 (`-DDC_PER_NODE_GEN`) — in two modes, every one of 420 runs gated on namespace
 conservation (**0 failures**). Threads are pinned one-per-physical-core via an
@@ -747,6 +749,8 @@ in-neither-list transient) or threading the two edges across the stack/fold
 commits; picked at implementation time.
 
 ### readdir results (`figures/dcache_readdir.png`, 2×96-core EPYC, best-of-5, conserved)
+
+> ⚠ **Superseded numbers (2026-09-30):** the numbers in this text were measured against a seqlock baseline whose lookup bracketed the whole walk on `rename_lock` — which the kernel's lookup does not do — with writers flat out, and before the `struct dcache` false-sharing fix in every engine.  The figures it references were re-swept on 2026-09-30 on the corrected methodology; for current numbers see README.md "Results" and REVIEW.md §1 "Re-swept verdict".
 
 To make the baseline honest, the seqlock arm's `readdir` was upgraded from the
 global `mutator_lock` to a **per-directory rwsem** — the faithful kernel analogue

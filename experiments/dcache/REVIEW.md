@@ -10,6 +10,43 @@ cites them.
 
 ## 1. Verdict
 
+### Re-swept verdict (2026-09-30) — supersedes the numbers below
+
+Every figure was re-swept on the corrected methodology (README "Results"): the
+kernel's RCU walk as the baseline's lookup, writers PACED wherever readers are
+compared, the harness PRNG decorrelated, a kernel-faithful in-place churn mode,
+and the vendored kernel rwsem as the baseline's directory lock.  The multiples
+quoted in the historical verdict below (~25×, ~8–60×, ~5–7.6× at every height)
+all came from flat-out writers or the old whole-walk baseline and are void.
+What survives, measured:
+
+1. **Readers: parity at realistic rename rates, a growing lead above them.**
+   At 10k renames/s every arm is within 2% of seqlock; the localized arms lead
+   1.16–1.18× at 100k/s and 1.64–1.71× at 300k/s, where seqlock's writers stop
+   keeping up.  seqlock still wins positive hits on objects being renamed at
+   low concurrency (txn 0.76–0.90× up to 32 readers) and the reverse walk at 2–8
+   readers.  The d_seq/causality machinery is cheap in the kernel's fast path;
+   the txn win is under rename load, not at rest.
+2. **Writers: the clear win.**  Flat out the bucket lock renames 3.8–26× seqlock,
+   txn-mark 2.2–4.7×.  Part of that is the per-directory rwsem and cross-dir
+   rename mutex the txn designs dissolve (lock-free readdir leaves no reader to
+   exclude) — a legitimate axis, but it means a kernel port's gain depends on
+   what the VFS still takes around the dcache.
+3. **Create/delete: the old "txn loses churn" was the LRU.**  The allocating
+   add/unlink path spends 39–57% of its cycles on one per-node LRU lock; on the
+   path the kernel takes for same-name churn (in place) every txn arm and the
+   bucket lock beat seqlock, up to 2.4×.
+4. **Correctness found by the re-sweep:** the MW engine's exchange (two
+   delete + insert-at-head moves) made existing paths transiently ABSENT to the
+   localized readers — fixed with in-place replaces, gated by
+   `make check-xchg-absent`; the old exchange stress was vacuous (one arm, 4096
+   buckets).
+
+The architecture conclusion stands (§2): the bucket lock + SW txn hybrid is the
+best writer and matches the best reader.
+
+### Historical verdict (2026-07-31)
+
 The question was: can an RCU pseudo-transaction formulation dissolve the
 kernel dentry cache's `rename_lock` + `d_seq` machinery, on both the
 simplification and the scaling axis?  The answer decomposed into four parts,
@@ -30,6 +67,25 @@ none of which was the answer we started with:
    arms keep scaling to the full machine (~2200 Mlookups/s @184 readers,
    ~25× the seqlock baseline).  Localization is the scaling win, not the
    transaction per se.
+
+   ⛔ **CORRECTION (2026-09-29): the "~25× the seqlock baseline" is void.**
+   That baseline bracketed every lookup on `rename_lock` and retried on any
+   rename anywhere.  The kernel's RCU walk has never done that (`lookup_fast`:
+   *"Rename seqlock is not required here"*, since 2.6.38): it validates
+   `d_seq` hand-over-hand, samples `rename_lock` once at `path_init`, and
+   consults it again only on a miss.  The whole-walk bracket is what the
+   kernel reserves for its REVERSE walks (`d_path`, `dentry_path_raw`) — the
+   snapshot guarantee every txn arm gives on every lookup.  The baseline now
+   has both: the kernel's fast path (default; pairs with per-node/mark, which
+   give MORE) and `-DDC_SEQ_SNAPSHOT` (the guarantee-matched partner of
+   txn-global, with the kernel's bounded `read_seqbegin_or_lock` retry).  Two
+   more fidelity defects went with it: `rename_lock` shared a cacheline with
+   the hash geometry every hop reads (the kernel makes it
+   `__cacheline_aligned_in_smp`; txn-global's `rename_gen` had the same
+   packing), and `__d_move` took the dir rwsems INSIDE `rename_lock`'s write
+   section (the kernel's `lock_rename` takes `i_rwsem` first).  Re-swept
+   2026-09-30 -- see "Re-swept verdict" above; `scripts/check_dcache_figures.sh`
+   verifies every figure carries data from the current sources.
 
 3. **The writer story inverted twice, and the honest result is a split.**
    Making the seqlock baseline kernel-faithful on the write path (per-bucket
