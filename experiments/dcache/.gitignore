@@ -2,11 +2,16 @@
 # build output (the Makefile's binaries + *.o) or editor scratch.  Whitelist the
 # source kinds so a newly-added binary never needs a matching ignore line.
 *
+# ...but not DIRECTORIES: `*` matches them too, git never descends into an
+# excluded directory, and nothing below can re-include a file whose parent is
+# excluded -- krwsem/'s tracked sources could not be staged by path, and a new
+# source there would have been ignored silently.  Files inside a subdirectory
+# still go through the whitelist below.
+!*/
 !*.c
 !*.h
 !*.md
 !Makefile
 !.gitignore
-!figures/
 figures/*
 !figures/.gitkeep
