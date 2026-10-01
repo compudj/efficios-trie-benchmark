@@ -295,10 +295,12 @@ static void run_bench(int nr_readers, double *read_mops, double *write_kops)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	uint64_t t0 = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	bench_perf_ctl("enable");	/* count only the timed window */
 	__atomic_store_n(&start_flag, 1, __ATOMIC_RELEASE);
 
 	usleep(DURATION_SEC * 1000000);
 	__atomic_store_n(&stop_flag, 1, __ATOMIC_RELEASE);
+	bench_perf_ctl("disable");
 
 	for (int i = 0; i < nr_readers + (no_writer ? 0 : bench_nr_writers); i++)
 		pthread_join(threads[i], NULL);
