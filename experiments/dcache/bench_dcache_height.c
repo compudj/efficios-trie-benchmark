@@ -115,6 +115,7 @@
 #include "dcache.h"
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
+#include "dcache_bench_setup.h"
 
 extern unsigned long dc_seq_walk_retries __attribute__((weak));
 
@@ -671,6 +672,9 @@ int main(int argc, char **argv)
 		exit(2);
 	}
 
+	/* Setup memory lives on the first worker's node, from exec on (see
+	 * dcache_bench_setup.h: why not a CPU pin, and why not only here). */
+	dc_bench_setup_on_cpu(cpulist ? cpulist[0] : 0, argv);
 	rcu_register_thread();
 	g_dc = dc_create(nbuckets);
 
@@ -695,6 +699,7 @@ int main(int argc, char **argv)
 
 	tid = calloc(nthreads, sizeof(*tid));
 	wa = calloc(nthreads, sizeof(*wa));
+	dc_bench_setup_done();		/* workers allocate node-locally, as before */
 	for (i = 0; i < nthreads; i++) {
 		wa[i].id = i;
 		wa[i].cpu = cpulist ? cpulist[i] : i * cpustride;

@@ -89,6 +89,7 @@
 #include "dcache.h"
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
+#include "dcache_bench_setup.h"
 
 extern const int dc_lookup_id_is_address __attribute__((weak));
 static inline int id_is_address(void)
@@ -922,6 +923,9 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 	total_slots = nwriters * slots;
 
+	/* Setup memory lives on the first worker's node, from exec on (see
+	 * dcache_bench_setup.h: why not a CPU pin, and why not only here). */
+	dc_bench_setup_on_cpu(cpulist_len ? cpulist[0] : 0, argv);
 	rcu_register_thread();
 	g_dc = dc_create(nbuckets);
 	if (!g_dc) {
@@ -979,6 +983,7 @@ int main(int argc, char **argv)
 		ra[i].seed = 0xdeadbeefULL ^ ((uint64_t) (i + 1) * 0x2545F4914F6CDD1DULL);
 	}
 
+	dc_bench_setup_done();		/* workers allocate node-locally, as before */
 	for (i = 0; i < nwriters; i++)
 		pthread_create(&wt[i], NULL, writer_fn, &wa[i]);
 	signal(SIGTERM, stats_signal);

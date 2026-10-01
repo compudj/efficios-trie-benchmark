@@ -103,6 +103,7 @@
 #include "dcache.h"
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
+#include "dcache_bench_setup.h"
 
 /*
  * Weak ref: defined by the seqlock engine, absent from the txn engine.  Reading
@@ -129,7 +130,8 @@ static int    nthreads     = 4;
 static double rename_frac  = 0.10;	/* fraction of ops that are renames */
 static int    ndirs        = 8;		/* rename-target dirs d0..d(ndirs-1) */
 static int    depth        = 2;		/* leaf path depth (>=2) */
-static int    leaves       = 16;	/* leaves owned per thread */
+static int    leaves       = 16;	/* leaves owned per thread (per writer
+					 * under writers_own) */
 static long   duration_ms  = 1000;
 static int    cpustride    = 1;
 /*
@@ -211,8 +213,7 @@ static double rename_rate  = 0.0;
  * --readdir (split mode only): the reader threads enumerate a random target dir
  * (dc_readdir of /pfx/d{k}) instead of a full-path leaf lookup.  To keep the
  * directory size -- and thus the per-readdir cost -- INDEPENDENT of the reader
- * count, the namespace is owned only by the writers: g_nnames = nwriters*leaves
- * leaves total, so scaling the readers does not grow the dirs they list.
+ * count, the namespace is owned only by the writers (writers_own below).
  */
 static int    readdir_mode = 0;
 /*
@@ -221,6 +222,22 @@ static int    readdir_mode = 0;
  * behind getcwd / readlink(/proc/PID/fd/N).  Works in split or homogeneous mode.
  */
 static int    dpath_mode   = 0;
+/*
+ * WRITER-OWNED NAMESPACE (role-split --readdir, --dpath and --hit-current, with
+ * at least one writer): the readers own no leaves, and the writers own the whole
+ * namespace, g_nnames = nwriters*leaves, writer w owning [w*leaves ..).  So the
+ * namespace does not grow with the reader count, and every leaf a dpath or hit
+ * reader targets is one the writers are moving.
+ *
+ * ⛔ Until 2026-09-30 only readdir did this.  dpath and hit readers each owned
+ * `leaves` names that NOTHING ever moves and drew their target from all of
+ * them, so only nwriters/nthreads of the targets moved: 80% at 2 readers + 8
+ * writers, 20% at 32, 4% at 184.  The reader axis of those panels confounded
+ * the reader count with the share of targets in motion, and the growing set of
+ * static leaves grew each reader's working set too (L1 misses per hit 3.5 ->
+ * 5.5 from 2 to 32 readers, every engine).
+ */
+static int    writers_own  = 0;
 /*
  * Negative dentries (default ON for lookup readers; --no-negatives restores the
  * legacy workload).  A reader asks for a leaf name in a RANDOM dir, and a leaf
@@ -240,8 +257,9 @@ static int    negatives    = 1;
  * --hit-current: the POSITIVE-hit reader.  Each owner publishes every token's
  * CURRENT (dir, name) in g_cur[] after each successful move or same-dir
  * rename (an exchange trades the objects behind two names, not the names), and
- * a reader looks up a random token's current path.  So nearly every lookup is a
- * positive hit on an object the writers are moving right now -- the dense
+ * a reader looks up a random token's current path.  Every token is a writer's
+ * (writers_own), so nearly every lookup is a positive hit on an object the
+ * writers are moving right now, at any reader count -- the dense
  * reader/rename interaction the probing workload (1-2% of lookups on a moving
  * leaf) only grazes: d_seq retries on seqlock, shell resolution on txn.  The
  * read of g_cur[] is racy by design; a stale one names a vacated path, misses,
@@ -254,7 +272,8 @@ static int    g_nnames     = 0;		/* effective leaf namespace size */
 /*
  * Names [0, g_static_names) are owned by readers, which never rename, so after
  * priming a lookup of one can only miss if priming left a hole or something
- * dropped the negative: the miss counter for them should read 0.
+ * dropped the negative: the miss counter for them should read 0.  Zero under
+ * writers_own (the readers own nothing).
  */
 static int    g_static_names = 0;
 
@@ -548,15 +567,15 @@ static void *worker(void *arg)
 	 * placement would shift with W and confound the reader-throughput curve. */
 	int role = (nwriters >= 0) ? (me->id >= nthreads - nwriters) : -1;
 	/*
-	 * Leaf ownership.  Normally every thread owns leaves [id*leaves ..).  In
-	 * --readdir mode the readers own nothing (they only list dirs); the writers
-	 * own the whole fixed namespace, writer w (the w'th of the last nwriters
-	 * ids) owning [w*leaves ..).  So the namespace -- and dir sizes -- do not
-	 * grow with the reader count.
+	 * Leaf ownership.  Normally every thread owns leaves [id*leaves ..).
+	 * Under writers_own the readers own nothing; the writers own the whole
+	 * fixed namespace, writer w (the w'th of the last nwriters ids) owning
+	 * [w*leaves ..).  So the namespace -- and dir sizes -- do not grow with
+	 * the reader count.
 	 */
-	int owns = !(readdir_mode && role == 0);
-	int base = readdir_mode ? (me->id - (nthreads - nwriters)) * leaves
-				: me->id * leaves;
+	int owns = !(writers_own && role == 0);
+	int base = writers_own ? (me->id - (nthreads - nwriters)) * leaves
+			       : me->id * leaves;
 	long long ops = 0;
 	struct pace pace;
 	int i;
@@ -930,12 +949,14 @@ static void usage(const char *p)
 	    "                     aggregate (\"250k\", \"1M\"); default unpaced.\n"
 	    "  --hit-current   => readers look up each leaf's CURRENT path (published\n"
 	    "                     by its owner): positive hits on moving objects.\n"
+	    "                     In split mode only writers own the namespace.\n"
 	    "  --no-negatives  => (lookup readers) skip the negative-dentry priming\n"
 	    "                     and the cache-on-miss: the legacy workload, whose\n"
 	    "                     lookups are ~99%% misses.\n"
 	    "  --dpath         => readers report a random leaf's CURRENT path from a\n"
 	    "                     handle pinned at seed time (dc_dentry_path: the\n"
 	    "                     kernel's dentry_path_raw) instead of a lookup.\n"
+	    "                     In split mode only writers own the namespace.\n"
 	    "  --op-mix rename=A,move=B,exchange=C\n"
 	    "                  => weight the leaf ops of the taxonomy.  `rename` is\n"
 	    "                     SAME-dir (the token flips between its two reserved\n"
@@ -1038,13 +1059,17 @@ int main(int argc, char **argv)
 		depth = DC_PATH_MAX;		/* leave room for d{k} + leaf */
 	g_prefix_len = depth - 2;
 	rename_thr = (unsigned int) (rename_frac * (double) FRAC_ONE + 0.5);
-	/* In --readdir mode only the writers own leaves, so the namespace (and the
-	 * dirs the readers list) stays fixed as the reader count scales. */
-	g_nnames = readdir_mode ? nwriters * leaves : nthreads * leaves;
-	g_static_names = (nwriters >= 0 && !readdir_mode)
+	/* Readers that target the writers' objects own no leaves (writers_own).
+	 * With zero writers nothing moves and the readers keep their own names. */
+	writers_own = nwriters >= 1 && (readdir_mode || dpath_mode || hit_mode);
+	g_nnames = writers_own ? nwriters * leaves : nthreads * leaves;
+	g_static_names = (nwriters >= 0 && !writers_own)
 		? (nthreads - nwriters) * leaves : 0;
 	total = g_nnames;
 
+	/* Setup memory lives on the first worker's node, from exec on (see
+	 * dcache_bench_setup.h: why not a CPU pin, and why not only here). */
+	dc_bench_setup_on_cpu(cpulist ? cpulist[0] : 0, argv);
 	rcu_register_thread();
 	g_dc = dc_create(nbuckets);
 	g_final_dir = calloc(total, sizeof(*g_final_dir));
@@ -1119,6 +1144,7 @@ int main(int argc, char **argv)
 
 	tid = calloc(nthreads, sizeof(*tid));
 	wa = calloc(nthreads, sizeof(*wa));
+	dc_bench_setup_done();		/* workers allocate node-locally, as before */
 	for (i = 0; i < nthreads; i++) {
 		wa[i].id = i;
 		wa[i].cpu = cpulist ? cpulist[i] : i * cpustride;
