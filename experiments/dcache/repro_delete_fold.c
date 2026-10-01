@@ -164,8 +164,10 @@ static void *deleter(void *arg)
 	(void) arg;
 	dc_register_thread();
 
-	/* Wait until the fold has READ the host's word but not yet written it. */
-	sem_wait(&g_in_transfer);
+	/* Wait until the fold has READ the host's word but not yet written it --
+	 * RCU-offline: the fold runs only after a grace period this thread
+	 * would otherwise hold off for ever. */
+	sem_wait_quiescent(&g_in_transfer);
 
 	r = dc_delete(g_dc, path_of(&p, "/d/g"));
 	if (r != 0)

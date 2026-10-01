@@ -81,7 +81,7 @@ ENGINE   ?= seqlock
 HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_rand.h dcache_bench_setup.h dcache_bench_run.h dcache_node.h \
 	    dcache_bench_pace.h $(URCU_DEP)
 
-.PHONY: check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
+.PHONY: check-shared check-shared-tsan check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
 	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan \
@@ -262,6 +262,68 @@ xchg-tsan: stress_dcache_xchg.c dcache_txn.c $(HDRS)
 	  stress_dcache_xchg.c dcache_txn.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_xchg_tsan 4 4 6 8 15000
+
+# SHARED-RENAMER stress (stress_dcache_shared.c): several writers rename the
+# SAME leaves, each with its own call_rcu worker, so the folds of one entry run
+# CONCURRENTLY -- a TRANSFER against a re-rename or an unlink of the same entry,
+# many demoted shells' frees against the host they point at.  Every other
+# harness gives an object one owner, so those pairs never ran (and it is what
+# found the race that retired the transition chain, 2026-10-01).  Each
+# txn-based arm, under ASan, in the reverse-walk arm and the
+# rename+unlink+re-add arm (-DSTRESS_UNLINK).
+#
+# TWO leaf counts, because each is blind where the other is not.  4 leaves
+# piles up demoted shells (every leaf is re-renamed long before its fold runs),
+# but for the same reason a fold there practically never finds its shell still
+# the top: measured, 4 TRANSFERs in 160k folds, all after the writers stopped
+# -- vacuous for the TRANSFER-vs-rename/unlink race.  1024 leaves gives
+# thousands of TRANSFERs racing live writers (a bucket-lock fold that skipped
+# its locked recheck failed 10/10 there, 1/10 at 4 leaves; 4 of the 10 by
+# hanging).  The timeout is part of the check: a corrupted hash list can hang
+# instead of crashing.
+SHARED_ITERS ?= 20000
+SHARED_TIMEOUT ?= 300
+check-shared: stress_dcache_shared.c dcache_txn.c dcache_bucketlock.c $(HDRS) | check-lib
+	@set -e; for arm in txn_global::dcache_txn.c \
+	    txn_pernode:-DDC_PER_NODE_GEN:dcache_txn.c \
+	    txn_mark:-DDC_MARK_GEN:dcache_txn.c \
+	    bucketlock:-DDC_MARK_GEN:dcache_bucketlock.c; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
+	  echo "== check-shared: $$name"; \
+	  $(CC) $(ASANFLAGS) $$defs $(HCPP) -o stress_shared_$$name \
+	    stress_dcache_shared.c $$src $(LDFLAGS) $(LDLIBS); \
+	  $(CC) $(ASANFLAGS) $$defs -DSTRESS_UNLINK $(HCPP) -o stress_shared_unlink_$$name \
+	    stress_dcache_shared.c $$src $(LDFLAGS) $(LDLIBS); \
+	  for leaves in 4 1024; do \
+	    timeout $(SHARED_TIMEOUT) ./stress_shared_$$name 8 4 8 $$leaves $(SHARED_ITERS); \
+	    timeout $(SHARED_TIMEOUT) ./stress_shared_unlink_$$name 8 2 8 $$leaves $(SHARED_ITERS); \
+	  done; \
+	done
+
+# The same, under TSAN (needs the compiler-builtins liburcu; see stress-tsan).
+check-shared-tsan: stress_dcache_shared.c dcache_txn.c dcache_bucketlock.c $(HDRS) | check-lib
+	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see stress-tsan"; \
+	  exit 1; }
+	@set -e; for arm in txn_global::dcache_txn.c \
+	    txn_pernode:-DDC_PER_NODE_GEN:dcache_txn.c \
+	    txn_mark:-DDC_MARK_GEN:dcache_txn.c \
+	    bucketlock:-DDC_MARK_GEN:dcache_bucketlock.c; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
+	  echo "== check-shared-tsan: $$name"; \
+	  $(CC) $(TSANFLAGS) $$defs $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
+	    -o stress_shared_$${name}_tsan stress_dcache_shared.c $$src \
+	    -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS); \
+	  $(CC) $(TSANFLAGS) $$defs -DSTRESS_UNLINK $(KEEPID) $(TSAN_SLAB_CPP) -I$(URCU_TSAN_INC) -I. \
+	    -o stress_shared_unlink_$${name}_tsan stress_dcache_shared.c $$src \
+	    -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS); \
+	  for leaves in 4 1024; do \
+	    TSAN_OPTIONS="halt_on_error=0 history_size=4" timeout $(SHARED_TIMEOUT) \
+	      ./stress_shared_$${name}_tsan 4 2 8 $$leaves 5000; \
+	    TSAN_OPTIONS="halt_on_error=0 history_size=4" timeout $(SHARED_TIMEOUT) \
+	      ./stress_shared_unlink_$${name}_tsan 4 2 8 $$leaves 5000; \
+	  done; \
+	done
 
 # An exchange's two names exist before AND after its commit, so a lockless
 # lookup of either must never come back ABSENT.  Two detectors, because each is
@@ -1078,4 +1140,4 @@ clean:
 	  mixed_cycle_bucketlock_asan stress_dcache_bucketlock_tsan stress_dcache_xchg_bucketlock_tsan \
 	  stress_dcache_dirs_bucketlock_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
-	  bench_dcache_churn_txn_mark
+	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl
