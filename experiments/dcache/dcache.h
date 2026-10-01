@@ -111,11 +111,10 @@
 /*
  * -DDC_DEBUG_NAME_GUARD: make the fold TRANSFER's plain d_iname copy checkable.
  *
- * The fold's TRANSFER hands a node's identity one hop down the transition chain
- * with a plain 40/48-byte struct copy into the successor.  It is safe for
- * exactly one reason: the successor is the UNINDEXED content host at that
- * moment, and no reader reads a non-top node's name -- match and pos/neg come
- * off the write-once top.  That reason is an invariant enforced by a comment,
+ * The fold's TRANSFER hands a shell's identity back to its content host with a
+ * plain 40/48-byte struct copy.  It is safe for exactly one reason: the host
+ * is UNINDEXED at that moment, and no reader reads a non-top node's name --
+ * match and pos/neg come off the write-once top.  That reason is an invariant enforced by a comment,
  * and it is the last thing standing between the fold and a data race; it has
  * already had to be re-argued twice.  A new reader path that reaches a node by
  * any route other than an index scan -- d_host, d_fwd, a child pointer -- and

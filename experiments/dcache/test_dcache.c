@@ -361,9 +361,9 @@ static void test_negative_dentries(void)
  * is still outstanding, then populated.  This is the misdirection the whole
  * experiment is about, in its sharpest single-threaded form: two distinct
  * directories legitimately carry the same name at the same time -- the old one
- * living on a transition chain under its NEW parent, the new one freshly
- * indexed under the OLD parent -- and a file added under the new one must not
- * follow the old one when the fold finally collapses the chain.
+ * named by a pending shell under its NEW parent, the new one freshly indexed
+ * under the OLD parent -- and a file added under the new one must not follow
+ * the old one when the fold finally hands the name back to the host.
  */
 static void test_recreate_over_moved_dir(void)
 {

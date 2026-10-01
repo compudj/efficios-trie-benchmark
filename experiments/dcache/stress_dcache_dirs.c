@@ -35,9 +35,10 @@
  * defaults -- many movers over few anchors (K<=4) AND many cycle pairs -- can
  * collapse throughput.  The async fold is grace-period-bound; under saturating
  * escalation the worker threads park in the engine's fair-mutex lane while
- * RCU-online (not quiescing), grace periods stall, folds stop draining,
- * transition chains grow without bound (chain depth into the thousands), and
- * renames go O(chain) -> a feedback collapse.  No cycle ever forms and every
+ * RCU-online (not quiescing), grace periods stall, folds stop draining, and
+ * demoted shells pile up without bound.  (Under the transition chain this
+ * design had until 2026-10-01, chain depth reached the thousands and renames
+ * went O(chain) -> a feedback collapse.)  No cycle ever forms and every
  * completing run conserves; it is the GP-bound-fold property (see the design
  * note) tripped by lane-parking rather than a blocked main thread.
  */
@@ -62,7 +63,7 @@
  * -- many movers over FEW anchors (K<=4) AND many cycle pairs -- drives the
  * async fold's grace-period-bound reclamation into collapse: worker threads park
  * in the engine's fair-mutex escalation lane (RCU-online, not quiescing), so
- * grace periods stall, folds stop draining, transition chains grow without
+ * grace periods stall, folds stop draining, demoted shells pile up without
  * bound, and rename throughput craters.  That is a LIVENESS cliff (the same
  * GP-bound-fold property documented for the leaf harness, here tripped by
  * lane-parking rather than a blocked main), NOT a correctness failure -- no

@@ -12,26 +12,25 @@
  * concurrent walker misdirected by a mid-walk rename) with the global rename
  * generation counter (see dc_lookup / stack_shell and repro_dcache.c), and
  * lands the ASYNC, per-node call_rcu fold: a rename now stacks a shell in ONE
- * MCAS commit (both indexes + gen bump + demote) and defers compression to a
- * fold worker a grace period later, which either transfers the identity one hop
- * down (still top) or splices the node out (demoted to a middle relay by a
- * racing re-rename) -- both over a transacted, doubly linked chain, so
- * concurrent folds stay consistent.  The cross-dir loop check is now lock-free
+ * MCAS commit (both indexes + gen bump + demote) and defers the rest to a fold
+ * worker a grace period later, which either moves the shell's name into the
+ * host (the shell is still the named top) or frees the shell (a later rename or
+ * an unlink removed it).  There is no chain between top and host.  The cross-dir
+ * loop check is now lock-free
  * too: d_parent is transacted, and a cross-parent rename folds the whole
  * new_parent->root ancestry walk into its commit's validate set via
  * urcu_txn_load_validate() (reject -EINVAL if the victim appears), so two moves
  * that would jointly form a cycle cannot both commit (see stack_shell).  Unlink
- * works mid-fold too: it removes the current named top from both indexes without
- * demoting it, which the pending fold reads as an unlink and RECLAIMs the whole
- * orphaned chain (see fold()/dc_unlink); and the atomic exchange composes TWO
- * shell stacks -- both index del/insert pairs, both loop checks + reparents -- in
- * ONE commit (dc_rename_exchange).  Chain DEPTH is nobody's fast-path concern:
- * every access resolves the content host in ONE hop through the write-once
- * d_host skip pointer (host_of_rcu), so readers, readdir, walk_rec, the folds and
- * the writers are all O(1) in chain depth and NOTHING traverses a chain.  Depth
- * therefore costs memory, not time, and the async fold -- which call_rcu already
- * batches per grace period -- drains it at the rate renames create it (steady
- * state ~ churn x GP latency).  A synchronous fold-ahead relief valve used to cap
+ * works mid-fold too: it removes the current named top and frees the host; a
+ * shell top is left to its pending fold, which finds it out of the index and
+ * frees it (see fold()/dc_unlink).  The atomic exchange composes TWO shell stacks
+ * -- both index del/insert pairs, both loop checks + reparents -- in ONE commit
+ * (dc_rename_exchange).  Readers reach the host in ONE hop through the
+ * write-once d_host skip pointer (host_of_rcu), the reverse walk reaches the top
+ * through the host's d_top, and demoted shells cost memory, not time: the async
+ * fold -- which call_rcu already
+ * batches per grace period -- frees them at the rate renames create them
+ * (steady state ~ churn x GP latency).  A synchronous fold-ahead relief valve used to cap
  * depth for the GP-stalled case; it is RETIRED (see the git history): reaching
  * its trigger cost the writer an O(chain) walk INSIDE its read-side section,
  * which stopped it quiescing, which stalled the very grace periods the fold needs
@@ -82,65 +81,37 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #include <urcu/rcu-txn-sw.h>		/* bucket lock: single-writer flip-proxy commit */
 #include <urcu/rcu-txn-sw-hlist.h>	/* bucket lock: SW hlist node type + _prepare forms */
 /*
- * Chain-serialization strategy (mutually exclusive):
- *   default          SW enqueue + per-host FOLD LOCK dequeue (== DC_CHAIN_FOLDLOCK,
- *                    the DEFAULT): the folds take a per-host lock and rewrite the
- *                    chain with PLAIN stores; the demote does NOT take it, so the
- *                    producer never contends -- only fold workers do.  Best of the
- *                    three: nearly matches the chain lock uncontended and scales
- *                    past both alternatives (figures/dcache_swmw.png).
- *   DC_CHAIN_LOCK    original per-host CHAIN LOCK covering demote + folds; SW index
- *                    commit (the reference build).
- *   DC_CHAIN_SWMW    SW enqueue + MW dequeue: the chain rides a mixed SW/MW commit,
- *                    chain lock retired (lock-free folds; scales, but the MW
- *                    descriptor cost loses uncontended).
- * The two mixed variants (default/FOLDLOCK and SWMW) share the SW-enqueue front-end
- * (DC_CHAIN_MIXED) and the mixed reader resolve; they differ only in the fold.
+ * One build.  The chain-serialization variants (DC_CHAIN_LOCK, DC_CHAIN_SWMW,
+ * DC_SWMW_PAD, the DC_CHAIN_FOLDLOCK default) compared ways of serializing the
+ * folds of a transition chain.  There has been no chain since 2026-10-01 (see
+ * fold()) -- a fold now only touches the index and the host's d_top, under the
+ * bucket lock it already takes -- so they are retired.  The index commits
+ * through the canonical urcu_txn_* front-end's SW records (store_sw).
  */
-#if (defined(DC_CHAIN_LOCK) + defined(DC_CHAIN_SWMW) + defined(DC_CHAIN_FOLDLOCK)) > 1
-# error "DC_CHAIN_LOCK / DC_CHAIN_SWMW / DC_CHAIN_FOLDLOCK are mutually exclusive"
+#if defined(DC_CHAIN_LOCK) || defined(DC_CHAIN_SWMW) || defined(DC_SWMW_PAD) || \
+    defined(DC_CHAIN_FOLDLOCK)
+# error "the bucket-lock chain variants are retired: there is no chain to serialize"
 #endif
-#if !defined(DC_CHAIN_LOCK) && !defined(DC_CHAIN_SWMW)
-# define DC_CHAIN_FOLDLOCK 1	/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
-#endif
-#if defined(DC_CHAIN_SWMW) || defined(DC_CHAIN_FOLDLOCK)
-# define DC_CHAIN_MIXED 1	/* SW enqueue via the mixed engine; reader resolves mixed records */
-#endif
-/* The mixed engine is the canonical urcu_txn_* front-end (<urcu/rcu-txn.h>,
- * included above); no extra include is needed for a DC_CHAIN_MIXED build. */
 
 #include "dcache.h"
 #define DC_TXN_STATS_IMPL
 #include "dcache_txn_stats.h"
 
 /*
- * ---- engine selector: pure single-writer SW vs mixed SW/MW -----------------
+ * ---- engine: the mixed front-end's SW records ------------------------------
  *
- * The DEFAULT bucket lock build drives the pure single-writer engine (rcu-txn-sw.h): the
- * index commits SW under the bucket lock and the transition chain (d_fwd/d_back)
- * is serialized by a SEPARATE per-host chain lock.  A MIXED build (DC_CHAIN_SWMW /
- * DC_CHAIN_FOLDLOCK) drives the mixed engine (rcu-txn.h): the index and the
- * demote commit SW (store_sw, bucket-locked) in ONE commit; the two variants
- * differ only in how the FOLD removes nodes (MW records vs a per-host fold lock).
- * add/unlink stay plain locked stores on ALL builds.  The SW proxy and the MW
- * record share a resolve header, so ONE reader (dc_proxy_resolve) serves both;
- * only the record helpers, the escalation domain, and the shell ops differ.
+ * The shell ops (stack, exchange, the fold's TRANSFER) commit SW records
+ * (store_sw, under the bucket locks) through the canonical urcu_txn_* front-end
+ * (rcu-txn.h); add/unlink stay plain locked stores.  The front-end resolves SW
+ * proxies and MW records through one header, so ONE reader (dc_proxy_resolve)
+ * serves both.
  */
-#ifdef DC_CHAIN_MIXED
 typedef struct urcu_txn	dc_swtxn_t;
 typedef struct urcu_txn_domain	dc_domain_t;
 #define dc_sw_record(txn, slot, o, n, tag) \
 	urcu_txn_store_sw((txn), (slot), (o), (n), (tag))
 #define dc_proxy_resolve(p) \
 	urcu_txn_resolve_record((struct urcu_txn_record *) (p))
-#else
-typedef struct urcu_txn_sw_txn		dc_swtxn_t;
-typedef struct urcu_txn_domain		dc_domain_t;
-#define dc_sw_record(txn, slot, o, n, tag) \
-	urcu_txn_sw_record((txn), (slot), (o), (n), (tag))
-#define dc_proxy_resolve(p) \
-	urcu_txn_sw_proxy_get((struct urcu_txn_sw_proxy *) (p))
-#endif
 
 #ifdef DC_TEST_HOOKS
 /*
@@ -155,7 +126,7 @@ void (*dc_test_walk_hook)(int depth);
  * Test-only rendezvous fired in dc_rename AFTER the shell is stacked (old top
  * demoted, out of every index) and BEFORE its fold is queued.  A repro pauses a
  * writer here to interpose a concurrent re-rename of the same entry and exercise
- * the fold's top-vs-middle-relay branch.  NULL and never compiled into normal
+ * the fold's still-top-vs-demoted branch.  NULL and never compiled into normal
  * builds.
  */
 void (*dc_test_fold_hook)(void);
@@ -264,56 +235,34 @@ struct dentry {
 #endif
 
 	/*
-	 * ---- cold cache-line layout (grouped around the FOLD LOCK) -------------
+	 * ---- cold cache-line layout -------------------------------------------
 	 * CL0 above is the reader-hot line (identity + mark).  The cold fields are
-	 * split so the fold lock's line carries ONLY fold-side and read-only words,
-	 * never a field another core reads concurrently with a fold:
-	 *   CL1 (the fold-lock line): d_fwd, d_back (the chain a fold rewrites under
-	 *     the lock), d_fold_lock, d_dc (read-only), d_inode/d_isdir (set at
-	 *     creation), d_rcu (reclaim).  A fold acquires the lock and mutates the
-	 *     chain within one line; the only other writer of it is the demote
-	 *     (d_back), co-located per-CPU with the fold worker, so the line stays
-	 *     local.
+	 * split so that CL1 carries ONLY writer-side and read-only words, never a
+	 * field another core reads concurrently:
+	 *   CL1: d_fwd (write-once), d_top (written by the demote and a fold's
+	 *     TRANSFER, both under the top's bucket lock), d_dc (read-only),
+	 *     d_inode/d_isdir (set at creation), d_rcu (reclaim).
 	 *   CL2 (the structural-reader line): d_parent + d_moving (read cross-core by
 	 *     a peer mover's cycle check), d_child_head + d_sib + the d_id/d_host
-	 *     union (read cross-core by readdir / host_of_rcu).  Kept OFF the fold-lock
-	 *     line so a readdir or a peer's ancestry walk does not bounce it.
+	 *     union (read cross-core by readdir / host_of_rcu).  Kept off CL1 so a
+	 *     readdir or a peer's ancestry walk does not bounce the writer's line.
+	 * (CL1 used to be "the fold-lock line": it held a per-host lock that
+	 * serialized a chain's folds; there is no chain since 2026-10-01, so no
+	 * lock -- see fold().)
 	 *
-	 * Transition chain, doubly linked and TRANSACTED (the splice MCASes both
-	 * links atomically so concurrent folds stay consistent).  d_fwd is read by
-	 * readers following a chain -- via bl_read(), since it can briefly
-	 * hold a commit descriptor; d_back is read by fold workers and by the
-	 * reverse walk (dc_dentry_path's named_top_rcu).  Both NULL
-	 * in steady state (settled content host = its own top, no chain).
+	 * d_fwd: WRITE-ONCE.  A shell's points at its host (the value d_host holds),
+	 * a host's is NULL: the host/shell discriminator of the non-HOT1CL layouts,
+	 * and what lru_evict_settled() uses to skip shells.  No longer a chain link.
+	 *
+	 * d_top, meaningful on the HOST only: its entry's current named top -- the
+	 * shell that names it -- or NULL while the host names its entry itself.  A
+	 * stack or exchange moves it to the new shell, a fold's TRANSFER resets it
+	 * to NULL, together with the index change; so the reverse walk reads an
+	 * entry's name in two loads and an indexed shell is always its host's
+	 * d_top.  (Until 2026-10-01: a doubly linked d_fwd/d_back chain.)
 	 */
-	struct dentry *d_fwd;			/* down toward content host; NULL at host */
-	struct dentry *d_back;			/* up toward named top;     NULL at top  */
-#ifndef DC_CHAIN_SWMW
-	/*
-	 * Per-host serialization word for the transition chain (d_fwd/d_back).  Its
-	 * ROLE depends on the build:
-	 *   DEFAULT (fold-lock dequeue): the per-host FOLD LOCK -- only the folds
-	 *     (dequeue) take it and rewrite the chain with plain reader-atomic stores;
-	 *     the demote (enqueue) does NOT, so the producer never contends on it --
-	 *     only fold workers do.
-	 *   DC_CHAIN_LOCK (legacy): the classic per-host CHAIN LOCK -- the demote AND
-	 *     all three fold branches take it, so every chain mutation is a plain
-	 *     store, at the cost of coupling the producer with the folds.
-	 *   DC_CHAIN_SWMW retires it (the chain rides the mixed commit as MW records,
-	 *     -8 B) -- absent in that build.
-	 * One lock per chain: all its nodes share this address-stable tail host
-	 * (host_of_rcu).  Taken under rcu_read_lock() so the host cannot be reclaimed
-	 * while it is held.  Kept DISTINCT from d_moving (the cross-dir cycle Dekker
-	 * flag) so a fold does not trip a concurrent move's ancestry check.  Cold. */
-	unsigned long d_fold_lock;
-#elif defined(DC_SWMW_PAD)
-	/*
-	 * PERF A/B CONTROL only (-DDC_SWMW_PAD): restore the 8 bytes the retired
-	 * chain lock freed, at the SAME offset, so a same-size (176 B) A/B isolates
-	 * the lock-free-chain MECHANISM from the -8B FOOTPRINT.  Never read/written.
-	 */
-	unsigned long d_swmw_pad;
-#endif
+	struct dentry *d_fwd;			/* write-once: shell -> host; NULL on a host */
+	struct dentry *d_top;			/* host: current named top; NULL = itself */
 	struct dcache *d_dc;			/* owner, so a call_rcu fold reaches the domain */
 	int d_inode;
 	/*
@@ -360,12 +309,17 @@ struct dentry {
 	/*
 	 * ---- CL2: the structural-reader line (see the cold-layout note above) --
 	 * Every field here is read cross-core by an operation OTHER than a fold, so
-	 * it is kept off the fold lock's line.
+	 * it is kept off CL1.
 	 */
 
 	/* writer-side bookkeeping.  d_parent + d_moving are read cross-core by a peer
-	 * mover's ancestry cycle check; keep them ADJACENT so a walk hop reads both. */
-	struct dentry *d_parent;		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
+	 * mover's ancestry cycle check; keep them ADJACENT so a walk hop reads both.
+	 * ALIGNED: this is where CL2 starts, and it must not depend on CL1 summing
+	 * to 64 bytes -- removing the 8-byte fold lock (2026-10-01) slid d_parent
+	 * onto CL1, splitting it from d_moving.  (No benchmark here moved either
+	 * way; the alignment keeps the layout the comments describe.) */
+	struct dentry *d_parent		/* logical parent; TRANSACTED (DC_PARENT_TAG) */
+		__attribute__((aligned(64)));
 	/*
 	 * MOVE-IN-PROGRESS flag (cross-dir cycle prevention).  A cross-parent move
 	 * sets this on its host before validating the ancestry, and clears it after
@@ -383,7 +337,7 @@ struct dentry {
 	 * rcu-txn-hlist, mutated by MCAS and traversed under RCU.  d_child_head
 	 * heads THIS node's children; d_sib links this node into its parent's
 	 * child-hlist.  Distinct from d_hash (the name-bucket link).  Read cross-core
-	 * by readdir, so on CL2 -- off the fold lock's line.
+	 * by readdir, so on CL2 -- off CL1.
 	 */
 	struct urcu_txn_sw_hlist_head d_child_head;
 	struct urcu_txn_sw_hlist_node d_sib;
@@ -394,8 +348,8 @@ struct dentry {
 	 * STABLE per-node property d_fwd==NULL (host) vs !=NULL (shell) -- a node is
 	 * born a host or a shell and never crosses over, so each node only ever
 	 * touches ONE member (no type-punning).  A reader resolves the host in O(1)
-	 * with host_of_rcu().  The shell's d_host is WRITE-ONCE (the tail is fold-
-	 * invariant), so it's a plain rcu_dereference.  This reuses the old
+	 * with host_of_rcu().  The shell's d_host is WRITE-ONCE (a fold never moves
+	 * the host), so it's a plain rcu_dereference.  This reuses the old
 	 * "cosmetic" shell d_id slot -- shells never needed their own id (readers use
 	 * the host's) and hosts never need a self skip pointer.  (Under DC_HOT1CL the
 	 * union is hoisted onto the hot line above instead.)
@@ -424,10 +378,10 @@ struct dentry {
 	 *
 	 * So these links must not share a line with anything another core touches
 	 * for a different reason -- and BOTH existing cold lines fail that test:
-	 *   CL1 is the fold-lock line, whose stated contract is "ONLY fold-side
-	 *       and read-only words, never a field another core reads concurrently
-	 *       with a fold" -- and it holds d_fwd, which chain-following READERS
-	 *       resolve;
+	 *   CL1 is the writer line, whose stated contract is "ONLY writer-side
+	 *       and read-only words, never a field another core reads
+	 *       concurrently" -- and it holds d_fwd, which the non-HOT1CL
+	 *       layouts' READERS test as the host/shell discriminator;
 	 *   CL2 is the structural-reader line -- d_child_head / d_sib for readdir,
 	 *       and d_host, which host_of_rcu resolves on every shelled LOOKUP.
 	 *
@@ -542,54 +496,11 @@ static inline void bl_unlock2(struct urcu_txn_sw_hlist_head *x,
 		bl_unlock(y);
 }
 
-#ifndef DC_CHAIN_SWMW
-/*
- * ---- per-host chain-serialization lock (the FOLD LOCK) ------------------ *
- *
- * A test-and-TEST-and-set spinlock on host->d_fold_lock (0 = free, 1 = held):
- * one cmpxchg, then plain loads until it reads free (it cmpxchg'd on every spin
- * until 2026-09-30, stealing the line from the holder each time).  It is
- * taken BEFORE any bucket-head lock and in address order (an exchange grays
- * two), so the global lock order is {fold locks < bucket-head locks}, each
- * class address-ordered -- no bucket is ever held while waiting on a fold lock,
- * so the two classes cannot deadlock.  Held only under rcu_read_lock(), so the
- * host stays alive (a spinner is itself in an RCU read section, so the host it
- * spins on cannot pass a grace period and be freed).  In the DEFAULT build only
- * the folds take it (the fold lock); DC_CHAIN_LOCK also has the demote take it
- * (the classic chain lock); DC_CHAIN_SWMW retires it (MW dequeue).
- *
- */
-static inline void fold_lock(struct dentry *host)
-{
-	while (uatomic_cmpxchg(&host->d_fold_lock, 0UL, 1UL) != 0UL)
-		do {
-			caa_cpu_relax();
-		} while (uatomic_load(&host->d_fold_lock, CMM_RELAXED) != 0UL);
-}
-static inline void fold_unlock(struct dentry *host)
-{
-	uatomic_store(&host->d_fold_lock, 0UL, CMM_RELEASE);
-}
-/* Two chain locks in ADDRESS ORDER (exchange); dedup a degenerate a == b. */
-static inline void fold_lock2(struct dentry *a, struct dentry *b)
-{
-	if (a == b)	{ fold_lock(a); return; }
-	if (a < b)	{ fold_lock(a); fold_lock(b); }
-	else		{ fold_lock(b); fold_lock(a); }
-}
-static inline void fold_unlock2(struct dentry *a, struct dentry *b)
-{
-	fold_unlock(a);
-	if (a != b)
-		fold_unlock(b);
-}
-#endif	/* !DC_CHAIN_SWMW */
-
 /*
  * Lock up to @n bucket heads in ADDRESS ORDER, de-duplicating coincident heads
  * (a same-parent rename shares one child head; a hash collision can share a
  * bucket).  Sorts @h in place (@n is tiny -- <= 4); pass the SAME array, still
- * sorted, to bl_unlock_n.  Taken AFTER the chain lock(s) (chain < bucket).
+ * sorted, to bl_unlock_n.
  */
 static inline void bl_lock_n(struct urcu_txn_sw_hlist_head **h, int n)
 {
@@ -785,8 +696,8 @@ static inline void bl_sw_del_marked(dc_swtxn_t *txn,
  * Record an IN-PLACE replace of @oldn by @newn into txn: @newn takes @oldn's
  * exact slot, and @oldn's own next is MARKED so top_unhashed_rcu(@oldn) reports
  * it left the index (a fold TRANSFER, like a del, is a walk-causality event for
- * @oldn -- it is no longer the indexed top).  @newn must be UNLINKED (a demoted
- * relay or the content host, out of every index) -- its next/pprev are set here
+ * @oldn -- it is no longer the indexed top).  @newn must be UNLINKED (a fresh
+ * shell or the content host, out of every index) -- its next/pprev are set here
  * pre-publish.  Unlike a del + add-head, only *oldn->pprev is rewritten (to
  * @newn), so it never double-writes a first-slot bucket head (no same-slot
  * record conflict).  The caller holds @oldn's bucket-head lock. */
@@ -1032,7 +943,7 @@ static inline void dc_transfer_iparent(struct dentry *m, struct dentry *n)
 /*
  * Flip the content HOST between positive and negative in place: d_instantiate
  * (@negative 0, @id is the new inode) and d_delete (@negative 1, @id ignored).
- * The dentry keeps its address, bucket, children and chain position.  @id is
+ * The dentry keeps its address, bucket, children and named top.  @id is
  * stored before the flip -- a reader that sees the node positive must already
  * see the id that came with it.
  *
@@ -1041,20 +952,11 @@ static inline void dc_transfer_iparent(struct dentry *m, struct dentry *n)
  * so this is a plain read-modify-write rather than a cmpxchg:
  *
  *   - The only other writer of a reachable host's d_iparent is the fold's
- *     TRANSFER, which holds the same bucket lock across its handover.
- *   - The TRANSFER writes @n->d_fwd, the TOP'S IMMEDIATE SUCCESSOR; this writes
- *     host_of_rcu(top), the CHAIN TAIL.  Those are the same node only when the
- *     chain is exactly top->host -- and then the fold's bucket, derived from
- *     that same top, is the bucket held here.
- *   - The fold's other two arms never touch this word: SPLICE and RECLAIM move
- *     chain pointers (d_fwd/d_back) only.
- *
- * The FOLD LOCK is deliberately NOT taken.  It is unnecessary by the argument
- * above, and taking it here would be a deadlock rather than an over-precaution:
- * the documented hierarchy is {fold locks < bucket-head locks} precisely so that
- * "no bucket is ever held while waiting on a fold lock", and the fold acquires
- * fold_lock(host) BEFORE its buckets.  Grabbing the fold lock with a bucket in
- * hand inverts that.
+ *     TRANSFER, which writes it only while its shell is still hashed -- still
+ *     the named top -- and holds that shell's bucket lock across the
+ *     handover: the very lock held here, since both derive it from the top.
+ *   - A fold whose shell is no longer hashed only frees the shell; it never
+ *     touches the host.
  *
  * The STORE stays a relaxed atomic: readers sample this word plainly for pos/neg
  * and take no lock, so writer-writer exclusion does not make a plain store legal.
@@ -1088,31 +990,15 @@ static int dc_set_negative(struct dentry *host, int negative, uint64_t id)
 }
 
 #ifdef DC_STRESS_DEBUG
-/* Coarse counters for diagnosing fold drain / chain growth (not thread-exact).
- * dc_dbg_fold_retries = total loop attempts (both loops); dc_dbg_fold_aborts =
- * commit-level ABORTs only (a genuine MCAS race, distinct from the deterministic
- * main->reclaim second loop the harness's 25% mid-unlink drives). */
+/* Coarse counters for diagnosing fold drain (not thread-exact).
+ * dc_dbg_fold_retries = fold attempts; dc_dbg_fold_aborts = commit-level
+ * ABORTs only. */
 unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_aborts;
 # define DC_DBG_FOLD_ATTEMPT() uatomic_inc(&dc_dbg_fold_retries)
 # define DC_DBG_FOLD_ABORT()   uatomic_inc(&dc_dbg_fold_aborts)
 #else
 # define DC_DBG_FOLD_ATTEMPT() ((void) 0)
 # define DC_DBG_FOLD_ABORT()   ((void) 0)
-#endif
-
-/*
- * fold takes the age-0 MW fast path: measured, fold's commits ABORT only ~0.001%
- * of the time (1-2 in >1M folds, flat across 4..48 writers -- see dc_dbg_fold_aborts).
- * Its frequent extra work is the deterministic main->reclaim second loop an unlink
- * drives, NOT contention, so expect_conflict (skip age-0) was a pure pessimization:
- * it forced the sorted, blocking path for ~99.999% of folds that commit clean first
- * try.  The rare genuine conflict (a concurrent SPLICE of m) is handled by the retry
- * loop.  -DDC_FOLD_EXPECT_CONFLICT restores the old hint for A/B.
- */
-#ifdef DC_FOLD_EXPECT_CONFLICT
-# define DC_FOLD_CONFLICT_HINT(txn) urcu_txn_expect_conflict(txn)
-#else
-# define DC_FOLD_CONFLICT_HINT(txn) ((void) (txn))
 #endif
 
 /*
@@ -1155,8 +1041,8 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 /*
  * Placement mirrors dcache_seqlock's (and the kernel's): the read-mostly geometry
  * every hop reads on a line no writer touches, each written word on its own line
- * (the domain is live under DC_CHAIN_SWMW's escalations; rename_gen is written
- * by the counter arms).  dc_create allocates the struct 64-byte aligned.
+ * (rename_gen is written by the counter arms).  dc_create allocates the struct
+ * 64-byte aligned.
  */
 struct dcache {
 	struct dc_lru_shard *lru;		/* nlru shards; see lru_shard_index */
@@ -1166,11 +1052,10 @@ struct dcache {
 	struct dentry *root;
 	/*
 	 * Escalation domain (fair-mutex fallback lane) for the NAMESPACE INDEX.
-	 * Vestigial in the default pure-SW build (the SW commit takes no domain --
-	 * it cannot contention-abort, so it has no lane), but LIVE under
-	 * DC_CHAIN_SWMW: the mixed shell ops carry MW records that can abort, so
-	 * they run the full begin/commit/end retry loop against this domain and
-	 * re-inherit the fair-mutex escalation discipline.
+	 * Vestigial: every index commit is pure SW (commit_sw takes no domain --
+	 * it cannot contention-abort, so it has no lane).  urcu_txn_init() still
+	 * wants one.  (It was live under the retired DC_CHAIN_SWMW, whose shell
+	 * ops carried MW records.)
 	 */
 	dc_domain_t domain __attribute__((aligned(64)));
 #if defined(DC_LRU_MCAS) && !defined(DC_NO_LRU)
@@ -1180,9 +1065,10 @@ struct dcache {
 	 * rcu-txn-list.h says a domain should be shared by lists "that form ONE
 	 * logical structure" -- and the LRU is not part of the namespace index.
 	 * They share no slots, and one has no business funnelling the other
-	 * through a fair mutex.  Sharing dc->domain would do exactly that under
-	 * DC_CHAIN_SWMW, where the shell ops are also MW and can escalate: an
-	 * escalation raised by a rename would capture the LRU's commits too.
+	 * through a fair mutex.  Sharing dc->domain would have done exactly that
+	 * under the retired DC_CHAIN_SWMW, whose shell ops were also MW and could
+	 * escalate: an escalation raised by a rename would capture the LRU's
+	 * commits too.
 	 *
 	 * That failure mode is not hypothetical here.  f9b6901a fixed a bug where
 	 * every lane holder re-asserted domain->active, so ONE escalation captured
@@ -1209,11 +1095,11 @@ struct dcache {
 #define DC_GEN_TAG	URCU_TXN_TAG
 
 /*
- * Engine proxy tag for the transacted transition chain (d_fwd/d_back).  The
- * splice MCASes both links of a middle relay in one commit, so a concurrent
- * fold sees a consistent chain; readers following d_fwd resolve the slot with
- * bl_read() (it may briefly hold a commit descriptor).  Node addresses
- * are >= 8-byte aligned, so bit 0 is clear on every live value the slot holds.
+ * Engine proxy tag for the host's d_top, written by store_sw in the stack and
+ * exchange commits; readers resolve the slot with bl_read() (it may briefly
+ * hold a commit record).  Node addresses are >= 8-byte aligned, so bit 0 is
+ * clear on every live value the slot holds.  (d_fwd, write-once and set before
+ * publication, never holds one; its reads keep bl_read() for uniformity.)
  */
 #define DC_FWD_TAG	URCU_TXN_TAG
 
@@ -1243,13 +1129,7 @@ static inline struct urcu_txn_sw_hlist_head *bucket_of(struct dcache *dc,
 
 const char *dc_engine_name(void)
 {
-#if defined(DC_CHAIN_LOCK)
-	return "bucketlock-chainlock";		/* legacy: per-host chain lock (demote + folds) */
-#elif defined(DC_CHAIN_SWMW)
-	return "bucketlock-swmw";		/* mixed SW/MW: chain MW, index SW, no chain lock */
-#elif defined(DC_CHAIN_FOLDLOCK)
-	return "bucketlock-foldlock";		/* DEFAULT: SW enqueue + per-host fold-lock dequeue */
-#elif defined(DC_MARK_GEN)
+#if defined(DC_MARK_GEN)
 	return "bucketlock-mark";
 #elif defined(DC_PER_NODE_GEN)
 	return "bucketlock-pernode";
@@ -1311,7 +1191,7 @@ static struct dentry *dentry_alloc(struct dcache *dc, struct dentry *parent,
 	d->d_iparent = parent;
 	d->d_iname = *name;
 	d->d_fwd = NULL;
-	d->d_back = NULL;
+	d->d_top = NULL;
 	d->d_parent = parent;
 	d->d_dc = dc;
 	urcu_txn_sw_hlist_init(&d->d_child_head);
@@ -1406,8 +1286,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 		return NULL;
 	}
 #endif
-	/* One escalation domain type now (the canonical urcu_txn_domain); LIVE only
-	 * for a DC_CHAIN_MIXED build's shell ops, vestigial otherwise. */
+	/* vestigial (pure-SW commits), see struct dcache */
 	urcu_txn_domain_init(&dc->domain);
 
 	dc_qstr_init(&rootname, "");
@@ -1436,11 +1315,12 @@ void dc_destroy(struct dcache *dc)
 	if (!dc)
 		return;
 	/*
-	 * Two barriers: the first drains every queued fold worker (each folds a
-	 * shell out of its chain, then call_rcu's the shell's own free); the
-	 * second drains those shell frees.  After both, every chain is settled
-	 * (each content host is its own named top again) and no shell remains, so
-	 * the child-hlists hold only hosts for free_subtree to reclaim directly.
+	 * Two barriers: the first drains every queued fold worker (each moves
+	 * its shell's name into the host or finds the shell unhashed, then
+	 * call_rcu's the shell's own free); the second drains those shell frees.
+	 * After both, every content host is its own named top again and no shell
+	 * remains, so the child-hlists hold only hosts for free_subtree to
+	 * reclaim directly.
 	 */
 	rcu_barrier();				/* run pending folds */
 	rcu_barrier();				/* run the frees they queued */
@@ -1460,13 +1340,22 @@ void dc_quiescent(void)         { rcu_quiescent_state(); }
 
 
 /*
+ * The value @host's d_top holds while @top names its entry: NULL when the host
+ * is its own top.  The expected-old (and new) of every d_top write.
+ */
+static inline struct dentry *dtop_val(struct dentry *host, struct dentry *top)
+{
+	return top == host ? NULL : top;
+}
+
+
+/*
  * Resolve @top's content host in O(1) (readers).  A settled top (d_fwd == NULL)
  * IS its own host.  A shell (d_fwd != NULL) holds a WRITE-ONCE skip pointer to
- * the tail host in its d_id/d_host union slot -- read as a pointer only because
+ * its host in its d_id/d_host union slot -- read as a pointer only because
  * d_fwd != NULL proves @top is a shell (a stable per-node property).  The d_fwd
  * load is the discriminator and is ordered before the union access, so a host's
- * id is never dereferenced as a pointer.  Unlike chain_host_rcu()'s O(depth)
- * walk, this is one hop regardless of chain depth.
+ * id is never dereferenced as a pointer.
  */
 static inline struct dentry *host_of_rcu(struct dentry *top)
 {
@@ -1595,7 +1484,7 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
  * commit that bumps the host gen (the hlist del contract + txn_bump_gen).  The
  * per-node reader tests this right AFTER sampling the host gen: it is the
  * "re-verify the edge under the sample" step a single host counter needs, since
- * the counter is reached only after the name match + chain resolve (there is no
+ * the counter is reached only after the name match + host resolve (there is no
  * pre-navigation point at which to sample it).  Call under rcu_read_lock().
  */
 static inline int top_unhashed_rcu(struct dentry *top)
@@ -1727,7 +1616,7 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 	 * name, resolve to its content host, SAMPLE that host's gen, then (rmb)
 	 * confirm the top is still the current indexed top -- the "re-verify the
 	 * edge under the sample" step a single host counter needs, since the gen is
-	 * reached only after the name match + chain resolve (there is no
+	 * reached only after the name match + host resolve (there is no
 	 * pre-navigation point to sample it).  Remember (host, gen) per hop; on the
 	 * way UP re-read every latched host's gen.  All unchanged means the whole
 	 * path was simultaneously live at the leaf-turnaround instant -- each hop's
@@ -1866,6 +1755,31 @@ static inline void dc_reclaim(struct dentry *d)
 
 /* ---- add / unlink ------------------------------------------------------ */
 
+/*
+ * Is @host's entry still named?  Its named top is the host's d_top, or the host
+ * itself when that is NULL; the entry is alive while that top is in the index.
+ * A rename moves d_top and marks the old top in one commit, so a top found
+ * marked with d_top MOVED meanwhile is a rename, not a death: look again.  A
+ * marked top that is still d_top is an unlink (which leaves d_top alone) or an
+ * eviction.  Call with @host's child head locked (dc_add_typed), which the
+ * unlink and the shrinker hold while they remove the top.
+ */
+static int entry_alive(struct dentry *host)
+{
+	for (;;) {
+		struct dentry *t = bl_read((void **) &host->d_top, DC_FWD_TAG);
+		struct dentry *top = t ? t : host;
+		int marked = 0;
+
+		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next),
+					&marked);
+		if (!marked)
+			return 1;
+		if (bl_read((void **) &host->d_top, DC_FWD_TAG) == t)
+			return 0;
+	}
+}
+
 static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 			uint64_t id, int isdir, int positive)
 {
@@ -1928,59 +1842,40 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		free(d);			/* never published */
 		return -ENOENT;
 	}
-#ifndef DC_NO_LRU
-	{
-		/*
-		 * ⭐ AND RE-CHECK THAT A SETTLED PARENT IS STILL HASHED -- a
-		 * DIFFERENT question from "is it positive", and the one the
-		 * shrinker makes live.
-		 *
-		 * Half of a GUARD PAIR with lru_evict_settled(); the other half
-		 * is that eviction now also holds &d->d_child_head while it
-		 * checks children_empty(d).  Both are needed:
-		 *
-		 *   add first    -> eviction blocks on this child head, then
-		 *                   sees a non-empty child list and skips;
-		 *   evict first  -> it has already marked the parent, and THIS
-		 *                   test is what stops the add.
-		 *
-		 * Without the second half, publishing here leaves the child
-		 * hashed, on the LRU, and naming a parent one grace period from
-		 * being freed -- a later sweeper then reads that child's stale
-		 * d_parent and takes bl_lock2() on freed memory.
-		 *
-		 * ⚠⚠ ONLY FOR A SETTLED PARENT.  A host with a shell stacked
-		 * above it is legitimately absent from the index -- the shell
-		 * carries the entry -- so its own d_hash reads MARKED while the
-		 * directory is perfectly alive.  Testing unconditionally
-		 * rejected every add under a renamed directory (test_dcache
-		 * "name recreated over a moved directory", 8 failures).  A
-		 * chained parent needs no test anyway: lru_evict_settled bails
-		 * on d_back/d_fwd, so it cannot be the one evicting it.
-		 *
-		 * ⚠ TSAN finds this race; ASan does NOT, because the churn
-		 * recycles the parent's storage before the sweeper's write
-		 * lands, so the access is to validly-allocated memory by then.
-		 * Do not read an ASan pass as coverage for it.
-		 *
-		 * -ENOENT is the right answer and callers already expect it: it
-		 * means "the prefix went", which is exactly what happened.  The
-		 * root reads as hashed (d_hash.next NULL, hence unmarked), so
-		 * adds directly under it are unaffected.
-		 */
-		int pmarked = 0;
-
-		if (!uatomic_load(&parent->d_back, CMM_RELAXED) &&
-		    !uatomic_load(&parent->d_fwd, CMM_RELAXED))
-			(void) bl_hlist_resolve(
-				rcu_dereference(parent->d_hash.next), &pmarked);
-		if (pmarked) {
-			bl_unlock2(bucket, &parent->d_child_head);
-			free(d);		/* never published */
-			return -ENOENT;
-		}
+	/*
+	 * ⭐ AND RE-CHECK THAT THE PARENT'S ENTRY IS STILL ALIVE -- a DIFFERENT
+	 * question from "is it positive".  Two paths free a directory's host
+	 * while an add may be resolving under it: the shrinker (a settled host)
+	 * and an unlink (since 2026-10-01 an unlink frees the host even when a
+	 * rename shell names the entry -- there is no chain left to do it later).
+	 * Each holds the host's OWN child head (this lock) while it checks
+	 * children_empty and removes the entry's top, so:
+	 *
+	 *   add first    -> the remover blocks on this child head, then sees a
+	 *                   non-empty child list and refuses (or skips);
+	 *   remove first -> the entry's top is already marked, and THIS test is
+	 *                   what stops the add.
+	 *
+	 * Without it, publishing here leaves a child hashed under a host one
+	 * grace period from being freed.  The test is on the entry's TOP, not
+	 * the host: a host a shell names is legitimately out of the index (its
+	 * own d_hash reads MARKED while the directory is alive -- testing the
+	 * host rejected every add under a renamed directory, test_dcache "name
+	 * recreated over a moved directory").  See entry_alive().
+	 *
+	 * ⚠ TSAN finds the shrinker race; ASan does NOT, because the churn
+	 * recycles the parent's storage before the sweeper's write lands.  Do
+	 * not read an ASan pass as coverage for it.
+	 *
+	 * -ENOENT is the right answer and callers already expect it: it means
+	 * "the prefix went".  The root reads as alive (d_hash.next NULL, hence
+	 * unmarked), so adds directly under it are unaffected.
+	 */
+	if (!entry_alive(parent)) {
+		bl_unlock2(bucket, &parent->d_child_head);
+		free(d);		/* never published */
+		return -ENOENT;
 	}
-#endif
 #ifndef DC_NO_ADD_DUP_RECHECK
 	/*
 	 * ⭐ RE-CHECK THE NAME UNDER THE BUCKET LOCK -- the check above is a
@@ -2105,7 +2000,7 @@ int dc_instantiate(struct dcache *dc, const struct dc_path *path, uint64_t id)
 			bl_unlock(bucket);
 			continue;		/* re-find the current top */
 		}
-		host = host_of_rcu(top);	/* O(1); the chain tail */
+		host = host_of_rcu(top);	/* O(1) */
 		ret = dc_set_negative(host, 0, id);
 		bl_unlock(bucket);
 		break;
@@ -2168,7 +2063,7 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 			isdir_locked = NULL;
 			continue;		/* re-find the current top */
 		}
-		host = host_of_rcu(top);	/* O(1); the chain tail */
+		host = host_of_rcu(top);	/* O(1) */
 		if (host->d_isdir && host != isdir_locked) {
 			/*
 			 * A DIRECTORY needs its OWN child-list head locked too,
@@ -2235,22 +2130,28 @@ static void dentry_free_cb(struct rcu_head *rh)
  *   SETTLED (top == host, top->d_fwd == NULL): the named top IS the content host
  *   and has no fold queued, so unlink frees it directly after a grace period.
  *
- *   MID-TRANSITION (top is a rename shell, top->d_fwd != NULL): removing the top
- *   from the index without demoting it (d_back stays NULL) is exactly the signal
- *   the shell's pending fold reads as an unlink -- it then RECLAIMs the whole
- *   orphaned chain (see fold()).  Unlink must NOT free the shell (its fold does)
- *   nor the host (the reclaim cascade does).
+ *   MID-TRANSITION (top is a rename shell): the entry dies all the same, so
+ *   unlink frees the HOST after a grace period and leaves the shell to the fold
+ *   its rename queued, which finds it out of the index and frees it without
+ *   touching the host (see fold()).
  *
- * Loops re-finding the top: a concurrent fold that transfers (promotes the
- * successor into the index) between the find and the del makes our del -ENOENT,
- * so we re-find the new top and remove that instead.
+ * The host's OWN child head is locked too, with children_empty re-checked
+ * under it: that is the lock dc_add publishes a child under, so an add either
+ * lands first (and this refuses -ENOTEMPTY) or finds the entry dead
+ * (entry_alive).  Checked only unlocked, an add could slip in between and
+ * leave a child hashed under the freed host.
+ *
+ * Loops re-finding the top: a concurrent fold that transfers (promotes the host
+ * into the index) between the find and the del makes our re-verify fail, so we
+ * re-find the new top and remove that instead.
  */
 int dc_unlink(struct dcache *dc, const struct dc_path *path)
 {
 	struct dentry *parent, *top, *host;
 	const struct qstr *name;
 	struct urcu_txn_sw_hlist_head *bucket;
-	int settled, ret, can_free;
+	struct urcu_txn_sw_hlist_head *heads[3];
+	int settled, ret, can_free, nheads;
 
 	if (path->ndepth == 0)
 		return -EINVAL;
@@ -2273,8 +2174,8 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			ret = -ENOTEMPTY;
 			goto out;
 		}
-		/* top == host iff top is settled (no forwarding chain below it) --
-		 * host_of_rcu() already answered this; no d_fwd read needed. */
+		/* top == host iff top is settled (not a shell) -- host_of_rcu()
+		 * already answered this; no d_fwd read needed. */
 		settled = (top == host);
 
 		/*
@@ -2290,7 +2191,24 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		 * valid), never an interior waypoint.  The del's MARK is what a
 		 * straddling reader's top_unhashed_rcu observes; no gen is owed.
 		 */
-		bl_lock2(bucket, &parent->d_child_head);
+		heads[0] = bucket;
+		heads[1] = &parent->d_child_head;
+		nheads = 2;
+		/*
+		 * A directory's OWN child head too, which excludes a dc_add
+		 * under it (dc_add locks its parent's child head) across the
+		 * children_empty re-check below: the host is freed whether or
+		 * not a shell names it.  The kernel pays the same, vfs_rmdir
+		 * locks the victim's inode.  Measured: an empty-directory
+		 * add/unlink churn against 32-64 concurrent listers runs ~5%
+		 * slower for it (the lock word shares a line with the d_sib
+		 * the listers read); without listers ~1%.  Not for a FILE:
+		 * dc_add answers -ENOTDIR under one and d_isdir is write-once,
+		 * so no child can land.
+		 */
+		if (host->d_isdir)
+			heads[nheads++] = &host->d_child_head;
+		bl_lock_n(heads, nheads);
 		{	/* re-verify top is still hashed under the lock: the deletion
 			 * MARK on d_hash.next fires if a concurrent unlink or a fold
 			 * transfer removed it between our find and our acquire. */
@@ -2299,13 +2217,18 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			(void) bl_hlist_resolve(
 				rcu_dereference(top->d_hash.next), &marked);
 			if (marked) {
-				bl_unlock2(bucket, &parent->d_child_head);
+				bl_unlock_n(heads, nheads);
 				continue;	/* re-find the current top */
 			}
 		}
+		if (!children_empty(host)) {	/* an add landed first */
+			bl_unlock_n(heads, nheads);
+			ret = -ENOTEMPTY;
+			goto out;
+		}
 		bl_hlist_del_locked(&top->d_hash);
 		bl_hlist_del_locked(&top->d_sib);
-		bl_unlock2(bucket, &parent->d_child_head);
+		bl_unlock_n(heads, nheads);
 		break;				/* removed from both indexes */
 	}
 	/* PHASE 3: off the LRU IMMEDIATELY, never lazily.  The node's call_rcu
@@ -2320,13 +2243,12 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	 * This is mainline __dentry_kill's `can_free = false` for a dentry on a
 	 * shrink list.  Taking it off here instead would disown a victim mid-
 	 * eviction, which is exactly the free-while-queued defect. */
-	can_free = lru_del_can_free(dc, host, settled);
-	if (top != host)
-		lru_del(dc, top);
+	can_free = lru_del_can_free(dc, host, 1);
+	if (!settled)
+		lru_del(dc, top);	/* the shell is its fold's to free */
 	rcu_read_unlock();
-	if (settled && can_free)		/* host has no fold queued: free it */
-		call_rcu(&top->d_rcu, dentry_free_cb);
-	/* else: top is a shell; its pending fold RECLAIMs the orphaned chain */
+	if (can_free)			/* the entry dies: free its host */
+		call_rcu(&host->d_rcu, dentry_free_cb);
 	return 0;
 out:
 	rcu_read_unlock();
@@ -2375,19 +2297,18 @@ static int cross_cycle_check(struct dcache *dc, struct dentry *host,
 /*
  * STACK one entry into an ALREADY-OPEN txn (records only -- no cycle check, no
  * commit).  Removes @top from BOTH indexes and inserts @shell -- the new named
- * top, which must already forward to @top (shell->d_fwd = top) -- into
- * @new_bucket + @new_parent's child-hlist; the demote (@top->d_back = shell) is
- * the CALLER's plain store under the chain lock, atomic-to-a-fold with this
- * removal because the caller holds that lock across both the commit and it.
+ * top, a shell of @top's entry (shell->d_host = shell->d_fwd = host) -- into
+ * @new_bucket + @new_parent's child-hlist, and records the demote (the host's
+ * d_top = shell) in the same commit.
  *
  * The CYCLE CHECK is the caller's job, run via cross_cycle_check() BEFORE taking
- * the chain / bucket locks -- so the (bounded, O(depth)) ancestry walk does not
+ * the bucket locks -- so the (bounded, O(depth)) ancestry walk does not
  * lengthen the lock hold (it needs only host->d_moving, grayed earlier).  This
  * records only INDEX edges (+ the cross-parent reparent); when @cross_parent it
  * also stores host->d_parent = new_parent.
  *
  * The caller owns the SW txn (init + commit) and holds the four bucket-head
- * locks + the per-host chain lock, so the records are single-writer.
+ * locks, so the records are single-writer.
  */
 static void stack_one_prepare(dc_swtxn_t *txn,
 			      struct dentry *top, struct dentry *host,
@@ -2411,20 +2332,13 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 	 * rewrites only *top->pprev and still MARKs top; otherwise del + add-head into
 	 * two distinct heads.
 	 *
-	 * The DEMOTE (top->d_back = shell) atomicity-to-a-fold differs by engine:
-	 *   DEFAULT: d_back is a chain link the CALLER plain-stores under the per-host
-	 *   CHAIN LOCK after this commit -- held across both, so a fold reads
-	 *   (index, d_back) consistently.  Not recorded here.
-	 *   DC_CHAIN_SWMW: the chain lock is gone, so the demote is a record in THIS
-	 *   commit, and a fold then resolves (index mark, d_back) against ONE control
-	 *   word -- never a torn pair.  The chain is an SPMC list -- ONE producer per
-	 *   host (a demote of top holds top's bucket lock; a top has d_back==NULL so no
-	 *   splice's fwd or promote ever writes it), MANY consumers (concurrent folds).
-	 *   So the demote (the ENQUEUE) is a store_SW: single-writer under the bucket
-	 *   lock, a plain park, never a CAS.  Only the folds (the multi-consumer
-	 *   DEQUEUE) need MW.  With the index edits also store_sw, the whole stack is a
-	 *   pure-SW commit (commit_sw) -- as cheap as the chain-lock build's, minus the
-	 *   chain lock.
+	 * The DEMOTE (the host's d_top moves from top to shell) is a store_SW in
+	 * THIS commit, so a fold resolves (index mark, d_top) against ONE control
+	 * word -- never a torn pair.  d_top's writers are this demote, the
+	 * exchange's and a fold's TRANSFER, all holding the bucket lock of the
+	 * entry's current top, so the slot is single-writer and a plain park
+	 * suffices.  With the index edits also store_sw, the stack stays a pure-SW
+	 * commit (commit_sw).
 	 */
 	if (from_bucket == new_bucket) {		/* same hash bucket */
 		bl_sw_replace(txn, &top->d_hash, &shell->d_hash);
@@ -2438,10 +2352,8 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 		bl_sw_del_marked(txn, &top->d_sib);
 		bl_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
 	}
-#ifdef DC_CHAIN_MIXED
-	(void) urcu_txn_store_sw(txn, (void **) &top->d_back, NULL, shell,
-				      DC_FWD_TAG);
-#endif
+	(void) urcu_txn_store_sw(txn, (void **) &host->d_top,
+				      dtop_val(host, top), shell, DC_FWD_TAG);
 	if (cross_parent)
 		(void) dc_sw_record(txn, (void **) &host->d_parent,
 					  parent_of_rcu(host), new_parent,
@@ -2454,7 +2366,7 @@ static void stack_one_prepare(dc_swtxn_t *txn,
  * two renames to one name, or a rename racing a dc_add of it, would otherwise
  * both publish and leave two dentries spelled alike in one bucket.
  *
- * A NEGATIVE, settled (no shell chain) FILE occupant is REPLACED, as the
+ * A NEGATIVE, settled (not a shell) FILE occupant is REPLACED, as the
  * kernel's d_move drops a negative target: it is removed from both indexes
  * here, with the same marked stores dc_unlink uses, and handed back in *@neg
  * for the caller to reclaim after a grace period.  It is removed just before
@@ -2492,367 +2404,14 @@ static void dest_reclaim(struct dcache *dc, struct dentry *neg)
 		call_rcu(&neg->d_rcu, dentry_free_cb);
 }
 
-#ifndef DC_CHAIN_MIXED	/* ===== default: per-host chain lock + plain demote ===== */
 
 /*
- * STACK.  Move the entry named (@from_parent, @from_name) so it becomes named
- * (@new_parent, @new_name), preserving its content host (children key on the
- * host's address, so they never rehash).  ONE SW commit stacks a fresh shell
- * (stack_one_prepare) into both indexes -- atomic to a concurrent walker via the
- * selector -- and the old top's DEMOTE (d_back = shell) is a plain store under
- * the per-host chain lock, held across the commit so a fold reads (index, d_back)
- * consistently.  The entry never del+inserts its OWN links -- the shell carries
- * the new name.  Compression (fold) is deferred to a call_rcu worker (see
- * fold()); this returns as soon as the entry is reachable under its new name.
- * When @cross_parent, the loop check + d_parent reparent ride the same commit.
- *
- * LOCKING.  Single-writer over all four affected chains: take the per-host CHAIN
- * lock (for the demote) FIRST, then the four bucket heads {from-hash, from-child,
- * new-hash, new-child} in address order (chain < bucket globally; bl_lock_n
- * de-dups coincident heads).  A cross-parent move also grays host->d_moving (the
- * cycle Dekker flag) before the ancestry walk.  Walk causality is the demote MARK
- * -- no gen bump (mark-only, see the shell-op #error above).
- *
- * Returns 0 (shell in *out_shell, host in *out_host), -ENOMEM, -ENOENT (the
- * entry vanished), or -EINVAL (the move would create a directory cycle).  Loops
- * internally, re-finding the top, so a concurrent fold that demotes the top
- * between attempts is retried rather than lost.
- */
-static int stack_shell(struct dcache *dc,
-		struct dentry *from_parent, const struct qstr *from_name,
-		struct dentry *new_parent, const struct qstr *new_name,
-		int cross_parent,
-		struct dentry **out_shell, struct dentry **out_host)
-{
-	struct urcu_txn_sw_hlist_head *from_bucket =
-		bucket_of(dc, from_parent, from_name->hash);
-	struct urcu_txn_sw_hlist_head *new_bucket =
-		bucket_of(dc, new_parent, new_name->hash);
-	struct dentry *shell = dentry_alloc(dc, new_parent, new_name, 0, 0, 1);
-	struct dentry *top = NULL, *host = NULL, *neg = NULL;
-	int ret;
-
-	if (!shell)
-		return -ENOMEM;
-#ifdef DC_HOT1CL
-	shell->d_iparent = (struct dentry *)
-		((uintptr_t) shell->d_iparent | DC_TAG_SHELL);
-#endif
-
-	rcu_read_lock();			/* keeps top/host alive across the commit */
-	for (;;) {
-		struct urcu_txn_sw_hlist_head *heads[4];
-		struct urcu_txn_sw_txn txn;
-		enum urcu_txn_status st;
-		int marked = 0;
-
-		top = find_top_rcu(dc, from_parent, from_name);
-		if (!top) {			/* concurrently removed */
-			ret = -ENOENT;
-			goto out_free;
-		}
-		host = host_of_rcu(top);	/* O(1); invariant across renames/folds */
-		shell->d_host = host;		/* union slot = skip pointer to tail host */
-		shell->d_fwd = top;		/* new top forwards to the old top */
-
-		/*
-		 * Gray host for the cross-dir cycle Dekker, BEFORE the ancestry walk.
-		 * test-and-set (not a plain OR): two writers must not both drive a move
-		 * of the SAME node -- a loser retries, only the owner clears; the
-		 * cmpxchg's full barrier is the StoreLoad the walk needs.  (SW has no
-		 * escalation/fair-mutex lane, so -- unlike the MW engine -- there is no
-		 * begin-order constraint on where this is taken.)  Same-parent moves
-		 * take no walk, so no flag.
-		 */
-		if (cross_parent &&
-		    uatomic_cmpxchg(&host->d_moving, 0UL, 1UL) != 0UL)
-			continue;		/* another writer owns this host's move */
-
-		/*
-		 * Cross-dir cycle check BEFORE any lock: the (bounded, O(depth))
-		 * ancestry walk needs only host->d_moving (grayed above, Dekker) and
-		 * plain d_parent reads -- NOT the chain / bucket locks -- so running it
-		 * here keeps the lock hold O(1), instead of blocking a concurrent fold
-		 * of this host for the whole walk.  Its result is independent of top
-		 * (host is rename-invariant), so it need not be re-run under the lock.
-		 */
-		if (cross_parent) {
-			int c = cross_cycle_check(dc, host, new_parent);
-
-			if (c) {		/* -EINVAL cycle (terminal) / -EAGAIN (retry) */
-				uatomic_and(&host->d_moving, ~1UL);
-				if (c == -EINVAL) {
-					ret = -EINVAL;
-					goto out_free;
-				}
-				continue;	/* re-find + retry */
-			}
-		}
-
-		/*
-		 * Chain lock (host), then the four bucket heads (address-ordered), and
-		 * RE-VERIFY top is still hashed under the lock: a concurrent unlink or a
-		 * fold transfer also takes these locks, so it can only have changed top
-		 * between our find and our acquire, and it leaves the old top's
-		 * d_hash.next MARKED -> re-find the current top.
-		 */
-		heads[0] = from_bucket;
-		heads[1] = &from_parent->d_child_head;
-		heads[2] = new_bucket;
-		heads[3] = &new_parent->d_child_head;
-		fold_lock(host);
-		bl_lock_n(heads, 4);
-		(void) bl_hlist_resolve(rcu_dereference(top->d_hash.next), &marked);
-		if (marked) {
-			bl_unlock_n(heads, 4);
-			fold_unlock(host);
-			if (cross_parent)
-				uatomic_and(&host->d_moving, ~1UL);
-			continue;		/* re-find the current top */
-		}
-		/*
-		 * A NEGATIVE destination directory must not gain a child, and a
-		 * rename INTO it is the SECOND way that can happen -- dc_add is
-		 * the first, and guarding only dc_add left this hole.  Checked
-		 * here, under new_parent->d_child_head: the head dc_delete holds
-		 * while it verifies children_empty and flips the state, which is
-		 * what makes the two atomic.  Not a retry -- the parent stays
-		 * negative until someone instantiates it.
-		 */
-		if (!DC_IS_POSITIVE(new_parent)) {
-			bl_unlock_n(heads, 4);
-			fold_unlock(host);
-			if (cross_parent)
-				uatomic_and(&host->d_moving, ~1UL);
-			ret = -ENOENT;
-			goto out_free;
-		}
-#ifndef DC_NO_RENAME_DEST_RECHECK
-		/*
-		 * ⭐ AND RE-CHECK THE DESTINATION NAME UNDER new_bucket -- the
-		 * caller's __child_lookup() is a CHECK-THEN-ACT holding nothing,
-		 * exactly like the one dc_add used to have.  Two renames to one
-		 * destination, or a rename racing a dc_add of that name, both
-		 * pass it and both publish, and the bucket ends up with TWO
-		 * dentries spelled alike: a lookup resolves whichever the chain
-		 * reaches first while a child-list walk descends the other.
-		 *
-		 * ⚠ dc_add's fix does NOT cover this.  That one makes the ADD
-		 * notice a publish; it does nothing to make the RENAME notice
-		 * one, so the pair was closed in one direction only.
-		 *
-		 * new_bucket is heads[2] and is already held, so the test and
-		 * the publish below are atomic against every racer for this
-		 * name -- same (parent, name) hashes to the same bucket.  The
-		 * caller's unlocked check stays as the cheap reject that avoids
-		 * allocating a shell.  A negative occupant is replaced (d_move).
-		 */
-		if (dest_claim_locked(dc, new_parent, new_name, top, &neg)) {
-			bl_unlock_n(heads, 4);
-			fold_unlock(host);
-			if (cross_parent)
-				uatomic_and(&host->d_moving, ~1UL);
-			ret = -EEXIST;
-			goto out_free;
-		}
-#endif
-
-		urcu_txn_sw_init(&txn);
-		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
-				  from_bucket, shell, cross_parent);
-		st = urcu_txn_sw_commit(&txn);	/* atomic index flip; no ABORT under the lock */
-		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
-		if (st == URCU_TXN_STATUS_OK)
-			/* DEMOTE: plain store under the chain lock -- atomic-to-fold with
-			 * top's index removal above, both held under this lock. */
-			uatomic_store(&top->d_back, shell, CMM_RELEASE);
-		bl_unlock_n(heads, 4);
-		fold_unlock(host);
-		if (cross_parent)
-			uatomic_and(&host->d_moving, ~1UL);
-		if (st != URCU_TXN_STATUS_OK) {	/* MEMORY_ERROR: nothing published */
-			ret = -ENOMEM;
-			goto out_free;
-		}
-		break;				/* committed: entry now named anew */
-	}
-	rcu_read_unlock();
-	dest_reclaim(dc, neg);
-	*out_shell = shell;
-	if (out_host)
-		*out_host = host;
-	return 0;
-out_free:
-	rcu_read_unlock();
-	dest_reclaim(dc, neg);		/* dropped before an OOM commit */
-	free(shell);
-	return ret;
-}
-
-/*
- * FOLD.  Compress shell @n out of its transition chain by exactly one hop.
- * Runs from a call_rcu callback a grace period after @n was stacked, so any
- * reader that observed @n's OLD sibling threading (its d_sib in the previous
- * directory) has drained -- which is what lets the transfer re-link the child
- * list without a concurrent readdir jumping directories.
- *
- * The whole fold runs under @n's per-host CHAIN LOCK, so the chain (d_fwd/d_back)
- * is STABLE: back/fwd are read once and every concurrent fold of this chain (and
- * the stack's demote) serializes on the same lock.  That single lock replaces
- * the MCAS engine's shared-slot ABORT -- the SW engine has none, so two folds
- * splicing adjacent nodes could otherwise reclaim a still-reachable node (UAF).
- * No retry loop is needed: the branch is decided once from the stable chain.
- *
- *   @n was demoted to a middle relay (d_back != NULL): SPLICE.  @n is in NO
- *   index; rewire the doubly linked chain past @n -- back->d_fwd = fwd (a
- *   reader-visible lone store) and fwd->d_back = back (fold-only) -- with plain
- *   stores under the chain lock, touching no index.
- *
- *   @n is still the named top (d_back == NULL) AND still hashed: TRANSFER.  Copy
- *   @n's identity one hop down into m = @n->d_fwd, replace @n by m in BOTH
- *   indexes (one SW commit, atomic to readers), and promote m (m->d_back = NULL,
- *   plain store under the chain lock).  The identity copy into m is a safe
- *   pre-publish plain store: m is the unindexed content host and no reader reads
- *   a HOST's d_iparent/d_iname.  Membership is read under @n's bucket locks (the
- *   mark), not via a replace -ENOENT, since the SW replace cannot report it.
- *
- *   @n is the top but GONE from the index (its d_hash.next is MARKED while
- *   d_back is STILL NULL): an unlink removed the named top without demoting it.
- *   RECLAIM: dismantle the orphaned chain from @n down -- detach @n
- *   (@n->d_fwd = NULL) and promote the successor m WITHOUT re-indexing (plain
- *   stores under the chain lock), so m stays out of every index and its own fold
- *   reclaims in turn; the content host at the tail (m->d_fwd == NULL) has no fold
- *   queued, so it is freed here.
- *
- * @n is then reclaimed after a further grace period.  Self-free: each shell is
- * folded exactly once, by the fold its own rename queued, so no double free.
- */
-static void fold(struct dcache *dc, struct dentry *n)
-{
-	struct dentry *host = host_of_rcu(n);	/* chain's tail host (invariant) */
-	struct dentry *host_to_free = NULL;
-	struct dentry *back, *fwd, *m;
-	int reclaim_n = 1;
-
-	rcu_read_lock();
-	fold_lock(host);			/* serialize this chain's mutations */
-	back = uatomic_load(&n->d_back, CMM_RELAXED);	/* stable under the chain lock */
-	fwd  = uatomic_load(&n->d_fwd, CMM_RELAXED);
-
-	if (back) {
-		/* SPLICE: @n is a middle relay, in no index (its demoter removed it),
-		 * so @n and @fwd are both still linked chain nodes.  The chain lock --
-		 * not a shared-slot CAS -- keeps a concurrent fold of a neighbour from
-		 * racing this rewrite. */
-		uatomic_store(&back->d_fwd, fwd, CMM_RELEASE);	/* reader-visible skip */
-		uatomic_store(&fwd->d_back, back, CMM_RELEASE);	/* reverse walk reads it */
-		goto done;
-	}
-
-	/*
-	 * @n's d_back is NULL: it is the top, OR an orphan top (an unlink removed it
-	 * without demoting).  Distinguish under @n's index locks by the mark: read
-	 * @n->d_hash.next's MARK while excluding a concurrent unlink (which takes the
-	 * same bucket lock but not the chain lock).
-	 */
-	m = fwd;
-	{
-		struct dentry *parent = parent_of_rcu(n);
-		struct urcu_txn_sw_hlist_head *heads[2];
-		struct urcu_txn_sw_txn txn;
-		enum urcu_txn_status st;
-		int marked = 0;
-
-		heads[0] = bucket_of(dc, parent, n->d_iname.hash);
-		heads[1] = &parent->d_child_head;
-		bl_lock_n(heads, 2);
-		(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
-		if (marked) {
-			/* out of the index + d_back still NULL (stable under the chain
-			 * lock) => an unlink removed it: RECLAIM the orphan chain. */
-			bl_unlock_n(heads, 2);
-			host_to_free =
-				uatomic_load(&m->d_fwd, CMM_RELAXED) ? NULL : m;
-			uatomic_store(&n->d_fwd, NULL, CMM_RELEASE);	/* detach @n */
-			uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m (harmless if host) */
-			goto done;
-		}
-
-		/* TRANSFER: pull @n's identity down into m, then replace @n by m in
-		 * BOTH indexes in one SW commit (atomic to readers), then promote m.
-		 * The handover is NOT a plain pre-publish store any more: phase 2
-		 * made pos/neg authoritative on the host, so d_delete writes this
-		 * same word from another thread -- see dc_transfer_iparent(). */
-#if defined(DC_HOT1CL)
-		dc_transfer_iparent(m, n);
-#else
-		m->d_iparent = n->d_iparent;
-#endif
-		DC_NAME_XFER_BEGIN(m);
-		m->d_iname = n->d_iname;
-		DC_NAME_XFER_END(m);
-
-		urcu_txn_sw_init(&txn);
-		bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
-		bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
-		st = urcu_txn_sw_commit(&txn);		/* no ABORT under the lock */
-		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
-		if (st == URCU_TXN_STATUS_OK) {
-			uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
-		} else {
-			/* OOM (best-effort, as the MCAS fold): nothing published, @n is
-			 * still the indexed top -- do NOT reclaim it; the chain stays
-			 * uncompressed rather than freeing a live top. */
-			reclaim_n = 0;
-		}
-		bl_unlock_n(heads, 2);
-	}
-
-done:
-	fold_unlock(host);
-	rcu_read_unlock();
-#ifdef DC_STRESS_DEBUG
-	uatomic_inc(&dc_dbg_folds);
-#endif
-	/*
-	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
-	 * and that was a free-while-queued by construction rather than by race.
-	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
-	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
-	 * frees are hosts.  Nothing had exercised it because no test ran renames
-	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
-	 *
-	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
-	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
-	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
-	 * answer is not consulted here: the shrinker cannot be holding a node
-	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
-	 * set), so the handoff branch is unreachable -- but calling the guarded
-	 * form is what keeps that true if the skip rule ever changes.
-	 */
-	if (host_to_free) {
-		(void) lru_del_can_free(dc, host_to_free, 1);
-		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	}
-	if (reclaim_n) {
-		(void) lru_del_can_free(dc, n, 1);
-		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
-	}
-}
-
-#else	/* ===== DC_CHAIN_MIXED: SW enqueue (store_sw); fold splits SWMW vs RMLOCK ===== */
-
-/*
- * STACK (mixed SW/MW).  Same shell-vehicle move as the default build, but the
- * per-host chain lock is retired: the index edits (store_sw, bucket-locked) and
- * the old top's DEMOTE (top->d_back = shell, store_mw) ride ONE mixed commit
- * (stack_one_prepare), so a fold reads (index, d_back) resolved against one
- * control word.  The commit is ABORT-FREE under the bucket lock (the demote's
- * CAS-old = NULL cannot fail while we hold top's bucket lock -- see
- * stack_one_prepare), so this is as cheap as the pure-SW commit; the front-end's
- * escalation lane is inherited (begin/commit/end) but never actually escalates
- * for an index op.  FAIR-MUTEX DISCIPLINE: begin FIRST; d_moving + bucket locks
- * AFTER begin; every terminal bail abandon()+end(), every retry conflict()+end().
+ * STACK.  The index edits (store_sw, bucket-locked) and the DEMOTE (the host's
+ * d_top = shell) ride ONE commit (stack_one_prepare), so a fold reads (index,
+ * d_top) resolved against one control word.  The commit is pure-SW, abort-free
+ * under the bucket locks.  DISCIPLINE (inherited from the mixed front-end):
+ * begin FIRST; d_moving + bucket locks AFTER begin; every terminal bail
+ * abandon()+end(), every retry conflict()+end().
  *
  * Returns 0 (shell in *out_shell, host in *out_host), -ENOMEM, -ENOENT, or -EINVAL
  * (directory cycle).  Loops internally, re-finding the top.
@@ -2909,7 +2468,7 @@ static int stack_shell(struct dcache *dc,
 		}
 		host = host_of_rcu(top);	/* O(1); invariant across renames/folds */
 		shell->d_host = host;		/* union slot = skip pointer to tail host */
-		shell->d_fwd = top;		/* new top forwards to the old top */
+		shell->d_fwd = host;		/* write-once: marks a shell (see struct) */
 
 		/*
 		 * Gray host for the cross-dir cycle Dekker, AFTER begin.  test-and-set
@@ -3018,347 +2577,98 @@ out_free:
 	return ret;
 }
 
-#ifdef DC_CHAIN_SWMW	/* ---- dequeue = MW records (lock-free folds) ---- */
 
 /*
- * FOLD (mixed SW/MW).  Same three branches as the default build, but WITHOUT the
- * per-host chain lock: the chain (d_fwd/d_back) is now MW, so overlapping folds of
- * one chain serialize on the store_mw CAS-old (old = the folded node) exactly as
- * the all-MW engine does -- adjacent SPLICEs / RECLAIM-vs-SPLICE conflict on the
- * shared d_fwd slot and re-derive.  The branch is re-decided every attempt.
+ * FOLD.  Runs from a call_rcu callback a grace period after shell @n was
+ * stacked.  There is no chain between an entry's named top and its host (see
+ * the txn engine's fold() for the history and the argument): a fold either
+ * moves @n's name into the host or frees @n, decided by whether @n is still in
+ * the index.  Every step is serialized by the bucket lock of @n's slot, which a
+ * rename (its demote) or an unlink of the entry also takes:
  *
- *   d_back != NULL: SPLICE -- a pure chain edit, MW-only (no index, no lock).
- *   d_back == NULL: TRANSFER (still hashed) or RECLAIM (unlinked orphan).  The
- *   store_sw index replace needs @n's bucket lock, so unlike the all-MW fold this
- *   branch takes the lock and classifies by the MARK under it (store_sw cannot
- *   report -ENOENT the way the MW replace did): unmarked -> TRANSFER; marked +
- *   d_back still NULL -> RECLAIM; marked + d_back now set -> a re-rename demoted
- *   @n, drop the lock and re-loop -> SPLICE.
+ *   @n still indexed: it is the entry's named top (the host's d_top).
+ *   TRANSFER: copy @n's identity into the host, replace @n by the host in BOTH
+ *   indexes (one SW commit, atomic to readers), and reset d_top to NULL -- a
+ *   plain store under @n's bucket lock, which excludes the demote.  The
+ *   identity copy is safe pre-publish for the reasons the txn fold gives; the
+ *   handover is an ATOMIC RMW because d_delete writes the host's pos/neg from
+ *   another thread without this lock (dc_transfer_iparent()).
  *
- * The TRANSFER commit is ABORT-FREE under the lock (m->d_back == n is stable while
- * we hold @n's bucket lock and @n is unmarked); SPLICE/RECLAIM commits CAN abort
- * (a neighbour fold moved a chain slot) and retry.
+ *   @n no longer indexed: demoted by a later rename, or removed by an unlink.
+ *   Garbage either way, and the host is not this fold's: free @n, touch neither
+ *   the host nor @n's old directory.
+ *
+ * The membership test runs FIRST without a lock, and only an indexed @n has its
+ * index locks taken (and the test repeated under them): a demoted @n's old
+ * directory may have emptied, been unlinked and been freed before this fold
+ * runs, so locking its child head could touch freed memory.  An indexed @n sits
+ * in its parent's child list, so the parent cannot be unlinked meanwhile, and
+ * this RCU read-side section keeps it allocated across a race with that.
  */
 static void fold(struct dcache *dc, struct dentry *n)
 {
-	struct dentry *host_to_free = NULL;
-	struct urcu_txn txn;
+	struct dentry *host = host_of_rcu(n);	/* write-once d_host */
 	int reclaim_n = 1;
+	int marked = 0;
 
 	rcu_read_lock();
-	urcu_txn_init(&txn, &dc->domain);
-	for (;;) {
-		struct dentry *back, *fwd, *m;
-		enum urcu_txn_status st;
-		int marked = 0;
+	DC_DBG_FOLD_ATTEMPT();
+	(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
+	if (!marked) {
+		struct dentry *parent = parent_of_rcu(n);
+		struct urcu_txn_sw_hlist_head *heads[2];
 
-		DC_DBG_FOLD_ATTEMPT();
-		/* WAITING reads: a writer needs a value stable across the commit. */
-		back = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG);
-		fwd  = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
-
-		if (back != NULL) {
-			/* SPLICE: @n is a middle relay in NO index.  MW-only; the CAS-old
-			 * on back->d_fwd / fwd->d_back serializes adjacent folds (what the
-			 * retired chain lock used to do). */
-			urcu_txn_begin(&txn);
-			DC_FOLD_CONFLICT_HINT(&txn);
-			(void) urcu_txn_store_mw(&txn, (void **) &back->d_fwd,
-						      n, fwd, DC_FWD_TAG);
-			(void) urcu_txn_store_mw(&txn, (void **) &fwd->d_back,
-						      n, back, DC_FWD_TAG);
-			st = urcu_txn_commit(&txn);
-			DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
-			urcu_txn_end(&txn);
-			if (st == URCU_TXN_STATUS_ABORT) {
-				DC_DBG_FOLD_ABORT();
-				continue;
-			}
-			if (st < 0)		/* OOM: nothing published, @n still linked */
-				reclaim_n = 0;	/* leak-not-UAF (best effort) */
-			break;
-		}
-
-		/*
-		 * @n's d_back is NULL: it is the top, OR an orphan top (an unlink
-		 * removed it without demoting).  Classify under @n's index locks by the
-		 * MARK -- the store_sw index replace needs the lock regardless.
-		 */
-		m = fwd;
-		{
-			struct dentry *parent = parent_of_rcu(n);
-			struct urcu_txn_sw_hlist_head *heads[2];
-
-			heads[0] = bucket_of(dc, parent, n->d_iname.hash);
-			heads[1] = &parent->d_child_head;
-
-			urcu_txn_begin(&txn);
-			DC_FOLD_CONFLICT_HINT(&txn);
-			bl_lock_n(heads, 2);		/* AFTER begin (fair-mutex discipline) */
-			(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next),
-						 &marked);
-			if (marked) {
-				/* @n out of the index.  Under the bucket lock no demote can
-				 * be in progress, so re-read d_back to classify: NULL => an
-				 * unlink removed it (RECLAIM); non-NULL => a committed
-				 * re-rename demoted it (relay -> re-loop -> SPLICE). */
-				struct dentry *b2 = urcu_txn_read(
-					(void **) &n->d_back, DC_FWD_TAG);
-
-				bl_unlock_n(heads, 2);
-				urcu_txn_conflict(&txn);
-				urcu_txn_end(&txn);
-				if (b2 == NULL)
-					goto reclaim;
-				continue;		/* demoted: re-read -> SPLICE */
-			}
-
-			/* TRANSFER: pull @n's identity down into m, replace @n by m
-			 * in BOTH indexes (store_sw), promote m (m->d_back n->NULL,
-			 * store_mw).  Abort-free under the lock (m->d_back == n is
-			 * stable while @n is unmarked).  The identity handover is an
-			 * ATOMIC RMW, not a plain pre-publish store: phase 2 put
-			 * pos/neg on the host, so d_delete writes this same word from
-			 * another thread -- see dc_transfer_iparent(). */
+		heads[0] = bucket_of(dc, parent, n->d_iname.hash);
+		heads[1] = &parent->d_child_head;
+		bl_lock_n(heads, 2);
+		(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
+		if (!marked) {
 #if defined(DC_HOT1CL)
-			dc_transfer_iparent(m, n);
+			dc_transfer_iparent(host, n);
 #else
-			m->d_iparent = n->d_iparent;
+			host->d_iparent = n->d_iparent;
 #endif
-			DC_NAME_XFER_BEGIN(m);
-			m->d_iname = n->d_iname;
-			DC_NAME_XFER_END(m);
-
-			bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
-			bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
-			(void) urcu_txn_store_mw(&txn, (void **) &m->d_back,
-						      n, NULL, DC_FWD_TAG);
-			st = urcu_txn_commit(&txn);
-			DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
-			bl_unlock_n(heads, 2);
-			urcu_txn_end(&txn);
-			if (st == URCU_TXN_STATUS_ABORT) {
-				DC_DBG_FOLD_ABORT();
-				continue;
-			}
-			if (st < 0)		/* OOM: nothing published, @n still indexed */
-				reclaim_n = 0;	/* do NOT free a live top */
-			break;
-		}
-	}
-	goto done;
-
-reclaim:
-	/*
-	 * @n is an orphan top (d_back == NULL, out of the index): an unlink removed
-	 * the named top without demoting.  Detach @n and promote its successor m in
-	 * ONE MW commit; storing @n->d_fwd = NULL (CAS-old = m) conflicts with a
-	 * concurrent SPLICE of m, so they serialize.  m either continues the cascade
-	 * (its own fold reclaims) or is the content host (m->d_fwd == NULL, no fold
-	 * queued) and is freed here.
-	 */
-	for (;;) {
-		struct dentry *m = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
-		enum urcu_txn_status st;
-
-		DC_DBG_FOLD_ATTEMPT();
-		host_to_free = urcu_txn_read((void **) &m->d_fwd,
-						   DC_FWD_TAG) == NULL ? m : NULL;
-		urcu_txn_begin(&txn);
-		DC_FOLD_CONFLICT_HINT(&txn);
-		(void) urcu_txn_store_mw(&txn, (void **) &n->d_fwd, m, NULL,
-					      DC_FWD_TAG);	/* detach; conflicts w/ a splice of m */
-		(void) urcu_txn_store_mw(&txn, (void **) &m->d_back, n, NULL,
-					      DC_FWD_TAG);	/* promote m (harmless if host) */
-		st = urcu_txn_commit(&txn);
-		DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
-		urcu_txn_end(&txn);
-		if (st == URCU_TXN_STATUS_ABORT) {
-			DC_DBG_FOLD_ABORT();
-			continue;		/* n->d_fwd moved (splice) or m->d_back changed */
-		}
-		if (st < 0) {			/* OOM: nothing published; chain intact */
-			host_to_free = NULL;
-			reclaim_n = 0;
-		}
-		break;
-	}
-
-done:
-	rcu_read_unlock();
-#ifdef DC_STRESS_DEBUG
-	uatomic_inc(&dc_dbg_folds);
-#endif
-	/*
-	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
-	 * and that was a free-while-queued by construction rather than by race.
-	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
-	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
-	 * frees are hosts.  Nothing had exercised it because no test ran renames
-	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
-	 *
-	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
-	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
-	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
-	 * answer is not consulted here: the shrinker cannot be holding a node
-	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
-	 * set), so the handoff branch is unreachable -- but calling the guarded
-	 * form is what keeps that true if the skip rule ever changes.
-	 */
-	if (host_to_free) {
-		(void) lru_del_can_free(dc, host_to_free, 1);
-		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	}
-	if (reclaim_n) {
-		(void) lru_del_can_free(dc, n, 1);
-		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
-	}
-}
-
-#else	/* DC_CHAIN_FOLDLOCK ---- dequeue = per-host FOLD LOCK (plain chain stores) ---- */
-
-/*
- * FOLD (mixed SW enqueue + FOLD-LOCK dequeue).  The demote (enqueue) is a
- * store_sw as in DC_CHAIN_SWMW, but the fold (dequeue) takes the per-host REMOVE
- * LOCK (host->d_fold_lock, reused) and rewrites the chain with PLAIN stores -- no
- * MW descriptor, no per-fold call_rcu of a descriptor, like the default chain-lock
- * build.  Two differences from that build make it worth the flag:
- *   - the demote does NOT take the fold lock (it is SW under the bucket lock), so
- *     the PRODUCER never contends on it -- only fold workers do;
- *   - because of that, d_back is NOT stable under the fold lock against a
- *     concurrent demote of a TOP, so it is read through the mixed reader and the
- *     demote race is caught by the mark-recheck under the bucket lock, exactly as
- *     the MW fold does.  Once a node is a RELAY (d_back != NULL) its chain slots
- *     ARE stable under the fold lock (a relay is never demoted; every removal
- *     takes the lock), so SPLICE / RECLAIM are single-shot plain stores.
- *
- * The TRANSFER's index replace stays a mixed-engine store_sw (so the mixed reader
- * resolves it) but on a NULL domain: it is an abort-free disjoint commit already
- * serialized by the remove + bucket locks, so it needs no fair-mutex lane and can
- * run with those locks held (no begin-park).
- */
-static void fold(struct dcache *dc, struct dentry *n)
-{
-	struct dentry *host = host_of_rcu(n);	/* chain's tail host (invariant) */
-	struct dentry *host_to_free = NULL;
-	int reclaim_n = 1;
-
-	rcu_read_lock();
-	fold_lock(host);			/* FOLD LOCK: serialize this chain's folds */
-	for (;;) {
-		struct dentry *back, *fwd, *m;
-		int marked = 0;
-
-		DC_DBG_FOLD_ATTEMPT();
-		back = urcu_txn_read((void **) &n->d_back, DC_FWD_TAG);
-		fwd  = urcu_txn_read((void **) &n->d_fwd, DC_FWD_TAG);
-
-		if (back != NULL) {
-			/* SPLICE: n is a relay; back/fwd stable under the fold lock. */
-			uatomic_store(&back->d_fwd, fwd, CMM_RELEASE);	/* reader-visible skip */
-			uatomic_store(&fwd->d_back, back, CMM_RELEASE);	/* reverse walk reads it */
-			break;
-		}
-
-		m = fwd;
-		{
-			struct dentry *parent = parent_of_rcu(n);
-			struct urcu_txn_sw_hlist_head *heads[2];
-
-			heads[0] = bucket_of(dc, parent, n->d_iname.hash);
-			heads[1] = &parent->d_child_head;
-			bl_lock_n(heads, 2);		/* fold lock < bucket lock (address-ordered) */
-			(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
-			if (marked) {
-				/* n out of the index; under the bucket lock no demote is in
-				 * progress.  Re-read d_back: NULL => an unlink removed the
-				 * orphan top (RECLAIM); non-NULL => a re-rename demoted it ->
-				 * n is now a relay: drop the bucket lock and re-derive -> SPLICE. */
-				struct dentry *b2 = urcu_txn_read(
-					(void **) &n->d_back, DC_FWD_TAG);
-
-				if (b2 == NULL) {
-					/* Under the fold lock n->d_fwd is stable (no splice
-					 * of m), so a single-shot detach + promote. */
-					host_to_free = urcu_txn_read(
-						(void **) &m->d_fwd, DC_FWD_TAG) ? NULL : m;
-					uatomic_store(&n->d_fwd, NULL, CMM_RELEASE);
-					uatomic_store(&m->d_back, NULL, CMM_RELEASE);
-					bl_unlock_n(heads, 2);
-					break;
-				}
-				bl_unlock_n(heads, 2);
-				continue;		/* demoted: re-read -> SPLICE */
-			}
-
-			/* TRANSFER: pull n's identity into m, replace n by m in both
-			 * indexes, promote m (plain store under the fold lock).  The
-			 * identity handover is an ATOMIC RMW -- the fold lock does NOT
-			 * exclude d_delete, which writes the host's pos/neg from
-			 * another thread; see dc_transfer_iparent(). */
-#if defined(DC_HOT1CL)
-			dc_transfer_iparent(m, n);
-#else
-			m->d_iparent = n->d_iparent;
-#endif
-			DC_NAME_XFER_BEGIN(m);
-			m->d_iname = n->d_iname;
-			DC_NAME_XFER_END(m);
+			DC_NAME_XFER_BEGIN(host);
+			host->d_iname = n->d_iname;
+			DC_NAME_XFER_END(host);
 			{
 				struct urcu_txn txn;
 				enum urcu_txn_status st;
 
-				urcu_txn_init(&txn, NULL);	/* no lane (see the note) */
+				/* no lane: an abort-free disjoint commit already
+				 * serialized by the bucket locks, run with them held */
+				urcu_txn_init(&txn, NULL);
 				urcu_txn_declare_disjoint(&txn);
 				urcu_txn_begin(&txn);
-				bl_sw_replace(&txn, &n->d_hash, &m->d_hash);
-				bl_sw_replace(&txn, &n->d_sib, &m->d_sib);
+				bl_sw_replace(&txn, &n->d_hash, &host->d_hash);
+				bl_sw_replace(&txn, &n->d_sib, &host->d_sib);
 				st = urcu_txn_commit_sw(&txn);
 				DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 				urcu_txn_end(&txn);
 				if (st == URCU_TXN_STATUS_OK)
-					uatomic_store(&m->d_back, NULL, CMM_RELEASE);	/* promote m */
-				else			/* OOM: nothing published, n still indexed */
+					uatomic_store(&host->d_top, NULL,
+						      CMM_RELEASE);	/* host names itself */
+				else		/* OOM: nothing published, n still indexed */
 					reclaim_n = 0;	/* do NOT free a live top */
 			}
-			bl_unlock_n(heads, 2);
-			break;
 		}
+		bl_unlock_n(heads, 2);
 	}
-	fold_unlock(host);			/* release the FOLD LOCK */
 	rcu_read_unlock();
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_folds);
 #endif
 	/*
-	 * ⭐ OFF THE LRU BEFORE THE FREE -- the fold had NO lru_del on any path,
-	 * and that was a free-while-queued by construction rather than by race.
-	 * resolve() marks recency on the HOST (txn_child_lookup_rcu ends
-	 * `return host_of_rcu(top)`), so hosts ARE on the LRU, and these two
-	 * frees are hosts.  Nothing had exercised it because no test ran renames
-	 * and the shrinker together; -DSTRESS_SHRINK now does, and fired 3/3.
-	 *
-	 * lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
-	 * use: on the lock arm it takes the shard lock and seals DC_LRU_DEAD, on
-	 * the MCAS arm it removes-and-seals the deque node in one commit.  Its
-	 * answer is not consulted here: the shrinker cannot be holding a node
-	 * that is mid-fold (lru_evict_settled skips anything with d_back/d_fwd
-	 * set), so the handoff branch is unreachable -- but calling the guarded
-	 * form is what keeps that true if the skip rule ever changes.
+	 * ⭐ OFF THE LRU BEFORE THE FREE.  resolve() marks recency on the HOST,
+	 * and lru_del_can_free(.., 1) is the same kill the unlink and the shrinker
+	 * use.  Its answer is not consulted: the shrinker cannot be holding a
+	 * shell (lru_evict_settled skips anything with d_fwd set).
 	 */
-	if (host_to_free) {
-		(void) lru_del_can_free(dc, host_to_free, 1);
-		call_rcu(&host_to_free->d_rcu, dentry_free_cb);
-	}
 	if (reclaim_n) {
 		(void) lru_del_can_free(dc, n, 1);
 		call_rcu(&n->d_rcu, dentry_free_cb);	/* reclaim @n after a GP */
 	}
 }
-
-#endif	/* DC_CHAIN_SWMW fold vs DC_CHAIN_FOLDLOCK fold */
-
-#endif	/* DC_CHAIN_MIXED */
 
 static void fold_cb(struct rcu_head *rh)
 {
@@ -3426,242 +2736,19 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 #ifdef DC_STRESS_DEBUG
 	uatomic_inc(&dc_dbg_renames);
 #endif
-	call_rcu(&shell->d_rcu, fold_cb);	/* the shell's fold compresses the chain */
+	call_rcu(&shell->d_rcu, fold_cb);	/* hands the name back to the host */
 	return 0;
 }
 
-#ifndef DC_CHAIN_MIXED	/* ===== default: per-host chain locks + plain demotes ===== */
 
 /*
- * EXCHANGE.  Atomically swap the entries named (pa, na) and (pb, nb): A becomes
- * named (pb, nb), B becomes named (pa, na), each keeping its content host.  ONE
- * SW commit performs all four index REPLACES -- sb (B's shell, name na) takes
- * topa's slot in bucket_a + pa's child head; sa (A's shell, name nb) takes
- * topb's slot in bucket_b + pb's child head -- so no concurrent walker observes
- * only half the swap.  The two demotes (topa->d_back = sa, topb->d_back = sb) are
- * plain stores under the two chain locks.
- *
- * NOT a pair of stack_one_prepare()s: an exchange does not del+add (which would
- * land move A's del and move B's add on the SAME head, aliasing when a top is
- * first).  Each (parent, name) SLOT is simply taken over by the OTHER entry's
- * shell -- an in-place replace.  When both tops share a head (a same-dir
- * exchange, or a hash collision), bl_sw_replace2 handles their possible
- * adjacency.
- *
- * A cycle-forming exchange (one host an ancestor of the other) is rejected
- * -EINVAL by the SAME d_moving flag protocol the single move uses: each move's
- * plain-read walk finds its own host on its new_parent -> root path.  BOTH hosts
- * are grayed (address-ordered) before either walk, so a peer's overlapping walk
- * sees a flag (Dekker).  No read-your-own-writes: a swap cycles iff one host is
- * ALREADY an ancestor of the other in the pre-swap tree.  Two folds are queued.
- *
- * LOCKING (as stack_shell, doubled): both chain locks (address-ordered) FIRST,
- * then the four bucket heads {bucket_a, bucket_b, pa-child, pb-child} in address
- * order (chain < bucket; bl_lock_n de-dups a shared head).  Walk causality is
- * the demote MARK -- no gen bump (mark-only).
- *
- * Returns 0, -ENOENT (an entry vanished), -EINVAL (the swap would create a
- * directory cycle), or -ENOMEM.  (-EEXIST cannot arise: each freed name is
- * re-taken by the other entry's shell in the same commit.)
- */
-int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
-		       const struct dc_path *bp)
-{
-	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
-	struct urcu_txn_sw_hlist_head *bucket_a, *bucket_b;
-	const struct qstr *na, *nb;
-	int cross, ret;
-
-	if (ap->ndepth == 0 || bp->ndepth == 0)
-		return -EINVAL;
-
-	pa = resolve(dc, ap, ap->ndepth - 1);
-	if (!pa)
-		return -ENOENT;
-	na = &ap->comp[ap->ndepth - 1];
-	pb = resolve(dc, bp, bp->ndepth - 1);
-	if (!pb)
-		return -ENOENT;
-	nb = &bp->comp[bp->ndepth - 1];
-
-	rcu_read_lock();
-	hosta = txn_child_lookup_rcu(dc, pa, na);
-	hostb = txn_child_lookup_rcu(dc, pb, nb);
-	rcu_read_unlock();
-	if (!hosta || !hostb)
-		return -ENOENT;
-	if (hosta == hostb)			/* same entry: exchange is a no-op */
-		return 0;
-
-	cross = pa != pb;
-	bucket_a = bucket_of(dc, pa, na->hash);
-	bucket_b = bucket_of(dc, pb, nb->hash);
-	sa = dentry_alloc(dc, pb, nb, 0, 0, 1); /* A's new top (name nb, parent pb) */
-	sb = dentry_alloc(dc, pa, na, 0, 0, 1); /* B's new top (name na, parent pa) */
-	if (!sa || !sb) {
-		free(sa);
-		free(sb);
-		return -ENOMEM;
-	}
-#ifdef DC_HOT1CL
-	sa->d_iparent = (struct dentry *) ((uintptr_t) sa->d_iparent | DC_TAG_SHELL);
-	sb->d_iparent = (struct dentry *) ((uintptr_t) sb->d_iparent | DC_TAG_SHELL);
-#endif
-
-	rcu_read_lock();			/* keeps tops/hosts alive across the commit */
-	for (;;) {
-		struct urcu_txn_sw_hlist_head *heads[4];
-		struct dentry *topa, *topb;
-		struct urcu_txn_sw_txn txn;
-		enum urcu_txn_status st;
-		int ma = 0, mb = 0, ca, cb;
-
-		topa = find_top_rcu(dc, pa, na);
-		topb = find_top_rcu(dc, pb, nb);
-		if (!topa || !topb) {		/* an entry vanished */
-			ret = -ENOENT;
-			goto out_free;
-		}
-		hosta = host_of_rcu(topa);	/* O(1); invariant per entry */
-		hostb = host_of_rcu(topb);
-		sa->d_host = hosta;		/* A's shell forwards to A's old top */
-		sa->d_fwd = topa;
-		sb->d_host = hostb;		/* B's shell forwards to B's old top */
-		sb->d_fwd = topb;
-
-		/*
-		 * Gray BOTH hosts before either cycle walk (Dekker), in ADDRESS ORDER
-		 * so two exchanges of the same pair cannot livelock; release a partial
-		 * acquire before retrying.  A same-parent exchange is a pure name swap
-		 * -- no reparent, no ancestry walk -- so no flag.
-		 */
-		if (cross) {
-			struct dentry *lo = hosta < hostb ? hosta : hostb;
-			struct dentry *hi = hosta < hostb ? hostb : hosta;
-
-			if (uatomic_cmpxchg(&lo->d_moving, 0UL, 1UL) != 0UL)
-				continue;	/* lo owned by another mover: retry */
-			if (uatomic_cmpxchg(&hi->d_moving, 0UL, 1UL) != 0UL) {
-				uatomic_and(&lo->d_moving, ~1UL);
-				continue;	/* hi owned by another mover: retry */
-			}
-		}
-
-		/*
-		 * Cycle checks BEFORE any lock (both hosts grayed above, Dekker): hosta
-		 * must not be an ancestor of pb, nor hostb of pa.  Running the bounded
-		 * O(depth) ancestry walks here keeps the lock hold O(1).  Independent of
-		 * the tops (hosts are rename-invariant), so no re-run under the lock.
-		 */
-		ca = cross ? cross_cycle_check(dc, hosta, pb) : 0;
-		cb = (cross && !ca) ? cross_cycle_check(dc, hostb, pa) : 0;
-		if (ca || cb) {
-			if (cross) {
-				uatomic_and(&hosta->d_moving, ~1UL);
-				uatomic_and(&hostb->d_moving, ~1UL);
-			}
-			if (ca == -EINVAL || cb == -EINVAL) {
-				ret = -EINVAL;
-				goto out_free;
-			}
-			continue;		/* -EAGAIN: re-find + retry */
-		}
-
-		/*
-		 * Chain locks (both, address-ordered) then the four bucket heads, and
-		 * RE-VERIFY both tops are still hashed under the lock (a marked top
-		 * means a concurrent unlink / fold transfer moved it -> re-find).
-		 */
-		heads[0] = bucket_a;
-		heads[1] = bucket_b;
-		heads[2] = &pa->d_child_head;
-		heads[3] = &pb->d_child_head;
-		fold_lock2(hosta, hostb);
-		bl_lock_n(heads, 4);
-		(void) bl_hlist_resolve(rcu_dereference(topa->d_hash.next), &ma);
-		(void) bl_hlist_resolve(rcu_dereference(topb->d_hash.next), &mb);
-		if (ma || mb)
-			goto retry_unlock;
-
-		/*
-		 * Record the four index replaces (sb takes topa's slot, sa takes
-		 * topb's), coalescing to a two-node replace when the tops share a head.
-		 */
-		urcu_txn_sw_init(&txn);
-		if (bucket_a == bucket_b)
-			bl_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
-					&topb->d_hash, &sa->d_hash);
-		else {
-			bl_sw_replace(&txn, &topa->d_hash, &sb->d_hash);
-			bl_sw_replace(&txn, &topb->d_hash, &sa->d_hash);
-		}
-		if (!cross)			/* same parent -> same child head */
-			bl_sw_replace2(&txn, &topa->d_sib, &sb->d_sib,
-					&topb->d_sib, &sa->d_sib);
-		else {
-			bl_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
-			bl_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
-		}
-		if (cross) {			/* reparent both hosts */
-			(void) dc_sw_record(&txn, (void **) &hosta->d_parent,
-						  parent_of_rcu(hosta), pb, DC_PARENT_TAG);
-			(void) dc_sw_record(&txn, (void **) &hostb->d_parent,
-						  parent_of_rcu(hostb), pa, DC_PARENT_TAG);
-		}
-		st = urcu_txn_sw_commit(&txn);	/* atomic swap; no ABORT under the locks */
-		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
-		if (st == URCU_TXN_STATUS_OK) {
-			/* demotes: plain stores under the two chain locks */
-			uatomic_store(&topa->d_back, sa, CMM_RELEASE);
-			uatomic_store(&topb->d_back, sb, CMM_RELEASE);
-		}
-		bl_unlock_n(heads, 4);
-		fold_unlock2(hosta, hostb);
-		if (cross) {
-			uatomic_and(&hosta->d_moving, ~1UL);
-			uatomic_and(&hostb->d_moving, ~1UL);
-		}
-		if (st != URCU_TXN_STATUS_OK) {	/* MEMORY_ERROR: nothing published */
-			ret = -ENOMEM;
-			goto out_free;
-		}
-		break;				/* swap committed */
-
-retry_unlock:
-		bl_unlock_n(heads, 4);
-		fold_unlock2(hosta, hostb);
-		if (cross) {
-			uatomic_and(&hosta->d_moving, ~1UL);
-			uatomic_and(&hostb->d_moving, ~1UL);
-		}
-		continue;			/* re-find + retry (marked top) */
-	}
-	rcu_read_unlock();
-#ifdef DC_STRESS_DEBUG
-	uatomic_add(&dc_dbg_renames, 2);
-#endif
-	call_rcu(&sa->d_rcu, fold_cb);
-	call_rcu(&sb->d_rcu, fold_cb);
-	return 0;
-out_free:
-	rcu_read_unlock();
-	free(sa);
-	free(sb);
-	return ret;
-}
-
-#else	/* ===== DC_CHAIN_MIXED: SW-enqueue exchange (shared by SWMW and RMLOCK) ===== */
-
-/*
- * EXCHANGE (mixed SW/MW).  Same atomic name swap as the default build, but the
- * two chain locks are retired: the four index REPLACES (store_sw, bucket-locked)
- * and the two DEMOTES (topa->d_back = sa, topb->d_back = sb -- store_mw) ride ONE
- * mixed commit, so a fold reads (index, d_back) resolved against one control word.
- * Both demotes' CAS-old = NULL cannot fail under the four bucket heads (a top's
- * d_back is NULL and a top is never a splice's fwd), so the commit is abort-free.
- * FAIR-MUTEX DISCIPLINE as the mixed stack_shell: begin FIRST; d_moving + bucket
- * locks AFTER begin; every terminal bail abandon()+end(), every retry
- * conflict()+end(), releasing both flags on all paths.
+ * EXCHANGE.  The four index REPLACES (store_sw, bucket-locked) and the two
+ * DEMOTES (hosta->d_top = sa, hostb->d_top = sb) ride ONE commit, so a fold
+ * reads (index, d_top) resolved against one control word.  store_sw, so the
+ * commit is abort-free under the bucket heads (see stack_one_prepare).
+ * DISCIPLINE as stack_shell: begin FIRST; d_moving + bucket locks AFTER begin;
+ * every terminal bail abandon()+end(), every retry conflict()+end(), releasing
+ * both flags on all paths.
  */
 int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		       const struct dc_path *bp)
@@ -3730,9 +2817,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		hosta = host_of_rcu(topa);	/* O(1); invariant per entry */
 		hostb = host_of_rcu(topb);
 		sa->d_host = hosta;		/* A's shell forwards to A's old top */
-		sa->d_fwd = topa;
+		sa->d_fwd = hosta;	/* write-once shell flag (see struct) */
 		sb->d_host = hostb;		/* B's shell forwards to B's old top */
-		sb->d_fwd = topb;
+		sb->d_fwd = hostb;
 
 		/*
 		 * Gray BOTH hosts (address-ordered) AFTER begin (Dekker): two exchanges
@@ -3819,13 +2906,13 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			bl_sw_replace(&txn, &topa->d_sib, &sb->d_sib);
 			bl_sw_replace(&txn, &topb->d_sib, &sa->d_sib);
 		}
-		/* Two demotes as store_SW records in the SAME commit: each is the SPMC
-		 * ENQUEUE of its chain -- single-producer under topX's bucket heads
-		 * (topX->d_back is NULL and stays so), a plain park, never a CAS. */
-		(void) urcu_txn_store_sw(&txn, (void **) &topa->d_back, NULL, sa,
-					      DC_FWD_TAG);
-		(void) urcu_txn_store_sw(&txn, (void **) &topb->d_back, NULL, sb,
-					      DC_FWD_TAG);
+		/* Each entry's new shell becomes its top in the SAME commit: a
+		 * store_SW, single-writer under topX's bucket heads (see
+		 * stack_one_prepare). */
+		(void) urcu_txn_store_sw(&txn, (void **) &hosta->d_top,
+					      dtop_val(hosta, topa), sa, DC_FWD_TAG);
+		(void) urcu_txn_store_sw(&txn, (void **) &hostb->d_top,
+					      dtop_val(hostb, topb), sb, DC_FWD_TAG);
 		if (cross) {			/* reparent both hosts (store_sw) */
 			(void) urcu_txn_store_sw(&txn, (void **) &hosta->d_parent,
 						      parent_of_rcu(hosta), pb,
@@ -3863,8 +2950,6 @@ out_free:
 	free(sb);
 	return ret;
 }
-
-#endif	/* DC_CHAIN_MIXED */
 
 /* ---- verification walk (quiescent) ------------------------------------- */
 
@@ -3921,9 +3006,9 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	struct urcu_txn_sw_hlist_head *heads[3];
 	int marked = 0;
 
-	if (uatomic_load(&d->d_back, CMM_RELAXED) ||
+	if (bl_read((void **) &d->d_top, DC_FWD_TAG) ||
 	    uatomic_load(&d->d_fwd, CMM_RELAXED))
-		return -EAGAIN;			/* on a transition chain */
+		return -EAGAIN;			/* renamed host, or a shell */
 	parent = parent_of_rcu(d);
 	if (!parent || parent == d)
 		return -EAGAIN;			/* the root anchors the tree */
@@ -3945,7 +3030,7 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	 *
 	 * bl_lock_n sorts by address and de-duplicates, so adding a third head
 	 * introduces no new deadlock edge -- the whole class stays
-	 * address-ordered, and {fold locks < bucket heads} is unchanged.
+	 * address-ordered.
 	 */
 	heads[0] = bucket;
 	heads[1] = &parent->d_child_head;
@@ -3956,7 +3041,7 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	 * between the isolate and this acquire. */
 	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
 	if (marked || !children_empty(d) ||
-	    uatomic_load(&d->d_back, CMM_RELAXED)) {
+	    bl_read((void **) &d->d_top, DC_FWD_TAG)) {
 		bl_unlock_n(heads, 3);
 		return -EAGAIN;
 	}
@@ -3978,7 +3063,7 @@ void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg)
 	struct dc_path path;
 
 	dc_path_reset(&path);
-	rcu_read_lock();			/* chain_host_rcu resolves d_fwd */
+	rcu_read_lock();			/* host_of_rcu resolves d_host */
 	walk_rec(dc->root, &path, fn, arg);
 	rcu_read_unlock();
 }
@@ -4062,21 +3147,20 @@ struct dentry *dc_lookup_dentry(struct dcache *dc, const struct dc_path *p)
 }
 
 /*
- * The node that currently NAMES @host: climb d_back to the top (NULL).  The
- * default build plain-stores the links under the per-host chain lock (release);
- * DC_CHAIN_SWMW transacts them, so each read resolves through bl_read.  Call
- * under rcu_read_lock: a shell is freed a grace period after the fold that
- * unlinks it.  A name read off the returned top is never mid-TRANSFER, for the
- * reason given in dcache_txn.c's named_top_rcu (the fold is call_rcu-deferred
- * past the demoting rename, here too).
+ * The node that currently NAMES @host: its d_top, or @host itself when that is
+ * NULL -- one load.  Read through bl_read, since the stack and exchange commit
+ * it as a record.  Call under rcu_read_lock: a shell is freed a grace period
+ * after its fold.  A name read off the returned top is never mid-TRANSFER: the
+ * fold copies the shell's name into the host before the commit that publishes
+ * the host, and resets d_top only after it, under the same bucket lock; a walk
+ * that still reads the (now unhashed) shell in between reads the same name and
+ * parent the host now carries.
  */
 static inline struct dentry *named_top_rcu(struct dentry *host)
 {
-	struct dentry *n = host, *b;
+	struct dentry *t = bl_read((void **) &host->d_top, DC_FWD_TAG);
 
-	while ((b = bl_read((void **) &n->d_back, DC_FWD_TAG)) != NULL)
-		n = b;
-	return n;
+	return t ? t : host;
 }
 
 /*

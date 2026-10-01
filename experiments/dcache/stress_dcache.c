@@ -3,7 +3,7 @@
  * stress_dcache.c -- concurrent stress + conservation harness for the txn dcache
  * engine's ASYNC fold.  The deterministic repro (repro_fold) went latent once the
  * fold moved into a call_rcu worker, so THIS is the primary validator for the
- * concurrent stack/fold/splice machinery.  Run it under ASan (UAF / double-free /
+ * concurrent stack/fold machinery.  Run it under ASan (UAF / double-free /
  * torn read) and, on a liburcu built with compiler atomic builtins, TSAN (data
  * races).
  *
@@ -17,13 +17,14 @@
  * exactly the path its owner last recorded.  This still exercises the hard races:
  *
  *   - a writer re-renaming its own leaf faster than the fold worker drains it
- *     builds a multi-node chain and races its next STACK against the pending
- *     fold on the SAME chain (transfer-vs-splice re-classification, stack
- *     re-find on -ENOENT);
+ *     demotes shells whose folds are still pending, and races its next STACK
+ *     against the pending fold of the current top (transfer-vs-free decision,
+ *     stack re-find on -ENOENT);
  *   - a fraction of iterations rename-then-UNLINK a leaf with no quiesce between,
- *     so the unlink lands on a live shell (top != host) and the pending fold
- *     RECLAIMs the orphaned chain while it races the writer's own and earlier
- *     folds draining on the worker; a re-add restores the leaf (conservation);
+ *     so the unlink lands on a live shell (top != host), frees the host, and
+ *     leaves the shell to its pending fold, which races the writer's own and
+ *     earlier folds draining on the worker; a re-add restores the leaf
+ *     (conservation);
  *   - two leaves moving into the same directory concurrently contend on that
  *     dir's child-hlist head and on the global rename_gen bump;
  *   - readers resolve /d{k}/L{gid} concurrently with all of it: a POSITIVE

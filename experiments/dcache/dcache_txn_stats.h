@@ -35,7 +35,7 @@ enum dc_ts_site {
 	DC_TS_UNLINK,		/* dc_unlink index removal */
 	DC_TS_STATE,		/* d_instantiate / d_delete pos-neg flip */
 	DC_TS_STACK,		/* rename: stack_shell */
-	DC_TS_FOLD,		/* the fold's TRANSFER / SPLICE / RECLAIM */
+	DC_TS_FOLD,		/* the fold's TRANSFER */
 	DC_TS_XCHG,		/* exchange */
 	DC_TS_LRU_ADD,		/* LRU enqueue (MCAS arm) */
 	DC_TS_LRU_DEL,		/* LRU removal (MCAS arm) */
