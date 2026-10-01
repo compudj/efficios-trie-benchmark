@@ -9,6 +9,12 @@ the dense reader/rename interaction the probing panels (split_scale, whose
 terminals are ~97% negative hits on dentries no rename touches) barely reach:
 d_seq retries on the seqlock engine, shell resolution on the txn engines.
 
+The namespace is the writers' 256 leaves at every reader count: the readers own
+none, so every lookup targets a moving object and adding readers adds no
+leaves.  (Before 2026-09-30 each reader also owned 32 leaves nothing moves, so
+only 8/(readers+8) of the lookups -- 80% at 2 readers, 4% at 184 -- targeted a
+moving object, and the reader axis confounded the two.)
+
   seqlock           the kernel's RCU walk (hand-over-hand d_seq)
   seqlock-snapshot  the same, bracketed on rename_lock (read_seqbegin_or_lock)
   txn-global        rename_gen bracket

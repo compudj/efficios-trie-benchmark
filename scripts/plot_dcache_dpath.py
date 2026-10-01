@@ -17,8 +17,11 @@ guarantee, each with its own mechanism:
 
 On the txn engines the climb starts at the object's content host and follows
 the transition chain's back links to the node that currently names it: it is
-O(renames of that object not yet folded).  This bench renames each of 256
-leaves at up to millions of renames per second, far faster than real
+O(renames of that object not yet folded).  The readers own no leaves: every
+handle is one of the writers' 256 leaves at every reader count (before
+2026-09-30 each reader also owned 32 leaves nothing moves, so only
+8/(readers+8) of the walks targeted a moving object).  This bench renames each
+of those 256 leaves at up to millions of renames per second, far faster than real
 workloads rename one object (atomic-save and lock-file protocols rename a NEW
 object each time), so the low-reader-count points -- where the writers run
 fastest -- are a stress case for that chain, not a workload.

@@ -240,6 +240,8 @@ fi
 # kernel itself serves with a whole-path snapshot (__dentry_path brackets on
 # rename_lock), so it is the like-for-like comparison for engines that give
 # every walk a snapshot: the seqlock arms both run the kernel's reverse walk.
+# The readers own no leaves (bench writers_own): every handle is one of the
+# writers' WFIX*LEAVES leaves, whatever the reader count.
 if want dpath_scale; then
 RUN_EXTRA="--dpath"
 echo ">> dpath_scale panel: $WFIX writers, --dpath, sweep readers up to $RMAX" >&2
@@ -253,7 +255,8 @@ fi
 # Readers look up each leaf's CURRENT path, published by its owner (bench
 # --hit-current), so nearly every lookup is a positive hit on an object the
 # writers are renaming right now: the dense reader/rename interaction the
-# probing panels (split_scale: ~97% negative hits) barely touch.
+# probing panels (split_scale: ~97% negative hits) barely touch.  As in
+# dpath_scale the readers own no leaves, so that holds at every reader count.
 if want hit_scale; then
 RUN_EXTRA="--hit-current"
 echo ">> hit_scale panel: $WFIX writers, --hit-current, sweep readers up to $RMAX" >&2
