@@ -14,33 +14,69 @@ cites them.
 
 Every figure was re-swept on the corrected methodology (README "Results"): the
 kernel's RCU walk as the baseline's lookup, writers PACED wherever readers are
-compared, the harness PRNG decorrelated, a kernel-faithful in-place churn mode,
-and the vendored kernel rwsem as the baseline's directory lock.  The multiples
-quoted in the historical verdict below (~25×, ~8–60×, ~5–7.6× at every height)
-all came from flat-out writers or the old whole-walk baseline and are void.
-What survives, measured:
+compared, the harness PRNG decorrelated, positive-hit and reverse-walk readers
+aimed only at moving objects, a kernel-faithful in-place churn mode, the
+vendored kernel rwsem as the baseline's directory lock, spinlocks that wait
+with plain loads as the kernel's do, and the seeded namespace homed on the
+benchmark's own node.  The multiples quoted in the historical verdict below
+(~25×, ~8–60×, ~5–7.6× at every height) all came from flat-out writers or the
+old whole-walk baseline and are void.  What survives, measured:
 
 1. **Readers: parity at realistic rename rates, a growing lead above them.**
    At 10k renames/s every arm is within 2% of seqlock; the localized arms lead
-   1.16–1.18× at 100k/s and 1.64–1.71× at 300k/s, where seqlock's writers stop
-   keeping up.  seqlock still wins positive hits on objects being renamed at
-   low concurrency (txn 0.76–0.90× up to 32 readers) and the reverse walk at 2–8
-   readers.  The d_seq/causality machinery is cheap in the kernel's fast path;
-   the txn win is under rename load, not at rest.
-2. **Writers: the clear win.**  Flat out the bucket lock renames 3.8–26× seqlock,
-   txn-mark 2.2–4.7×.  Part of that is the per-directory rwsem and cross-dir
-   rename mutex the txn designs dissolve (lock-free readdir leaves no reader to
-   exclude) — a legitimate axis, but it means a kernel port's gain depends on
-   what the VFS still takes around the dcache.
-3. **Create/delete: the old "txn loses churn" was the LRU.**  The allocating
+   1.16–1.19× at 100k/s and 1.78–1.86× at 300k/s, where seqlock's writers stop
+   keeping up.  seqlock still wins where every lookup targets an object being
+   renamed, at low concurrency (up to 32 readers: txn-global 0.95–1.01×,
+   txn-mark 0.86–0.93×, per-node and bucket lock 0.79–0.86×), and the reverse
+   walk at 2–8 readers (0.63–0.75×).  The mechanism is a trade: an unfolded
+   rename shell makes a hit read three cachelines instead of one, and shells
+   live ~5 ms (`call_rcu` batching), so each reader pays a private L1-capacity
+   cost; seqlock's in-place rename costs every reader a coherence miss instead,
+   which is cheap with few readers and grows with them.  At rest the mark arm is
+   at parity; the d_seq/causality machinery is cheap in the kernel's fast path,
+   and the txn win is under rename load, not at rest.
+   ⚠ The positive-hit and reverse-walk panels before 2026-09-30 let readers own
+   leaves nothing moves, so only 8/(readers+8) of their targets moved; the
+   numbers above are from the corrected harness (`bench_dcache.c` writers_own).
+   ⚠ In that dense-hit panel the bucket lock is the lowest arm at 128–184
+   readers (0.87–0.92×): readers with a stale path miss on the name a rename
+   just vacated and all cache a negative at once, on the bucket and parent
+   child-list locks the renamers need (0.95× without negative caching).  With
+   the test-and-set spins both engines had until 2026-09-30 it was 0.67–0.75×
+   with its writers below the offered rate.  What is left is the herd itself;
+   the kernel coalesces it (`d_alloc_parallel`), this port does not.
+2. **Interconnect sensitivity is asymmetric.**  With the namespace homed on the
+   far socket, seqlock's readdir and reverse walk lose 30–40% and the txn
+   readers 2–5%: seqlock's readers RMW a directory's rwsem or re-read
+   `rename_lock`, so every transfer pays the trip to the line's home node,
+   while the txn readers only read shared lines.  Unpinned, the setup thread
+   picked that home at random per session — the 1.4× sweep-to-sweep swings of
+   seqlock's 16-reader readdir and reverse walk.  Spreading readers one per CCD
+   hurts every engine (seqlock −35–55%, txn −13–16%): they share a few hot
+   lines.
+3. **Writers: the clear win.**  Flat out the bucket lock renames 4.5–21.2×
+   seqlock, txn-mark 2.0–4.5×.  Part of that is the per-directory rwsem and
+   cross-dir rename mutex the txn designs dissolve (lock-free readdir leaves no
+   reader to exclude) — a legitimate axis, but it means a kernel port's gain
+   depends on what the VFS still takes around the dcache.
+4. **Create/delete: the old "txn loses churn" was the LRU.**  The allocating
    add/unlink path spends 39–57% of its cycles on one per-node LRU lock; on the
    path the kernel takes for same-name churn (in place) every txn arm and the
-   bucket lock beat seqlock, up to 2.4×.
-4. **Correctness found by the re-sweep:** the MW engine's exchange (two
+   bucket lock beat seqlock, up to 1.85×, three quarters of the bucket lock's
+   lead being the directory rwsem.
+5. **Correctness found by the re-sweep:** the MW engine's exchange (two
    delete + insert-at-head moves) made existing paths transiently ABSENT to the
    localized readers — fixed with in-place replaces, gated by
    `make check-xchg-absent`; the old exchange stress was vacuous (one arm, 4096
    buckets).
+
+6. **Methodology traps found by the re-sweep.**  A setup pinned to one CPU
+   before an exec made jemalloc size its arenas for one CPU — one arena for 200
+   threads — and halved the bucket lock's writers in a sweep that was then
+   discarded (check `MALLOC_CONF=stats_print:true`, `opt.narenas`; never start a
+   jemalloc benchmark single-CPU-pinned, `taskset -c N` included).  And the
+   allocator faults its first chunks in before `main()`, so placing memory from
+   inside `main()` is too late: the setup sets a memory policy and re-execs.
 
 The architecture conclusion stands (§2): the bucket lock + SW txn hybrid is the
 best writer and matches the best reader.
