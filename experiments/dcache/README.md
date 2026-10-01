@@ -219,6 +219,20 @@ beyond that seqlock's renamers cannot keep up (`dcache_readdir.png`).
 Directory exchanges at every height: lookups within 0.92–1.10× at 100k/s
 (`dcache_height.png`).
 
+**At rest** (`dcache_idle.png`: the same four reader panels with the writers
+idle, same namespace and placement, no rename in the timed window).  Probing
+lookups: every engine within 0.92–1.08× of seqlock, parity from 32 readers.
+Positive hits: txn-global 1.07–1.11×, txn-mark 0.97–1.01×, per-node 0.90–0.94×,
+the bucket lock 0.83–0.88× — so under renames txn-mark's hit gap is the shell
+(the trade above), while per-node's generation sampling and the bucket lock's
+per-hop pointer decoding are a cost they pay at rest too.  Reverse walk: every
+txn arm leads at every reader count, 1.10–1.56×, with nothing to defend
+against.  readdir: txn 1.20–1.26× at 2 readers, 2.1–2.2× at 16, 4–5.6× at
+128–184 — seqlock's readdir stops scaling at ~400 Mreaddir/s from 96 readers
+with no writer at all: its readers RMW the directory's rwsem count (as the
+kernel's `iterate_shared` takes `i_rwsem` shared), so the readdir wall of the
+loaded panel is the rwsem's read side, not the renames.
+
 **Interconnect sensitivity** — a result in its own right.  With the seeded
 namespace homed on the far socket (16 readers + 8 writers, all on socket 0),
 seqlock's readdir drops 93 → 65 Mreaddir/s and its reverse walk ~375 → ~270
