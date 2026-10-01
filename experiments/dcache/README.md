@@ -36,7 +36,7 @@ nothing, not from an engine that was slow.
 | `REVIEW.md` | retrospective: verdict, design rules, **methodology rules**, open items |
 | `test_dcache.c` | single-threaded correctness + namespace-conservation harness |
 | `repro_dcache.c` | deterministic 1-writer/1-walker repro of the walk-causality race (`make repro`) |
-| `stress_dcache*.c` | concurrent stress: namespace, cross-dir moves, exchange, shared renamers (`stress_dcache_shared.c`: several writers rename the same objects, so one entry's folds run concurrently) (ASan/TSAN arms) |
+| `stress_dcache*.c` | concurrent stress: namespace, cross-dir moves, exchange, shared renamers (`stress_dcache_shared.c`: several writers rename the same objects, so one entry's folds run concurrently), directory unlink vs adds under it (`stress_dcache_rmdir.c`, with must-fail mutation arms) (ASan/TSAN arms) |
 | `bench_dcache.c` | path-lookup bench: role-split readers/writers, `--op-mix`, conservation-gated |
 | `bench_dcache_churn.c` | add/unlink churn + `readdir`; `--readdir-names` builds a real per-dirent `qstr` |
 | `bench_dcache_height.c` | directory-op bench at a chosen subtree height (`--op`) |

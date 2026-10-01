@@ -466,20 +466,24 @@ items here are the ones that actually fired in this experiment):
 
 ## 6. Open items
 
-- **No harness races a directory unlink against an add under it** (found
-  2026-10-01).  Both engines exclude it: the bucket lock's unlink takes the
-  victim directory's own child head (`dc_add` locks its parent's), and the txn
-  engine's commit seals that head with an MW record; `dc_add` re-checks the
-  parent entry is alive under its locks.  But every concurrent harness unlinks
-  files, or empty directories nobody adds under (allocating churn toggles empty
-  directories), so neither exclusion has been seen to fire: with the bucket
-  lock's taken out, all 11 gates that build that engine still pass.  Measured
-  cost of that lock: ~5% of
-  empty-directory churn against 32–64 concurrent listers (the lock word shares a
-  line with the `d_sib` listers read), ~1% without — the kernel pays it too
-  (`vfs_rmdir` locks the victim).  Wanted: a harness where writers unlink and
-  re-add directories while other writers add children under them, with ASan and
-  a census, and a mutant that drops the exclusion to prove it fires.
+- **Directory unlink vs an add under it — closed 2026-10-01**
+  (`stress_dcache_rmdir.c`, `make check-rmdir`).  Both engines exclude it: the
+  bucket lock's unlink takes the victim directory's own child head (`dc_add`
+  locks its parent's) and `dc_add` re-checks the parent entry is alive under
+  its locks; the txn engine's commit seals that head with an MW record.  Until
+  this harness no concurrent test unlinked a directory anyone was adding under,
+  so neither exclusion had been seen to fire — with the bucket lock's taken out,
+  all 11 gates that build that engine still passed.  Now unlinkers remove and
+  re-add directories while adders publish and remove children under them; a
+  child, once added, pins its parent, so it must stay reachable and its own
+  unlink must succeed.  Every mutation arm fails 5/5 runs at natural timings
+  (no seal: ~7–11k lost children per run; no unlink lock: ~350; no add check:
+  ~7–8k) and every correct build passes 5/5, also with the window widened from
+  inside the unlink (`-DDC_TEST_UNLINK_DELAY_US`), under ASan and TSAN.  ASan
+  stays silent on the mutants — the orphaned child is never dereferenced — so
+  the lost-child check is the detector.  The bucket-lock lock's cost: ~5% of
+  empty-directory churn against 32–64 concurrent listers, ~1% without; the
+  kernel pays it too (`vfs_rmdir` locks the victim).
 
 - **Coverage gaps** (`dcache-rename-taxonomy`) — *closed: all four cells now have
   a number* (result block below).  `bench_dcache --op-mix
