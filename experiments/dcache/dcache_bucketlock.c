@@ -500,12 +500,23 @@ bl_first(struct urcu_txn_sw_hlist_head *h)
 		 & ~DC_BL_LOCK);
 }
 
+/*
+ * Test-and-TEST-and-set, as the kernel's bit_spin_lock is: one fetch_or, then
+ * wait with plain loads until the bit clears.  Readers load this word on every
+ * walk through the bucket, so a waiter that RMWs it on every spin (plain
+ * test-and-set, what this was until 2026-09-30) invalidates it under all of
+ * them and under the holder.  Measured: stale readers caching the same negative
+ * at once (bench_dcache --hit-current, 184 readers) cost this engine 33% of its
+ * lookups and its renamers 12% of their paced rate; half of that was the spin.
+ */
 static inline void bl_lock(struct urcu_txn_sw_hlist_head *h)
 {
 	uintptr_t *p = (uintptr_t *) &h->first;
 
 	while (__atomic_fetch_or(p, DC_BL_LOCK, __ATOMIC_ACQUIRE) & DC_BL_LOCK)
-		caa_cpu_relax();
+		do {
+			caa_cpu_relax();
+		} while (__atomic_load_n(p, __ATOMIC_RELAXED) & DC_BL_LOCK);
 }
 
 static inline void bl_unlock(struct urcu_txn_sw_hlist_head *h)
@@ -535,7 +546,9 @@ static inline void bl_unlock2(struct urcu_txn_sw_hlist_head *x,
 /*
  * ---- per-host chain-serialization lock (the FOLD LOCK) ------------------ *
  *
- * A test-and-set spinlock on host->d_fold_lock (0 = free, 1 = held).  It is
+ * A test-and-TEST-and-set spinlock on host->d_fold_lock (0 = free, 1 = held):
+ * one cmpxchg, then plain loads until it reads free (it cmpxchg'd on every spin
+ * until 2026-09-30, stealing the line from the holder each time).  It is
  * taken BEFORE any bucket-head lock and in address order (an exchange grays
  * two), so the global lock order is {fold locks < bucket-head locks}, each
  * class address-ordered -- no bucket is ever held while waiting on a fold lock,
@@ -549,7 +562,9 @@ static inline void bl_unlock2(struct urcu_txn_sw_hlist_head *x,
 static inline void fold_lock(struct dentry *host)
 {
 	while (uatomic_cmpxchg(&host->d_fold_lock, 0UL, 1UL) != 0UL)
-		caa_cpu_relax();
+		do {
+			caa_cpu_relax();
+		} while (uatomic_load(&host->d_fold_lock, CMM_RELAXED) != 0UL);
 }
 static inline void fold_unlock(struct dentry *host)
 {

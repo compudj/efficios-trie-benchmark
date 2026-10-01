@@ -8,7 +8,7 @@
  *
  * It maps kernel primitives to userspace equivalents:
  *   - atomic_long_t / smp_* / READ_ONCE  -> C11 __atomic builtins
- *   - raw_spinlock_t                     -> a test-and-set spinlock
+ *   - raw_spinlock_t                     -> a test-and-test-and-set spinlock
  *   - task_struct / current / wake_q     -> a per-thread TLS task + futex park
  *   - schedule()/set_current_state()     -> futex wait on the task's wake word
  *   - jiffies / HZ / handoff timeout     -> CLOCK_MONOTONIC in 1/250 s ticks
@@ -138,7 +138,7 @@ static inline void list_move_tail(struct list_head *e, struct list_head *h)
 	     &pos->member != (head);					\
 	     pos = n, n = list_entry(n->member.next, __typeof__(*n), member))
 
-/* ---- raw_spinlock_t (test-and-set) --------------------------------------- */
+/* ---- raw_spinlock_t (test-and-test-and-set) ------------------------------ */
 typedef struct { volatile int locked; } raw_spinlock_t;
 #define raw_spin_lock_init(l)	do { (l)->locked = 0; } while (0)
 static inline void raw_spin_lock(raw_spinlock_t *l)

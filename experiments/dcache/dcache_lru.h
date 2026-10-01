@@ -1061,10 +1061,25 @@ const int dc_lru_inuse_is_removed = 1;	/* LOCK arm REMOVES, as the kernel does *
 void dc_lru_validate(void *stream) { (void) stream; }
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
 
+/*
+ * The shard's spinlock (the kernel's list_lru_one.lock).
+ *
+ * Test-and-TEST-and-set: one cmpxchg, then wait with plain loads until the word
+ * reads free.  The kernel's spinlock_t (a qspinlock) never RMWs the lock word
+ * while it waits either; a waiter that cmpxchg'd on every spin (what this was
+ * until 2026-09-30) stole the line from the holder on every iteration.  Not a
+ * FIFO lock like the qspinlock: a queued lock hands the lock to a waiter that
+ * may be descheduled, and the kernel prevents that by disabling preemption
+ * while spinning -- this harness cannot, and co-pins each writer's call_rcu
+ * worker (which takes this lock on the fold and free paths) on its writer's
+ * CPU, so a FIFO handoff would convoy behind it for a timeslice.
+ */
 static inline void lru_lock(struct dc_lru_shard *sh)
 {
 	while (uatomic_cmpxchg(&sh->lock, 0UL, 1UL) != 0UL)
-		caa_cpu_relax();
+		do {
+			caa_cpu_relax();
+		} while (uatomic_load(&sh->lock, CMM_RELAXED) != 0UL);
 	cmm_smp_mb();
 }
 

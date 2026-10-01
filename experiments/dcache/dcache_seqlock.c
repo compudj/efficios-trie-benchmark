@@ -440,13 +440,22 @@ static inline void bl_set_first_rcu(struct dc_bucket *b, struct dc_hnode *n)
  * The atomic fetch_or/fetch_and touch the whole word but only ever flip bit 0;
  * the holder's chain stores (bl_set_first_rcu, hlist_del_rcu's *pprev) preserve
  * that bit by value, so lock and data never clobber each other.
+ *
+ * Test-and-TEST-and-set, as bit_spin_lock is: one test_and_set_bit, then wait
+ * with plain loads until the bit clears.  A waiter that RMWs the word on every
+ * spin (plain test-and-set, what this was until 2026-09-30) steals the line
+ * from the holder and from every reader walking the chain; a herd of readers
+ * caching the same negative made that measurable (bench_dcache --hit-current,
+ * 128-184 readers).
  */
 static inline void bl_lock(struct dc_bucket *b)
 {
 	uintptr_t *p = (uintptr_t *) &b->first;
 
 	while (__atomic_fetch_or(p, DC_BL_LOCK, __ATOMIC_ACQUIRE) & DC_BL_LOCK)
-		caa_cpu_relax();
+		do {
+			caa_cpu_relax();
+		} while (__atomic_load_n(p, __ATOMIC_RELAXED) & DC_BL_LOCK);
 }
 
 static inline void bl_unlock(struct dc_bucket *b)
@@ -490,11 +499,25 @@ static inline void hlist_del_rcu(struct dc_hnode *n)
 /* ---- PHASE 3: struct list_lru (s_dentry_lru) --------------------------- */
 #ifndef DC_NO_LRU
 
-/* list_lru_one.lock -- a plain spinlock, as in the kernel. */
+/*
+ * list_lru_one.lock -- a plain spinlock, as in the kernel.
+ *
+ * Test-and-TEST-and-set: one cmpxchg, then wait with plain loads until the word
+ * reads free.  The kernel's spinlock_t (a qspinlock) never RMWs the lock word
+ * while it waits either; a waiter that cmpxchg'd on every spin (what this was
+ * until 2026-09-30) stole the line from the holder on every iteration.  Not a
+ * FIFO lock like the qspinlock: a queued lock hands the lock to a waiter that
+ * may be descheduled, and the kernel prevents that by disabling preemption
+ * while spinning -- this harness cannot, and co-pins each writer's call_rcu
+ * worker (which takes this lock on the fold and free paths) on its writer's
+ * CPU, so a FIFO handoff would convoy behind it for a timeslice.
+ */
 static inline void lru_lock(struct dc_lru_one *l)
 {
 	while (uatomic_cmpxchg(&l->lock, 0UL, 1UL) != 0UL)
-		caa_cpu_relax();
+		do {
+			caa_cpu_relax();
+		} while (uatomic_load(&l->lock, CMM_RELAXED) != 0UL);
 	cmm_smp_mb();
 }
 
