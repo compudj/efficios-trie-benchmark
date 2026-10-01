@@ -29,6 +29,7 @@ declare -A INPUTS=(
 	[dcache_readdir]="dcache_sweep"
 	[dcache_dpath]="dcache_sweep"
 	[dcache_hit]="dcache_sweep"
+	[dcache_idle]="dcache_sweep"
 	[dcache_sat]="dcache_sweep"
 	[dcache_height]="dcache_height"
 	[dcache_churn]="dcache_churn"

@@ -107,7 +107,9 @@ done
 # run <panel> <engine> <threads> <writers(-1=homog)> <rename_frac> [rate]
 # -> best-of-RUNS appends a CSV row; readers = threads-writers in split mode,
 # else threads.  [rate] (renames/s, aggregate) paces the writers; omitted or 0
-# runs them flat out.  $RUN_EXTRA (global) appends extra flags, e.g. "--readdir
+# runs them flat out; `idle` paces them to 0.001/s -- one rename each at the
+# start of the warm-up, none in the timed window -- and records rate 0 with
+# every run eligible (there is no rate to sustain).  $RUN_EXTRA (global) appends extra flags, e.g. "--readdir
 # --leaves 64"; a later --leaves overrides the one baked into $COMMON (argv:
 # last wins).  For readdir panels the "Mlookups/s:" field carries the readdir
 # CALL rate.
@@ -117,7 +119,9 @@ run() {
   local bin=$BIN/${BINOF[$eng]} split="" readers=$threads r pace=""
   local cons=OK out runs="" best_lk best_rn paced
   if [[ "$writers" -ge 0 ]]; then split="--writers $writers"; readers=$((threads-writers)); fi
-  [[ "$rate" != 0 ]] && pace="--rename-rate $rate"
+  local tgt=$rate
+  if [[ "$rate" == idle ]]; then pace="--rename-rate 0.001"; tgt=0; rate=0
+  elif [[ "$rate" != 0 ]]; then pace="--rename-rate $rate"; fi
   # decontend: writers>=0 -> 16*writers dirs; homogeneous (writers<0) -> 16*threads
   local nw=$(( writers >= 0 ? writers : threads ))
   local nd=$(( 16 * (nw < 1 ? 1 : nw) ))
@@ -130,7 +134,7 @@ run() {
     fi
     runs+="$(field "$out" "Mlookups/s:") $(field "$out" "Mrenames/s:")"$'\n'
   done
-  read -r best_lk best_rn paced < <(pick_run "$rate" <<< "$runs")
+  read -r best_lk best_rn paced < <(pick_run "$tgt" <<< "$runs")
   echo "$panel,$eng,$threads,$writers,$readers,$frac,$rate,$best_lk,$best_rn,$paced,$cons,$SRC_ID" >> "$CSV"
   printf "  %-11s %-16s thr=%-4s w=%-3s frac=%-5s rate=%-8s rd=%8s Mlk/s  wr=%8s Mrn/s  %-5s %s\n" \
     "$panel" "$eng" "$threads" "$writers" "$frac" "$rate" "$best_lk" "$best_rn" "$paced" "$cons" >&2
@@ -278,6 +282,45 @@ echo ">> readdir_w panel: $RRD readers, --readdir, sweep writers (namespace fixe
 for w in 1 2 4 8 16 24 32 48; do
   RUN_EXTRA="--readdir --leaves $((RDTOTAL / w))"
   for e in $ENGINES; do run readdir_w "$e" $((RRD+w)) "$w" 1.0 $((w * PER_W)); done
+done
+RUN_EXTRA=""
+fi
+
+# ---- Panels: IDLE reader scaling -- the four reader ops with no renames ------
+# The rename-load panels above (split_scale, hit_scale, dpath_scale,
+# readdir_scale), re-run with the writers idle: the same 8 writer threads own
+# the same namespace on the same cores, paced to 0.001 renames/s (`idle`), so
+# their only renames -- one each -- fall in the warm-up and the timed window is
+# rename-free.  What each engine's readers cost at rest, point for point
+# against the loaded panels: the per-hop costs a rename load hides (per-node
+# generation sampling, the bucket lock's pointer decoding).
+if want idle_scale; then
+echo ">> idle_scale panel: $WFIX idle writers, probing lookups, sweep readers up to $RMAX" >&2
+for rd in $RDPTS; do
+  for e in $ENGINES; do run idle_scale "$e" $((rd+WFIX)) "$WFIX" 1.0 idle; done
+done
+fi
+if want idle_hit; then
+RUN_EXTRA="--hit-current"
+echo ">> idle_hit panel: $WFIX idle writers, --hit-current, sweep readers up to $RMAX" >&2
+for rd in $RDPTS; do
+  for e in $ENGINES; do run idle_hit "$e" $((rd+WFIX)) "$WFIX" 1.0 idle; done
+done
+RUN_EXTRA=""
+fi
+if want idle_dpath; then
+RUN_EXTRA="--dpath"
+echo ">> idle_dpath panel: $WFIX idle writers, --dpath, sweep readers up to $RMAX" >&2
+for rd in $RDPTS; do
+  for e in $ENGINES; do run idle_dpath "$e" $((rd+WFIX)) "$WFIX" 1.0 idle; done
+done
+RUN_EXTRA=""
+fi
+if want idle_readdir; then
+RUN_EXTRA="--readdir --leaves 64"	# as readdir_scale: 32 kids per dir
+echo ">> idle_readdir panel: $WFIX idle writers, --readdir, sweep readers up to $RMAX" >&2
+for rd in $RDPTS; do
+  for e in $ENGINES; do run idle_readdir "$e" $((rd+WFIX)) "$WFIX" 1.0 idle; done
 done
 RUN_EXTRA=""
 fi

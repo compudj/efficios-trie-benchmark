@@ -15,16 +15,14 @@ guarantee, each with its own mechanism:
   txn-mark     climb + deletion-mark double collect
   bucketlock   climb + deletion-mark double collect
 
-On the txn engines the climb starts at the object's content host and follows
-the transition chain's back links to the node that currently names it: it is
-O(renames of that object not yet folded).  The readers own no leaves: every
-handle is one of the writers' 256 leaves at every reader count (before
-2026-09-30 each reader also owned 32 leaves nothing moves, so only
-8/(readers+8) of the walks targeted a moving object).  This bench renames each
-of those 256 leaves at up to millions of renames per second, far faster than real
-workloads rename one object (atomic-save and lock-file protocols rename a NEW
-object each time), so the low-reader-count points -- where the writers run
-fastest -- are a stress case for that chain, not a workload.
+On the txn engines each hop reads the name off the host's d_top -- the shell
+that names it, or the host itself -- in two loads.  Until 2026-10-01 the
+shells formed a chain and each hop climbed it, O(renames of that object not
+yet folded): 2-3 shells at this load, which is why seqlock led at 2-8 readers
+then (0.63-0.75x).  The readers own no leaves: every handle is one of the
+writers' 256 leaves at every reader count (before 2026-09-30 each reader also
+owned 32 leaves nothing moves, so only 8/(readers+8) of the walks targeted a
+moving object).
 
 The writers are PACED to 100k renames/s (bench --rename-rate), the same
 offered load for every engine; the right panel shows what each engine's
@@ -94,8 +92,8 @@ for ax in (ax1, ax2):
     dp.legend(ax, fontsize=7.5, loc="best")
     ax.set_xlabel("dedicated reader threads (each reporting a random leaf's path)")
 ax1.set_title("reverse-walk reader scaling — 8 writers paced to 100k renames/s,\n"
-              "sweep readers; one hw thread per core.  txn climbs are O(unfolded\n"
-              "renames of the leaf): 256 leaves share the offered rate",
+              "sweep readers; one hw thread per core.  256 leaves share the offered\n"
+              "rate; a txn hop reads its name off the host's d_top (two loads)",
               fontsize=9.5)
 ax1.set_ylabel("reverse walks / s   (Mdpaths/s, higher is better)")
 dp.ratio_strip(ax1, rows, "readers", "mlookups_s", ENGINES, COLOR, MARKER,

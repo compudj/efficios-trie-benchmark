@@ -24,7 +24,7 @@ mkdir -p "$LOGDIR"
 
 # sweep script -> the plot scripts its CSV feeds
 declare -a SWEEPS=(
-	"run_dcache.sh:plot_dcache.py plot_dcache_sat.py plot_dcache_readdir.py plot_dcache_dpath.py plot_dcache_hit.py"
+	"run_dcache.sh:plot_dcache.py plot_dcache_sat.py plot_dcache_readdir.py plot_dcache_dpath.py plot_dcache_hit.py plot_dcache_idle.py"
 	"run_dcache_height.sh:plot_dcache_height.py"
 	"run_dcache_churn.sh:plot_dcache_churn.py"
 	"run_dcache_churn_scaling.sh:plot_dcache_churn_scaling.py"
