@@ -32,14 +32,12 @@ declare -a SWEEPS=(
 	"run_dcache_optaxonomy.sh:plot_dcache_optaxonomy.py"
 	"run_dcache_optype.sh:plot_dcache_optype.py"
 	"run_dcache_readdir_churn.sh:plot_dcache_readdir_churn.py"
-	"run_dcache_swmw.sh:plot_dcache_swmw.py"
 )
 
 echo ">> logs: $LOGDIR" >&2
 echo ">> building the in-tree bench binaries" >&2
 make -C "$REPO/experiments/dcache" -j32 bench height churn \
-	bench_dcache_bucketlock_chainlock bench_dcache_bucketlock_swmw \
-	bench_dcache_bucketlock_swmw_pad > "$LOGDIR/build.log" 2>&1 ||
+	> "$LOGDIR/build.log" 2>&1 ||
 	{ echo "!! build failed, see $LOGDIR/build.log" >&2; exit 1; }
 
 failed=""

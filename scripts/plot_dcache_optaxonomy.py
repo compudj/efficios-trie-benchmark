@@ -46,21 +46,13 @@ OUT = os.environ.get("OUT",
                                   "dcache_optaxonomy.png"))
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
-         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000",
-         # the bucketlock engine's three chain strategies: greys off the shipped
-         # arm's black, so a reader groups them by eye as one engine.
-         "bucketlock-chainlock": "#7F7F7F", "bucketlock-swmw": "#4D4D4D",
-         "bucketlock-swmw-pad": "#B0B0B0"}
+         "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
 ELAB = {"seqlock": "seqlock (kernel baseline)",
         "txn-global": "txn — GLOBAL rename_gen (a seqcount)",
         "txn-pernode": "txn — PER-NODE host gen",
         "txn-mark": "txn — deletion MARK",
-        "bucketlock": "bucket lock — FOLD LOCK chain (shipped, 176 B)",
-        "bucketlock-chainlock": "bucket lock — CHAIN LOCK (legacy, 176 B)",
-        "bucketlock-swmw": "bucket lock — all-MW chain (168 B)",
-        "bucketlock-swmw-pad": "bucket lock — all-MW chain, padded (176 B ctl)"}
-ORDER = ("seqlock", "txn-global", "txn-pernode", "txn-mark", "bucketlock",
-         "bucketlock-chainlock", "bucketlock-swmw", "bucketlock-swmw-pad")
+        "bucketlock": "bucket lock (SW index commits)"}
+ORDER = ("seqlock", "txn-global", "txn-pernode", "txn-mark", "bucketlock")
 
 # (panel, op) -> x label.  Only the taxonomy's FILE row is plotted on the leaf
 # side; the directory-leaf rows stay in the CSV (they are empty-directory ops,

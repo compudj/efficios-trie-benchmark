@@ -118,29 +118,14 @@ CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE (set JE=)"; exit 1; }
 
 declare -A EDEF=( [seqlock]="" [txn-global]="" [txn-pernode]="-DDC_PER_NODE_GEN" \
-                  [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" \
-                  [bucketlock-chainlock]="-DDC_MARK_GEN -DDC_CHAIN_LOCK" \
-                  [bucketlock-swmw]="-DDC_MARK_GEN -DDC_CHAIN_SWMW" \
-                  [bucketlock-swmw-pad]="-DDC_MARK_GEN -DDC_CHAIN_SWMW -DDC_SWMW_PAD" )
+                  [txn-mark]="-DDC_MARK_GEN" [bucketlock]="-DDC_MARK_GEN" )
 declare -A ESRC=( [seqlock]="dcache_seqlock.c" [txn-global]="dcache_txn.c" \
                   [txn-pernode]="dcache_txn.c" [txn-mark]="dcache_txn.c" \
-                  [bucketlock]="dcache_bucketlock.c" \
-                  [bucketlock-chainlock]="dcache_bucketlock.c" \
-                  [bucketlock-swmw]="dcache_bucketlock.c" \
-                  [bucketlock-swmw-pad]="dcache_bucketlock.c" )
-# The three chain strategies of the bucketlock engine are carried so the op
-# taxonomy can price the published "fold lock vs all-MW chain" gap on the op the
-# original measurement never took (same-dir rename) as well as on the cross-dir
-# move it did take:
-#   bucketlock            per-host FOLD LOCK dequeue (the default/shipped arm), 176 B
-#   bucketlock-chainlock  legacy per-host CHAIN LOCK (the A/B baseline), 176 B
-#   bucketlock-swmw       lock-free MW chain via the mixed commit, 168 B
-#   bucketlock-swmw-pad   the MW chain with the retired 8 B restored as dead
-#                         padding -- the SAME-SIZE control, so bucketlock-vs-pad
-#                         isolates the chain MECHANISM and pad-vs-swmw the -8 B.
-# Reading the published gap against `swmw` alone confounds mechanism with size.
-ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock \
-                    bucketlock-chainlock bucketlock-swmw bucketlock-swmw-pad"}
+                  [bucketlock]="dcache_bucketlock.c" )
+# (The bucket lock's three chain-strategy arms -- chainlock, swmw, swmw-pad --
+# were retired with the transition chain itself, 2026-10-01: there is no chain
+# left to serialize.)
+ENGINES=${ENGINES:-"seqlock txn-global txn-pernode txn-mark bucketlock"}
 # Which panels to run.  Both by default; `PANELS=leaf` re-runs only the leaf
 # taxonomy (the panel that prices the cross_parent branch on its own).
 PANELS=${PANELS:-"leaf dir"}

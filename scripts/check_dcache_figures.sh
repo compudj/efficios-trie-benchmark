@@ -37,7 +37,6 @@ declare -A INPUTS=(
 	[dcache_optaxonomy]="dcache_optaxonomy"
 	[dcache_optype]="dcache_optype"
 	[dcache_readdir_churn]="dcache_readdir_churn"
-	[dcache_swmw]="dcache_swmw"
 	[dcache_slabroute]="dcache_churn dcache_churn_rseq dcache_churn_batch dcache_churn_batch_rseq"
 )
 
