@@ -86,7 +86,7 @@
  *
  * Usage: bench_dcache_height --writers W --nthreads N --move-height H
  *          [--op exchange|exchange-cross|rename|move]
- *          [--branch B] [--tree-depth D] [--duration MS]
+ *          [--branch B] [--tree-depth D] [--duration MS] [--warmup MS]
  *          [--cpulist c0,..] [--cpustride N] [--nbuckets N] [--quiesce N]
  */
 
@@ -116,6 +116,7 @@
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
 #include "dcache_bench_setup.h"
+#include "dcache_bench_run.h"
 
 extern unsigned long dc_seq_walk_retries __attribute__((weak));
 
@@ -126,6 +127,7 @@ static int    branch     = 2;		/* B: children per interior node */
 static int    tree_depth = 8;		/* D: band depth (leaves at depth D) */
 static int    move_height = -1;		/* H: swept; REQUIRED (0..D-1) */
 static long   duration_ms = 1000;
+static long   warmup_ms   = WARMUP_MS_DEFAULT;	/* untimed, before it */
 static int    cpustride  = 1;
 static int   *cpulist    = NULL;
 static int    cpulist_len = 0;
@@ -176,10 +178,7 @@ static struct qstr *g_digit_q;		/* [branch]   "0".."B-1" */
 static struct qstr g_spare_q[2];
 
 /* ---- start gate / timing ------------------------------------------------ */
-#define GOFLAG_INIT 0
-#define GOFLAG_RUN  1
-#define GOFLAG_STOP 2
-static volatile int goflag = GOFLAG_INIT;
+static volatile int goflag = GOFLAG_INIT;	/* phases: dcache_bench_run.h */
 static int nthreads_running;
 
 static long long now_ns(void)
@@ -323,13 +322,18 @@ static void *worker(void *arg)
 		(void) poll(NULL, 0, 1);
 	rcu_thread_online();
 
-	while (uatomic_read(&goflag) == GOFLAG_RUN) {
+	int phase = GOFLAG_WARM, phase_r;
+	while ((phase_r = run_continue(&goflag, &phase)) != 0) {
+		if (caa_unlikely(phase_r == 2))	/* the timed window opens: restart
+						 * throughput; nabsent/errs keep
+						 * counting from the warm-up on */
+			me->nlookups = me->nrenames = 0;
 		if (is_writer) {
 			struct dc_path a, b;
 			int ca = 0, cb = 0, ok;
 
-			if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
-				break;			/* window closed while paced */
+			if (!pace_wait(&pace, &goflag, GOFLAG_STOP))
+				break;			/* run ended while paced */
 			switch (op) {
 			case DC_OP_EXCHANGE:
 				/* DIRECTORY RENAME: exchange two sibling height-H
@@ -561,7 +565,7 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 	    "usage: %s --writers W --nthreads N --move-height H\n"
-	    "         [--branch B] [--tree-depth D] [--duration MS]\n"
+	    "         [--branch B] [--tree-depth D] [--duration MS] [--warmup MS]\n"
 	    "         [--cpulist c0,..] [--cpustride N] [--nbuckets N] [--quiesce N]\n"
 	    "  Balanced B-ary band per writer (B^D leaves each); writers relocate a\n"
 	    "  height-H subtree; readers walk random full leaf paths.\n"
@@ -601,6 +605,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--branch"))      branch = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--tree-depth"))  tree_depth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))    duration_ms = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--warmup"))      warmup_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--cpustride"))   cpustride = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
@@ -709,11 +714,11 @@ int main(int argc, char **argv)
 		(void) poll(NULL, 0, 1);
 	cmm_smp_mb();
 
+	rcu_thread_offline();
+	run_start(&goflag, warmup_ms);	/* untimed warm-up, then the window */
 	if (&dc_seq_walk_retries)
 		retries0 = uatomic_read(&dc_seq_walk_retries);
-	rcu_thread_offline();
 	t0 = now_ns();
-	uatomic_set(&goflag, GOFLAG_RUN);
 	(void) poll(NULL, 0, (int) duration_ms);
 	uatomic_set(&goflag, GOFLAG_STOP);
 	t1 = now_ns();

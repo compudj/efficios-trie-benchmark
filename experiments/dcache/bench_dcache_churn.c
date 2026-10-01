@@ -61,7 +61,8 @@
  * real cold d_id, and is therefore exact in BOTH builds.
  *
  * Usage: bench_dcache_churn [--readers R] [--writers W] [--ndirs N]
- *                           [--slots S] [--duration MS] [--cpulist c0,c1,...]
+ *                           [--slots S] [--duration MS] [--warmup MS]
+ *                           [--cpulist c0,c1,...]
  *                           [--prefix-depth D]
  *                           [--evict continuous|bursty|off] [--evict-cap N]
  *                           [--evict-period MS] [--evict-batch N]
@@ -90,6 +91,7 @@
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
 #include "dcache_bench_setup.h"
+#include "dcache_bench_run.h"
 
 extern const int dc_lookup_id_is_address __attribute__((weak));
 static inline int id_is_address(void)
@@ -145,6 +147,7 @@ static double churn_rate = 0.0;
 static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
 static long duration_ms = 1000;
+static long warmup_ms = WARMUP_MS_DEFAULT;	/* untimed, before it */
 static int prefix_depth = 2;
 /*
  * ---- PHASE 3: RECLAIM CADENCE (--evict) -----------------------------------
@@ -202,10 +205,7 @@ static int g_prefix_len;
 
 /* ---- plumbing ------------------------------------------------------------ */
 
-#define GOFLAG_INIT 0
-#define GOFLAG_RUN  1
-#define GOFLAG_STOP 2
-static volatile int goflag = GOFLAG_INIT;
+static volatile int goflag = GOFLAG_INIT;	/* phases: dcache_bench_run.h */
 static int nthreads_running;
 
 static long long now_ns(void)
@@ -424,9 +424,14 @@ static void *writer_fn(void *arg)
 	}
 	pace_init(&pace, churn_rate, nwriters);
 	wait_go();
-	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
-		if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
-			break;			/* window closed while paced */
+	int phase = GOFLAG_WARM, phase_r;
+	while ((phase_r = run_continue(&goflag, &phase)) != 0) {
+		if (caa_unlikely(phase_r == 2))	/* window opens: restart throughput
+						 * (errs, nlost, nrebuild, errh keep
+						 * counting from the warm-up on) */
+			me->nadds = me->nunlinks = 0;
+		if (!pace_wait(&pace, &goflag, GOFLAG_STOP))
+			break;			/* run ended while paced */
 		int j = (int) xrange(&s, (uint32_t) slots);
 		int gid = me->base + j;
 		struct dc_path p;
@@ -537,7 +542,8 @@ static void *shrinker_fn(void *arg)
 	(void) arg;
 	dc_register_thread();
 	wait_go();
-	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
+	int phase = GOFLAG_WARM;
+	while (run_continue(&goflag, &phase) != 0) {
 		struct timespec ts = {
 			.tv_sec  = evict_period_ms / 1000,
 			.tv_nsec = (evict_period_ms % 1000) * 1000000L,
@@ -577,7 +583,11 @@ static void *reader_fn(void *arg)
 	dc_register_thread();
 	pin_thread(me->idx);
 	wait_go();
-	while (__atomic_load_n(&goflag, __ATOMIC_ACQUIRE) == GOFLAG_RUN) {
+	int phase = GOFLAG_WARM, phase_r;
+	while ((phase_r = run_continue(&goflag, &phase)) != 0) {
+		if (caa_unlikely(phase_r == 2))	/* window opens: restart throughput
+						 * (lk_wrong keeps counting) */
+			me->nlookups = me->ndirents = 0;
 		int dr = (int) xrange(&s, (uint32_t) ndirs);
 		struct dc_path p;
 
@@ -839,7 +849,7 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 	    "usage: %s [--readers R] [--writers W] [--ndirs N] [--slots S]\n"
-	    "          [--duration MS] [--prefix-depth D] [--nbuckets N]\n"
+	    "          [--duration MS] [--warmup MS] [--prefix-depth D] [--nbuckets N]\n"
 	    "          [--cpulist c0,c1,...] [--churn-rate R]\n"
 	    "  writers TOGGLE their own slots (present -> unlink, absent -> add);\n"
 	    "  readers look up random slots and must tolerate ABSENT.\n"
@@ -898,6 +908,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--ndirs"))         ndirs = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--slots"))         slots = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--warmup"))        warmup_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--prefix-depth"))  prefix_depth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))      nbuckets = (unsigned) atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))       parse_cpulist(argv[++i]);
@@ -1014,8 +1025,8 @@ int main(int argc, char **argv)
 	 */
 	rcu_thread_offline();
 
+	run_start(&goflag, warmup_ms);	/* untimed warm-up, then the window */
 	t0 = now_ns();
-	__atomic_store_n(&goflag, GOFLAG_RUN, __ATOMIC_RELEASE);
 	{
 		struct timespec ts = { duration_ms / 1000,
 				       (duration_ms % 1000) * 1000000L };

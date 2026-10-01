@@ -62,10 +62,12 @@ static inline void pace_init(struct pace *p, double rate, int nwriters)
 }
 
 /*
- * Wait for the next op's release time.  Returns 0 if *@goflag left @run while
- * waiting (the window closed: do not start the op), else 1.
+ * Wait for the next op's release time.  Returns 0 if *@goflag reached @stop
+ * while waiting (the run ended: do not start the op), else 1.  Paces through
+ * the warm-up as through the timed window: the schedule never restarts, so
+ * the window opens on writers already at their steady rate.
  */
-static inline int pace_wait(struct pace *p, volatile int *goflag, int run)
+static inline int pace_wait(struct pace *p, volatile int *goflag, int stop)
 {
 	long long now;
 
@@ -76,7 +78,7 @@ static inline int pace_wait(struct pace *p, volatile int *goflag, int run)
 		p->next_ns = now;
 	if (now < p->next_ns) {
 		do {
-			if (CMM_LOAD_SHARED(*goflag) != run)
+			if (CMM_LOAD_SHARED(*goflag) == stop)
 				return 0;
 			dc_quiescent();
 			caa_cpu_relax();

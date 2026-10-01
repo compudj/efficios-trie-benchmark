@@ -75,6 +75,7 @@
  *                     [--dpath]
  *                     [--op-mix rename=A,move=B,exchange=C]
  *                     [--ndirs N] [--depth N] [--leaves N] [--duration MS]
+ *                     [--warmup MS]
  *                     [--cpustride N] [--cpulist c0,c1,...] [--nbuckets N]
  */
 
@@ -104,6 +105,7 @@
 #include "dcache_bench_rand.h"
 #include "dcache_bench_pace.h"
 #include "dcache_bench_setup.h"
+#include "dcache_bench_run.h"
 
 /*
  * Weak ref: defined by the seqlock engine, absent from the txn engine.  Reading
@@ -133,6 +135,7 @@ static int    depth        = 2;		/* leaf path depth (>=2) */
 static int    leaves       = 16;	/* leaves owned per thread (per writer
 					 * under writers_own) */
 static long   duration_ms  = 1000;
+static long   warmup_ms    = WARMUP_MS_DEFAULT;	/* untimed, before it */
 static int    cpustride    = 1;
 /*
  * Explicit CPU map: thread i pins to cpulist[i], overriding the id*cpustride
@@ -373,10 +376,7 @@ static int   g_prefix_len;		/* = depth - 2 */
 
 /* ---- timing / start gate ------------------------------------------------ */
 
-#define GOFLAG_INIT 0
-#define GOFLAG_RUN  1
-#define GOFLAG_STOP 2
-static volatile int goflag = GOFLAG_INIT;
+static volatile int goflag = GOFLAG_INIT;	/* phases: dcache_bench_run.h */
 static int nthreads_running;
 
 static long long now_ns(void)
@@ -540,6 +540,18 @@ static void report_err(const char *op, int rc, const struct dc_path *a,
 		b->ndepth ? b->comp[b->ndepth - 1].name : "");
 }
 
+/*
+ * The timed window opened: restart this worker's THROUGHPUT counters.  The
+ * correctness counters -- lk_wrong, nabs_static, errs, and the priming tally --
+ * keep counting from the start, so a fault during the warm-up still shows.
+ */
+static void window_open(struct warg *me)
+{
+	me->nlookups = me->ndirents = 0;
+	me->nrenames = me->nexch = me->nsamedir = 0;
+	me->npos = me->nneg = me->nabs = me->nnegadd = 0;
+}
+
 static void *worker(void *arg)
 {
 	struct warg *me = arg;
@@ -631,14 +643,17 @@ static void *worker(void *arg)
 		(void) poll(NULL, 0, 1);
 	rcu_thread_online();
 
-	while (uatomic_read(&goflag) == GOFLAG_RUN) {
+	int phase = GOFLAG_WARM, phase_r;
+	while ((phase_r = run_continue(&goflag, &phase)) != 0) {
+		if (caa_unlikely(phase_r == 2))
+			window_open(me);	/* the timed window starts now */
 		int do_rename = (role < 0)
 			? ((int) (xtop(&s, FRAC_BITS) < rename_thr))
 			: role;
 
 		if (do_rename) {
-			if (!pace_wait(&pace, &goflag, GOFLAG_RUN))
-				break;			/* window closed while paced */
+			if (!pace_wait(&pace, &goflag, GOFLAG_STOP))
+				break;			/* run ended while paced */
 			int j0 = (int) xrange(&s, (uint32_t) leaves);
 			unsigned int die = xtop(&s, FRAC_BITS);
 			int j1 = -1;
@@ -931,7 +946,8 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 	    "usage: %s [--nthreads N] [--rename-frac F] [--writers K] [--ndirs N]\n"
-	    "          [--depth N] [--leaves N] [--duration MS] [--cpustride N]\n"
+	    "          [--depth N] [--leaves N] [--duration MS] [--warmup MS]\n"
+	    "          [--cpustride N]\n"
 	    "          [--cpulist c0,c1,...] [--nbuckets N]\n"
 	    "  --cpulist ...   => explicit CPU map (thread i -> ci), overriding\n"
 	    "                     --cpustride.  Feed it `hwloc-calc core:all.pu:0`\n"
@@ -947,6 +963,8 @@ static void usage(const char *p)
 	    "                     dir size is fixed as readers scale.\n"
 	    "  --rename-rate R => (split mode) pace the writers to R renames/s in\n"
 	    "                     aggregate (\"250k\", \"1M\"); default unpaced.\n"
+	    "  --warmup MS     => run the workload untimed for MS first, then open\n"
+	    "                     the --duration window (default 200).\n"
 	    "  --hit-current   => readers look up each leaf's CURRENT path (published\n"
 	    "                     by its owner): positive hits on moving objects.\n"
 	    "                     In split mode only writers own the namespace.\n"
@@ -997,6 +1015,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--depth"))       depth = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--leaves"))      leaves = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))    duration_ms = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--warmup"))      warmup_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--cpustride"))   cpustride = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--cpulist"))     parse_cpulist(argv[++i]);
 		else if (!strcmp(argv[i], "--nbuckets"))    nbuckets = (unsigned) atoi(argv[++i]);
@@ -1157,18 +1176,18 @@ int main(int argc, char **argv)
 	cmm_smp_mb();
 
 	/*
-	 * Go RCU-offline for the whole timed window AND the join: main is a
+	 * Go RCU-offline for the warm-up, the timed window AND the join: main is a
 	 * registered QSBR thread but only sleeps in poll()/blocks in join here,
 	 * reporting no quiescent state.  Left online it would stall EVERY grace
 	 * period for the entire measurement -- and the txn engine's async fold is
 	 * grace-period-bound, so its chains would grow unbounded (O(n^2)) and the
 	 * throughput number would be a liveness artifact, not the engine's speed.
 	 */
+	rcu_thread_offline();
+	run_start(&goflag, warmup_ms);	/* untimed warm-up, then the window */
 	if (&dc_seq_walk_retries)
 		retries0 = uatomic_read(&dc_seq_walk_retries);
-	rcu_thread_offline();
 	t0 = now_ns();
-	uatomic_set(&goflag, GOFLAG_RUN);
 	(void) poll(NULL, 0, (int) duration_ms);
 	uatomic_set(&goflag, GOFLAG_STOP);
 	t1 = now_ns();
