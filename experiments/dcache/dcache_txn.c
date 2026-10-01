@@ -136,6 +136,27 @@ void (*dc_test_del_hook)(void);
 #endif
 
 /*
+ * TEST-ONLY: -DDC_TEST_UNLINK_DELAY_US=N sleeps N us inside the unlink of a
+ * DIRECTORY, after its last check that the victim is empty and before the
+ * removal is published -- the window an add under the victim must not land in
+ * (stress_dcache_rmdir.c, make check-rmdir).  At natural timings that window
+ * is a few instructions.  Never set in a measured build.
+ */
+#ifdef DC_TEST_UNLINK_DELAY_US
+#include <time.h>
+static void dc_test_unlink_delay(void)
+{
+	struct timespec ts = { DC_TEST_UNLINK_DELAY_US / 1000000,
+			       (DC_TEST_UNLINK_DELAY_US % 1000000) * 1000L };
+
+	(void) nanosleep(&ts, NULL);
+}
+#define DC_TEST_UNLINK_DELAY()	dc_test_unlink_delay()
+#else
+#define DC_TEST_UNLINK_DELAY()	do { } while (0)
+#endif
+
+/*
  * The 1-CL split hot-path layout (simplification-s4.md §5) is the DEFAULT: the
  * reader-hot set -- inline identity, the per-node walk gen (d_seq), and the
  * still-indexed mark (d_hash.next) -- all fit in CL0, so BOTH the global and the
@@ -2405,6 +2426,8 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			urcu_txn_end(&txn);
 			continue;		/* re-find the current top */
 		}
+		if (host->d_isdir)
+			DC_TEST_UNLINK_DELAY();	/* test-only window widener */
 		st = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
 		if (st == URCU_TXN_STATUS_ABORT)

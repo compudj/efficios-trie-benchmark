@@ -146,6 +146,35 @@ void (*dc_test_transfer_hook)(void);
 #endif
 
 /*
+ * TEST-ONLY: -DDC_TEST_UNLINK_DELAY_US=N sleeps N us inside the unlink of a
+ * DIRECTORY, after its last check that the victim is empty and before the
+ * removal is published -- the window an add under the victim must not land in
+ * (stress_dcache_rmdir.c, make check-rmdir).  At natural timings that window
+ * is a few instructions.  Never set in a measured build.
+ */
+#ifdef DC_TEST_UNLINK_DELAY_US
+#include <time.h>
+static void dc_test_unlink_delay(void)
+{
+	struct timespec ts = { DC_TEST_UNLINK_DELAY_US / 1000000,
+			       (DC_TEST_UNLINK_DELAY_US % 1000000) * 1000L };
+
+	(void) nanosleep(&ts, NULL);
+}
+#define DC_TEST_UNLINK_DELAY()	dc_test_unlink_delay()
+#else
+#define DC_TEST_UNLINK_DELAY()	do { } while (0)
+#endif
+
+/*
+ * TEST-ONLY mutation arms for make check-rmdir, each dropping one half of the
+ * exclusion between a directory's unlink and an add under it; each must make
+ * stress_dcache_rmdir FAIL, or the harness proves nothing.
+ *   -DDC_TEST_NO_RMDIR_LOCK  dc_unlink does not lock the victim's child head
+ *   -DDC_TEST_NO_ADD_ALIVE   dc_add does not re-check its parent is alive
+ */
+
+/*
  * The 1-CL split hot-path layout (simplification-s4.md §5) is the DEFAULT: the
  * reader-hot set -- inline identity, the per-node walk gen (d_seq), and the
  * still-indexed mark (d_hash.next) -- all fit in CL0, so BOTH the global and the
@@ -1871,11 +1900,13 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	 * "the prefix went".  The root reads as alive (d_hash.next NULL, hence
 	 * unmarked), so adds directly under it are unaffected.
 	 */
+#ifndef DC_TEST_NO_ADD_ALIVE
 	if (!entry_alive(parent)) {
 		bl_unlock2(bucket, &parent->d_child_head);
 		free(d);		/* never published */
 		return -ENOENT;
 	}
+#endif
 #ifndef DC_NO_ADD_DUP_RECHECK
 	/*
 	 * ⭐ RE-CHECK THE NAME UNDER THE BUCKET LOCK -- the check above is a
@@ -2206,8 +2237,10 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 		 * dc_add answers -ENOTDIR under one and d_isdir is write-once,
 		 * so no child can land.
 		 */
+#ifndef DC_TEST_NO_RMDIR_LOCK
 		if (host->d_isdir)
 			heads[nheads++] = &host->d_child_head;
+#endif
 		bl_lock_n(heads, nheads);
 		{	/* re-verify top is still hashed under the lock: the deletion
 			 * MARK on d_hash.next fires if a concurrent unlink or a fold
@@ -2226,6 +2259,8 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 			ret = -ENOTEMPTY;
 			goto out;
 		}
+		if (host->d_isdir)
+			DC_TEST_UNLINK_DELAY();	/* test-only window widener */
 		bl_hlist_del_locked(&top->d_hash);
 		bl_hlist_del_locked(&top->d_sib);
 		bl_unlock_n(heads, nheads);

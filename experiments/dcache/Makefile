@@ -81,7 +81,7 @@ ENGINE   ?= seqlock
 HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_rand.h dcache_bench_setup.h dcache_bench_run.h dcache_node.h \
 	    dcache_bench_pace.h $(URCU_DEP)
 
-.PHONY: check-shared check-shared-tsan check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
+.PHONY: check-shared check-shared-tsan check-rmdir check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \
 	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
 	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan \
@@ -324,6 +324,41 @@ check-shared-tsan: stress_dcache_shared.c dcache_txn.c dcache_bucketlock.c $(HDR
 	      ./stress_shared_unlink_$${name}_tsan 4 2 8 $$leaves 5000; \
 	  done; \
 	done
+
+# INSERT-vs-UNLINK (stress_dcache_rmdir.c): adds of children under a directory
+# racing that directory's unlink, which frees its host.  Every arm's correct
+# build must PASS at natural timings and with the unlink's window widened from
+# inside its critical section (-DDC_TEST_UNLINK_DELAY_US); every mutation arm
+# -- one per half of each engine's exclusion -- must FAIL at natural timings,
+# or the harness proves nothing (each fails 5/5 runs; see the harness header).
+RMDIR_ARGS ?= 2 6 2 4 20000
+check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c $(HDRS) | check-lib
+	@set -e; for arm in txn_global::dcache_txn.c \
+	    txn_pernode:-DDC_PER_NODE_GEN:dcache_txn.c \
+	    txn_mark:-DDC_MARK_GEN:dcache_txn.c \
+	    bucketlock:-DDC_MARK_GEN:dcache_bucketlock.c; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
+	  for widen in "" -DDC_TEST_UNLINK_DELAY_US=50; do \
+	    echo "== check-rmdir: $$name $${widen:-(natural timings)}"; \
+	    $(CC) $(ASANFLAGS) $$defs $$widen $(HCPP) -o stress_rmdir_$$name \
+	      stress_dcache_rmdir.c $$src $(LDFLAGS) $(LDLIBS); \
+	    out=$$(timeout $(SHARED_TIMEOUT) ./stress_rmdir_$$name $(RMDIR_ARGS)) || \
+	      { echo "$$out"; echo "check-rmdir: FAIL ($$name $$widen)"; exit 1; }; \
+	    echo "$$out" | tail -3; \
+	  done; \
+	done
+	@set -e; for arm in "txn_mark:-DDC_MARK_GEN -DDC_TXN_NO_PARENT_SEAL:dcache_txn.c" \
+	    "bucketlock_nolock:-DDC_MARK_GEN -DDC_TEST_NO_RMDIR_LOCK:dcache_bucketlock.c" \
+	    "bucketlock_noalive:-DDC_MARK_GEN -DDC_TEST_NO_ADD_ALIVE:dcache_bucketlock.c"; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
+	  echo "== check-rmdir MUST-FAIL control: $$name ($$defs)"; \
+	  $(CC) $(ASANFLAGS) $$defs $(HCPP) -o stress_rmdir_mut_$$name \
+	    stress_dcache_rmdir.c $$src $(LDFLAGS) $(LDLIBS); \
+	  if timeout $(SHARED_TIMEOUT) ./stress_rmdir_mut_$$name $(RMDIR_ARGS) > /dev/null; then \
+	    echo "check-rmdir: MUTANT $$name PASSED -- the harness is vacuous"; exit 1; \
+	  else echo "  fails as it must"; fi; \
+	done
+	@echo "check-rmdir: PASS"
 
 # An exchange's two names exist before AND after its commit, so a lockless
 # lookup of either must never come back ABSENT.  Two detectors, because each is
@@ -1140,4 +1175,4 @@ clean:
 	  mixed_cycle_bucketlock_asan stress_dcache_bucketlock_tsan stress_dcache_xchg_bucketlock_tsan \
 	  stress_dcache_dirs_bucketlock_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
-	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl
+	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl stress_rmdir_*
