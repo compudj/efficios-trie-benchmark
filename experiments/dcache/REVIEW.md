@@ -10,36 +10,41 @@ cites them.
 
 ## 1. Verdict
 
-### Re-swept verdict (2026-09-30) — supersedes the numbers below
+### Re-swept verdict (2026-10-01) — supersedes the numbers below
 
 Every figure was re-swept on the corrected methodology (README "Results"): the
 kernel's RCU walk as the baseline's lookup, writers PACED wherever readers are
 compared, the harness PRNG decorrelated, positive-hit and reverse-walk readers
 aimed only at moving objects, a kernel-faithful in-place churn mode, the
 vendored kernel rwsem as the baseline's directory lock, spinlocks that wait
-with plain loads as the kernel's do, and the seeded namespace homed on the
-benchmark's own node.  The multiples quoted in the historical verdict below
-(~25×, ~8–60×, ~5–7.6× at every height) all came from flat-out writers or the
-old whole-walk baseline and are void.  What survives, measured:
+with plain loads as the kernel's do, the seeded namespace homed on the
+benchmark's own node, and a 200 ms warm-up before every timed window — and on
+the chain-free rename shells (item 7).  The multiples quoted in the
+historical verdict below (~25×, ~8–60×, ~5–7.6× at every height) all came
+from flat-out writers or the old whole-walk baseline and are void.  What
+survives, measured:
 
 1. **Readers: parity at realistic rename rates, a growing lead above them.**
-   At 10k renames/s every arm is within 2% of seqlock; the localized arms lead
-   1.16–1.19× at 100k/s and 1.78–1.86× at 300k/s, where seqlock's writers stop
+   At 10k renames/s every arm is within 3% of seqlock; the localized arms lead
+   1.17–1.19× at 100k/s and 1.77–1.88× at 300k/s, where seqlock's writers stop
    keeping up.  seqlock still wins where every lookup targets an object being
-   renamed, at low concurrency (up to 32 readers: txn-global 0.95–1.01×,
-   txn-mark 0.86–0.93×, per-node and bucket lock 0.79–0.86×), and the reverse
-   walk at 2–8 readers (0.63–0.75×).  The mechanism is a trade: an unfolded
-   rename shell makes a hit read three cachelines instead of one, and shells
-   live ~5 ms (`call_rcu` batching), so each reader pays a private L1-capacity
-   cost; seqlock's in-place rename costs every reader a coherence miss instead,
-   which is cheap with few readers and grows with them.  At rest the mark arm is
-   at parity; the d_seq/causality machinery is cheap in the kernel's fast path,
-   and the txn win is under rename load, not at rest.
+   renamed, at low concurrency (up to 32 readers: txn-global 0.94–0.99×,
+   txn-mark 0.87–0.93×, per-node 0.83–0.90×, bucket lock 0.77–0.83×).  The
+   mechanism is a trade: an unfolded rename shell makes a hit read three
+   cachelines instead of one, and shells live ~5 ms (`call_rcu` batching), so
+   each reader pays a private L1-capacity cost; seqlock's in-place rename costs
+   every reader a coherence miss instead, which is cheap with few readers and
+   grows with them.  At rest the mark arm is at parity; the d_seq/causality
+   machinery is cheap in the kernel's fast path, and the txn win is under
+   rename load, not at rest.  The reverse walk, which seqlock won at 2–8
+   readers (0.63–0.75×) while a txn reverse walk climbed the transition chain,
+   is now a txn win at every reader count (1.10–1.45× at 2 readers, 5.2–6.9×
+   at 32–64; item 7).
    ⚠ The positive-hit and reverse-walk panels before 2026-09-30 let readers own
    leaves nothing moves, so only 8/(readers+8) of their targets moved; the
    numbers above are from the corrected harness (`bench_dcache.c` writers_own).
    ⚠ In that dense-hit panel the bucket lock is the lowest arm at 128–184
-   readers (0.87–0.92×): readers with a stale path miss on the name a rename
+   readers (0.85–0.88×): readers with a stale path miss on the name a rename
    just vacated and all cache a negative at once, on the bucket and parent
    child-list locks the renamers need (0.95× without negative caching).  With
    the test-and-set spins both engines had until 2026-09-30 it was 0.67–0.75×
@@ -54,15 +59,16 @@ old whole-walk baseline and are void.  What survives, measured:
    seqlock's 16-reader readdir and reverse walk.  Spreading readers one per CCD
    hurts every engine (seqlock −35–55%, txn −13–16%): they share a few hot
    lines.
-3. **Writers: the clear win.**  Flat out the bucket lock renames 4.5–21.2×
-   seqlock, txn-mark 2.0–4.5×.  Part of that is the per-directory rwsem and
-   cross-dir rename mutex the txn designs dissolve (lock-free readdir leaves no
-   reader to exclude) — a legitimate axis, but it means a kernel port's gain
-   depends on what the VFS still takes around the dcache.
+3. **Writers: the clear win.**  Flat out the bucket lock renames 4.4–22.3×
+   seqlock, txn-mark 2.1–4.7×, txn-pernode up to 20.2× on leaf exchanges.
+   Part of that is the per-directory rwsem and cross-dir rename mutex the txn
+   designs dissolve (lock-free readdir leaves no reader to exclude) — a
+   legitimate axis, but it means a kernel port's gain depends on what the VFS
+   still takes around the dcache.
 4. **Create/delete: the old "txn loses churn" was the LRU.**  The allocating
    add/unlink path spends 39–57% of its cycles on one per-node LRU lock; on the
    path the kernel takes for same-name churn (in place) every txn arm and the
-   bucket lock beat seqlock, up to 1.85×, three quarters of the bucket lock's
+   bucket lock beat seqlock, up to 1.81×, three quarters of the bucket lock's
    lead being the directory rwsem.
 5. **Correctness found by the re-sweep:** the MW engine's exchange (two
    delete + insert-at-head moves) made existing paths transiently ABSENT to the
@@ -77,6 +83,30 @@ old whole-walk baseline and are void.  What survives, measured:
    jemalloc benchmark single-CPU-pinned, `taskset -c N` included).  And the
    allocator faults its first chunks in before `main()`, so placing memory from
    inside `main()` is too late: the setup sets a memory policy and re-execs.
+
+7. **The transition chain had a use-after-free, and is gone (2026-10-01).**
+   The lock-free folds (txn engine, bucket lock's MW-dequeue arm) spliced
+   middle relays without pinning the links they read: two adjacent relays
+   folding on different `call_rcu` workers both committed and left a freed relay
+   linked.  No harness had ever let one entry's folds run concurrently — every
+   one gave an object a single owner — until `stress_dcache_shared.c` (several
+   writers renaming the same objects, each with its own worker): txn-mark 3/3,
+   txn-global 1/3, MW-dequeue 2/3 runs.  Pinning every read link was correct but
+   made each splice walk the chain (O(chain²) to drain; it hung under an
+   exchange storm), and the shells between host and top were never needed: now
+   a fold only hands the name back to the host or frees its shell.  Measured
+   against the chain engines on one harness: reverse walks 1.66–2.02× faster,
+   flat-out renames up to 1.89×, lookups unchanged.  Three lessons from the way
+   there: (a) the first gate run of the new fold hung — a retry that escalated
+   and then found its shell gone kept the fallback lane for ever, the same
+   re-decide-at-the-head shape as the earlier wedge, so every retry loop gets
+   `dc_lane_giveback()` at its exit; (b) the shared-renamer stress at 4 leaves
+   was VACUOUS for the transfer race (4 transfers in 160k folds, all after the
+   writers stopped) — it runs at 1024 leaves too, where a mutant fold is caught
+   10/10; (c) a bucket-lock dip that looked like the new fold was the new
+   victim-directory lock in unlink (a correctness fix, ~5% of empty-directory
+   churn against listers), found only after two plausible mechanisms were
+   measured and refuted.
 
 The architecture conclusion stands (§2): the bucket lock + SW txn hybrid is the
 best writer and matches the best reader.
@@ -165,16 +195,23 @@ One line each; full detail in `rename-shell-transition.md`.
   publishing a transient named shell in one commit (both indexes), never by
   mutating identity in place; the one in-place write (fold TRANSFER) lands
   inside a `call_rcu` grace-period window where no reader can see it.
-- **Fold cascade** — per-node async `call_rcu` workers compress chains;
-  each node freed by its *own* fold (self-free ⇒ no double-free by splices).
-- **SPMC chain decomposition** — enqueue (demote) is single-producer under
-  the bucket lock (`store_sw` / plain store); dequeue (splice/reclaim/
-  transfer) is multi-consumer.  Three dequeue strategies kept as build arms:
-  per-host **fold lock** (default; plain stores, no producer coupling),
-  legacy chain lock (`-DDC_CHAIN_LOCK`), MW dequeue (`-DDC_CHAIN_SWMW`).
+- **One fold per shell, no chain** (2026-10-01) — an entry is its host plus
+  at most one shell naming it (the host's `d_top`).  A shell's `call_rcu`
+  fold either hands its name back to the host (it is still the named top:
+  replace it by the host in both indexes, `d_top` = NULL, one commit) or just
+  frees it (a later rename demoted it, or an unlink removed it); it never
+  touches the host in the second case, and an unlink frees the host even
+  while a shell names it.  This replaced a doubly linked transition chain
+  (`d_fwd`/`d_back`) whose folds TRANSFERred one hop at a time, SPLICEd
+  middle relays out and RECLAIMed orphaned chains: its lock-free SPLICE
+  pinned none of the links it read (a use-after-free under shared renamers,
+  `stress_dcache_shared.c`), and the reverse walk climbed it.  The bucket
+  lock's three chain-serialization arms (per-host fold lock, legacy chain
+  lock, MW dequeue) went with it.
 - **Abort-free-under-lock** — every index-bearing commit's CAS-old values are
   provably stable while the bucket lock is held, so those commits carry MW
-  records but cannot contention-abort; only lockless chain folds can.
+  records but cannot contention-abort; only the lock-free engine's commits
+  can.
 - **`d_host` skip pointer** — write-once, union-overlaid on `d_id`, points
   at the fold-invariant tail host: O(1) host resolution for readers *and*
   writers, zero struct growth, never dereferences a splicing transient.
@@ -429,6 +466,21 @@ items here are the ones that actually fired in this experiment):
 
 ## 6. Open items
 
+- **No harness races a directory unlink against an add under it** (found
+  2026-10-01).  Both engines exclude it: the bucket lock's unlink takes the
+  victim directory's own child head (`dc_add` locks its parent's), and the txn
+  engine's commit seals that head with an MW record; `dc_add` re-checks the
+  parent entry is alive under its locks.  But every concurrent harness unlinks
+  files, or empty directories nobody adds under (allocating churn toggles empty
+  directories), so neither exclusion has been seen to fire: with the bucket
+  lock's taken out, all 11 gates that build that engine still pass.  Measured
+  cost of that lock: ~5% of
+  empty-directory churn against 32–64 concurrent listers (the lock word shares a
+  line with the `d_sib` listers read), ~1% without — the kernel pays it too
+  (`vfs_rmdir` locks the victim).  Wanted: a harness where writers unlink and
+  re-add directories while other writers add children under them, with ASan and
+  a census, and a mutant that drops the exclusion to prove it fires.
+
 - **Coverage gaps** (`dcache-rename-taxonomy`) — *closed: all four cells now have
   a number* (result block below).  `bench_dcache --op-mix
   rename=A,move=B,exchange=C` adds same-dir **rename**: each token owns a
@@ -445,8 +497,10 @@ items here are the ones that actually fired in this experiment):
   itself.  Sweep: `scripts/run_dcache_optaxonomy.sh` →
   `figures/dcache_optaxonomy.png`.
 
-  **Result — leaf panel, file leaves, 8 writers / 184 readers, best-of-5,
-  0 conservation failures.**  Writer Mrenames/s; `rn/mv` is the same-dir-vs-
+  **Result (2026-07-31; historical — the three bucket-lock chain arms were
+  retired with the chain on 2026-10-01) — leaf panel, file leaves, 8 writers /
+  184 readers, best-of-5, 0 conservation failures.**  Writer Mrenames/s;
+  `rn/mv` is the same-dir-vs-
   cross-dir ratio, i.e. what the `cross_parent` branch costs (cycle check +
   `d_moving` lock + reparent + 2nd child head) with no subtree attached:
 
@@ -1224,5 +1278,5 @@ items here are the ones that actually fired in this experiment):
 | Sweeps / plots | `scripts/run_dcache*.sh`, `scripts/plot_dcache*.py` |
 | Descriptor-slab arms | `scripts/dcache_*.csv` = default; `_rseq`, `_batch`, `_batch_rseq` suffixes are the other three routes (§6) |
 | Slab route selection | `URCU_BUILD=` picks the liburcu build; the sweeps and the Makefile DERIVE `-DURCU_SLAB_RSEQ` / `-DURCU_TXN_SLAB_BATCH` from it, since both are header-inline and must match the library |
-| Figures | `figures/dcache_{s3,readdir,readdir_churn,churn,churn_scaling,height,optype,optaxonomy,namewidth,swmw}.png`, `figures/perf_dcache_*` |
+| Figures | `figures/dcache_{s3,sat,readdir,readdir_churn,dpath,hit,churn,churn_scaling,height,optype,optaxonomy,namewidth,slabroute}.png`, `figures/perf_dcache_*` |
 | Hybrid-engine design notes | `design/dcache-dlm-sw.md`, `design/mixed-sw-mw-txn.md`, `design/dcache-lru-txn.md` |

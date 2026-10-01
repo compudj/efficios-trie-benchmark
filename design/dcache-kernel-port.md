@@ -35,9 +35,9 @@ other:
 1. **Shell-stacked renames.**  A rename allocates a *shell* dentry carrying
    the new (parent, name) and a skip pointer to the moving object — the
    *host*, which never moves in memory.  One commit publishes the shell in
-   the new hash bucket and child list and demotes the old top (deletion mark
-   + `d_back`).  A `call_rcu` *fold* later copies the identity back into the
-   host, re-indexes it and frees the shell.
+   the new hash bucket and child list, demotes the old top (deletion mark) and
+   points the host's `d_top` at the shell.  A `call_rcu` *fold* later copies
+   the identity back into the host, re-indexes it and frees the shell.
 2. **Write-once index identity.**  Because a node's (parent, name) never
    changes while it is in an index, a lookup compares names with no `d_seq`.
 3. **Walk causality without `rename_lock`.**  Three arms: one global
@@ -149,19 +149,19 @@ dentry's OWN `d_name` with that dentry's `d_seq`, copying inline bytes or
 taking a ref on the external name, and retries if `d_seq` moved.  Left as is,
 it would be *wrong*, not racy: a rename no longer writes the host's name, so it
 would return the pre-rename name, cleanly, until the fold -- and `d_seq` could
-not catch it, since nothing wrote that name.  Converted to climb to the top
-(host -> `d_back` -> the node with `d_back == NULL`, under RCU) and copy or ref
-THAT name, it is not racy:
+not catch it, since nothing wrote that name.  Converted to read the top
+(the host's `d_top`, or the host itself when that is NULL, under RCU) and copy
+or ref THAT name, it is not racy:
 
 - no torn copy: a shell's name is written before the shell is published, and
   the host's is rewritten only by the fold, a grace period after the rename
   that demoted it -- after any reader that saw the host as top has finished;
 - no stale storage: a shell is freed a grace period after its fold, and
   external names are already `atomic_inc_not_zero()` + `kfree_rcu`; a failed
-  increment (the fold dropped the shell's last ref) re-climbs from the host;
+  increment (the fold dropped the shell's last ref) re-reads from the host;
 - linearizable: the result is the name current when the top was observed.
 
-It also gets simpler: no `d_seq` retry for names, only the re-climb on a
+It also gets simpler: no `d_seq` retry for names, only the re-read on a
 failed external-name ref.  Its contract is unchanged (the snapshot owns its
 copy or ref), so its 13 callers outside dcache.c need nothing.
 
@@ -200,18 +200,19 @@ holders) would starve it; after N failed tries the fold escalates to a
 blocking `down_write` in a dedicated worker -- the kernel rwsem is
 writer-fair, so it gets through.
 
-Only the fold that retires the CURRENT top needs the lock (the TRANSFER, and
-its variant for an entry unlinked while shelled).  A middle relay stopped
-being the top when a later rename demoted it; that rename held the relay's
-directory lock exclusively, so every locked reader of its name had released
-it, and no new one can obtain it -- the accessor now returns the newer top.
+Only a fold whose shell is still the CURRENT top needs the lock (the
+TRANSFER).  Any other shell stopped being the top when a later rename demoted
+it or an unlink removed it; that operation held the shell's directory lock
+exclusively, so every locked reader of its name had released it, and no new
+one can obtain it -- the accessor now returns the newer top, or nothing.  Its
+fold only frees it.
 
 | | Userspace fold | Kernel fold |
 |---|---|---|
 | Trigger | `call_rcu`, a grace period after the rename | `queue_rcu_work`, a grace period after the rename |
 | Context | RCU callback, cannot sleep | workqueue, may sleep |
 | Excludes readers by | RCU only | RCU, plus the parent's `i_rwsem` (trylock) for the TRANSFER |
-| Excludes a racing re-rename by | the engine: MCAS aborts / per-host fold lock, re-deciding TRANSFER vs SPLICE each attempt | the same, but a re-rename of the entry being TRANSFERred cannot run at all: it needs the lock the fold holds |
+| Excludes a racing re-rename by | the engine: MCAS aborts / the bucket lock, re-deciding TRANSFER vs free each attempt | the same, but a re-rename of the entry being TRANSFERred cannot run at all: it needs the lock the fold holds |
 | Can be deferred | never | yes, on a contended directory: shells live longer (memory and one skip-pointer hop, not correctness) |
 | Name copy into the host | plain store, safe because no reader reads an unindexed host's name | under the host's `d_lock` and the parent's `i_rwsem` |
 | Teardown | `rcu_barrier()` in `dc_destroy` | umount must drain it: `rcu_barrier()` + flush the workqueue before the dentries are killed |

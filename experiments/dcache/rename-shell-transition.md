@@ -7,6 +7,45 @@ serialization point; stacking does not). The engine here takes **no lock and no
 seqlock** — renames are lock-free through the urcu-txn (rcu-mcas) engine, and the
 reader is a plain RCU walk with an inline name compare.
 
+> **Update 2026-10-01 — there is no transition chain any more.**  The doubly
+> linked `d_fwd`/`d_back` chain described below is gone from every txn-based
+> engine (the txn arms and the bucket lock).  An entry is now its **host**,
+> plus at most one shell naming it — the host's `d_top` (NULL while the host
+> names itself) — plus demoted shells that are only waiting for their own fold
+> to free them.  Read the text below with this map: "the top of the chain" ⇔
+> `host.d_top` (or the host); "a middle relay" ⇔ a demoted shell, which nothing
+> points at but its pending fold.  What changed:
+>
+> - **fold(n)**: if `n` is no longer hashed (a later rename demoted it, or an
+>   unlink removed it) it frees `n` and touches nothing else — not the host,
+>   not `n`'s old directory.  If `n` is still hashed it is the named top, and
+>   the fold TRANSFERs its identity straight into the host: replace `n` by the
+>   host in both indexes and set `d_top` to NULL, in one commit.  No SPLICE, no
+>   orphan RECLAIM walk.
+> - **unlink** frees the host even when a shell names the entry (there is no
+>   chain left to do it later); the shell goes to its pending fold.  A fold
+>   whose shell is still hashed holds the host alive through RCU: the unlink
+>   that would free the host must first remove that shell from the index, and
+>   the fold rechecks that inside its commit (txn) or under the bucket lock.
+> - **reverse walk** (`dc_dentry_path`): host → `d_top` → name, two loads per
+>   component.
+> - **`d_fwd`** is a write-once shell flag (it holds the host), kept as the
+>   host/shell discriminator of the layouts that test it.
+>
+> Why: the chain's lock-free SPLICE pinned none of the links it read, so two
+> adjacent middle relays folding on different `call_rcu` workers could both
+> commit and leave a freed relay linked.  No harness exercised it: every one
+> gave an object a single owner, so one chain's folds always ran in order.
+> `stress_dcache_shared.c` (`make check-shared`) does, and caught it on the txn
+> arms and the bucket lock's DC_CHAIN_SWMW build (its lock-serialized builds
+> were immune).  Replacing `d_back` by the host's `d_top` and pinning every read
+> link was correct, but each SPLICE then walked down from `d_top` to find its
+> predecessor — O(chain) per fold, O(chain²) to drain — and hung under an
+> exchange storm on one entry.  The intermediate shells were never needed:
+> every operation wants the host or the top.  The bucket lock's three
+> chain-serialization arms (chain lock, all-MW chain, padded control) are
+> retired with the chain.
+
 ## Goals, all four at once
 
 1. **inline name** — name bytes live in the dentry, so the RCU walk compares them
