@@ -497,6 +497,26 @@ static inline void hlist_del_rcu(struct dc_hnode *n)
 /* ---- children list (verify + -ENOTEMPTY; writer/quiescent only) --------- */
 
 /* ---- PHASE 3: struct list_lru (s_dentry_lru) --------------------------- */
+/*
+ * TEST-ONLY: -DDC_TEST_RETAIN_DELAY_US=N sleeps N us in a writer's walk between
+ * a component's d_seq check and its LRU re-arm -- the window a concurrent kill
+ * must land in to race the re-arm -- and, under -DDC_TEST_SEQ_LRU_ADD_LATE,
+ * between dc_add's publish and its enqueue.  check-rmdir widens with it.
+ */
+#ifdef DC_TEST_RETAIN_DELAY_US
+#include <time.h>
+static void dc_test_retain_delay(void)
+{
+	struct timespec ts = { DC_TEST_RETAIN_DELAY_US / 1000000,
+			       (DC_TEST_RETAIN_DELAY_US % 1000000) * 1000L };
+
+	nanosleep(&ts, NULL);
+}
+#define DC_TEST_RETAIN_DELAY()	dc_test_retain_delay()
+#else
+#define DC_TEST_RETAIN_DELAY()	do { } while (0)
+#endif
+
 #ifndef DC_NO_LRU
 
 /*
@@ -543,13 +563,42 @@ static inline unsigned int lru_nid(void)
 	return nid < DC_LRU_NODES ? nid : nid % DC_LRU_NODES;
 }
 
-/* list_lru_add: at the TAIL.  @d must not already be on a list. */
-static void lru_add(struct dcache *dc, struct dentry *d)
-{
-	unsigned int nid = lru_nid();
-	struct dc_lru_one *l = &dc->s_dentry_lru[nid];
+/*
+ * The membership word, d_lru.shard.  The kernel makes LRU membership atomic
+ * with a dentry's death through d_lock, which retain_dentry's d_lru_add and
+ * __dentry_kill's d_lru_del both hold, plus the reference a ref-walk holds
+ * across its dput.  This port has neither on the paths that race -- a writer's
+ * walk re-arms a dentry (lru_retain) holding no lock on it -- so the word
+ * carries the exclusion instead:
+ *
+ *   OFF      not on a list, alive, re-armable (never added, or LRU_REMOVED)
+ *   ON(i)    linked on node shard i; changed only under that shard's lock
+ *   SHRINK   isolated by the shrinker, about to be killed or put back: a
+ *            re-arm must not touch it (mainline's DCACHE_SHRINK_LIST)
+ *   DEAD     killed: never re-armed, never linked again
+ *
+ * Without it, two races were open.  A walk that passed its d_seq check before
+ * a concurrent unlink re-armed the dentry after the unlink's lru_del, so the
+ * LRU kept a pointer past the call_rcu free; and dc_add published the dentry
+ * before enqueueing it, so a walk finding it in between linked it onto its own
+ * shard and the add linked it again -- one node on two lists.
+ *
+ * The hot paths stay free of atomic RMWs.  dc_add enqueues BEFORE publishing
+ * (lru_add_new: nobody can see the dentry, so plain stores suffice), and a kill
+ * of a listed dentry is a plain store under the shard lock it already takes.
+ * Only the rare transitions out of OFF and SHRINK -- a re-arm's claim, a kill
+ * of an unlisted dentry, the shrinker's put-back -- use cmpxchg, and they race
+ * exactly each other.
+ */
+#define DC_SEQ_LRU_OFF		0u
+#define DC_SEQ_LRU_ON(nid)	((nid) + 1u)	/* 1 .. DC_LRU_NODES */
+#define DC_SEQ_LRU_SHRINK	0xfffffffeu
+#define DC_SEQ_LRU_DEAD		0xffffffffu
+#define DC_SEQ_LRU_IS_ON(st)	((st) != DC_SEQ_LRU_OFF && (st) <= DC_LRU_NODES)
 
-	lru_lock(l);
+/* Link @d at @l's tail.  Caller holds @l and owns @d's membership word. */
+static void lru_link_tail_locked(struct dc_lru_one *l, struct dentry *d)
+{
 	d->d_lru.prev = l->tail;
 	d->d_lru.next = NULL;
 	if (l->tail)
@@ -558,11 +607,46 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 		l->head = d;
 	l->tail = d;
 	l->nr_items++;
-	d->d_lru.shard = nid + 1;
+}
+
+/*
+ * list_lru_add for a dentry nobody else can see yet: dc_add calls it BEFORE
+ * hlist_add_head_rcu publishes @d, so no walk, unlink or shrinker can race the
+ * claim and a plain store does it.
+ */
+static void lru_add_new(struct dcache *dc, struct dentry *d)
+{
+	unsigned int nid = lru_nid();
+	struct dc_lru_one *l = &dc->s_dentry_lru[nid];
+
+	lru_lock(l);
+	lru_link_tail_locked(l, d);
+	uatomic_store(&d->d_lru.shard, DC_SEQ_LRU_ON(nid), CMM_RELAXED);
 	lru_unlock(l);
 }
 
-static void lru_del_locked(struct dc_lru_one *l, struct dentry *d)
+/*
+ * Re-arm a published dentry (lru_retain).  CLAIM the word OFF -> ON under the
+ * shard lock: the cmpxchg is what a concurrent kill's OFF -> DEAD seal races,
+ * so a dying dentry is never linked, and holding the lock across the claim and
+ * the link means a killer that reads ON(i) finds it linked once it gets the
+ * lock.  Losing the claim (ON elsewhere, SHRINK, DEAD) leaves nothing to do.
+ */
+static void lru_add_claim(struct dcache *dc, struct dentry *d)
+{
+	unsigned int nid = lru_nid();
+	struct dc_lru_one *l = &dc->s_dentry_lru[nid];
+
+	lru_lock(l);
+	if (uatomic_cmpxchg(&d->d_lru.shard, DC_SEQ_LRU_OFF,
+			    DC_SEQ_LRU_ON(nid)) == DC_SEQ_LRU_OFF)
+		lru_link_tail_locked(l, d);
+	lru_unlock(l);
+}
+
+/* Unlink @d from @l, leaving its word at @newst.  Caller holds @l. */
+static void lru_del_locked(struct dc_lru_one *l, struct dentry *d,
+			   unsigned int newst)
 {
 	if (d->d_lru.prev)
 		d->d_lru.prev->d_lru.next = d->d_lru.next;
@@ -573,23 +657,64 @@ static void lru_del_locked(struct dc_lru_one *l, struct dentry *d)
 	else
 		l->tail = d->d_lru.prev;
 	d->d_lru.prev = d->d_lru.next = NULL;
-	d->d_lru.shard = 0;
+	uatomic_store(&d->d_lru.shard, newst, CMM_RELAXED);
 	l->nr_items--;
 }
 
-/* list_lru_del: IMMEDIATE physical removal, from anywhere in the list. */
+/*
+ * list_lru_del for a dentry being KILLED: IMMEDIATE physical removal, and seal
+ * the word DEAD so no re-arm can link it after the caller's call_rcu.
+ *
+ *   ON(i)   unlink under shard i's lock, store DEAD (re-derived under it: a
+ *           shrinker may have isolated it, or a re-arm moved it, meanwhile)
+ *   OFF     cmpxchg to DEAD; a lost race means a re-arm claimed it -- retry,
+ *           and take it off the shard it named
+ *   SHRINK  cmpxchg to DEAD: the shrinker's lru_kill() re-verifies the
+ *           dentry under the dir and bucket locks the caller holds or held,
+ *           so it skips a dentry this kill already unhashed, and its put-back
+ *           (SHRINK -> OFF) loses to this seal
+ *   DEAD    nothing to do
+ */
 static void lru_del(struct dcache *dc, struct dentry *d)
 {
-	unsigned int idx = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
-	struct dc_lru_one *l;
+#ifdef DC_TEST_SEQ_LRU_NO_SEAL
+	/* MUTATION (check-rmdir must fail): the pre-2026-10-02 kill -- unlink
+	 * and leave the word OFF, so a racing walk re-arms a dentry being
+	 * freed. */
+	unsigned int st0 = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
 
-	if (!idx)
+	if (DC_SEQ_LRU_IS_ON(st0)) {
+		struct dc_lru_one *l0 = &dc->s_dentry_lru[st0 - 1];
+
+		lru_lock(l0);
+		if (uatomic_load(&d->d_lru.shard, CMM_RELAXED) == st0)
+			lru_del_locked(l0, d, DC_SEQ_LRU_OFF);
+		lru_unlock(l0);
+	}
+	return;
+#endif
+	for (;;) {
+		unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+		struct dc_lru_one *l;
+
+		if (st == DC_SEQ_LRU_DEAD)
+			return;
+		if (!DC_SEQ_LRU_IS_ON(st)) {	/* OFF or SHRINK */
+			if (uatomic_cmpxchg(&d->d_lru.shard, st,
+					    DC_SEQ_LRU_DEAD) == st)
+				return;
+			continue;
+		}
+		l = &dc->s_dentry_lru[st - 1];
+		lru_lock(l);
+		if (uatomic_load(&d->d_lru.shard, CMM_RELAXED) != st) {
+			lru_unlock(l);
+			continue;
+		}
+		lru_del_locked(l, d, DC_SEQ_LRU_DEAD);
+		lru_unlock(l);
 		return;
-	l = &dc->s_dentry_lru[idx - 1];
-	lru_lock(l);
-	if (d->d_lru.shard)
-		lru_del_locked(l, d);
-	lru_unlock(l);
+	}
 }
 
 /*
@@ -609,12 +734,16 @@ static void lru_del(struct dcache *dc, struct dentry *d)
  */
 static void lru_retain(struct dcache *dc, struct dentry *d)
 {
-	if (caa_likely(uatomic_load(&d->d_lru.shard, CMM_RELAXED))) {
+	unsigned int st = uatomic_load(&d->d_lru.shard, CMM_RELAXED);
+
+	if (caa_likely(DC_SEQ_LRU_IS_ON(st))) {
 		if (!uatomic_load(&d->d_lru.referenced, CMM_RELAXED))
 			uatomic_store(&d->d_lru.referenced, 1, CMM_RELAXED);
 		return;
 	}
-	lru_add(dc, d);				/* re-arm after an LRU_REMOVED */
+	if (st == DC_SEQ_LRU_OFF)
+		lru_add_claim(dc, d);		/* re-arm after an LRU_REMOVED */
+	/* SHRINK: the shrinker owns it; DEAD: it is being freed */
 }
 
 unsigned long dc_lru_count(struct dcache *dc)
@@ -627,17 +756,59 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return n;
 }
 
+long dc_lru_check(struct dcache *dc)
+{
+	long bad = 0;
+	unsigned int i;
+
+	for (i = 0; i < DC_LRU_NODES; i++) {
+		struct dc_lru_one *l = &dc->s_dentry_lru[i];
+		struct dentry *d, *prev = NULL;
+		unsigned long n = 0, want = l->nr_items;
+
+		for (d = l->head; d && n <= want; prev = d, d = d->d_lru.next) {
+			unsigned int st = uatomic_load(&d->d_lru.shard,
+						       CMM_RELAXED);
+			const char *why = NULL;
+
+			n++;
+			if (st != DC_SEQ_LRU_ON(i))
+				why = "word does not name this list";
+			else if (DC_IS_UNHASHED(d))
+				why = "listed but unhashed (killed)";
+			else if (d->d_lru.prev != prev)
+				why = "prev link disagrees";
+			if (why) {
+				if (bad < 8)
+					fprintf(stderr, "LRUCHK node %u pos %lu "
+						"%p word=%#x: %s\n", i, n - 1,
+						(void *) d, st, why);
+				bad++;
+			}
+		}
+		if (n != want || l->tail != prev) {
+			if (bad < 8)
+				fprintf(stderr, "LRUCHK node %u: walked %lu of "
+					"nr_items %lu, tail %s\n", i, n, want,
+					l->tail == prev ? "ok" : "WRONG");
+			bad++;
+		}
+	}
+	return bad;
+}
+
 const char *dc_lru_arm(void) { return "pernode"; }
 const int dc_lru_inuse_is_removed = 1;	/* kernel-faithful: LRU_REMOVED */
 
 #else	/* DC_NO_LRU */
-static inline void lru_add(struct dcache *dc, struct dentry *d)
+static inline void lru_add_new(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_del(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_retain(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
+long dc_lru_check(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 long dc_shrink_local(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
 const char *dc_lru_arm(void) { return "none"; }
@@ -1053,8 +1224,11 @@ static inline enum walk_ret path_walk_rcu(struct dcache *dc,
 		/* step_into: the child is still the one we matched */
 		if (read_seqcount_retry(&d->d_seq, next_seq))
 			return WALK_RESTART;
-		if (writer)
+		if (writer) {
+			/* the re-arm races a kill that lands right here */
+			DC_TEST_RETAIN_DELAY();
 			lru_retain(dc, d);
+		}
 		cur = d;
 		seq = next_seq;
 	}
@@ -1300,8 +1474,20 @@ static int dc_add_typed_state(struct dcache *dc, const struct dc_path *path,
 	 * d_children and flips the state, so this test under this lock is what
 	 * makes the two atomic.  One predicted load-and-branch inside a critical
 	 * section the add already entered -- no new lock.
+	 *
+	 * The same goes for an UNLINKED parent: the walk above may have found
+	 * it before a concurrent dc_unlink removed it (empty at the time) and
+	 * re-added the name as a NEW dentry, and a child linked under the old
+	 * one is unreachable.  dc_unlink unhashes a directory holding its own
+	 * dir lock -- this one -- so the test below and that unhash exclude each
+	 * other.  It is the kernel's IS_DEADDIR(dir) check in may_create(), for
+	 * the S_DEAD vfs_rmdir sets under the victim's i_rwsem.
 	 */
-	if (!DC_IS_POSITIVE(parent)) {
+	if (!DC_IS_POSITIVE(parent)
+#ifndef DC_TEST_NO_ADD_ALIVE	/* MUTATION (check-rmdir must fail) */
+	    || DC_IS_UNHASHED(parent)
+#endif
+	   ) {
 		ret = -ENOENT;
 		goto unlock;
 	}
@@ -1314,11 +1500,22 @@ static int dc_add_typed_state(struct dcache *dc, const struct dc_path *path,
 		ret = -ENOMEM;
 		goto unlock;
 	}
+#ifndef DC_TEST_SEQ_LRU_ADD_LATE
+	/* d_lru_add at the tail BEFORE the publish below: until it is hashed no
+	 * walk can re-arm it, so the enqueue needs no claim (see lru_add_new). */
+	lru_add_new(dc, d);
+#endif
 	/* A brand-new node has no readers yet: hlist_add_head_rcu is its one
 	 * publish (release).  No rename_lock bump -- add doesn't move anything. */
 	hlist_add_head_rcu(b, &d->d_hash);
 	children_add(parent, d);
-	lru_add(dc, d);			/* d_lru_add: the first last-put, at the tail */
+#ifdef DC_TEST_SEQ_LRU_ADD_LATE
+	/* MUTATION (check-rmdir must fail): the pre-2026-10-02 order -- enqueue
+	 * AFTER the publish, so a walk that finds @d first re-arms it onto its
+	 * own shard and this links it a second time. */
+	DC_TEST_RETAIN_DELAY();
+	lru_add_new(dc, d);
+#endif
 unlock:
 	bl_unlock(b);
 	dir_wunlock(parent);
@@ -1526,20 +1723,53 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 {
 	struct dentry *victim, *parent;
 	struct dc_bucket *b;
-	int ret = 0;
+	int isdir, ret = 0;
 
 	if (path->ndepth == 0)
 		return -EINVAL;			/* cannot unlink the root */
 
 	rcu_read_lock();
-	victim = resolve_dentry_rcu(dc, path, path->ndepth);
-	if (!victim) {
-		rcu_read_unlock();
-		return -ENOENT;
+	for (;;) {
+		victim = resolve_dentry_rcu(dc, path, path->ndepth);
+		if (!victim) {
+			rcu_read_unlock();
+			return -ENOENT;
+		}
+		parent = DC_DPARENT(victim);
+		/*
+		 * A DIRECTORY victim is locked too, with its parent, address-
+		 * ordered as dc_delete does: the kernel's rmdir holds the victim's
+		 * i_rwsem, and dc_add holds its parent's dir lock -- the victim's
+		 * own -- across its parent check and link, so the emptiness test
+		 * below and every add under the victim exclude each other.  With
+		 * only the parent's lock, an add could link a child after the test
+		 * passed and the child was lost under a freed directory
+		 * (stress_dcache_rmdir found 6726).  d_isdir is write-once, so the
+		 * lockless peek cannot be stale about the type.
+		 */
+		isdir = victim->d_isdir;
+#ifdef DC_TEST_NO_RMDIR_LOCK	/* MUTATION (check-rmdir must fail) */
+		isdir = 0;
+#endif
+		if (isdir)
+			dirs_wlock2(parent, victim);
+		else
+			dir_wlock(parent);
+		/*
+		 * RE-VERIFY under the parent's lock, which pins the victim's
+		 * parent and name (rename takes it): still hashed -- or a
+		 * concurrent unlink got there first and this one would unhash and
+		 * free it a second time -- and still under @parent, at the name
+		 * the bucket is taken from.
+		 */
+		if (!DC_IS_UNHASHED(victim) && DC_DPARENT(victim) == parent)
+			break;
+		if (isdir)
+			dirs_wunlock2(parent, victim);
+		else
+			dir_wunlock(parent);
 	}
-	parent = DC_DPARENT(victim);
 	b = bucket_of(dc, parent, victim->d_name.hash);
-	dir_wlock(parent);
 	bl_lock(b);
 	if (victim->d_children) {
 		ret = -ENOTEMPTY;
@@ -1560,7 +1790,10 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	call_rcu(&victim->d_rcu, dentry_free_cb);	/* honest deferred free */
 unlock:
 	bl_unlock(b);
-	dir_wunlock(parent);
+	if (isdir)
+		dirs_wunlock2(parent, victim);
+	else
+		dir_wunlock(parent);
 	rcu_read_unlock();
 	return ret;
 }
@@ -1996,6 +2229,8 @@ static int lru_kill(struct dcache *dc, struct dentry *d)
 	rcu_read_lock();
 	parent = DC_DPARENT(d);
 	if (!parent || parent == d) {		/* the root anchors the tree */
+		(void) uatomic_cmpxchg(&d->d_lru.shard, DC_SEQ_LRU_SHRINK,
+				       DC_SEQ_LRU_OFF);
 		rcu_read_unlock();
 		return -1;
 	}
@@ -2008,11 +2243,23 @@ static int lru_kill(struct dcache *dc, struct dentry *d)
 		hlist_del_rcu(&d->d_hash);
 		write_seqcount_end(&d->d_seq);
 		children_remove(parent, d);
+		/* SHRINK -> DEAD: only a kill moves a SHRINK word, and it would
+		 * have unhashed @d under these locks first */
+		uatomic_store(&d->d_lru.shard, DC_SEQ_LRU_DEAD, CMM_RELAXED);
 		call_rcu(&d->d_rcu, dentry_free_cb);
 		ret = 0;
 	}
 	bl_unlock(b);
 	dir_wunlock(parent);
+	/*
+	 * Not killed: still alive (it gained a child or moved), so put it back
+	 * to OFF for the next walk to re-arm -- unless an unlink killed it in the
+	 * meantime and sealed it DEAD, which this cmpxchg then leaves alone.
+	 * Inside the read-side section, so @d cannot have been freed yet.
+	 */
+	if (ret)
+		(void) uatomic_cmpxchg(&d->d_lru.shard, DC_SEQ_LRU_SHRINK,
+				       DC_SEQ_LRU_OFF);
 	rcu_read_unlock();
 	return ret;
 }
@@ -2042,24 +2289,22 @@ static long lru_shrink_nodes(struct dcache *dc, long nr,
 
 				if (!d)
 					break;
-				if (d->d_lru.referenced) {
-					d->d_lru.referenced = 0;
-					lru_del_locked(l, d);	/* LRU_ROTATE */
-					d->d_lru.prev = l->tail;
-					if (l->tail)
-						l->tail->d_lru.next = d;
-					else
-						l->head = d;
-					l->tail = d;
-					l->nr_items++;
-					d->d_lru.shard = i + 1;
+				if (uatomic_load(&d->d_lru.referenced,
+						 CMM_RELAXED)) {
+					uatomic_store(&d->d_lru.referenced, 0,
+						      CMM_RELAXED);
+					/* LRU_ROTATE: stays ON(i) */
+					lru_del_locked(l, d, DC_SEQ_LRU_ON(i));
+					lru_link_tail_locked(l, d);
 					continue;
 				}
 				if (d->d_children) {
-					lru_del_locked(l, d);	/* LRU_REMOVED */
+					/* LRU_REMOVED: alive, re-armable */
+					lru_del_locked(l, d, DC_SEQ_LRU_OFF);
 					continue;
 				}
-				lru_del_locked(l, d);
+				/* isolated: no re-arm until killed or put back */
+				lru_del_locked(l, d, DC_SEQ_LRU_SHRINK);
 				batch[n++] = d;
 			}
 			lru_unlock(l);

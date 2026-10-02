@@ -1071,12 +1071,15 @@ unsigned long dc_lru_count(struct dcache *dc)
 	return n;
 }
 
+long dc_lru_check(struct dcache *dc) { (void) dc; return 0; }
+
 #else	/* ================= THE LOCK ARM (per-shard spinlock) ================ */
 
 const int dc_lru_inuse_is_removed = 1;	/* LOCK arm REMOVES, as the kernel does */
 
 /* MCAS-only diagnostic; the lock arm has no marked-but-linked state. */
 void dc_lru_validate(void *stream) { (void) stream; }
+long dc_lru_check(struct dcache *dc) { (void) dc; return 0; }
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
 
 /*
@@ -1405,6 +1408,12 @@ static inline int lru_del_can_free(struct dcache *dc, struct dentry *d, int f)
 static inline void lru_assert_not_queued(struct dentry *d) { (void) d; }
 unsigned long dc_lru_count(struct dcache *dc) { (void) dc; return 0; }
 long dc_shrink(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+/* The rest of the API, so every harness links against the control arm too --
+ * the churn bench needs all three (it never did, so DC_NO_LRU never linked). */
+long dc_shrink_local(struct dcache *dc, long nr) { (void) dc; (void) nr; return 0; }
+const char *dc_lru_arm(void) { return "none"; }
+void dc_lru_validate(void *stream) { (void) stream; }
+long dc_lru_check(struct dcache *dc) { (void) dc; return 0; }
 const int dc_lru_inuse_is_removed = 1;
 #endif	/* DC_NO_LRU */
 #endif	/* DCACHE_LRU_TYPES */

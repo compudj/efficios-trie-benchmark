@@ -44,6 +44,14 @@
  * orphaned child is never dereferenced, so the lost-child check is the
  * detector.
  *
+ * The same traffic races the LRU, which is why the seqlock baseline runs it
+ * too: an adder's walk re-arms each victim directory it passes through while
+ * unlinkers kill and re-add those victims.  dc_lru_check() then verifies, at
+ * quiescence, that no killed dentry was re-armed (and freed while listed) and
+ * that no dentry was linked twice -- the two races seqlock's LRU had until
+ * 2026-10-02.  Its -DDC_TEST_RETAIN_DELAY_US=N widens the re-arm window, and
+ * -DDC_TEST_SEQ_LRU_NO_SEAL / -DDC_TEST_SEQ_LRU_ADD_LATE restore the two bugs.
+ *
  * Usage: ./stress_dcache_rmdir [unlinkers [adders [parents [victims [iters]]]]]
  * Exit 0 = no lost child, census clean; 1 = anomaly.
  */
@@ -202,7 +210,7 @@ int main(int argc, char **argv)
 	struct aarg *aa;
 	struct census c;
 	long unlinks = 0, busy = 0, uerrs = 0;
-	long added = 0, gone = 0, lost = 0, eexist = 0, aerrs = 0;
+	long added = 0, gone = 0, lost = 0, eexist = 0, aerrs = 0, lru_bad;
 	int i, anomaly = 0;
 
 	if (argc > 1) U = atoi(argv[1]);
@@ -278,6 +286,7 @@ int main(int argc, char **argv)
 	synchronize_rcu();
 	rcu_barrier();
 
+	lru_bad = dc_lru_check(g_dc);
 	memset(&c, 0, sizeof(c));
 	dc_walk(g_dc, census_cb, &c);
 	if (c.parents != P || c.victims != (long) P * V || c.children || c.stray)
@@ -296,6 +305,7 @@ int main(int argc, char **argv)
 	printf("LOST children        : %ld (expect 0)\n", lost);
 	printf("-EEXIST on own name  : %ld (expect 0)\n", eexist);
 	printf("errors               : %ld unlinker, %ld adder (expect 0)\n", uerrs, aerrs);
+	printf("LRU check            : %ld anomalies (expect 0)\n", lru_bad);
 	printf("census               : %ld parents, %ld victims, %ld children, %ld stray"
 	       " (expect %d, %d, 0, 0)\n", c.parents, c.victims, c.children, c.stray,
 	       P, P * V);
@@ -308,7 +318,7 @@ int main(int argc, char **argv)
 		printf("RESULT: VACUOUS (no victim unlink or no child add completed)\n");
 		return 1;
 	}
-	if (lost || eexist || uerrs || aerrs || anomaly) {
+	if (lost || eexist || uerrs || aerrs || anomaly || lru_bad) {
 		printf("RESULT: FAIL\n");
 		return 1;
 	}

@@ -437,6 +437,15 @@ void dc_txn_stats_dump(void *stream);
 void dc_txn_stats_last(void *stream);
 /* Walk the LRU and report any MARKED-but-LINKED node (diagnostic). */
 void dc_lru_validate(void *stream);
+/*
+ * Check the LRU at QUIESCENCE -- no operation in flight and every deferred
+ * free drained: each listed dentry must be live (hashed) and say it is on the
+ * list it is on, the links must agree both ways, and the counts must match.
+ * Returns the number of anomalies, printing the first few to stderr; engines
+ * and arms without a checker return 0.  Under ASan, a freed dentry still on a
+ * list faults here.
+ */
+long dc_lru_check(struct dcache *dc);
 
 /*
  * Unlink the leaf at path, RCU-deferring the free past a grace period (seam

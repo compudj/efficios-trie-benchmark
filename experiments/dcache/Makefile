@@ -342,13 +342,17 @@ check-shared-tsan: stress_dcache_shared.c dcache_txn.c dcache_bucketlock.c $(HDR
 # -- one per half of each engine's exclusion -- must FAIL at natural timings,
 # or the harness proves nothing (each fails 5/5 runs; see the harness header).
 RMDIR_ARGS ?= 2 6 2 4 20000
-check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c $(HDRS) | check-lib
+check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c dcache_seqlock.c \
+	     $(HDRS) | check-lib
 	@set -e; for arm in txn_global::dcache_txn.c \
 	    txn_pernode:-DDC_PER_NODE_GEN:dcache_txn.c \
 	    txn_mark:-DDC_MARK_GEN:dcache_txn.c \
-	    bucketlock:-DDC_MARK_GEN:dcache_bucketlock.c; do \
+	    bucketlock:-DDC_MARK_GEN:dcache_bucketlock.c \
+	    seqlock::dcache_seqlock.c; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
-	  for widen in "" -DDC_TEST_UNLINK_DELAY_US=50; do \
+	  widens='"" -DDC_TEST_UNLINK_DELAY_US=50'; \
+	  [ $$name = seqlock ] && widens='"" -DDC_TEST_RETAIN_DELAY_US=20'; \
+	  eval "set -- $$widens"; for widen in "$$@"; do \
 	    echo "== check-rmdir: $$name $${widen:-(natural timings)}"; \
 	    $(CC) $(ASANFLAGS) $$defs $$widen $(HCPP) -o stress_rmdir_$$name \
 	      stress_dcache_rmdir.c $$src $(LDFLAGS) $(LDLIBS); \
@@ -359,7 +363,11 @@ check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c $(HDRS) | ch
 	done
 	@set -e; for arm in "txn_mark:-DDC_MARK_GEN -DDC_TXN_NO_PARENT_SEAL:dcache_txn.c" \
 	    "bucketlock_nolock:-DDC_MARK_GEN -DDC_TEST_NO_RMDIR_LOCK:dcache_bucketlock.c" \
-	    "bucketlock_noalive:-DDC_MARK_GEN -DDC_TEST_NO_ADD_ALIVE:dcache_bucketlock.c"; do \
+	    "bucketlock_noalive:-DDC_MARK_GEN -DDC_TEST_NO_ADD_ALIVE:dcache_bucketlock.c" \
+	    "seqlock_nolock:-DDC_TEST_NO_RMDIR_LOCK:dcache_seqlock.c" \
+	    "seqlock_noalive:-DDC_TEST_NO_ADD_ALIVE:dcache_seqlock.c" \
+	    "seqlock_noseal:-DDC_TEST_SEQ_LRU_NO_SEAL -DDC_TEST_RETAIN_DELAY_US=20:dcache_seqlock.c" \
+	    "seqlock_addlate:-DDC_TEST_SEQ_LRU_ADD_LATE -DDC_TEST_RETAIN_DELAY_US=20:dcache_seqlock.c"; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; src=$${rest#*:}; \
 	  echo "== check-rmdir MUST-FAIL control: $$name ($$defs)"; \
 	  $(CC) $(ASANFLAGS) $$defs $(HCPP) -o stress_rmdir_mut_$$name \
