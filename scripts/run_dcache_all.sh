@@ -37,7 +37,11 @@ declare -a SWEEPS=(
 
 echo ">> logs: $LOGDIR" >&2
 echo ">> building the in-tree bench binaries" >&2
-make -C "$REPO/experiments/dcache" -j32 bench height churn \
+# -B, as for the routes below: the engines are header-inline and the liburcu
+# headers are not prerequisites of these binaries (the library is only an
+# order-only check), so after a liburcu update a plain make would keep binaries
+# compiled against the OLD headers and stamp their numbers with the new commit.
+make -B -C "$REPO/experiments/dcache" -j32 bench height churn \
 	> "$LOGDIR/build.log" 2>&1 ||
 	{ echo "!! build failed, see $LOGDIR/build.log" >&2; exit 1; }
 
