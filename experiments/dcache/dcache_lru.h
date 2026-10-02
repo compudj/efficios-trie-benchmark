@@ -269,6 +269,7 @@ static int lru_shards_init(struct dcache *dc);
 static unsigned int lru_nshards(void);
 #endif
 static void lru_add(struct dcache *dc, struct dentry *d);
+static inline void lru_add_new(struct dcache *dc, struct dentry *d);
 #ifdef DC_LRU_MCAS
 /* The shrinker's re-add targets a SPECIFIC shard; only that arm has one. */
 static void lru_add_at(struct dcache *dc, struct dentry *d, unsigned int idx);
@@ -809,6 +810,12 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 	lru_add_at(dc, d, lru_shard_index(dc));
 }
 
+/* The MCAS arm keeps its one enqueue: its claim is part of the deque commit. */
+static inline void lru_add_new(struct dcache *dc, struct dentry *d)
+{
+	lru_add(dc, d);
+}
+
 /*
  * ONE attempt at physical removal from wherever @d sits.  Returns 1 if THIS
  * call removed it, 0 if it was already off or a peer won.
@@ -1170,6 +1177,39 @@ static void lru_add(struct dcache *dc, struct dentry *d)
 }
 
 /*
+ * lru_add for a dentry NOBODY CAN REACH YET: the engine calls it before the
+ * publish, under the locks it publishes with.  No walk can re-arm the dentry and
+ * no killer can seal it until then, so there is nothing for the claim to race:
+ * a plain store does it, and the cmpxchg lru_add() needs -- inside the shard
+ * lock, where it stretches the hold time every other writer queues behind --
+ * stays off the create path.  Measured on allocating churn: the claim alone
+ * cost the bucket lock 0.98 -> 0.85 of the baseline at 4 writers.
+ *
+ * The shrinker CAN see @d once it is linked, and may isolate it; it cannot
+ * evict it early, because its lru_evict_settled() takes the bucket and child
+ * head locks the publish holds, and evicts a published dentry -- a legitimate
+ * eviction.  That ordering (publishing locks -> shard lock, never the reverse:
+ * the shrinker evicts with the shard lock dropped) is the precondition.
+ */
+static inline void lru_add_new(struct dcache *dc, struct dentry *d)
+{
+	unsigned int idx = lru_shard_index(dc);
+	struct dc_lru_shard *sh = &dc->lru[idx];
+
+	lru_lock(sh);
+	d->d_lru.prev = sh->tail;
+	d->d_lru.next = NULL;
+	if (sh->tail)
+		sh->tail->d_lru.next = d;
+	else
+		sh->head = d;
+	sh->tail = d;
+	sh->count++;
+	uatomic_store(&d->d_lru.shard, DC_LRU_ON(idx), CMM_RELAXED);
+	lru_unlock(sh);
+}
+
+/*
  * Splice out, wherever it sits, and leave the word at @newst.  Caller holds @sh.
  *
  * ⚠ @newst is a PARAMETER rather than a hardcoded DC_LRU_OFF because a killer
@@ -1400,6 +1440,8 @@ static void lru_assert_not_queued(struct dentry *d)
 static inline void lru_retain(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_add(struct dcache *dc, struct dentry *d)
+{ (void) dc; (void) d; }
+static inline void lru_add_new(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }
 static inline void lru_del(struct dcache *dc, struct dentry *d)
 { (void) dc; (void) d; }

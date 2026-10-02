@@ -1997,14 +1997,16 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 		return -EEXIST;
 	}
 #endif
+	/* PHASE 3: on the LRU at the TAIL (newest) BEFORE the publish, under the
+	 * locks it publishes with: until then no walk can re-arm @d and no kill
+	 * can seal it, so the enqueue is plain stores, without the claim cmpxchg
+	 * lru_add() must do inside the shard lock (see lru_add_new()).  This adds
+	 * the edge bucket/child-head -> shard lock; the shrinker never takes the
+	 * reverse (it evicts with the shard lock dropped). */
+	lru_add_new(dc, d);
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
 	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
-	/* PHASE 3: on the LRU at the TAIL (newest), AFTER publishing and outside
-	 * the bucket locks -- the LRU has no reader, so it need not be atomic with
-	 * the index edit, and taking a shard lock under a bucket lock would add an
-	 * ordering edge between two lock classes for nothing. */
-	lru_add(dc, d);
 	return 0;
 }
 
