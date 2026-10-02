@@ -26,10 +26,10 @@ survives, measured:
 
 1. **Readers: parity at realistic rename rates, a growing lead above them.**
    At 10k renames/s every arm is within 3% of seqlock; the localized arms lead
-   1.17–1.19× at 100k/s and 1.77–1.88× at 300k/s, where seqlock's writers stop
+   1.17–1.21× at 100k/s and 1.78–1.90× at 300k/s, where seqlock's writers stop
    keeping up.  seqlock still wins where every lookup targets an object being
-   renamed, at low concurrency (up to 32 readers: txn-global 0.94–0.99×,
-   txn-mark 0.87–0.93×, per-node 0.83–0.90×, bucket lock 0.77–0.83×).  The
+   renamed, at low concurrency (up to 32 readers: txn-global 0.95–1.00×,
+   txn-mark 0.87–0.93×, per-node 0.83–0.90×, bucket lock 0.83–0.89×).  The
    mechanism is a trade: an unfolded rename shell makes a hit read three
    cachelines instead of one, and shells live ~5 ms (`call_rcu` batching), so
    each reader pays a private L1-capacity cost; seqlock's in-place rename costs
@@ -38,18 +38,19 @@ survives, measured:
    machinery is cheap in the kernel's fast path, and the txn win is under
    rename load, not at rest.  The reverse walk, which seqlock won at 2–8
    readers (0.63–0.75×) while a txn reverse walk climbed the transition chain,
-   is now a txn win at every reader count (1.10–1.45× at 2 readers, 5.2–6.9×
+   is now a txn win at every reader count (1.10–1.45× at 2 readers, 5.1–7.2×
    at 32–64; item 7).
    ⚠ The positive-hit and reverse-walk panels before 2026-09-30 let readers own
    leaves nothing moves, so only 8/(readers+8) of their targets moved; the
    numbers above are from the corrected harness (`bench_dcache.c` writers_own).
-   ⚠ In that dense-hit panel the bucket lock is the lowest arm at 128–184
-   readers (0.85–0.88×): readers with a stale path miss on the name a rename
-   just vacated and all cache a negative at once, on the bucket and parent
-   child-list locks the renamers need (0.95× without negative caching).  With
-   the test-and-set spins both engines had until 2026-09-30 it was 0.67–0.75×
-   with its writers below the offered rate.  What is left is the herd itself;
-   the kernel coalesces it (`d_alloc_parallel`), this port does not.
+   ⚠ In that dense-hit panel the bucket lock is among the lowest arms at
+   128–184 readers (0.88–0.91×, txn-global 0.89–0.92×): readers with a stale
+   path miss on the name a rename just vacated and all cache a negative at
+   once, on the bucket and parent child-list locks the renamers need (0.95×
+   without negative caching).  With the test-and-set spins both engines had
+   until 2026-09-30 it was 0.67–0.75× with its writers below the offered rate.
+   What is left is the herd itself; the kernel coalesces it
+   (`d_alloc_parallel`), this port does not.
 2. **Interconnect sensitivity is asymmetric.**  With the namespace homed on the
    far socket, seqlock's readdir and reverse walk lose 30–40% and the txn
    readers 2–5%: seqlock's readers RMW a directory's rwsem or re-read
@@ -59,8 +60,8 @@ survives, measured:
    seqlock's 16-reader readdir and reverse walk.  Spreading readers one per CCD
    hurts every engine (seqlock −35–55%, txn −13–16%): they share a few hot
    lines.
-3. **Writers: the clear win.**  Flat out the bucket lock renames 4.4–22.3×
-   seqlock, txn-mark 2.1–4.7×, txn-pernode up to 20.2× on leaf exchanges.
+3. **Writers: the clear win.**  Flat out the bucket lock renames 4.0–22.0×
+   seqlock, txn-mark 2.2–4.7×, txn-pernode up to 20.5× on leaf exchanges.
    Part of that is the per-directory rwsem and cross-dir rename mutex the txn
    designs dissolve (lock-free readdir leaves no reader to exclude) — a
    legitimate axis, but it means a kernel port's gain depends on what the VFS
@@ -107,6 +108,19 @@ survives, measured:
    victim-directory lock in unlink (a correctness fix, ~5% of empty-directory
    churn against listers), found only after two plausible mechanisms were
    measured and refuted.
+
+8. **A mask on a loaded pointer is on the walk's critical path; a test is not
+   (2026-10-01).**  The bucket lock cleared its lock and mark bits with two ANDs
+   on every hash-chain link before the next load went through the pointer; a
+   test of those bits (almost never set) that uses the word as loaded gained its
+   readers 1.03–1.09× on lookups and 1.19× on reverse walks, at rest and under
+   renames, which is most of what separated it from txn-mark at rest.  GCC folds
+   `if (v & B) v -= B` into the mask, so an empty asm on the value in the
+   branch (`DC_OPAQUE`) keeps it a test at no cost.  The rule is NOT "always
+   test": on `d_iparent`, whose tag bits are data, the same test missed one
+   branch every third walk under renames and lost 11–15% — and why the loss is
+   that large is not established (the mispredicted work mostly overlaps the load
+   wait the mask pays anyway).  Measure per site.
 
 The architecture conclusion stands (§2): the bucket lock + SW txn hybrid is the
 best writer and matches the best reader.
