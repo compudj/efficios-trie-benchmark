@@ -572,29 +572,80 @@ static inline void *bl_read(void **slot, uintptr_t tag)
 }
 
 /*
- * Resolve a head-first / node-next hlist slot to the node it denotes.  Strip the
- * bucket LOCK (bit 2) FIRST -- a first-position insert can leave a head holding
- * proxy|TAG|LOCK, and the proxy address is only recoverable once the lock bit is
- * cleared -- then resolve the proxy (bit 0), then strip the deletion MARK (bit 1)
- * from the returned pointer, reporting it via *marked (NULL to ignore).
+ * DC_OPAQUE(v): make @v opaque to the optimizer, at no cost.  The empty asm
+ * claims to read and rewrite @v in a register; it emits no instruction, but the
+ * compiler can no longer see what the branch it sits in did to @v, so it cannot
+ * merge that branch with the path that skips it.  Used to keep
+ *
+ *	if (unlikely(v & BITS)) { v -= <bits set>; DC_OPAQUE(v); }
+ *
+ * from being folded into the equivalent, unconditional "v &= ~BITS" -- which
+ * GCC does whenever the branch body is simple enough.
+ *
+ * Why the branch is worth keeping.  On a POINTER the next load goes through, a
+ * mask puts an ALU op between the load and the loads that follow it, on the
+ * walk's dependency chain; a test with a well-predicted branch sits beside the
+ * chain and the next load issues on the raw value.  The test is also fewer
+ * instructions here: the fast path is one test-and-branch, and a caller that
+ * only wants the mark (top_unhashed_rcu) collapses to it.  Measured on
+ * bl_hlist_resolve (2026-10-01, 16 readers, interleaved medians), masking cost
+ * the bucket lock 9% of its positive hits at rest and 8% under 100k renames/s,
+ * and 16% of its reverse walks -- which only TEST the mark through it, so that
+ * part is fewer instructions (309 -> 265 per walk), not the dependency chain.
+ *
+ * ONLY WHERE THE BITS ARE ALMOST NEVER SET.  A hash-chain word qualifies: the
+ * lock bit is set only while a writer holds that bucket, the proxy tag only
+ * mid-commit, the mark only on a removed node -- with it, branch misses (all
+ * branches) stayed at 0.003 per reverse walk under 100k renames/s.  d_iparent
+ * does not: its SHELL / NEG bits are data (a leaf's named top is a shell most
+ * of the time under renames).  The same check on iparent_of() measured -1..-2%
+ * at rest and 11-15% SLOWER reverse walks under 100k renames/s (txn-global,
+ * txn-mark, bucket lock), branch misses going from ~0.01 to 0.31 per walk.  Why
+ * that loss is so large is NOT established: the slot breakdown shows most of
+ * the mispredicted work overlapping the load wait the mask pays anyway.
+ * Measure, per site, before choosing a test over a mask.
+ */
+#define DC_OPAQUE(v)	__asm__ ("" : "+r" (v))
+
+/*
+ * Resolve a head-first / node-next hlist slot to the node it denotes.
+ *
+ * Fast path: a clean word -- no lock, proxy tag or mark bit, which is every
+ * live node's next and every head no writer holds -- IS the node address, and
+ * is returned as loaded (see DC_OPAQUE for why that is a test and not a mask).
+ * Otherwise strip the bucket LOCK (bit 2) FIRST -- a first-position insert can
+ * leave a head holding proxy|TAG|LOCK, and the proxy address is only
+ * recoverable once the lock bit is cleared -- then resolve the proxy (bit 0),
+ * then strip the deletion MARK (bit 1) from the result, reporting it via
+ * *marked (NULL to ignore).
  */
 static inline struct urcu_txn_sw_hlist_node *
 bl_hlist_resolve(struct urcu_txn_sw_hlist_node *ptr, int *marked)
 {
-	uintptr_t v = (uintptr_t) ptr & ~DC_BL_LOCK;	/* slot-level lock strip */
+	uintptr_t v = (uintptr_t) ptr;
 
-	if (caa_unlikely((v & URCU_TXN_HLIST_TAG) == URCU_TXN_HLIST_TAG))
-		v = (uintptr_t) dc_proxy_resolve(
-			v & ~(uintptr_t) URCU_TXN_HLIST_TAG);
-	/*
-	 * A head-slot proxy carries the lock bit in its OLD/NEW targets too (the
-	 * settle must keep bit 2 on the slot), so strip it a second time off the
-	 * resolved value.  MARK (bit 1) is reported, then stripped.
-	 */
 	if (marked)
-		*marked = (int) (v & URCU_TXN_HLIST_MARK);
-	return (struct urcu_txn_sw_hlist_node *)
-		(v & ~(uintptr_t) (DC_BL_LOCK | URCU_TXN_HLIST_MARK));
+		*marked = 0;
+	if (caa_unlikely(v & (DC_BL_LOCK | URCU_TXN_HLIST_TAG |
+			      URCU_TXN_HLIST_MARK))) {
+		if (v & DC_BL_LOCK)
+			v -= DC_BL_LOCK;
+		/*
+		 * A head-slot proxy carries the lock bit in its OLD/NEW targets
+		 * too (the settle must keep bit 2 on the slot), so strip it
+		 * again off the resolved value.
+		 */
+		if (v & URCU_TXN_HLIST_TAG)
+			v = (uintptr_t) dc_proxy_resolve(
+				v - (uintptr_t) URCU_TXN_HLIST_TAG) & ~DC_BL_LOCK;
+		if (v & URCU_TXN_HLIST_MARK) {
+			if (marked)
+				*marked = 1;
+			v -= URCU_TXN_HLIST_MARK;
+		}
+		DC_OPAQUE(v);		/* keep the branch: no fold into a mask */
+	}
+	return (struct urcu_txn_sw_hlist_node *) v;
 }
 
 /* Resolved first / next step (call under rcu_read_lock()). */
