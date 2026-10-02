@@ -61,7 +61,8 @@ PANELS = [
      "lookups / s   (Mlookups/s)"),
     ("idle_dpath", "reverse walk from a pinned leaf handle (dentry_path_raw)",
      "reverse walks / s   (Mdpaths/s)"),
-    ("idle_readdir", "directory listing (32 children per directory)",
+    ("idle_readdir", "directory listing (32 children per directory) — the four "
+     "txn arms run\nidentical readdir code, so their curves coincide",
      "listings / s   (Mreaddir/s)"),
 ]
 

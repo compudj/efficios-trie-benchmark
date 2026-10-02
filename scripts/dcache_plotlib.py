@@ -102,6 +102,7 @@ def ratio_strip(ax, rows, x, y, engines, color, marker, base="seqlock",
                                               sharex=ax)
     b = dict(zip(*series(rows, x, y, engine=base, **match)[:2]))
     lo = hi = 1.0
+    lines = []
     for e in engines:
         if e == base:
             continue
@@ -111,8 +112,18 @@ def ratio_strip(ax, rows, x, y, engines, color, marker, base="seqlock",
             continue
         rs = [s[v] / b[v] for v in xs]
         lo, hi = min(lo, *rs), max(hi, *rs)
-        rax.plot(xs, rs, color=color[e], marker=marker[e], lw=1.4, ms=4.5,
-                 alpha=0.9)
+        lines.append((e, xs, rs))
+    # Arms that measure the same (identical reader code, e.g. every txn arm's
+    # readdir) coincide to within a pixel on this axis, and the last one drawn
+    # used to hide the rest.  Same thin line for every arm (no emphasis), but
+    # HOLLOW markers, each a size smaller than the one drawn before it, so
+    # coinciding arms show as nested outlines of their own shapes and colours.
+    n = len(lines)
+    for i, (e, xs, rs) in enumerate(lines):
+        k = n - 1 - i			# 0 for the last (topmost) line
+        rax.plot(xs, rs, color=color[e], marker=marker[e], lw=1.2,
+                 ms=4.0 + 1.5 * k, mfc="none", mec=color[e], mew=1.3,
+                 alpha=0.95)
     rax.axhline(1.0, color="0.3", lw=1.0, ls="--", zorder=0)
     rax.set_yscale("log", base=2)
     rax.set_ylim(lo / 1.15, hi * 1.15)
