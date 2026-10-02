@@ -344,9 +344,27 @@ const char *dc_lru_arm(void)
 #endif
 }
 
+#if defined(DC_LRU_PERCPU) || defined(DC_LRU_MM_CID)
+/*
+ * Newer librseq wants rseq_init() once per process before rseq_offset means
+ * anything: until then it is PTRDIFF_MIN, and rseq_current_cpu_raw() loads
+ * from the thread pointer plus that.  These arms read the rseq area
+ * themselves, so they initialize it themselves -- they used to work only
+ * because a liburcu built with the rseq slab calls it from a constructor, and
+ * crashed on the first dc_add() against one that does not.  Weak, because the
+ * older librseq some routes link initializes from its own constructor and has
+ * no such symbol.  Calling it twice is harmless.
+ */
+extern int rseq_init(void) __attribute__((weak));
+#endif
+
 /* How many shards this arm wants. */
 static unsigned int lru_nshards(void)
 {
+#if defined(DC_LRU_PERCPU) || defined(DC_LRU_MM_CID)
+	if (rseq_init)
+		(void) rseq_init();
+#endif
 #if defined(DC_LRU_PERCPU)
 	int n = rseq_get_max_nr_cpus();
 
