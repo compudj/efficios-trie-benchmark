@@ -68,6 +68,13 @@ if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' "$Bd/src/Makefile" 2>/dev/null
   SLABDEF="$SLABDEF -DURCU_TXN_SLAB_BATCH"
   SLABMODE="$SLABMODE + batch retirement"
 fi
+# Since liburcu made batch retirement the default, the per-descriptor route is
+# the opt-out, -DURCU_TXN_SLAB_NO_BATCH: header-inline as well, so derived the
+# same way.
+if grep -qE '^CPPFLAGS = .*-DURCU_TXN_SLAB_NO_BATCH' "$Bd/src/Makefile" 2>/dev/null; then
+  SLABDEF="$SLABDEF -DURCU_TXN_SLAB_NO_BATCH"
+  SLABMODE="$SLABMODE + per-descriptor retirement"
+fi
 INC="-I$Bd/include -I$BIN $SLABDEF $SLABINC"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread $SLABLIB"
 printf '>> liburcu %s (%s)  slab: %s\n' \

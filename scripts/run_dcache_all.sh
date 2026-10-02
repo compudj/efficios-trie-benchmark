@@ -9,7 +9,8 @@
 # re-plotted, and check_dcache_figures.sh reports it as stale.
 #
 # The slab-route figure (dcache_slabroute.png) compares four liburcu builds
-# (default, rseq, batch, batch+rseq) built from ONE commit with the same CFLAGS;
+# (default = batch retirement, rseq, nobatch = one call_rcu per descriptor,
+# nobatch+rseq) built from ONE commit with the same CFLAGS;
 # after the default route, the churn sweep re-runs against each route build
 # (see ROUTES below), and check_dcache_figures.sh verifies the four CSVs share a
 # liburcu commit and the current source hash.
@@ -69,7 +70,7 @@ done
 # Only churn_w, allocating toggles, runs there: the one panel and mode the
 # slab-route figure reads (in-place toggles commit no descriptor on the lock
 # engines).
-ROUTES=${ROUTES-"rseq:urcu-txn-build-rseq-a69be31e batch:urcu-txn-build-batch-a69be31e batch_rseq:urcu-txn-build-batch-rseq-a69be31e"}
+ROUTES=${ROUTES-"rseq:urcu-txn-build-rseq-c21f5a38 nobatch:urcu-txn-build-nobatch-c21f5a38 nobatch_rseq:urcu-txn-build-nobatch-rseq-c21f5a38"}
 if [[ -n "$ROUTES" && -z "${ONLY:-}" ]]; then
 	for r in $ROUTES; do
 		name=${r%%:*}

@@ -7,10 +7,16 @@ much of their ALLOCATING churn -- dc_unlink + dc_add per toggle -- is the
 descriptor slab.  The churn sweep was run against four slab routes, writers
 only, allocating mode:
 
-  scripts/dcache_churn.csv             default -- one call_rcu per descriptor
-  scripts/dcache_churn_rseq.csv        + rseq per-cpu local lists
-  scripts/dcache_churn_batch.csv       URCU_TXN_SLAB_BATCH -- retire by the batch
-  scripts/dcache_churn_batch_rseq.csv  both
+  scripts/dcache_churn.csv               default -- batch retirement
+  scripts/dcache_churn_rseq.csv          batch + rseq per-cpu local lists
+  scripts/dcache_churn_nobatch.csv       URCU_TXN_SLAB_NO_BATCH -- one call_rcu
+                                         per descriptor
+  scripts/dcache_churn_nobatch_rseq.csv  per descriptor + rseq
+
+Batch retirement became liburcu's default on 2026-10-02 (with batches kept per
+RCU flavor); until then the per-descriptor route was the default and batching
+the opt-in.  The RIGHT panel's reference stays the per-descriptor route either
+way, so the figure keeps answering what the slab routes buy over it.
 
 ENCODING.  The routes are a 2x2, so they are drawn as a 2x2 rather than as four
 arbitrary colours: HUE carries batching (the axis that matters), LINE STYLE
@@ -20,9 +26,9 @@ default-vs-rseq pair collapsed to dE 5.4 under tritanopia, below even the
 secondary-encoding floor).  seqlock and bucket-lock are context, in recessive
 grey: neither touches this slab, so they are the "did the machine move" control.
 
-LEFT panel is throughput.  RIGHT is the speedup of each route over the default,
-for the three txn engines, and the control band says what "no effect" looks
-like on the same axes.
+LEFT panel is throughput.  RIGHT is the speedup of each route over one call_rcu
+per descriptor, for the three txn engines, and the control band says what "no
+effect" looks like on the same axes.
 
 Measured 2026-09-30: batch retirement lifts the txn engines 1.10-1.26x at 1-4
 writers and does nothing from 8 up (0.98-1.03x); rseq local lists add a few
@@ -48,11 +54,12 @@ OUT = os.environ.get("OUT", os.path.join(HERE, os.pardir, "figures",
 
 # hue = batching, linestyle = rseq.  Validated: worst normal-vision dE 20.7,
 # worst CVD dE 14.3 (>= 15 / >= 8 required).
+# ROUTES[0] is the RIGHT panel's reference.
 ROUTES = [
-    ("",            "call_rcu per descriptor",      "#0072B2", "-"),
-    ("_rseq",       "+ rseq per-cpu local lists",   "#0072B2", "--"),
-    ("_batch",      "batch retirement",             "#D55E00", "-"),
-    ("_batch_rseq", "batch + rseq",                 "#D55E00", "--"),
+    ("_nobatch",      "call_rcu per descriptor",      "#0072B2", "-"),
+    ("_nobatch_rseq", "+ rseq per-cpu local lists",   "#0072B2", "--"),
+    ("",              "batch retirement (default)",   "#D55E00", "-"),
+    ("_rseq",         "batch + rseq",                 "#D55E00", "--"),
 ]
 CONTEXT = "#AAAAAA"
 TXN = ("txn-mark", "txn-pernode", "txn-global")
@@ -80,20 +87,24 @@ def load(suffix):
 
 
 data = {suf: load(suf) for suf, _, _, _ in ROUTES}
-base = data[""]
-if not base:
+ctx = data[""]			# the default route's sweep: context lines
+base = data[ROUTES[0][0]]	# the ratio reference: per descriptor
+if not ctx:
     raise SystemExit("no scripts/dcache_churn.csv -- run scripts/run_dcache_churn.sh")
+if not base:
+    raise SystemExit(f"no scripts/dcache_churn{ROUTES[0][0]}.csv -- run the "
+                     "slab routes (scripts/run_dcache_all.sh, ROUTES)")
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.6))
 
 # ---- left: throughput ----------------------------------------------------
 for eng, lab in (("seqlock", "seqlock (no txn slab)"),
                  ("bucketlock", "bucket lock (no txn slab)")):
-    if eng in base:
-        xs = sorted(base[eng])
-        ax1.plot(xs, [base[eng][x] for x in xs], "-", color=CONTEXT,
+    if eng in ctx:
+        xs = sorted(ctx[eng])
+        ax1.plot(xs, [ctx[eng][x] for x in xs], "-", color=CONTEXT,
                  lw=1.6, marker="o", ms=4, zorder=1)
-        ax1.annotate(lab, (xs[-1], base[eng][xs[-1]]), fontsize=8,
+        ax1.annotate(lab, (xs[-1], ctx[eng][xs[-1]]), fontsize=8,
                      color="#555555", xytext=(-4, 6),
                      textcoords="offset points", ha="right")
 
@@ -114,7 +125,7 @@ ax1.grid(alpha=0.25)
 ax1.set_axisbelow(True)
 ax1.legend(fontsize=8.5, frameon=False, loc="upper left")
 
-# ---- right: speedup over the default route -------------------------------
+# ---- right: speedup over one call_rcu per descriptor --------------------
 # All three txn engines, so consistency is visible rather than asserted; the
 # grey band is the same ratio computed on the engines that CANNOT be affected,
 # i.e. the measurement's own noise floor.
@@ -147,7 +158,7 @@ for suf, lab, colr, ls in ROUTES[1:]:
 
 ax2.axhline(1.0, color="#333333", lw=1.0, zorder=2)
 ax2.set_xlabel("writer threads")
-ax2.set_ylabel("speedup over the default route  (x)")
+ax2.set_ylabel("speedup over one call_rcu per descriptor  (x)")
 ax2.set_title("Same, as a ratio — median of the three txn engines", fontsize=11)
 ax2.set_xlim(left=0)
 ax2.grid(alpha=0.25)

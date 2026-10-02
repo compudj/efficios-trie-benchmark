@@ -38,6 +38,14 @@ URCU_TXN_SLAB_BATCH := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' \
 ifeq ($(URCU_TXN_SLAB_BATCH),yes)
 SLAB_CPP += -DURCU_TXN_SLAB_BATCH
 endif
+# Since liburcu made batch retirement the default (the flag above is then a
+# no-op, kept for older builds), the per-descriptor route is the opt-out
+# -DURCU_TXN_SLAB_NO_BATCH, derived the same way.
+URCU_TXN_SLAB_NO_BATCH := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_NO_BATCH' \
+			  $(URCU_TXN_BUILD)/src/Makefile && echo yes)
+ifeq ($(URCU_TXN_SLAB_NO_BATCH),yes)
+SLAB_CPP += -DURCU_TXN_SLAB_NO_BATCH
+endif
 
 ifeq ($(URCU_SLAB_RSEQ),yes)
 RSEQ_INC := $(shell grep -shoE '\-I[^ ]*librseq[^ ]*' $(URCU_TXN_BUILD)/src/Makefile | head -1)
@@ -206,6 +214,8 @@ URCU_TSAN_INC   := $(URCU_TSAN_BUILD)/include
 # than no gate.
 TSAN_SLAB_CPP := $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_BATCH' \
 		    $(URCU_TSAN_BUILD)/src/Makefile && echo -DURCU_TXN_SLAB_BATCH)
+TSAN_SLAB_CPP += $(shell grep -sqE '^CPPFLAGS = .*-DURCU_TXN_SLAB_NO_BATCH' \
+		    $(URCU_TSAN_BUILD)/src/Makefile && echo -DURCU_TXN_SLAB_NO_BATCH)
 TSAN_SLAB_CPP += $(shell grep -sqE '^CPPFLAGS = .*-DURCU_SLAB_RSEQ' \
 		    $(URCU_TSAN_BUILD)/src/Makefile && echo -DURCU_SLAB_RSEQ)
 URCU_TSAN_LIB   := $(URCU_TSAN_BUILD)/src/.libs
