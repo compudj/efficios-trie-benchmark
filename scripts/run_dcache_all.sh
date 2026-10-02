@@ -23,12 +23,17 @@ S=$REPO/scripts
 LOGDIR=${LOGDIR:-/tmp/dcache_resweep.$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$LOGDIR"
 
-# sweep script -> the plot scripts its CSV feeds
-declare -a SWEEPS=(
-	"run_dcache.sh:plot_dcache.py plot_dcache_sat.py plot_dcache_readdir.py plot_dcache_dpath.py plot_dcache_hit.py plot_dcache_idle.py"
-	"run_dcache_height.sh:plot_dcache_height.py"
+# sweep script -> the plot scripts its CSV feeds.  ORDER: the churn sweeps
+# first, then the slab routes (allocating churn too), then the rest -- churn is
+# where the engines still differ in ways we act on, so its numbers come first
+# and an interrupted run still leaves them complete.
+declare -a CHURN_SWEEPS=(
 	"run_dcache_churn.sh:plot_dcache_churn.py"
 	"run_dcache_churn_scaling.sh:plot_dcache_churn_scaling.py"
+)
+declare -a OTHER_SWEEPS=(
+	"run_dcache.sh:plot_dcache.py plot_dcache_sat.py plot_dcache_readdir.py plot_dcache_dpath.py plot_dcache_hit.py plot_dcache_idle.py"
+	"run_dcache_height.sh:plot_dcache_height.py"
 	"run_dcache_namewidth.sh:plot_dcache_namewidth.py"
 	"run_dcache_optaxonomy.sh:plot_dcache_optaxonomy.py"
 	"run_dcache_optype.sh:plot_dcache_optype.py"
@@ -46,7 +51,8 @@ make -B -C "$REPO/experiments/dcache" -j32 bench height churn \
 	{ echo "!! build failed, see $LOGDIR/build.log" >&2; exit 1; }
 
 failed=""
-for entry in "${SWEEPS[@]}"; do
+run_sweeps() {
+for entry in "$@"; do
 	sweep=${entry%%:*}
 	plots=${entry#*:}
 	[[ -n "${ONLY:-}" && " $ONLY " != *" $sweep "* ]] && continue
@@ -65,6 +71,7 @@ for entry in "${SWEEPS[@]}"; do
 	echo ">> $(date +%T) $sweep done in $(( $(date +%s) - start ))s," \
 	     "conservation failures: $(grep -c 'CONSERVATION FAILED' "$log")" >&2
 done
+}
 
 # ---- slab routes: the churn sweep against each route's liburcu -------------
 # dcache_slabroute.png compares the descriptor slab's four routes; each needs
@@ -75,6 +82,7 @@ done
 # slab-route figure reads (in-place toggles commit no descriptor on the lock
 # engines).
 ROUTES=${ROUTES-"rseq:urcu-txn-build-rseq-c21f5a38 nobatch:urcu-txn-build-nobatch-c21f5a38 nobatch_rseq:urcu-txn-build-nobatch-rseq-c21f5a38"}
+run_routes() {
 if [[ -n "$ROUTES" && -z "${ONLY:-}" ]]; then
 	for r in $ROUTES; do
 		name=${r%%:*}
@@ -98,6 +106,11 @@ if [[ -n "$ROUTES" && -z "${ONLY:-}" ]]; then
 	python3 "$S/plot_dcache_slabroute.py" >> "$LOGDIR/plots.log" 2>&1 ||
 		{ echo "!! plot_dcache_slabroute.py failed" >&2; failed="$failed slabroute"; }
 fi
+}
+
+run_sweeps "${CHURN_SWEEPS[@]}"
+run_routes
+run_sweeps "${OTHER_SWEEPS[@]}"
 
 echo ">> figure freshness:" >&2
 "$S/check_dcache_figures.sh" 2>&1 | tee "$LOGDIR/freshness.log" >&2

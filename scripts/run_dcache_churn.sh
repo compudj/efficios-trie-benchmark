@@ -148,7 +148,7 @@ run() {
 # names, or a dropping dentry-negative policy: allocation + LRU on every pair).
 # The slab-route runs set MODES=alloc: in-place toggles commit no descriptor on
 # the lock engines, so only the allocating path asks their question.
-MODES=${MODES:-"inplace alloc"}
+MODES=${MODES:-"alloc inplace"}		# allocating first: see run_dcache_all.sh
 for MODE in $MODES; do
 echo ">> toggle mode: $MODE" >&2
 
