@@ -410,8 +410,17 @@ static void *writer_fn(void *arg)
 	 * as an unbounded call_rcu backlog, since the writer keeps allocating at
 	 * full rate while its own reclaim gets half a cpu.  0 = the historical
 	 * co-pinned behaviour.
+	 *
+	 * DC_CRDP=shared creates no per-writer worker at all: every writer's
+	 * call_rcu() goes to liburcu's default worker, the configuration an
+	 * embedder gets without asking.  It is the reclaim route's worst case on
+	 * the per-descriptor slab route (one thread dereferences every
+	 * descriptor, from other cores' caches) and its O(1)-per-batch case on
+	 * URCU_TXN_SLAB_BATCH, which is what it exists to compare.
 	 */
-	if (cpu >= 0) {
+	const char *crdp_mode = getenv("DC_CRDP");
+
+	if (cpu >= 0 && !(crdp_mode && !strcmp(crdp_mode, "shared"))) {
 		const char *e = getenv("DC_CRDP_CPU_OFFSET");
 		int off = e ? atoi(e) : 0;
 		long nconf = sysconf(_SC_NPROCESSORS_CONF);
