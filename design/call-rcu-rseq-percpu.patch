@@ -1,0 +1,778 @@
+diff --git a/configure.ac b/configure.ac
+index 70c339fb..463a65d1 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -250,6 +250,12 @@ AE_FEATURE([legacy-mb], [Disable legacy memory barriers.])
+ AE_FEATURE_DEFAULT_DISABLE
+ AE_FEATURE([slab-rseq], [Experimental: use rseq per-cpu local freelists in the transaction descriptor slab. Requires librseq. The macro must be identical across every TU of a process, so an embedder building against this configuration must define URCU_SLAB_RSEQ too.])
+ 
++# Experimental: let call_rcu() producers on a per-cpu call_rcu thread's own cpu
++# enqueue with an rseq critical section instead of atomics (URCU_CALL_RCU_RSEQ,
++# see src/urcu-call-rcu-impl.h).  Disabled by default
++AE_FEATURE_DEFAULT_DISABLE
++AE_FEATURE([call-rcu-rseq], [Experimental: rseq per-cpu local queue for call_rcu() producers running on their call_rcu thread's cpu. Requires librseq and membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ). Library-internal: embedders need nothing. URCU_CALL_RCU_RSEQ=0 in the environment disables it at run time.])
++
+ # When given, add -Werror to WARN_CFLAGS and WARN_CXXFLAGS.
+ # Disabled by default
+ AE_FEATURE_DEFAULT_DISABLE
+@@ -303,6 +309,18 @@ AE_IF_FEATURE_ENABLED([slab-rseq], [
+   CPPFLAGS="$CPPFLAGS -DURCU_SLAB_RSEQ"
+ ])
+ 
++# URCU_CALL_RCU_RSEQ only changes code inside the library (call_rcu is out of
++# line), so it goes into config.h: no embedder-visible requirement.
++AE_IF_FEATURE_ENABLED([call-rcu-rseq], [
++  AC_CHECK_HEADER([rseq/rseq.h], [], [
++    AC_MSG_ERROR([--enable-call-rcu-rseq requires the librseq headers (rseq/rseq.h).])
++  ])
++  AC_CHECK_LIB([rseq], [rseq_init], [], [
++    AC_MSG_ERROR([--enable-call-rcu-rseq requires librseq with rseq_init().])
++  ])
++  AC_DEFINE([URCU_CALL_RCU_RSEQ], [1], [Use an rseq per-cpu local queue for call_rcu() producers on their call_rcu thread's cpu.])
++])
++
+ ##                                                                          ##
+ ## Set automake variables for optional feature conditionnals in Makefile.am ##
+ ##                                                                          ##
+diff --git a/src/urcu-call-rcu-impl.h b/src/urcu-call-rcu-impl.h
+index dfbbf084..3f5997f5 100644
+--- a/src/urcu-call-rcu-impl.h
++++ b/src/urcu-call-rcu-impl.h
+@@ -32,6 +32,18 @@
+ #include "urcu-utils.h"
+ #include "compat-smp.h"
+ 
++#ifdef URCU_CALL_RCU_RSEQ
++#include <rseq/rseq.h>
++#include <sys/syscall.h>
++/*
++ * Not <linux/membarrier.h>: the flavours that include this file define their
++ * own enum membarrier_cmd.  Values from the uapi header.
++ */
++#define URCU_CR_MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ		(1 << 7)
++#define URCU_CR_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ	(1 << 8)
++#define URCU_CR_MEMBARRIER_CMD_FLAG_CPU				(1 << 0)
++#endif
++
+ #define SET_AFFINITY_CHECK_PERIOD		(1U << 8)	/* 256 */
+ #define SET_AFFINITY_CHECK_PERIOD_MASK		(SET_AFFINITY_CHECK_PERIOD - 1)
+ 
+@@ -71,6 +83,39 @@ struct call_rcu_data {
+ 	pthread_mutex_t affinity_lock;
+ 	struct cds_list_head affinity_notifiers;
+ 	int affinity_lost;
++#ifdef URCU_CALL_RCU_RSEQ
++	/*
++	 * THE RSEQ LOCAL QUEUE, on a cache line of its own: producers on
++	 * @home_cpu write it, while cross-cpu producers keep writing cbs_tail.
++	 *
++	 * @local is a LIFO of rcu_head.next nodes mutated ONLY by rseq critical
++	 * sections running on @home_cpu -- the producers' pushes and the
++	 * worker's steal -- and, once demoted, by one plain drain.  It is never
++	 * the target of an atomic RMW: an rseq plain-store commit and an atomic
++	 * cannot share a word (rseq's atomicity is scoped to one cpu), so the
++	 * local queue and the wfcq never meet.  Same discipline as the
++	 * descriptor slab's local lists (rcu-txn-slab.h).
++	 *
++	 * @rseq_ok is read INSIDE every committing section (the second compare),
++	 * so clearing it and then issuing membarrier(...PRIVATE_EXPEDITED_RSEQ)
++	 * provably evicts any push still running on a stale decision; see
++	 * call_rcu_local_demote().  A check before the section would be sampled
++	 * once and survive the restart.
++	 *
++	 * @local_pushed counts pushes, rseq-only; @local_pushed_off counts the
++	 * rare push whose count could not be added on @home_cpu (the producer
++	 * migrated between its push and its count), atomic-only.  Disjoint words,
++	 * for the same reason.  They feed the queue-length cap only.
++	 */
++	struct {
++		struct cds_wfcq_node *local;
++		intptr_t local_pushed;
++		intptr_t rseq_ok;
++		int home_cpu;		/* the worker's cpu; -1: never rseq */
++	} rseq __attribute__((__aligned__(CAA_CACHE_LINE_SIZE)));
++	unsigned long local_pushed_off;
++	unsigned long local_drained;	/* worker (or quiescent drainer) only */
++#endif
+ } __attribute__((__aligned__(CAA_CACHE_LINE_SIZE)));
+ 
+ /*
+@@ -366,6 +411,246 @@ static void call_rcu_wait(struct call_rcu_data *crdp)
+ 	}
+ }
+ 
++/* Callbacks queued and not yet invoked: the wfcq's plus the local queue's. */
++static unsigned long call_rcu_qlen(struct call_rcu_data *crdp)
++{
++	unsigned long qlen = uatomic_load(&crdp->qlen);
++#ifdef URCU_CALL_RCU_RSEQ
++	long local = (long) ((unsigned long) CMM_LOAD_SHARED(crdp->rseq.local_pushed)
++			     + uatomic_load(&crdp->local_pushed_off)
++			     - CMM_LOAD_SHARED(crdp->local_drained));
++
++	if (local > 0)		/* a push is counted after it is visible */
++		qlen += (unsigned long) local;
++#endif
++	return qlen;
++}
++
++#ifdef URCU_CALL_RCU_RSEQ
++/*
++ * Whether crdps may use the local queue: rseq registered in this process,
++ * membarrier(...PRIVATE_EXPEDITED_RSEQ) registered -- without that fence a
++ * local queue could never be drained from another cpu, so teardown, hotplug
++ * and fork would have no safe way to reach it -- and not disabled with
++ * URCU_CALL_RCU_RSEQ=0.  Decided once, under call_rcu_mutex.
++ */
++static int call_rcu_rseq_state;		/* 0: undecided, 1: on, -1: off */
++
++static int call_rcu_rseq_usable(void)
++{
++	const char *e;
++
++	if (call_rcu_rseq_state)
++		return call_rcu_rseq_state > 0;
++	call_rcu_rseq_state = -1;
++	e = getenv("URCU_CALL_RCU_RSEQ");
++	if (e && !strcmp(e, "0"))
++		return 0;
++	(void) rseq_init();
++	if (!rseq_registered())
++		return 0;
++	if (syscall(__NR_membarrier,
++		    URCU_CR_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0))
++		return 0;
++	call_rcu_rseq_state = 1;
++	return 1;
++}
++
++static inline int call_rcu_local_empty(struct call_rcu_data *crdp)
++{
++	return crdp->rseq.home_cpu < 0 || !CMM_LOAD_SHARED(crdp->rseq.local);
++}
++
++/* Push @node on @crdp's local queue from @cpu.  0, or -1: take the wfcq path. */
++static inline int call_rcu_local_push(struct call_rcu_data *crdp,
++				      struct cds_wfcq_node *node, int cpu)
++{
++	int attempt;
++
++	for (attempt = 0; attempt < 8; attempt++) {
++		struct cds_wfcq_node *old = CMM_LOAD_SHARED(crdp->rseq.local);
++		int ret;
++
++		node->next = old;		/* unpublished until the commit */
++		ret = rseq_load_cbne_load_cbne_store__ptr(RSEQ_MO_RELAXED,
++				RSEQ_PERCPU_CPU_ID,
++				(intptr_t *) &crdp->rseq.local, (intptr_t) old,
++				&crdp->rseq.rseq_ok, 1, (intptr_t) node, cpu);
++		if (caa_likely(!ret))
++			return 0;
++		if (ret < 0) {			/* aborted */
++			if (rseq_current_cpu_raw() != cpu)
++				return -1;	/* migrated */
++			continue;		/* preempted or signalled */
++		}
++		/* a compare failed: @local moved (retry), or we were demoted */
++		if (!CMM_LOAD_SHARED(crdp->rseq.rseq_ok))
++			return -1;
++	}
++	return -1;
++}
++
++/* Count a local push for the queue-length cap, never with an RMW on @local_pushed. */
++static inline void call_rcu_local_count(struct call_rcu_data *crdp, int cpu)
++{
++	for (;;) {
++		if (!rseq_load_add_store__ptr(RSEQ_MO_RELAXED, RSEQ_PERCPU_CPU_ID,
++					      &crdp->rseq.local_pushed, 1, cpu))
++			return;
++		if (rseq_current_cpu_raw() != cpu) {	/* migrated since the push */
++			uatomic_inc(&crdp->local_pushed_off);
++			return;
++		}
++	}
++}
++
++/*
++ * Worker on @home_cpu: take the whole local queue.  Producers on this cpu are
++ * serialized with it by rseq itself: no atomic, no fence.  Returns the chain,
++ * newest first, or NULL -- also when a demotion beat it or it migrated (the
++ * next pass takes the demoted path).
++ */
++static struct cds_wfcq_node *call_rcu_local_steal(struct call_rcu_data *crdp)
++{
++	int cpu = crdp->rseq.home_cpu;
++
++	for (;;) {
++		struct cds_wfcq_node *old = CMM_LOAD_SHARED(crdp->rseq.local);
++		int ret;
++
++		if (!old)
++			return NULL;
++		ret = rseq_load_cbne_load_cbne_store__ptr(RSEQ_MO_RELAXED,
++				RSEQ_PERCPU_CPU_ID,
++				(intptr_t *) &crdp->rseq.local, (intptr_t) old,
++				&crdp->rseq.rseq_ok, 1, 0, cpu);
++		if (!ret)
++			return old;
++		if (ret < 0 && rseq_current_cpu_raw() != cpu)
++			return NULL;
++		if (ret > 0 && !CMM_LOAD_SHARED(crdp->rseq.rseq_ok))
++			return NULL;
++	}
++}
++
++/*
++ * Stop every rseq section from committing on @crdp's local queue, so that it
++ * can be drained from any cpu.  Clearing @rseq_ok alone does not do it: a push
++ * past its second compare would still commit -- with a @next naming a chain the
++ * drainer already took, which a later drain would then walk a second time.  The
++ * membarrier aborts every section on @home_cpu; each restarts, reads @rseq_ok
++ * == 0 and takes the wfcq path.  The fork child has no other thread, and a
++ * failed fence there is harmless.
++ */
++static int call_rcu_rseq_test_nofence;	/* mutation arm, test hook only */
++
++static void call_rcu_local_demote(struct call_rcu_data *crdp)
++{
++	uatomic_store(&crdp->rseq.rseq_ok, 0);
++	cmm_smp_mb();
++	if (call_rcu_rseq_test_nofence)
++		return;
++	if (syscall(__NR_membarrier, URCU_CR_MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
++		    URCU_CR_MEMBARRIER_CMD_FLAG_CPU, crdp->rseq.home_cpu))
++		(void) syscall(__NR_membarrier,
++			       URCU_CR_MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, 0);
++}
++
++/* Once demoted and fenced, @local has no rseq writer left: take it plainly. */
++static struct cds_wfcq_node *call_rcu_local_take_demoted(struct call_rcu_data *crdp)
++{
++	struct cds_wfcq_node *chain = CMM_LOAD_SHARED(crdp->rseq.local);
++
++	if (chain)
++		CMM_STORE_SHARED(crdp->rseq.local, NULL);
++	return chain;
++}
++
++/*
++ * The worker's share of a batch.  On @home_cpu: steal.  Off it (a re-pin still
++ * pending, or impossible): demote, then drain plainly; and once home again with
++ * the cpu still ours, promote back -- safe because while demoted nothing but
++ * this thread touched @local.
++ */
++static struct cds_wfcq_node *call_rcu_local_take(struct call_rcu_data *crdp)
++{
++	int home = rseq_current_cpu_raw() == crdp->rseq.home_cpu;
++	struct cds_wfcq_node *chain;
++
++	if (CMM_LOAD_SHARED(crdp->rseq.rseq_ok)) {
++		if (home)
++			return call_rcu_local_steal(crdp);
++		call_rcu_local_demote(crdp);
++	}
++	chain = call_rcu_local_take_demoted(crdp);
++	if (home && !uatomic_load(&crdp->affinity_lost))
++		uatomic_store(&crdp->rseq.rseq_ok, 1, CMM_RELEASE);
++	return chain;
++}
++
++/* Invoke a taken chain oldest first (it is LIFO); returns how many. */
++static unsigned long call_rcu_local_invoke(struct call_rcu_data *crdp,
++					   struct cds_wfcq_node *chain)
++{
++	struct cds_wfcq_node *fifo = NULL, *next;
++	unsigned long n = 0;
++
++	while (chain) {
++		next = chain->next;
++		chain->next = fifo;
++		fifo = chain;
++		chain = next;
++	}
++	for (; fifo; fifo = next) {
++		struct rcu_head *rhp = caa_container_of(fifo, struct rcu_head, next);
++
++		next = fifo->next;		/* before the callback frees it */
++		rhp->func(rhp);
++		n++;
++	}
++	CMM_STORE_SHARED(crdp->local_drained, crdp->local_drained + n);
++	return n;
++}
++
++/*
++ * Move whatever sits on @crdp's local queue onto its wfcq, oldest first, from
++ * any cpu: teardown and fork (the worker is stopped or gone) and the test hook
++ * (workers paused).  Leaves the crdp demoted.
++ */
++static void call_rcu_local_flush(struct call_rcu_data *crdp)
++{
++	struct cds_wfcq_node *chain, *fifo = NULL, *next;
++	unsigned long n = 0;
++
++	if (crdp->rseq.home_cpu < 0)
++		return;
++	call_rcu_local_demote(crdp);
++	chain = call_rcu_local_take_demoted(crdp);
++	while (chain) {
++		next = chain->next;
++		chain->next = fifo;
++		fifo = chain;
++		chain = next;
++	}
++	for (; fifo; fifo = next) {
++		next = fifo->next;
++		cds_wfcq_node_init(fifo);
++		cds_wfcq_enqueue(&crdp->cbs_head, &crdp->cbs_tail, fifo);
++		n++;
++	}
++	if (n) {
++		uatomic_add(&crdp->qlen, n);
++		CMM_STORE_SHARED(crdp->local_drained, crdp->local_drained + n);
++	}
++}
++#else
++static inline int call_rcu_local_empty(struct call_rcu_data *crdp)
++{
++	(void) crdp;
++	return 1;
++}
++#endif /* URCU_CALL_RCU_RSEQ */
++
+ static unsigned long call_rcu_qlen_cap(void)
+ {
+ 	const char *e = getenv("URCU_CALL_RCU_QLEN_CAP");
+@@ -396,7 +681,7 @@ static void call_rcu_batch_delay(struct call_rcu_data *crdp)
+ 
+ 		uatomic_store(&crdp->delay_futex, -1);
+ 		cmm_smp_mb();
+-		if (uatomic_load(&crdp->qlen) < cap)
++		if (call_rcu_qlen(crdp) < cap)
+ 			ret = futex(&crdp->delay_futex, FUTEX_WAIT, -1, &ts,
+ 					NULL, 0);
+ 		uatomic_store(&crdp->delay_futex, 0);
+@@ -404,7 +689,7 @@ static void call_rcu_batch_delay(struct call_rcu_data *crdp)
+ 			return;
+ 	}
+ #endif
+-	for (ms = 0; ms < 10 && uatomic_load(&crdp->qlen) < cap; ms++)
++	for (ms = 0; ms < 10 && call_rcu_qlen(crdp) < cap; ms++)
+ 		(void) poll(NULL, 0, 1);
+ }
+ 
+@@ -502,6 +787,7 @@ static void *call_rcu_thread(void *arg)
+ 		struct cds_wfcq_tail cbs_tmp_tail;
+ 		struct cds_wfcq_node *cbs, *cbs_tmp_n;
+ 		enum cds_wfcq_ret splice_ret;
++		struct cds_wfcq_node *local = NULL;
+ 
+ 		if (set_thread_cpu_affinity(crdp))
+ 			urcu_die(errno);
+@@ -528,8 +814,25 @@ static void *call_rcu_thread(void *arg)
+ 			&cbs_tmp_tail, &crdp->cbs_head, &crdp->cbs_tail);
+ 		urcu_posix_assert(splice_ret != CDS_WFCQ_RET_WOULDBLOCK);
+ 		urcu_posix_assert(splice_ret != CDS_WFCQ_RET_DEST_NON_EMPTY);
+-		if (splice_ret != CDS_WFCQ_RET_SRC_EMPTY) {
++#ifdef URCU_CALL_RCU_RSEQ
++		/*
++		 * The local queue AFTER the wfcq, and its callbacks BEFORE the
++		 * wfcq's: rcu_barrier() enqueues on the wfcq only, so a barrier
++		 * callback B spliced above comes after every local callback C
++		 * pushed before B was enqueued -- C's push happened-before B's
++		 * enqueue, which the splice observed, so the take below sees C.
++		 */
++		if (crdp->rseq.home_cpu >= 0) {
++			cmm_smp_mb();
++			local = call_rcu_local_take(crdp);
++		}
++#endif
++		if (splice_ret != CDS_WFCQ_RET_SRC_EMPTY || local) {
+ 			synchronize_rcu();
++#ifdef URCU_CALL_RCU_RSEQ
++			if (local)
++				(void) call_rcu_local_invoke(crdp, local);
++#endif
+ 			cbcount = 0;
+ 			__cds_wfcq_for_each_blocking_safe(&cbs_tmp_head,
+ 					&cbs_tmp_tail, cbs, cbs_tmp_n) {
+@@ -547,7 +850,8 @@ static void *call_rcu_thread(void *arg)
+ 		rcu_thread_offline();
+ 		if (!rt) {
+ 			if (cds_wfcq_empty(&crdp->cbs_head,
+-					&crdp->cbs_tail)) {
++					&crdp->cbs_tail) &&
++					call_rcu_local_empty(crdp)) {
+ 				call_rcu_wait(crdp);
+ 				call_rcu_batch_delay(crdp);
+ 				uatomic_dec(&crdp->futex);
+@@ -597,6 +901,12 @@ static void call_rcu_data_init(struct call_rcu_data **crdpp,
+ 	cds_wfcq_init(&crdp->cbs_head, &crdp->cbs_tail);
+ 	crdp->qlen = 0;
+ 	crdp->qlen_cap = call_rcu_qlen_cap();
++#ifdef URCU_CALL_RCU_RSEQ
++	/* A local queue needs a home: only a worker pinned to one cpu has it. */
++	crdp->rseq.home_cpu = (cpu_affinity >= 0 && call_rcu_rseq_usable()) ?
++			cpu_affinity : -1;
++	crdp->rseq.rseq_ok = crdp->rseq.home_cpu >= 0;
++#endif
+ 	crdp->futex = 0;
+ 	crdp->delay_futex = 0;
+ 	crdp->flags = flags;
+@@ -888,9 +1198,9 @@ static void wake_call_rcu_thread(struct call_rcu_data *crdp)
+ 		call_rcu_wake_up(crdp);
+ }
+ 
+-static void _call_rcu(struct rcu_head *head,
+-		      void (*func)(struct rcu_head *head),
+-		      struct call_rcu_data *crdp)
++static void _call_rcu_wfcq(struct rcu_head *head,
++			   void (*func)(struct rcu_head *head),
++			   struct call_rcu_data *crdp)
+ {
+ 	unsigned long qlen;
+ 
+@@ -903,6 +1213,35 @@ static void _call_rcu(struct rcu_head *head,
+ 		call_rcu_cut_delay(crdp);
+ }
+ 
++/*
++ * Enqueue on @crdp: a producer running on the crdp's worker cpu pushes on the
++ * local queue with one rseq critical section (no atomic); anything else --
++ * another cpu, a migration mid-push, a demoted crdp -- takes the wfcq path.
++ * The worker wake-up keeps its full fence on both paths: the rseq push is a
++ * plain store, and the Dekker pairing with the worker's futex needs it.
++ */
++static void _call_rcu(struct rcu_head *head,
++		      void (*func)(struct rcu_head *head),
++		      struct call_rcu_data *crdp)
++{
++#ifdef URCU_CALL_RCU_RSEQ
++	int cpu = crdp->rseq.home_cpu;
++
++	if (cpu >= 0 && rseq_current_cpu_raw() == cpu) {
++		head->func = func;
++		if (!call_rcu_local_push(crdp, &head->next, cpu)) {
++			call_rcu_local_count(crdp, cpu);
++			wake_call_rcu_thread(crdp);
++			if (caa_unlikely(crdp->qlen_cap &&
++					 call_rcu_qlen(crdp) >= crdp->qlen_cap))
++				call_rcu_cut_delay(crdp);
++			return;
++		}
++	}
++#endif
++	_call_rcu_wfcq(head, func, crdp);
++}
++
+ /*
+  * Schedule a function to be invoked after a following grace period.
+  * This is the only function that must be called -- the others are
+@@ -967,6 +1306,9 @@ void _call_rcu_data_free(struct call_rcu_data *crdp, unsigned int flags)
+ 		while ((uatomic_load(&crdp->flags) & URCU_CALL_RCU_STOPPED) == 0)
+ 			(void) poll(NULL, 0, 1);
+ 	}
++#ifdef URCU_CALL_RCU_RSEQ
++	call_rcu_local_flush(crdp);	/* the worker is stopped or gone */
++#endif
+ 	call_rcu_lock(&call_rcu_mutex);
+ 	if (!cds_wfcq_empty(&crdp->cbs_head, &crdp->cbs_tail)) {
+ 		call_rcu_unlock(&call_rcu_mutex);
+@@ -1110,7 +1452,8 @@ void rcu_barrier(void)
+ 		if (!work)
+ 			urcu_die(errno);
+ 		work->completion = completion;
+-		_call_rcu(&work->head, _rcu_barrier_complete, crdp);
++		/* the wfcq only: see the ordering note in call_rcu_thread() */
++		_call_rcu_wfcq(&work->head, _rcu_barrier_complete, crdp);
+ 	}
+ 	call_rcu_unlock(&call_rcu_mutex);
+ 
+@@ -1349,3 +1692,58 @@ unlock:
+ 		call_rcu_data_free(crdp);
+ 	}
+ }
++
++#ifdef URCU_CALL_RCU_RSEQ
++/*
++ * TEST ONLY: flush every crdp's local queue from the calling thread -- any
++ * cpu -- while producers keep pushing, as teardown and hotplug do, with the
++ * workers paused around it as for fork().  @fence == 0 skips the membarrier:
++ * the mutation arm, which must lose or double-invoke callbacks.  Promotes
++ * every crdp back afterwards.
++ */
++void urcu_call_rcu_rseq_test_flush_all(int fence);
++int urcu_call_rcu_rseq_test_enabled(struct call_rcu_data *crdp);
++unsigned long urcu_call_rcu_rseq_test_pushed(struct call_rcu_data *crdp);
++
++void urcu_call_rcu_rseq_test_flush_all(int fence)
++{
++	struct call_rcu_data *crdp;
++
++	call_rcu_lock(&call_rcu_mutex);
++	cds_list_for_each_entry(crdp, &call_rcu_data_list, list) {
++		uatomic_or(&crdp->flags, URCU_CALL_RCU_PAUSE);
++		cmm_smp_mb__after_uatomic_or();
++		wake_call_rcu_thread(crdp);
++	}
++	cds_list_for_each_entry(crdp, &call_rcu_data_list, list)
++		while ((uatomic_load(&crdp->flags) & URCU_CALL_RCU_PAUSED) == 0)
++			(void) poll(NULL, 0, 1);
++	call_rcu_rseq_test_nofence = !fence;
++	cds_list_for_each_entry(crdp, &call_rcu_data_list, list) {
++		call_rcu_local_flush(crdp);
++		if (crdp->rseq.home_cpu >= 0 && !crdp->affinity_lost)
++			uatomic_store(&crdp->rseq.rseq_ok, 1, CMM_RELEASE);
++	}
++	call_rcu_rseq_test_nofence = 0;
++	cds_list_for_each_entry(crdp, &call_rcu_data_list, list)
++		uatomic_and(&crdp->flags, ~URCU_CALL_RCU_PAUSE);
++	cds_list_for_each_entry(crdp, &call_rcu_data_list, list)
++		while ((uatomic_load(&crdp->flags) & URCU_CALL_RCU_PAUSED) != 0)
++			(void) poll(NULL, 0, 1);
++	call_rcu_unlock(&call_rcu_mutex);
++}
++
++/* TEST ONLY: is the local queue in use for @crdp? */
++int urcu_call_rcu_rseq_test_enabled(struct call_rcu_data *crdp)
++{
++	return crdp && crdp->rseq.home_cpu >= 0 &&
++		uatomic_load(&crdp->rseq.rseq_ok);
++}
++
++/* TEST ONLY: pushes @crdp's local queue has taken so far. */
++unsigned long urcu_call_rcu_rseq_test_pushed(struct call_rcu_data *crdp)
++{
++	return crdp ? (unsigned long) CMM_LOAD_SHARED(crdp->rseq.local_pushed) +
++		uatomic_load(&crdp->local_pushed_off) : 0;
++}
++#endif /* URCU_CALL_RCU_RSEQ */
+diff --git a/tests/regression/test_call_rcu_rseq.c b/tests/regression/test_call_rcu_rseq.c
+new file mode 100644
+index 00000000..49d44cb9
+--- /dev/null
++++ b/tests/regression/test_call_rcu_rseq.c
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++/*
++ * test_call_rcu_rseq.c -- exactly-once torture for the call_rcu rseq local
++ * queue (--enable-call-rcu-rseq).
++ *
++ * Per-cpu call_rcu threads; one producer pinned on each of P cpus pushes
++ * uniquely numbered callbacks (they take the rseq local path: on their
++ * worker's cpu), U unpinned producers push too (they migrate, so they hit the
++ * abort and wfcq paths).  A CHAOS thread keeps flushing every local queue from
++ * whatever cpu it runs on -- demote, fence, plain drain, re-enqueue on the
++ * wfcq, promote -- while the pushes are live: the cross-cpu drain teardown and
++ * hotplug perform.  A BARRIER thread pinned on a producer cpu pushes a callback
++ * on the local path and calls rcu_barrier(), which must not return before that
++ * callback ran.
++ *
++ * Every callback must run exactly once.  `nofence` makes the chaos thread skip
++ * the membarrier: the mutation arm, which must fail (a push that committed
++ * after the flush took its chain re-links that chain, and a later drain runs it
++ * again).
++ *
++ * Usage: test_call_rcu_rseq [producer_cpus [unpinned [seconds [nofence]]]]
++ * Exit 0 = exactly once, ordering held, local path used; 1 = anomaly.
++ */
++#define _GNU_SOURCE
++#include <pthread.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <urcu/urcu-memb.h>
++#include <urcu/uatomic.h>
++
++void urcu_call_rcu_rseq_test_flush_all(int fence);
++int urcu_call_rcu_rseq_test_enabled(struct call_rcu_data *crdp);
++unsigned long urcu_call_rcu_rseq_test_pushed(struct call_rcu_data *crdp);
++
++#define MAX_IDS		(1UL << 27)
++
++struct node {
++	struct rcu_head head;
++	unsigned long id;
++};
++
++static unsigned char *hits;		/* [MAX_IDS] invocation count, saturating */
++static unsigned long next_id;		/* id allocator (chunked) */
++static int stop, fence = 1;
++static unsigned long flushes, barrier_checks, barrier_fail;
++
++static void cb(struct rcu_head *h)
++{
++	struct node *n = caa_container_of(h, struct node, head);
++	unsigned char v = uatomic_add_return(&hits[n->id], 1);
++
++	(void) v;
++	free(n);
++}
++
++static void pin(int cpu)
++{
++	cpu_set_t s;
++
++	CPU_ZERO(&s);
++	CPU_SET(cpu, &s);
++	if (pthread_setaffinity_np(pthread_self(), sizeof(s), &s)) {
++		perror("pthread_setaffinity_np");
++		exit(2);
++	}
++}
++
++static void *producer(void *arg)
++{
++	long cpu = (long) arg;		/* -1: unpinned */
++	unsigned long id = 0, end = 0;
++
++	if (cpu >= 0)
++		pin((int) cpu);
++	urcu_memb_register_thread();
++	while (!uatomic_load(&stop)) {
++		struct node *n;
++
++		if (id == end) {	/* take ids 4096 at a time */
++			id = uatomic_add_return(&next_id, 4096) - 4096;
++			end = id + 4096;
++			if (end > MAX_IDS)
++				break;
++		}
++		n = malloc(sizeof(*n));
++		n->id = id++;
++		urcu_memb_call_rcu(&n->head, cb);
++	}
++	urcu_memb_unregister_thread();
++	return NULL;
++}
++
++static void *chaos(void *arg)
++{
++	(void) arg;
++	while (!uatomic_load(&stop)) {
++		struct timespec ts = { 0, (rand() % 400) * 1000L };
++
++		nanosleep(&ts, NULL);
++		urcu_call_rcu_rseq_test_flush_all(fence);
++		flushes++;
++	}
++	return NULL;
++}
++
++struct flag { struct rcu_head head; int done; };
++
++static void flag_cb(struct rcu_head *h)
++{
++	struct flag *f = caa_container_of(h, struct flag, head);
++
++	uatomic_store(&f->done, 1);
++}
++
++static void *barrier_checker(void *arg)
++{
++	long cpu = (long) arg;
++
++	pin((int) cpu);
++	urcu_memb_register_thread();
++	while (!uatomic_load(&stop)) {
++		struct flag *f = calloc(1, sizeof(*f));
++
++		urcu_memb_call_rcu(&f->head, flag_cb);	/* local: on its cpu */
++		urcu_memb_barrier();
++		if (!uatomic_load(&f->done))
++			barrier_fail++;		/* leak it: it may still run */
++		else
++			free(f);
++		barrier_checks++;
++	}
++	urcu_memb_unregister_thread();
++	return NULL;
++}
++
++int main(int argc, char **argv)
++{
++	int P = argc > 1 ? atoi(argv[1]) : 8;
++	int U = argc > 2 ? atoi(argv[2]) : 4;
++	int secs = argc > 3 ? atoi(argv[3]) : 10;
++	unsigned long i, ids, lost = 0, dup = 0, pushed = 0;
++	pthread_t *pt, ct, bt;
++	int enabled = 0, ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN), ret = 0;
++
++	if (argc > 4 && !strcmp(argv[4], "nofence"))
++		fence = 0;
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	if (P < 1 || P + 2 > ncpu) {
++		fprintf(stderr, "need 1 <= producer_cpus <= ncpu-2\n");
++		return 2;
++	}
++	hits = calloc(MAX_IDS, 1);
++	urcu_memb_register_thread();
++	if (create_all_cpu_call_rcu_data_memb(getenv("TEST_RT") ? URCU_CALL_RCU_RT : 0)) {
++		perror("create_all_cpu_call_rcu_data");
++		return 2;
++	}
++	for (i = 0; i < (unsigned long) P; i++)
++		enabled += urcu_call_rcu_rseq_test_enabled(get_cpu_call_rcu_data_memb((int) i));
++	printf("== test_call_rcu_rseq: %d pinned + %d unpinned producers, %ds, fence=%s; "
++	       "local queue enabled on %d/%d producer cpus\n",
++	       P, U, secs, fence ? "on" : "OFF (mutation arm)", enabled, P);
++
++	pt = calloc(P + U, sizeof(*pt));
++	for (i = 0; i < (unsigned long) (P + U); i++)
++		pthread_create(&pt[i], NULL, producer,
++			       (void *) (long) (i < (unsigned long) P ? (long) i : -1));
++	pthread_create(&ct, NULL, chaos, NULL);
++	pthread_create(&bt, NULL, barrier_checker, (void *) 0L);
++	urcu_memb_unregister_thread();
++	sleep(secs);
++	uatomic_store(&stop, 1);
++	for (i = 0; i < (unsigned long) (P + U); i++)
++		pthread_join(pt[i], NULL);
++	pthread_join(ct, NULL);
++	pthread_join(bt, NULL);
++
++	urcu_memb_register_thread();
++	urcu_memb_barrier();
++	urcu_memb_barrier();
++	for (i = 0; i < (unsigned long) P; i++)
++		pushed += urcu_call_rcu_rseq_test_pushed(get_cpu_call_rcu_data_memb((int) i));
++	ids = uatomic_load(&next_id);
++	if (ids > MAX_IDS)
++		ids = MAX_IDS;
++	/* ids handed out but not used (a producer's unfinished chunk) read 0 */
++	for (i = 0; i < ids; i++) {
++		if (hits[i] > 1)
++			dup++;
++	}
++	/* lost: count zeros below the highest id seen invoked per chunk */
++	for (i = 0; i < ids; i += 4096) {
++		unsigned long j, last = i;
++
++		for (j = i; j < i + 4096 && j < ids; j++)
++			if (hits[j])
++				last = j;
++		for (j = i; j < last; j++)
++			if (!hits[j])
++				lost++;
++	}
++	printf("callbacks: ~%lu issued, %lu pushed on the local path, %lu flushes, "
++	       "%lu barrier checks\n", ids, pushed, flushes, barrier_checks);
++	printf("double-invoked: %lu   lost: %lu   barrier ordering failures: %lu\n",
++	       dup, lost, barrier_fail);
++	if (dup || lost || barrier_fail)
++		ret = 1;
++	if (!enabled || !pushed) {
++		printf("VACUOUS: the local path was never used\n");
++		ret = 1;
++	}
++	printf("RESULT: %s\n", ret ? "FAIL" : "PASS");
++	free_all_cpu_call_rcu_data_memb();
++	urcu_memb_unregister_thread();
++	return ret;
++}
