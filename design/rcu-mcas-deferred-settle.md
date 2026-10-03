@@ -41,7 +41,7 @@ Verdict up front, in three parts:
 
 | Engine | Install A-B-A closed by | CAS per uncontended k-slot commit | Progress | Built here |
 |---|---|---|---|---|
-| Harris-Fraser-Pratt 2002 | RDCSS | 3k+1 | lock-free | no |
+| Harris-Fraser-Pratt 2002, Fraser 2004 | RDCSS / CCAS (conditional install) | 3k+1 | lock-free | no |
 | helping + latch (`-DURCU_MCAS_STOCK`, retired) | per-record FREE/BUSY/DONE | 4k+1 | bounded-blocking | yes |
 | **helping + deferred settle** (Guerraoui 2020) | unlock behind an epoch | **k+1** | **lock-free** | **no** |
 | sole-driver (shipped) | no second driver | k (+ k+1 stores) | bounded-blocking | yes |
@@ -130,6 +130,28 @@ What their paper does not settle, and we would owe ourselves:
   stale read. liburcu's read-side critical sections nest, so this does not
   transfer -- but it is the kind of thing an implementation gets wrong.
 - **They do not discuss freeing the memory the target words live in** (§5).
+
+Behind both stands Fraser's thesis (*Practical Lock-Freedom*,
+UCAM-CL-TR-579, 2004), which is the source for most of what §6 needs and should
+be read before theirs:
+
+- §3.2.1: the three phases (acquire, decision point, release), the conditional
+  install and its reason -- a helper must not "reacquire a location after the
+  MCAS operation has already succeeded" -- and acquisition in **address order**,
+  which is what bounds recursive helping.
+- §3.3.2: a transactional memory whose reads resolve through the owner's
+  descriptor "rather than helping the owner", and whose **aborts are ordered by
+  descriptor address** so that mutual aborts cannot livelock.
+- §5.2.2: descriptors are reference-counted and their memory is **type-stable**
+  (after Greenwald and Cheriton) -- never retasked, because a stale reference
+  may still touch it. That is §5's first answer, applied to descriptors.
+- §5.2.3: epoch-based reclamation, with the caveat in so many words: it is "not
+  strictly lock-free", since a stalled process stops reclamation for everyone.
+
+The original algorithm releases eagerly and pays a conditional install for it;
+Guerraoui et al. install bare and pay by deferring the release. Sole-driver has
+both -- the bare install and the eager release -- and pays in progress class.
+That triangle is the whole design space this note moves in.
 
 **Before prototyping: re-read the Oracle patent family** that the articles
 tree's patent sweep lists for MCAS (US 10,824,424 / 11,216,274; the paper's
@@ -331,15 +353,18 @@ measurement rather than here:
 
 ### 6.2 What lock-freedom requires
 
-- **Helpable transactions install in address order.** The published liveness
-  argument is that helping chains are finite because every operation acquires
-  in one global order. The engine's age-0 attempt installs flat, in caller
+- **Helpable transactions install in address order.** The liveness argument,
+  Fraser's and after him Guerraoui et al.'s, is that helping chains are finite
+  because every operation acquires in one global order: each level of recursion
+  is a conflict at a strictly higher address. The engine's age-0 attempt installs flat, in caller
   order; two such transactions can each hold what the other wants, and helpers
   would chase each other around the cycle. Either every multi-writer commit
   sorts (a cost the age-0 path exists to avoid), or an unsorted transaction is
   *abortable but not helpable*.
 - **Abort alone is obstruction-free, not lock-free.** Two transactions can abort
-  each other forever. A rank is needed -- the handle's age already is one: abort
+  each other forever. A rank is needed. Fraser's transactional memory uses the
+  descriptor's address, and lets one transaction abort only another that follows
+  it in that order; the handle's age is the rank this engine already has -- abort
   what is younger, help what is older.
 - **No domain-wide funnel.** The fair-mutex lane is a lock; a preempted lane
   holder stalls the lane. A lock-free engine keeps it out of the progress
