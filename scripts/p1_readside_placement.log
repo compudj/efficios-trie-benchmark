@@ -1,0 +1,42 @@
+# run_p1_readside_placement.sh  2026-10-03T13:39:51-04:00
+# bench HEAD a9c93006; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-packed-2793224e sha256 719889287b571ae5; engine 2793224e
+# RUNS=2 MAXT=96 socket 0 nodes 0,1,2,3,4,5,6,7,8,9,10,11
+# start: 5.12 42.76 61.40 1/3608 658343
+## all scat rculist run=1 13:39:51 load 5.12 42.76 61.40
+## all scat rculist_resolve run=1 13:40:47 load 22.88 40.36 59.45
+## all scat txn_sw_fwd run=1 13:41:44 load 27.76 37.83 57.43
+## all scat txn_sw_list run=1 13:42:40 load 33.92 36.43 55.64
+## all scat existence run=1 13:43:36 load 34.80 35.21 54.06
+## all scat rlu run=1 13:44:33 load 34.73 34.08 52.53
+## all walk rculist run=1 13:45:29 load 32.30 32.56 50.89
+## all walk rculist_resolve run=1 13:46:25 load 38.67 33.44 50.00
+## all walk txn_sw_fwd run=1 13:47:21 load 36.70 32.73 48.75
+## socket0 scat rculist run=1 13:48:18 load 35.48 32.02 47.52
+## socket0 scat rculist_resolve run=1 13:49:14 load 37.68 31.92 46.44
+## socket0 scat txn_sw_fwd run=1 13:50:10 load 38.74 32.02 45.57
+## socket0 scat txn_sw_list run=1 13:51:07 load 36.77 31.56 44.58
+## socket0 scat existence run=1 13:52:03 load 33.35 30.53 43.42
+## socket0 scat rlu run=1 13:52:59 load 36.97 30.72 42.60
+## socket0 walk rculist run=1 13:53:56 load 38.45 31.02 41.95
+## socket0 walk rculist_resolve run=1 13:54:52 load 36.68 30.73 41.17
+## socket0 walk txn_sw_fwd run=1 13:55:48 load 33.31 29.84 40.21
+## socket0 scat rculist run=2 13:56:45 load 36.92 30.15 39.59
+## socket0 scat rculist_resolve run=2 13:57:41 load 38.43 30.55 39.11
+## socket0 scat txn_sw_fwd run=2 13:58:37 load 36.60 30.32 38.49
+## socket0 scat txn_sw_list run=2 13:59:34 load 33.28 29.50 37.68
+## socket0 scat existence run=2 14:00:30 load 36.94 29.88 37.22
+## socket0 scat rlu run=2 14:01:26 load 38.44 30.32 36.88
+## socket0 walk rculist run=2 14:02:23 load 36.60 30.13 36.38
+## socket0 walk rculist_resolve run=2 14:03:19 load 33.24 29.33 35.69
+## socket0 walk txn_sw_fwd run=2 14:04:15 load 36.85 29.72 35.35
+## all scat rculist run=2 14:05:12 load 38.41 30.19 35.12
+## all scat rculist_resolve run=2 14:06:08 load 36.17 29.90 34.68
+## all scat txn_sw_fwd run=2 14:07:04 load 33.07 29.14 34.09
+## all scat txn_sw_list run=2 14:08:01 load 36.92 29.60 33.85
+## all scat existence run=2 14:08:57 load 37.41 29.86 33.63
+## all scat rlu run=2 14:09:53 load 35.77 29.63 33.28
+## all walk rculist run=2 14:10:49 load 32.97 28.92 32.77
+## all walk rculist_resolve run=2 14:11:46 load 36.75 29.39 32.62
+## all walk txn_sw_fwd run=2 14:12:42 load 31.37 28.36 32.03
+# end: 2026-10-03T14:13:38-04:00 33.36 28.38 31.77 2/3593 679535

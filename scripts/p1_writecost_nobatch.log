@@ -1,0 +1,86 @@
+# run_p1_writecost.sh  2026-10-03T10:09:28-04:00
+# bench HEAD a9c93006; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-packed-2793224e-nobatch sha256 aaf68e4181a1a26b; engine 2793224e
+# LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=5 MAXT=192 BENCH_WARMUP_SEC=4
+# start: 78.79 64.25 59.26 1/3603 308337
+## walk rculist_mutex run=1 10:09:28 load 78.79 64.25 59.26
+3848718 efficios  20   0 5657720 447868 150480 S 176.5   0.1   7:59.21 claude
+ 308342 efficios  20   0   17508  10156   3860 R  47.1   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+## walk txn_mutex run=1 10:10:54 load 71.78 62.87 59.03
+ 309884 efficios  20   0   17508  10108   3812 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered rculist_mutex run=1 10:12:19 load 71.73 62.65 59.12
+ 311403 efficios  20   0   17508  10136   3844 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered txn_mutex run=1 10:13:44 load 71.93 62.55 59.22
+ 312921 efficios  20   0   17508  10120   3828 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk txn_mutex run=2 10:15:09 load 70.30 61.92 59.12
+ 314440 efficios  20   0   17508  10072   3780 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk rculist_mutex run=2 10:16:34 load 69.99 61.48 59.03
+ 315959 efficios  20   0   17508  10156   3864 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:42.83 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+## scattered txn_mutex run=2 10:18:00 load 69.86 61.11 58.94
+ 317480 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 414964 150480 S   5.9   0.1   8:07.64 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+## scattered rculist_mutex run=2 10:19:25 load 69.77 60.83 58.86
+ 318996 efficios  20   0   17508  10104   3808 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.36 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk rculist_mutex run=3 10:20:51 load 69.79 60.63 58.79
+ 320513 efficios  20   0   17508  10176   3880 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk txn_mutex run=3 10:22:16 load 67.56 59.83 58.50
+ 322034 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered rculist_mutex run=3 10:23:41 load 79.88 61.89 59.10
+ 323553 efficios  20   0   17508  10096   3804 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered txn_mutex run=3 10:25:07 load 82.92 63.48 59.66
+ 325069 efficios  20   0   17508  10108   3812 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:42.92 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+## walk txn_mutex run=4 10:26:32 load 83.39 64.60 60.14
+ 326579 efficios  20   0   17508  10028   3736 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk rculist_mutex run=4 10:27:57 load 83.58 65.45 60.58
+ 328096 efficios  20   0   17508  10028   3736 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.37 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered txn_mutex run=4 10:29:23 load 83.68 66.11 60.99
+ 329613 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered rculist_mutex run=4 10:30:48 load 81.84 66.06 61.18
+ 331139 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk rculist_mutex run=5 10:32:14 load 81.53 66.06 61.36
+ 332655 efficios  20   0   17508  10156   3864 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## walk txn_mutex run=5 10:33:39 load 81.47 66.07 61.53
+ 334170 efficios  20   0   17508  10148   3852 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.66 kthreadd
+## scattered rculist_mutex run=5 10:35:04 load 78.77 65.34 61.44
+ 335682 efficios  20   0   17508  10108   3812 R  33.3   0.0   0:00.12 top
+   5061 root      20   0   18600   8248   7080 S   5.6   0.0   0:34.21 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+## scattered txn_mutex run=5 10:36:30 load 71.97 63.73 61.03
+ 337200 efficios  20   0   17508  10104   3812 R  38.9   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 413548 150480 S   5.6   0.1   8:19.99 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.38 systemd
+# end: 2026-10-03T10:37:55-04:00 71.87 63.33 60.95 1/3610 338745

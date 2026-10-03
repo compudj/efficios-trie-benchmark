@@ -27,13 +27,15 @@
 # wrote no log; the log below is the only addition.
 #
 # Binary: the packed P1 read binary, as run_p1_resolve_control.sh/readclass.
+# RE-PINNED 2026-10-03 at urcu-txn-dev 2793224e (see run_p1_resolve_control.sh);
+# the RESULT above is the 18809ea8 capture.
 #
 # Writes scripts/p1_readside_placement$TAG.csv  cond,layout,arm,run,x,read_mvisits,viol
 #        scripts/p1_readside_placement$TAG.log  provenance + per-invocation machine state
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-18809ea8}
-ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-2793224e}
+ENG_TREE=${ENG_TREE:-urcu-txn-build-2793224e}
 RUNS=${RUNS:-2}
 MAXT=${MAXT:-96}
 TAG=${TAG:-}

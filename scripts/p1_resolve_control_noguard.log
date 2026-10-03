@@ -1,157 +1,157 @@
-# run_p1_resolve_control.sh  2026-09-29T06:43:14-04:00
-# bench HEAD 974609c7; bench_list_scale.c sha256 185e8564e6d75719
-# binary ./arms-p1/bench_list_scale.pin-packed-18809ea8
-# binary sha256 9c3459468c666ebd; engine 18809ea8
+# run_p1_resolve_control.sh  2026-10-03T11:11:29-04:00
+# bench HEAD a9c93006; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-packed-2793224e
+# binary sha256 719889287b571ae5; engine 2793224e
 # LIST_SIZE=10000 CHURN=200 DURATION_SEC=3 RUNS=5 MAXT=192 BENCH_SHUFFLE=unset BENCH_WARMUP_SEC=4
-# start: 5.30 30.53 20.47 2/3903 2913103
-## readceil rculist run=1 06:43:14 load 5.30 30.53 20.47
-2913110 efficios  20   0   17508  10048   3724 R  35.3   0.0   0:00.13 top
-   5061 root      20   0   18600   8244   7080 S   5.9   0.0   0:32.66 systemd+
-1289625 efficios  20   0 5657876 555524 149164 S   5.9   0.1  33:16.33 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.47 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-## readceil rculist_resolve run=1 06:44:39 load 80.44 43.16 25.47
-2914426 efficios  20   0   17508  10056   3736 R  35.3   0.0   0:00.13 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.47 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+# start: 162.54 103.03 82.82 1/3655 483850
+## readceil rculist run=1 11:11:29 load 162.54 103.03 82.82
+3848718 efficios  20   0 5657720 445292 150480 S 155.6   0.1   8:51.93 claude
+ 483857 efficios  20   0   17688  10316   3868 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.57 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+## readceil rculist_resolve run=1 11:12:53 load 118.56 97.73 82.37
+ 485231 efficios  20   0   17688  10292   3736 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil txn_sw_fwd run=1 06:46:04 load 98.62 52.66 30.03
-2915746 efficios  20   0   17508  10128   3836 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1156554 root      20   0       0      0      0 I   5.9   0.0   0:07.47 kworker+
-3205977 root      20   0       0      0      0 I   5.9   0.0   0:02.94 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.47 systemd
-## readceil rculist_load run=1 06:47:29 load 103.14 59.85 34.21
-2917061 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.47 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil txn_sw_fwd run=1 11:14:18 load 107.84 93.72 81.96
+ 486530 efficios  20   0   17688  10292   3736 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_loadbr run=1 06:48:54 load 106.20 65.83 38.22
-2918380 efficios  20   0   17508  10052   3760 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.48 systemd
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_load run=1 11:15:43 load 105.25 90.70 81.58
+ 487856 efficios  20   0   17688  10288   3732 R  35.3   0.0   0:00.12 top
+3848718 efficios  20   0 5657720 478084 150480 S   5.9   0.1   9:03.49 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist_resolve run=2 06:50:18 load 106.95 70.32 41.87
-2919698 efficios  20   0   17508  10144   3848 R  35.3   0.0   0:00.13 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.48 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil txn_sw_fwd run=2 06:51:43 load 107.15 73.72 45.21
-2921013 efficios  20   0   17508  10160   3868 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.48 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_loadbr run=1 11:17:08 load 104.66 88.44 81.23
+ 489213 efficios  20   0   17508  10204   3880 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_load run=2 06:53:08 load 107.21 76.27 48.26
-2922321 efficios  20   0   17508  10168   3876 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.48 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_resolve run=2 11:18:33 load 106.57 87.33 81.13
+ 490517 efficios  20   0   17508  10184   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_loadbr run=2 06:54:33 load 108.95 78.74 51.23
-  83812 libvirt+  20   0  151.8g  19.9g  31868 S 100.0   2.6    5d+11h qemu-sy+
-2923650 efficios  20   0   17508  10076   3780 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.48 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist run=2 06:55:58 load 101.89 78.67 53.18
-2925035 efficios  20   0   17508  10172   3876 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.8g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.48 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil txn_sw_fwd run=3 06:57:23 load 97.89 77.61 54.71
-2926353 efficios  20   0   17508  10032   3736 R  33.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.49 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist_load run=3 06:58:47 load 96.92 76.82 56.11
-2927667 efficios  20   0   17508  10032   3736 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 454048 149164 S   5.9   0.1  33:30.82 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.49 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist_loadbr run=3 07:00:12 load 99.39 76.94 57.63
-2928987 efficios  20   0   17508  10080   3784 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.49 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist run=3 07:01:37 load 99.99 77.04 59.01
-2930296 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.49 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil txn_sw_fwd run=2 11:19:57 load 107.03 86.50 81.03
+ 491833 efficios  20   0   17508  10116   3796 R  41.2   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_resolve run=3 07:03:02 load 100.13 77.11 60.28
-2931612 efficios  20   0   17508  10144   3852 R  33.3   0.0   0:00.13 top
-   5061 root      20   0   18600   8244   7080 S   5.6   0.0   0:32.67 systemd+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-3810711 root      20   0       0      0      0 I   5.6   0.0   0:03.83 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.50 systemd
-## readceil rculist_load run=4 07:04:27 load 100.17 77.17 61.43
-2932928 efficios  20   0   17508  10144   3852 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.50 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_load run=2 11:21:22 load 107.15 85.87 80.94
+ 493145 efficios  20   0   17508  10168   3844 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_loadbr run=4 07:05:51 load 102.01 77.76 62.67
-2934244 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.50 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_loadbr run=2 11:22:47 load 107.22 85.43 80.86
+ 494459 efficios  20   0   17508  10184   3860 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist run=4 07:07:16 load 102.43 78.20 63.80
-2935560 efficios  20   0   17508  10076   3784 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.50 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist run=2 11:24:12 load 101.50 83.80 80.37
+ 495768 efficios  20   0   17508  10056   3732 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 423056 150480 S   5.9   0.1   9:13.09 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.58 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist_resolve run=4 07:08:41 load 102.53 78.53 64.84
-2936873 efficios  20   0   17508  10168   3876 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.50 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil txn_sw_fwd run=4 07:10:06 load 102.58 78.79 65.78
-2938229 efficios  20   0   17508  10152   3860 R  44.4   0.0   0:00.15 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.1   2.6    5d+11h qemu-sy+
-1222314 root      20   0       0      0      0 I   5.6   0.0   4:05.10 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-## readceil rculist_loadbr run=5 07:11:31 load 103.98 79.46 66.82
-2939544 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
-      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-## readceil rculist run=5 07:12:55 load 104.36 79.99 67.77
-2940860 efficios  20   0   17508  10072   3780 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil txn_sw_fwd run=3 11:25:37 load 97.84 81.48 79.52
+ 497082 efficios  20   0   17508  10128   3804 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_resolve run=5 07:14:20 load 104.41 80.37 68.63
-2942175 efficios  20   0   17508  10168   3876 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-1159180 root      20   0       0      0      0 I   5.9   0.0   0:03.96 kworker+
-3257789 root      20   0       0      0      0 I   5.9   0.0   0:03.63 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-## readceil txn_sw_fwd run=5 07:15:45 load 104.76 80.78 69.46
-2943496 efficios  20   0   17508  10060   3768 R  35.3   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_load run=3 11:27:02 load 96.91 79.72 78.74
+ 498389 efficios  20   0   17508  10164   3844 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
       4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
-## readceil rculist_load run=5 07:17:10 load 106.60 81.57 70.38
-2944809 efficios  20   0   17508  10172   3876 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.51 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.80 kthreadd
+## readceil rculist_loadbr run=3 11:28:26 load 97.31 78.65 78.12
+ 499701 efficios  20   0   17508  10184   3860 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
-# end: 2026-09-29T07:21:40-04:00 5.85 44.69 58.53 1/3893 2954071
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist run=3 11:29:51 load 99.49 78.32 77.71
+ 501011 efficios  20   0   17508  10120   3800 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist_resolve run=3 11:31:16 load 100.01 78.08 77.34
+ 502324 efficios  20   0   17508  10196   3876 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist_load run=4 11:32:41 load 100.14 77.89 77.00
+ 503633 efficios  20   0   17508  10196   3876 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.59 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist_loadbr run=4 11:34:06 load 101.98 78.30 76.88
+ 504942 efficios  20   0   17508  10060   3736 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.60 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist run=4 11:35:30 load 102.45 78.61 76.77
+ 506243 efficios  20   0   17508  10172   3848 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.60 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist_resolve run=4 11:36:55 load 102.54 78.84 76.67
+ 507565 efficios  20   0   17508  10136   3812 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 455824 150480 S  11.8   0.1   9:21.66 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.60 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+## readceil txn_sw_fwd run=4 11:38:20 load 102.56 79.01 76.58
+ 508894 efficios  20   0   17508  10164   3844 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.60 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist_loadbr run=5 11:39:45 load 104.02 79.64 76.67
+ 510245 efficios  20   0   17508  10192   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.61 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil rculist run=5 11:41:10 load 104.33 80.11 76.75
+ 511560 efficios  20   0   17508  10128   3804 R  41.2   0.0   0:00.13 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:34.38 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.61 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+## readceil rculist_resolve run=5 11:42:34 load 104.44 80.47 76.83
+ 512870 efficios  20   0   17508  10192   3868 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.61 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+## readceil txn_sw_fwd run=5 11:43:59 load 104.43 80.73 76.90
+ 514172 efficios  20   0   17508  10124   3804 R  41.2   0.0   0:00.13 top
+2727732 root      20   0       0      0      0 I   5.9   0.0   0:06.87 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.61 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+## readceil rculist_load run=5 11:45:24 load 106.54 81.55 77.17
+ 515481 efficios  20   0   17508  10184   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.61 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.68 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_wo+
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker+
+# end: 2026-10-03T11:48:34-04:00 19.37 58.09 69.24 1/3611 524696

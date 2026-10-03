@@ -63,6 +63,21 @@
 # binaries arms-p1/bench_list_scale.pin-packed-18809ea8 (and -rawcmp), built at
 # bench 974609c against urcu-txn-build-18809ea8 with the flags described here.
 # The results taken on b3e23f9f are in this file's and its outputs' git history.
+# RE-PINNED 2026-10-03 at urcu-txn-dev 2793224e, P1's new pin.  Against 18809ea8
+# the engine retires descriptors in batches by default (c21f5a38), inlines the
+# record append and no longer rounds reserve() up to 8 records (79ef08e8), reads
+# the cpu from the C library's rseq area in the slab (4de8fabf) and issues no
+# legacy barrier beside the slab freelist's cmpxchg (2793224e).
+# Packed binaries arms-p1/bench_list_scale.pin-packed-2793224e (and -rawcmp;
+# -nobatch is the same source with -DURCU_TXN_SLAB_NO_BATCH, the control; -rseq
+# is built against urcu-txn-build-2793224e-rseq, configured --enable-slab-rseq),
+# built at bench a9c9300 (harness source unchanged since 974609c) with the flags
+# described here, against urcu-txn-build-2793224e.  THAT TREE'S LIBRARIES ARE
+# -O2 -DNDEBUG (the Makefile's URCU_CFLAGS).  urcu-txn-build-18809ea8 was
+# configured bare, so every result taken on 18809ea8 ran liburcu's call_rcu and
+# grace-period code at -g -O2 WITH ASSERTIONS; only this translation unit, where
+# the engine's headers are inlined, was -O2 -DNDEBUG.  Those results are in this
+# file's and its outputs' git history; a first take on c21f5a38 was not kept.
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
 # WARM-UP: every point runs BENCH_WARMUP_SEC (default 4) seconds untimed before
@@ -70,9 +85,9 @@ cd /home/efficios/git/efficios-trie-benchmark
 # 4 s as the writer-scaling sweep.  A process's first point otherwise times its
 # own cold start: slab carving, page faults, call_rcu's pipeline filling.
 export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-18809ea8}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-packed-2793224e}
 TAG=${TAG:-}
-ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
+ENG_TREE=${ENG_TREE:-urcu-txn-build-2793224e}
 export DURATION_SEC=${DURATION_SEC:-3}
 export LIST_SIZE=${LIST_SIZE:-10000} CHURN=${CHURN:-200}
 RUNS=${RUNS:-5}
@@ -85,7 +100,7 @@ LOG=scripts/p1_resolve_control$TAG.log
 if [ "${DEREF_ONLY:-0}" = 1 ]; then RUNS=0; LOG=${LOG%.log}_deref.log; fi
 
 [ -x "$BIN" ] || { echo "missing $BIN (see header to build it)" >&2; exit 1; }
-ENG_COMMIT=${ENG_COMMIT:-18809ea8}
+ENG_COMMIT=${ENG_COMMIT:-2793224e}
 [ "$(git -C "$ENG_TREE" rev-parse --short=8 HEAD)" = "$ENG_COMMIT" ] \
   || { echo "ERROR: $ENG_TREE is not at $ENG_COMMIT" >&2; exit 1; }
 ldd "$BIN" | grep -q "$ENG_TREE/src/.libs/liburcu-qsbr" \

@@ -52,8 +52,15 @@
 # with ...-nodelock4 re-runs the five arms on that source.  TAG=_e re-takes
 # them on urcu-txn-dev 18809ea8, P1's pin since 2026-09-29,
 # with ...-18809ea8 built at bench dc08669 against urcu-txn-build-18809ea8;
-# _c and _d are on engine b3e23f9f.  TAG=_f (default here) re-takes _e with
-# MEMPLACE=socket (below) and is the batch P1's fig:writerscale plots.  TAG=_g
+# _c and _d are on engine b3e23f9f.  TAG=_f re-takes _e with
+# MEMPLACE=socket (below) and is the batch P1's fig:writerscale plotted while
+# P1 pinned 18809ea8.  TAG=_h (default here, 2026-10-03) re-takes _f on
+# urcu-txn-dev 2793224e, P1's pin since then (batched descriptor retirement
+# by default, inlined record append, reserve() honoring a bound below 8, no
+# legacy barrier in the slab's pop and push): ...-aligned-2793224e, built at
+# bench a9c9300 (harness source unchanged since dc08669) against
+# urcu-txn-build-2793224e.  It is the batch
+# fig:writerscale plots.  TAG=_g
 # is a spot check, WRITERS="160 176 184 188 190 191 192", taken with a guest VM
 # (compudjdev, 288 vCPUs, unpinned, mostly idle) shut down: _f's 191 -> 192
 # jump (8-23% on the finer-locked arms, 192 the only tight point above 96) is the
@@ -100,11 +107,11 @@
 # the harness's stderr).
 set -u
 cd /home/efficios/git/efficios-trie-benchmark
-BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-18809ea8}
-TAG=${TAG:-_f}
+BIN=${BIN:-./arms-p1/bench_list_scale.pin-aligned-2793224e}
+TAG=${TAG:-_h}
 MEMPLACE=${MEMPLACE:-socket}
 export BENCH_WARMUP_SEC=${BENCH_WARMUP_SEC:-4}
-ENG_TREE=${ENG_TREE:-urcu-txn-build-18809ea8}
+ENG_TREE=${ENG_TREE:-urcu-txn-build-2793224e}
 DUR=${DUR:-2}
 RUNS=${RUNS:-5}
 WRITERS=${WRITERS:-"1 2 4 8 16 32 64 96 128 160 191 192"}

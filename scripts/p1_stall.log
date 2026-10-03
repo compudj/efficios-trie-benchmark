@@ -1,406 +1,406 @@
-# run_p1_stall.sh  2026-09-29T08:00:05-04:00
-# bench HEAD 974609c7; bench_list_scale.c sha256 185e8564e6d75719
-# binary ./arms-p1/bench_list_scale.pin-packed-18809ea8 sha256 9c3459468c666ebd; engine 18809ea8
+# run_p1_stall.sh  2026-10-03T12:25:39-04:00
+# bench HEAD a9c93006; bench_list_scale.c sha256 185e8564e6d75719
+# binary ./arms-p1/bench_list_scale.pin-packed-2793224e sha256 719889287b571ae5; engine 2793224e
 # RUNS=5, 1 reader, no writer, CHURN=200, BENCH_WARMUP_SEC=4
-# start: 5.50 42.91 60.95 1/3896 2994978
-## seq10k rculist run=1 08:00:05 load 5.50 42.91 60.95
-2994983 efficios  20   0   17508  10024   3728 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.55 systemd
-## seq10k rculist_load run=1 08:00:13 load 4.81 41.53 60.30
-2995381 efficios  20   0   17508  10028   3736 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.55 systemd
-## seq10k rculist_resolve run=1 08:00:21 load 4.50 40.86 59.99
-2995772 efficios  20   0   17508  10140   3848 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.55 systemd
-## seq10k txn_sw_fwd run=1 08:00:28 load 3.96 39.54 59.35
-2996165 efficios  20   0   17508  10144   3848 R  44.4   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.55 systemd
-## seq10k rculist_loadbr run=1 08:00:36 load 3.73 38.90 59.04
-2996557 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.56 systemd
-1156554 root      20   0       0      0      0 I   5.9   0.0   0:07.57 kworker+
-## seq10k rculist_load run=2 08:00:43 load 3.23 37.64 58.41
-2996956 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.56 systemd
-## seq10k rculist_resolve run=2 08:00:51 load 3.05 37.03 58.10
-2997347 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.57 systemd
-   2292 root      rt   0       0      0      0 S   5.9   0.0   0:02.66 migrati+
-## seq10k txn_sw_fwd run=2 08:00:58 load 2.66 35.83 57.49
-2997740 efficios  20   0   17508  10144   3852 R  35.3   0.0   0:00.13 top
-   5061 root      20   0   18600   8244   7080 S   5.9   0.0   0:32.69 systemd+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_loadbr run=2 08:01:06 load 2.41 34.68 56.88
-2998132 efficios  20   0   17508  10156   3860 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist run=2 08:01:14 load 2.29 34.12 56.58
-2998530 efficios  20   0   17508  10092   3800 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_resolve run=3 08:01:21 load 2.10 33.03 55.98
-2998922 efficios  20   0   17508  10160   3868 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k txn_sw_fwd run=3 08:01:29 load 2.01 32.50 55.69
-2999314 efficios  20   0   17508  10096   3800 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_loadbr run=3 08:01:36 load 1.85 31.46 55.10
-2999707 efficios  20   0   17508  10180   3884 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## seq10k rculist run=3 08:01:44 load 1.78 30.95 54.81
-3000105 efficios  20   0   17508  10148   3852 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_load run=3 08:01:52 load 1.66 29.97 54.23
-3000496 efficios  20   0   17508  10156   3860 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-1289625 efficios  20   0 5657876 452704 149164 S   5.6   0.1  34:16.20 claude
-## seq10k txn_sw_fwd run=4 08:01:59 load 1.61 29.49 53.95
-3000890 efficios  20   0   17508  10148   3852 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452164 149164 S   5.9   0.1  34:16.29 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_loadbr run=4 08:02:07 load 1.76 28.60 53.40
-3001283 efficios  20   0   17508  10120   3828 R  41.2   0.0   0:00.14 top
-   1971 root      rt   0       0      0      0 S   5.9   0.0   0:02.35 migrati+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist run=4 08:02:14 load 1.70 28.14 53.11
-3001683 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452704 149164 S  11.8   0.1  34:16.45 claude
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-## seq10k rculist_load run=4 08:02:22 load 1.59 27.24 52.56
-3002074 efficios  20   0   17508  10032   3736 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.1   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_resolve run=4 08:02:29 load 1.54 26.81 52.28
-3002466 efficios  20   0   17508  10152   3860 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_loadbr run=5 08:02:37 load 1.46 25.96 51.73
-3002860 efficios  20   0   17508  10060   3768 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist run=5 08:02:45 load 1.42 25.54 51.45
-3003259 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 453424 149164 S   5.9   0.1  34:16.79 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## seq10k rculist_load run=5 08:02:52 load 1.36 24.73 50.91
-3003650 efficios  20   0   17508  10144   3848 R  38.9   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452244 149164 S  22.2   0.1  34:16.87 claude
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-## seq10k rculist_resolve run=5 08:03:00 load 1.33 24.34 50.64
-3004043 efficios  20   0   17508  10164   3868 R  38.9   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.6   0.0   6:30.05 rcu_pre+
-1224569 root      20   0       0      0      0 I   5.6   0.0   0:02.12 kworker+
-## seq10k txn_sw_fwd run=5 08:03:07 load 1.28 23.57 50.11
-3004436 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## shuf10k rculist run=1 08:03:15 load 1.25 23.20 49.85
-3004836 efficios  20   0   17508  10124   3832 R  35.3   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.57 systemd
-## shuf10k rculist_load run=1 08:03:23 load 1.29 22.48 49.33
-3005227 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1289625 efficios  20   0 5657876 452720 149164 S   5.9   0.1  34:17.19 claude
-## shuf10k rculist_resolve run=1 08:03:30 load 1.27 22.12 49.07
-3005620 efficios  20   0   17508  10028   3736 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.06 rcu_pre+
-   5061 root      20   0   18600   8244   7080 S   5.9   0.0   0:32.70 systemd+
-## shuf10k txn_sw_fwd run=1 08:03:38 load 1.23 21.43 48.55
-3006012 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.58 systemd
-## shuf10k rculist_loadbr run=1 08:03:45 load 1.21 21.09 48.30
-3006410 efficios  20   0   17508  10008   3716 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_load run=2 08:03:53 load 1.18 20.43 47.79
-3006802 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_resolve run=2 08:04:00 load 1.16 20.10 47.54
-3007197 efficios  20   0   17508  10012   3716 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k txn_sw_fwd run=2 08:04:08 load 1.14 19.47 47.04
-3007588 efficios  20   0   17508  10152   3860 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452728 149164 S   5.9   0.1  34:17.64 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_loadbr run=2 08:04:16 load 1.13 19.17 46.79
-3007987 efficios  20   0   17508  10168   3876 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf10k rculist run=2 08:04:23 load 1.11 18.57 46.30
-3008378 efficios  20   0   17508  10140   3848 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452180 149164 S  17.6   0.1  34:17.84 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_resolve run=3 08:04:31 load 1.10 18.28 46.06
-3008770 efficios  20   0   17508  10156   3860 R  38.9   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.6   0.0   6:30.08 rcu_pre+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k txn_sw_fwd run=3 08:04:38 load 1.08 17.71 45.58
-3009163 efficios  20   0   17508  10092   3800 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_loadbr run=3 08:04:46 load 1.08 17.43 45.34
-3009561 efficios  20   0   17508  10156   3860 R  38.9   0.0   0:00.14 top
-   5061 root      20   0   18600   8244   7080 S   5.6   0.0   0:32.71 systemd+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-## shuf10k rculist run=3 08:04:54 load 1.06 16.89 44.86
-3009955 efficios  20   0   17508  10144   3848 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  17.6   2.6    5d+11h qemu-sy+
-   3849 root      20   0  178264 124204 122692 S   5.9   0.0   0:40.35 systemd+
-## shuf10k rculist_load run=3 08:05:01 load 1.06 16.62 44.62
-3010350 efficios  20   0   17508  10072   3780 R  38.9   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452180 149164 S   5.6   0.1  34:18.24 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k txn_sw_fwd run=4 08:05:09 load 1.12 16.13 44.16
-3010743 efficios  20   0   17508  10160   3868 R  41.2   0.0   0:00.14 top
-1846541 root      20   0       0      0      0 I   5.9   0.0   0:04.78 kworker+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_loadbr run=4 08:05:16 load 1.10 15.63 43.70
-3011141 efficios  20   0   17508  10104   3808 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-4087480 root      20   0       0      0      0 I   5.6   0.0   0:12.04 kworker+
-## shuf10k rculist run=4 08:05:24 load 1.09 15.38 43.47
-3011532 efficios  20   0   17508  10152   3860 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
- 788045 root      20   0       0      0      0 I   5.9   0.0   0:01.36 kworker+
-## shuf10k rculist_load run=4 08:05:32 load 1.08 14.91 43.01
-3011925 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.10 rcu_pre+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-## shuf10k rculist_resolve run=4 08:05:39 load 1.07 14.68 42.79
-3012319 efficios  20   0   17508  10176   3852 R  47.1   0.0   0:00.15 top
-1289625 efficios  20   0 5657876 453536 149164 S   5.9   0.1  34:18.64 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.58 systemd
-## shuf10k rculist_loadbr run=5 08:05:47 load 1.06 14.23 42.34
-3012718 efficios  20   0   17508  10168   3876 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.6   0.0   0:56.59 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf10k rculist run=5 08:05:54 load 1.06 14.01 42.12
-3013111 efficios  20   0   17508  10168   3876 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1289625 efficios  20   0 5657876 452976 149164 S   5.9   0.1  34:18.82 claude
-## shuf10k rculist_load run=5 08:06:02 load 1.05 13.58 41.68
-3013502 efficios  20   0   17508  10060   3768 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  16.7   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf10k rculist_resolve run=5 08:06:09 load 1.04 13.37 41.46
-3013894 efficios  20   0   17508  10092   3800 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf10k txn_sw_fwd run=5 08:06:17 load 1.04 12.96 41.02
-3014293 efficios  20   0   17508  10136   3844 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf1m rculist run=1 08:06:25 load 1.03 12.76 40.81
-3014687 efficios  20   0   17508  10140   3848 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1222314 root      20   0       0      0      0 I   5.9   0.0   4:16.58 kworker+
-## shuf1m rculist_load run=1 08:06:32 load 1.03 12.38 40.38
-3015078 efficios  20   0   17508  10008   3716 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-2048112 root      20   0       0      0      0 I   5.9   0.0   0:10.85 kworker+
-## shuf1m rculist_resolve run=1 08:06:40 load 1.02 12.19 40.17
-3015477 efficios  20   0   17508  10080   3788 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-2696329 root      20   0       0      0      0 I   5.9   0.0   0:07.92 kworker+
-## shuf1m txn_sw_fwd run=1 08:06:48 load 1.02 11.82 39.75
-3015868 efficios  20   0   17508  10032   3736 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf1m rculist_loadbr run=1 08:06:56 load 1.02 11.64 39.54
-3016262 efficios  20   0   17508  10076   3780 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist_load run=2 08:07:04 load 1.02 11.29 39.13
-3016655 efficios  20   0   17508  10164   3868 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist_resolve run=2 08:07:11 load 1.01 10.95 38.72
-3017055 efficios  20   0   17508  10008   3716 R  41.2   0.0   0:00.14 top
-1289625 efficios  20   0 5657876 452724 149164 S   5.9   0.1  34:19.55 claude
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m txn_sw_fwd run=2 08:07:19 load 1.01 10.78 38.52
-3017446 efficios  20   0   17508  10020   3724 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.1   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist_loadbr run=2 08:07:27 load 1.01 10.46 38.11
-3017838 efficios  20   0   17508  10080   3784 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf1m rculist run=2 08:07:35 load 1.01 10.30 37.91
-3018230 efficios  20   0   17508  10088   3796 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist_resolve run=3 08:07:43 load 1.01 10.00 37.52
-3018630 efficios  20   0   17508  10128   3832 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 R   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m txn_sw_fwd run=3 08:07:50 load 1.01 9.85 37.32
-3019021 efficios  20   0   17508  10136   3844 R  35.3   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist_loadbr run=3 08:07:59 load 1.00 9.56 36.93
-3019415 efficios  20   0   17508  10148   3852 R  47.1   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.59 systemd
-## shuf1m rculist run=3 08:08:06 load 1.00 9.41 36.74
-3019808 efficios  20   0   17508  10144   3852 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   5.9   0.0   0:56.60 systemd
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.16 rcu_pre+
-## shuf1m rculist_load run=3 08:08:14 load 1.00 9.14 36.35
-3020207 efficios  20   0   17508  10012   3716 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1289625 efficios  20   0 5657876 452744 149164 S   5.9   0.1  34:20.12 claude
-## shuf1m txn_sw_fwd run=4 08:08:22 load 1.00 8.87 35.98
-3020601 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.60 systemd
-## shuf1m rculist_loadbr run=4 08:08:30 load 1.00 8.74 35.79
-3020992 efficios  20   0   17508  10144   3852 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.60 systemd
-## shuf1m rculist run=4 08:08:38 load 1.00 8.48 35.41
-3021385 efficios  20   0   17508  10140   3848 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.60 systemd
-## shuf1m rculist_load run=4 08:08:45 load 1.00 8.36 35.23
-3021784 efficios  20   0   17508  10136   3844 R  41.2   0.0   0:00.14 top
-   5061 root      20   0   18600   8244   7080 S   5.9   0.0   0:32.72 systemd+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-## shuf1m rculist_resolve run=4 08:08:53 load 1.00 8.11 34.86
-3022177 efficios  20   0   17508  10092   3796 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.18 rcu_pre+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.60 systemd
-## shuf1m rculist_loadbr run=5 08:09:01 load 1.00 8.00 34.68
-3022581 efficios  20   0   17508  10144   3852 R  38.9   0.0   0:00.14 top
-   3849 root      20   0  178264 124204 122692 S   5.6   0.0   0:40.36 systemd+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-## shuf1m rculist run=5 08:09:09 load 1.00 7.77 34.32
-3023005 efficios  20   0   17508  10140   3848 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.61 systemd
-## shuf1m rculist_load run=5 08:09:16 load 1.00 7.65 34.14
-3023406 efficios  20   0   17508  10156   3860 R  41.2   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.61 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf1m rculist_resolve run=5 08:09:24 load 1.22 7.48 33.80
-3023797 efficios  20   0   17508  10140   3848 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.61 systemd
-## shuf1m txn_sw_fwd run=5 08:09:32 load 1.19 7.27 33.45
-3024189 efficios  20   0   17508  10096   3800 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1265424 root      20   0       0      0      0 I   5.9   0.0   0:04.02 kworker+
-## shuf4m rculist run=1 08:09:40 load 1.17 7.16 33.27
-3024589 efficios  20   0   17508  10164   3868 R  47.1   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.61 systemd
-## shuf4m rculist_load run=1 08:09:52 load 1.13 6.86 32.76
-3024981 efficios  20   0   17508  10076   3780 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-1289625 efficios  20   0 5657876 454308 149164 S   5.9   0.1  34:21.36 claude
-## shuf4m rculist_resolve run=1 08:10:04 load 1.11 6.67 32.42
-3025377 efficios  20   0   17508  10152   3860 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.21 rcu_pre+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.61 systemd
-## shuf4m txn_sw_fwd run=1 08:10:16 load 1.09 6.48 32.08
-3025791 efficios  20   0   17508  10092   3800 R  35.3   0.0   0:00.13 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist_loadbr run=1 08:10:29 load 1.07 6.21 31.58
-3026191 efficios  20   0   17508  10008   3716 R  35.3   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf4m rculist_load run=2 08:10:41 load 1.06 6.04 31.25
-3026590 efficios  20   0   17508  10148   3852 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist_resolve run=2 08:10:53 load 0.98 5.77 30.76
-3026983 efficios  20   0   17508  10144   3852 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-3257789 root      20   0       0      0      0 I   5.6   0.0   0:03.68 kworker+
-## shuf4m txn_sw_fwd run=2 08:11:05 load 0.98 5.62 30.44
-3027376 efficios  20   0   17508  10160   3868 R  47.1   0.0   0:00.15 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist_loadbr run=2 08:11:19 load 0.99 5.39 29.97
-3027774 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf4m rculist run=2 08:11:30 load 1.06 5.26 29.66
-3028167 efficios  20   0   17508  10028   3732 R  38.9   0.0   0:00.14 top
-   1467 root      rt   0       0      0      0 S   5.6   0.0   0:02.48 migrati+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist_resolve run=3 08:11:42 load 1.05 5.05 29.20
-3028568 efficios  20   0   17508  10088   3796 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.25 rcu_pre+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-## shuf4m txn_sw_fwd run=3 08:11:54 load 1.04 4.92 28.90
-3028962 efficios  20   0   17508  10072   3780 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.8   2.6    5d+11h qemu-sy+
-   6102 root       0 -20       0      0      0 I   5.9   0.0   0:00.06 kworker+
-## shuf4m rculist_loadbr run=3 08:12:08 load 1.03 4.73 28.45
-3029356 efficios  20   0   17508  10140   3848 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-4087480 root      20   0       0      0      0 I   5.6   0.0   0:12.06 kworker+
-## shuf4m rculist run=3 08:12:20 load 1.03 4.60 28.16
-3029754 efficios  20   0   17508  10148   3852 R  35.3   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist_load run=3 08:12:31 load 1.10 4.50 27.87
-3030146 efficios  20   0   17508  10012   3716 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S  11.1   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m txn_sw_fwd run=4 08:12:43 load 1.07 4.33 27.44
-3030546 efficios  20   0   17508  10008   3716 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.27 rcu_pre+
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-## shuf4m rculist_loadbr run=4 08:12:57 load 1.06 4.16 27.02
-3030939 efficios  20   0   17508  10072   3780 R  41.2   0.0   0:00.14 top
-     15 root      20   0       0      0      0 I   5.9   0.0   6:30.28 rcu_pre+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.62 systemd
-## shuf4m rculist run=4 08:13:08 load 1.05 4.06 26.74
-3031345 efficios  20   0   17508  10136   3844 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.63 systemd
-## shuf4m rculist_load run=4 08:13:21 load 1.04 3.96 26.46
-3031760 efficios  20   0   17508  10060   3768 R  35.3   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.63 systemd
-      2 root      20   0       0      0      0 S   0.0   0.0   0:02.81 kthreadd
-## shuf4m rculist_resolve run=4 08:13:33 load 1.18 3.85 26.06
-3032149 efficios  20   0 5245412   1.3g   1.2g R  66.7   0.2   0:07.54 git
-3032193 efficios  20   0   17508  10044   3752 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.63 systemd
-## shuf4m rculist_loadbr run=5 08:13:45 load 1.23 3.77 25.80
-3032597 efficios  20   0   17508  10076   3784 R  41.2   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.9   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.63 systemd
-## shuf4m rculist run=5 08:13:57 load 1.27 3.69 25.54
-3032992 efficios  20   0   17508  10024   3732 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.63 systemd
-## shuf4m rculist_load run=5 08:14:09 load 1.37 3.59 25.15
-3033382 efficios  20   0 4608728 841792 547832 R  88.9   0.1   0:17.55 git
-3033406 efficios  20   0   17508  10160   3868 R  38.9   0.0   0:00.14 top
-  83812 libvirt+  20   0  151.7g  19.9g  31868 S   5.6   2.6    5d+11h qemu-sy+
-## shuf4m rculist_resolve run=5 08:14:21 load 1.47 3.54 24.91
-3033382 efficios  20   0 4622092   1.1g 886312 R 100.0   0.2   0:29.34 git
-3033819 efficios  20   0   17508  10016   3724 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.64 systemd
-## shuf4m txn_sw_fwd run=5 08:14:32 load 1.67 3.48 24.54
-3034210 efficios  20   0 4289852 781596 633048 R  94.4   0.1   0:01.26 git
-3034213 efficios  20   0   17508  10144   3852 R  38.9   0.0   0:00.14 top
-      1 root      20   0   24172  15012  10656 S   0.0   0.0   0:56.64 systemd
-# end: 2026-09-29T08:14:46-04:00 1.72 3.43 24.30 2/3910 3034638
+# start: 17.68 55.03 66.90 1/3602 565487
+## seq10k rculist run=1 12:25:39 load 17.68 55.03 66.90
+3848718 efficios  20   0 5657720 445628 150540 S 170.6   0.1  10:09.92 claude
+ 565492 efficios  20   0   17508  10056   3732 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k rculist_load run=1 12:25:47 load 15.12 53.25 66.20
+ 565895 efficios  20   0   17508  10128   3804 R  35.3   0.0   0:00.12 top
+3848718 efficios  20   0 5657720 445340 150540 S  11.8   0.1  10:11.02 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k rculist_resolve run=1 12:25:54 load 13.99 52.38 65.85
+ 566311 efficios  39  19  127968  64596   4992 R 100.0   0.0   0:00.85 pdflatex
+ 566314 efficios  20   0   17508  10172   3848 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 461988 150540 R  17.6   0.1  10:12.15 claude
+## seq10k txn_sw_fwd run=1 12:26:02 load 12.14 50.72 65.16
+ 566765 efficios  20   0   17508  10060   3740 R  38.9   0.0   0:00.13 top
+ 235237 root      20   0       0      0      0 I   5.6   0.0   0:07.63 kworker+
+3848718 efficios  20   0 5657720 483012 150540 S   5.6   0.1  10:13.17 claude
+## seq10k rculist_loadbr run=1 12:26:09 load 11.25 49.90 64.82
+ 567162 efficios  20   0   17508  10188   3868 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 489216 150540 S  29.4   0.1  10:13.81 claude
+ 542196 efficios  20   0 1294328   8336   6416 S   5.9   0.0   0:00.09 2.1.288
+## seq10k rculist_load run=2 12:26:17 load 9.75 48.31 64.14
+ 567589 efficios  39  19  407988 242844  33084 R  94.4   0.0   0:01.94 xelatex
+ 567595 efficios  20   0   17508  10136   3816 R  38.9   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 447520 150540 S  22.2   0.1  10:14.81 claude
+## seq10k rculist_resolve run=2 12:26:25 load 9.13 47.54 63.80
+ 568000 efficios  20   0   17508  10132   3812 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 475240 150540 S   5.9   0.1  10:15.85 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k txn_sw_fwd run=2 12:26:32 load 7.88 46.00 63.13
+ 568391 efficios  20   0   17508  10132   3812 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:44.90 rcu_pre+
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:34.40 systemd+
+## seq10k rculist_loadbr run=2 12:26:40 load 7.33 45.26 62.80
+ 568788 efficios  20   0   17508  10168   3844 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist run=2 12:26:47 load 6.44 43.81 62.14
+ 569180 efficios  20   0   17508  10184   3864 R  38.9   0.0   0:00.13 top
+1803702 root      20   0       0      0      0 I   5.6   0.0   0:10.46 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k rculist_resolve run=3 12:26:55 load 6.00 43.10 61.81
+ 569576 efficios  20   0   17508  10172   3852 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:44.91 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k txn_sw_fwd run=3 12:27:03 load 5.16 41.70 61.15
+ 569967 efficios  20   0   17508  10128   3804 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 449712 150540 S   5.9   0.1  10:17.86 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+## seq10k rculist_loadbr run=3 12:27:10 load 4.52 40.36 60.51
+ 570359 efficios  20   0   17508  10116   3796 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist run=3 12:27:18 load 4.24 39.71 60.19
+ 570750 efficios  20   0   17508  10124   3804 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist_load run=3 12:27:25 load 3.74 38.43 59.55
+ 571142 efficios  20   0   17508  10120   3800 R  38.9   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.6   0.0   9:44.92 rcu_pre+
+ 542196 efficios  20   0 1294328   8336   6416 S   5.6   0.0   0:00.32 2.1.288
+## seq10k txn_sw_fwd run=4 12:27:33 load 3.52 37.81 59.24
+ 571534 efficios  20   0   17508  10188   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist_loadbr run=4 12:27:40 load 3.13 36.60 58.61
+ 571933 efficios  20   0   17508  10192   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist run=4 12:27:48 load 2.96 36.01 58.31
+ 572324 efficios  20   0   17508  10188   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.66 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist_load run=4 12:27:56 load 2.74 34.87 57.70
+ 572718 efficios  20   0   17508  10100   3780 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.67 systemd
+     15 root      20   0       0      0      0 I   5.9   0.0   9:44.93 rcu_pre+
+## seq10k rculist_resolve run=4 12:28:03 load 2.60 34.31 57.39
+ 573109 efficios  20   0   17508  10184   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist_loadbr run=5 12:28:11 load 2.35 33.21 56.79
+ 573510 efficios  20   0   17508  10120   3796 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist run=5 12:28:18 load 2.24 32.67 56.49
+ 573901 efficios  20   0   17508  10188   3868 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k rculist_load run=5 12:28:26 load 2.05 31.63 55.89
+ 574292 efficios  20   0   17508  10188   3868 R  35.3   0.0   0:00.12 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:44.94 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+## seq10k rculist_resolve run=5 12:28:34 load 1.97 31.12 55.60
+ 574683 efficios  20   0   17508  10148   3828 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## seq10k txn_sw_fwd run=5 12:28:41 load 1.82 30.13 55.01
+ 575084 efficios  20   0   17508  10196   3876 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.67 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist run=1 12:28:49 load 1.75 29.65 54.72
+ 575477 efficios  20   0   17508  10172   3852 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_load run=1 12:28:56 load 1.64 28.70 54.15
+ 575870 efficios  20   0   17508  10072   3752 R  38.9   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 415140 150540 S   5.6   0.1  10:19.24 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_resolve run=1 12:29:04 load 1.59 28.24 53.86
+ 576261 efficios  20   0   17508  10176   3852 R  38.9   0.0   0:00.13 top
+   5061 root      20   0   18600   8248   7080 S   5.6   0.0   0:34.41 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k txn_sw_fwd run=1 12:29:11 load 1.49 27.34 53.29
+ 576660 efficios  20   0   17508  10120   3800 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_loadbr run=1 12:29:19 load 1.45 26.91 53.01
+ 577052 efficios  20   0   17508  10160   3836 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 415696 150540 S   5.9   0.1  10:19.47 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_load run=2 12:29:27 load 1.38 26.05 52.45
+ 577446 efficios  20   0   17508  10176   3852 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:44.96 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_resolve run=2 12:29:34 load 1.35 25.64 52.18
+ 577837 efficios  20   0   17508  10160   3840 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 415308 150540 S   5.9   0.1  10:19.65 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k txn_sw_fwd run=2 12:29:42 load 1.30 24.83 51.63
+ 578235 efficios  20   0   17508  10124   3804 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_loadbr run=2 12:29:49 load 1.27 24.43 51.36
+ 578627 efficios  20   0   17508  10188   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist run=2 12:29:57 load 1.23 23.66 50.82
+ 579020 efficios  20   0   17508  10124   3800 R  44.4   0.0   0:00.14 top
+   5139 root      20   0   11.6g 195280  38676 S   5.6   0.0   8:16.60 incusd
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_resolve run=3 12:30:05 load 1.21 23.28 50.55
+ 579413 efficios  20   0   17508  10172   3848 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k txn_sw_fwd run=3 12:30:12 load 1.26 22.56 50.02
+ 579811 efficios  20   0   17508  10164   3844 R  38.9   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 420152 150540 S   5.6   0.1  10:20.15 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_loadbr run=3 12:30:20 load 1.24 22.21 49.76
+ 580204 efficios  20   0   17508  10148   3828 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist run=3 12:30:27 load 1.20 21.51 49.24
+ 580596 efficios  20   0   17508  10188   3864 R  35.3   0.0   0:00.12 top
+3848718 efficios  20   0 5657720 420156 150540 S   5.9   0.1  10:20.31 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf10k rculist_load run=3 12:30:35 load 1.18 21.17 48.98
+ 580988 efficios  20   0   17508  10152   3832 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k txn_sw_fwd run=4 12:30:42 load 1.16 20.50 48.46
+ 581387 efficios  20   0   17508  10172   3852 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_loadbr run=4 12:30:50 load 1.14 20.18 48.21
+ 581778 efficios  20   0   17508  10180   3856 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist run=4 12:30:58 load 1.12 19.54 47.70
+ 582178 efficios  20   0   17508  10128   3804 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_load run=4 12:31:05 load 1.11 19.24 47.45
+ 582569 efficios  20   0   17508  10124   3800 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_resolve run=4 12:31:13 load 1.02 18.62 46.95
+ 582967 efficios  20   0   17508  10120   3800 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_loadbr run=5 12:31:20 load 1.02 18.04 46.45
+ 583359 efficios  20   0   17508  10164   3844 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist run=5 12:31:28 load 1.02 17.75 46.21
+ 583750 efficios  20   0   17508  10116   3796 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_load run=5 12:31:36 load 1.01 17.20 45.72
+ 584141 efficios  20   0   17508  10176   3852 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k rculist_resolve run=5 12:31:43 load 1.01 16.93 45.48
+ 584539 efficios  20   0   17508  10064   3744 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf10k txn_sw_fwd run=5 12:31:51 load 1.01 16.41 45.01
+ 584930 efficios  20   0   17508  10124   3800 R  41.2   0.0   0:00.13 top
+   1734 root      rt   0       0      0      0 S   5.9   0.0   0:03.24 migrati+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf1m rculist run=1 12:31:58 load 1.01 16.15 44.77
+ 585325 efficios  20   0   17508  10132   3812 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_load run=1 12:32:06 load 1.01 15.65 44.30
+ 585716 efficios  20   0   17508  10168   3848 R  41.2   0.0   0:00.13 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:34.42 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+## shuf1m rculist_resolve run=1 12:32:14 load 1.01 15.41 44.07
+ 586114 efficios  20   0   17508  10204   3884 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m txn_sw_fwd run=1 12:32:21 load 1.25 14.98 43.62
+ 586505 efficios  20   0   17508  10180   3856 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_loadbr run=1 12:32:29 load 1.22 14.75 43.39
+ 586896 efficios  20   0   17508  10176   3852 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.68 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_load run=2 12:32:37 load 1.19 14.30 42.94
+ 587295 efficios  20   0   17508  10184   3860 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.69 systemd
+3848718 efficios  20   0 5657720 414496 150540 S   5.9   0.1  10:22.20 claude
+## shuf1m rculist_resolve run=2 12:32:45 load 1.17 14.08 42.71
+ 587687 efficios  20   0   17508  10136   3812 R  41.2   0.0   0:00.13 top
+   2802 root      20   0       0      0      0 S   5.9   0.0   1:02.47 kcompac+
+1134776 root      20   0       0      0      0 I   5.9   0.0   0:07.05 kworker+
+## shuf1m txn_sw_fwd run=2 12:32:53 load 1.15 13.65 42.27
+ 588078 efficios  20   0   17508  10060   3736 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.69 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_loadbr run=2 12:33:01 load 1.12 13.23 41.82
+ 588473 efficios  20   0   17508  10184   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.69 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist run=2 12:33:08 load 1.11 13.03 41.60
+ 588871 efficios  20   0   17508  10176   3852 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.6   0.0   1:03.70 systemd
+   2791 root      20   0       0      0      0 S   5.6   0.0   0:54.46 kcompac+
+## shuf1m rculist_resolve run=3 12:33:16 load 1.10 12.63 41.17
+ 589263 efficios  20   0   17508  10200   3876 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 414500 150540 S   5.9   0.1  10:22.74 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf1m txn_sw_fwd run=3 12:33:24 load 1.09 12.44 40.95
+ 589654 efficios  20   0   17508  10056   3736 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_loadbr run=3 12:33:32 load 1.07 12.06 40.52
+ 590045 efficios  20   0   17508  10128   3804 R  41.2   0.0   0:00.13 top
+   5061 root      20   0   18600   8248   7080 S   5.9   0.0   0:34.43 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf1m rculist run=3 12:33:39 load 1.07 11.88 40.31
+ 590443 efficios  20   0   17508  10120   3800 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_load run=3 12:33:47 load 1.06 11.52 39.89
+ 590834 efficios  20   0   17508  10068   3744 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m txn_sw_fwd run=4 12:33:55 load 1.05 11.34 39.68
+ 591228 efficios  20   0   17508  10172   3848 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 414500 150540 S  11.8   0.1  10:23.26 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf1m rculist_loadbr run=4 12:34:03 load 1.04 11.00 39.27
+ 591619 efficios  20   0   17508  10188   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist run=4 12:34:11 load 1.04 10.67 38.86
+ 592017 efficios  20   0   17508  10188   3864 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_load run=4 12:34:18 load 1.03 10.51 38.65
+ 592408 efficios  20   0   17508  10168   3844 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_resolve run=4 12:34:26 load 1.03 10.20 38.25
+ 592801 efficios  20   0   17508  10188   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_loadbr run=5 12:34:34 load 1.02 10.04 38.05
+ 593193 efficios  20   0   17508  10056   3736 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist run=5 12:34:42 load 1.02 9.75 37.65
+ 593591 efficios  20   0   17508  10120   3800 R  33.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m rculist_load run=5 12:34:49 load 1.02 9.60 37.45
+ 593982 efficios  20   0   17508  10092   3768 R  38.9   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 414524 150540 S   5.6   0.1  10:24.01 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf1m rculist_resolve run=5 12:34:57 load 1.02 9.32 37.06
+ 594376 efficios  20   0   17508  10208   3884 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf1m txn_sw_fwd run=5 12:35:05 load 1.01 9.18 36.87
+ 594767 efficios  20   0   17508  10036   3712 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist run=1 12:35:13 load 1.01 8.91 36.48
+ 595167 efficios  20   0   17508  10176   3852 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_load run=1 12:35:24 load 1.01 8.65 36.10
+ 595558 efficios  20   0   17508  10192   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_resolve run=1 12:35:36 load 1.01 8.27 35.54
+ 595951 efficios  20   0   17508  10120   3800 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 416756 150540 S   5.9   0.1  10:24.61 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf4m txn_sw_fwd run=1 12:35:48 load 1.00 8.03 35.17
+ 596349 efficios  20   0   17508  10052   3732 R  38.9   0.0   0:00.13 top
+1642977 root      20   0       0      0      0 I   5.6   0.0   0:05.68 kworker+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf4m rculist_loadbr run=1 12:36:01 load 1.00 7.69 34.62
+ 596743 efficios  20   0   17508  10192   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_load run=2 12:36:13 load 1.00 7.47 34.26
+ 597143 efficios  20   0   17508  10172   3852 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_resolve run=2 12:36:25 load 1.00 7.25 33.91
+ 597534 efficios  20   0   17508  10120   3796 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m txn_sw_fwd run=2 12:36:37 load 1.00 6.95 33.38
+3848718 efficios  20   0 5657720 414248 150540 S  76.5   0.1  10:25.40 claude
+ 597926 efficios  20   0   17508  10188   3868 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.70 systemd
+## shuf4m rculist_loadbr run=2 12:36:49 load 1.00 6.75 33.03
+ 598325 efficios  20   0   17508  10052   3732 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist run=2 12:37:01 load 1.00 6.47 32.52
+ 598718 efficios  20   0   17508  10168   3844 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_resolve run=3 12:37:13 load 1.00 6.29 32.18
+ 599125 efficios  20   0   17508  10192   3868 R  41.2   0.0   0:00.13 top
+3848718 efficios  20   0 5657720 450456 150540 S  23.5   0.1  10:27.14 claude
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+## shuf4m txn_sw_fwd run=3 12:37:25 load 1.00 6.11 31.84
+ 599542 efficios  20   0   17508  10184   3864 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_loadbr run=3 12:37:38 load 1.00 5.86 31.35
+ 599940 efficios  20   0   17508  10172   3848 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist run=3 12:37:50 load 1.00 5.70 31.02
+ 600332 efficios  20   0   17508  10056   3736 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_load run=3 12:38:02 load 1.01 5.47 30.54
+ 600726 efficios  20   0   17508  10188   3868 R  35.3   0.0   0:00.12 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m txn_sw_fwd run=4 12:38:14 load 1.01 5.32 30.22
+ 601118 efficios  20   0   17508  10192   3868 R  38.9   0.0   0:00.13 top
+   5061 root      20   0   18600   8248   7080 S   5.6   0.0   0:34.44 systemd+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+## shuf4m rculist_loadbr run=4 12:38:26 load 1.01 5.11 29.75
+ 601510 efficios  20   0   17508  10204   3884 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist run=4 12:38:38 load 1.01 4.97 29.45
+ 601909 efficios  20   0   17508  10052   3732 R  41.2   0.0   0:00.13 top
+     15 root      20   0       0      0      0 I   5.9   0.0   9:45.16 rcu_pre+
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+## shuf4m rculist_load run=4 12:38:50 load 1.00 4.84 29.14
+ 602302 efficios  20   0   17508  10172   3848 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.71 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_resolve run=4 12:39:02 load 0.94 4.64 28.68
+ 602699 efficios  20   0   17508  10148   3824 R  41.2   0.0   0:00.13 top
+ 602726 root      20   0   16040  15340   1748 R  41.2   0.0   0:00.07 pidof
+      1 root      20   0   24172  15012  10656 S   5.9   0.0   1:03.72 systemd
+## shuf4m rculist_loadbr run=5 12:39:14 load 0.95 4.52 28.39
+ 603129 efficios  20   0   17508  10116   3796 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.72 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist run=5 12:39:25 load 0.96 4.40 28.09
+ 603523 efficios  20   0   17508  10136   3812 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.72 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_load run=5 12:39:37 load 0.90 4.22 27.65
+ 603922 efficios  20   0   17508  10180   3856 R  41.2   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.72 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m rculist_resolve run=5 12:39:49 load 0.91 4.11 27.37
+ 604314 efficios  20   0   17508  10172   3848 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.72 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+## shuf4m txn_sw_fwd run=5 12:40:01 load 0.93 3.96 26.94
+ 604708 efficios  20   0   17508  10136   3812 R  38.9   0.0   0:00.13 top
+      1 root      20   0   24172  15012  10656 S   0.0   0.0   1:03.72 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:03.69 kthreadd
+# end: 2026-10-03T12:40:14-04:00 0.94 3.86 26.66 1/3610 605105

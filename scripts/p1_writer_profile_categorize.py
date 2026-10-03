@@ -10,6 +10,9 @@ engines and categories, not against the clock.  The writer thread is the one
 running the engine's write function; the call_rcu worker, on its own core, is
 the one running reclaim callbacks.
 
+A reader thread, when the run has one, is reported with role `reader` and is
+not part of any share: it runs on its own core.
+
 Categories:
   commit               urcu_txn_sw_commit_flavor
   list_op_and_staging  the write function and its loop, and the engine's
@@ -36,17 +39,25 @@ Two attributions need the thread, which is why this runs per thread:
 
   sched_getcpu is called once per slab allocation and once per call_rcu, and
   its self time cannot be split by caller, so on the txn_sw_list writer it is
-  apportioned by call count: one slab allocation and, on average, 1.5 call_rcu
-  per update (an insert defers the descriptor; a delete defers the descriptor
-  and the node), so 1/2.5 = 40% goes to descriptor_slab.  The PLT-stub samples
-  (bench:liburcu ~ 1:2) are consistent with that.
+  apportioned by call count: one slab allocation and P1_CALL_RCU_PER_UPDATE
+  call_rcu per update.  That is 0.5 (the default here) on an engine that
+  retires descriptors in batches, c21f5a38's default: only a delete's node is
+  deferred per update -- the batch route finds its arena from the block, with
+  no cpu lookup, and enters call_rcu once per batch -- so 1/1.5 = 67% goes to
+  descriptor_slab.  It is 1.5 with one call_rcu per descriptor (18809ea8, or
+  -DURCU_TXN_SLAB_NO_BATCH: an insert defers the descriptor; a delete defers
+  the descriptor and the node), so 1/2.5 = 40%; on 18809ea8 the PLT-stub
+  samples (bench:liburcu ~ 1:2) were consistent with that.
 """
-import re, subprocess, sys
+import os, re, subprocess, sys
 from collections import defaultdict
 
 eng, data, rate, secs = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
 WSYM = {'txn_sw_list': 'su_write', 'rculist': 'rl_write'}[eng]
-SLAB_GETCPU_SHARE = 1.0 / 2.5          # txn_sw_list writer only, see above
+# txn_sw_list writer only, see above.  P1_SLAB_GETCPU_CALLS=0 for an engine
+# configured --enable-slab-rseq, whose slab reads the cpu from the rseq area.
+_SLAB_CALLS = float(os.environ.get('P1_SLAB_GETCPU_CALLS', '1'))
+SLAB_GETCPU_SHARE = _SLAB_CALLS / (_SLAB_CALLS + float(os.environ.get('P1_CALL_RCU_PER_UPDATE', '0.5')))
 
 def cat(dso, sym, role):
     """Return a list of (category, weight) for one symbol."""
@@ -57,6 +68,7 @@ def cat(dso, sym, role):
     # The engine's out-of-line staging and list calls (on 18809ea8 the edges
     # are recorded in urcu_txn_sw_record_chain, no longer inlined).
     if (sym.startswith('urcu_txn_sw_record') or sym.startswith('urcu_txn_sw__find')
+            or sym.startswith('urcu_txn_sw__grow') or sym.startswith('urcu_txn_sw__chain')
             or sym.startswith('urcu_txn_sw_list_')):
         return [('list_op_and_staging', 1.0)]
     if sym.startswith('urcu_slab_') or sym == 'urcu_txn_sw_free_rcu':
@@ -84,7 +96,7 @@ def report(extra):
     return subprocess.run(['perf', 'report', '-i', data, '--stdio', '--no-children'] + extra,
                           capture_output=True, text=True).stdout
 
-tids = [m.group(1) for m in re.finditer(r'^\s+[\d.]+%\s+(\d+):', report(['--sort', 'pid']), re.M)][:3]
+tids = [m.group(1) for m in re.finditer(r'^\s+[\d.]+%\s+(\d+):', report(['--sort', 'pid']), re.M)][:4]
 upd = rate * 1e6 * secs
 for t in tids:
     txt = report(['--sort', 'dso,sym', '--percent-limit', '0', '--tid', t])
@@ -93,6 +105,7 @@ for t in tids:
             for m in re.finditer(r'^\s+([\d.]+)%\s+(\S+)\s+\[[.k]\]\s+(.*)$', txt, re.M)]
     top = [s for _, _, s in rows[:15]]
     role = ('writer' if WSYM in top else
+            'reader' if any(s in ('su_read', 'rl_read', 'reader_thread') for s in top) else
             'worker' if any(s in ('call_rcu_thread', 'urcu_txn_sw_free_rcu', 'seg_reclaim_cb') for s in top)
             else 'main')
     c = defaultdict(float)
