@@ -86,7 +86,7 @@ HCPP     := $(KEEPID) $(CPPFLAGS)
 ENGINE   ?= seqlock
 # $(URCU_DEP) rides in HDRS because nearly every target here already lists HDRS,
 # so one line makes a liburcu rebuild invalidate every binary that links it.
-HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_rand.h dcache_bench_setup.h dcache_bench_run.h dcache_node.h \
+HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_rand.h dcache_bench_setup.h dcache_bench_run.h dcache_node.h dcache_qspinlock.h \
 	    dcache_bench_pace.h $(URCU_DEP)
 
 .PHONY: check-shared check-shared-tsan check-rmdir check-rename-livelock check-lifecycle all check check-asan repro repro-asan repro-fold	stress stress-asan stress-tsan stress-dirs stress-dirs-asan \

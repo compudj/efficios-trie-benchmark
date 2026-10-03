@@ -87,6 +87,7 @@
 #include <rseq/rseq.h>			/* phase 3: NUMA node id (list_lru sharding) */
 #include "dcache_node.h"		/* phase 3: this CPU's node, rseq or getcpu */
 #endif
+#include "dcache_qspinlock.h"		/* list_lru_one.lock: a qspinlock */
 
 #include "dcache.h"
 #include "dcache_txn_stats.h"
@@ -272,12 +273,15 @@ struct dentry {
 #define DC_LRU_NODES	64		/* >= nr_node_ids anywhere we run */
 
 struct dc_lru_one {			/* struct list_lru_one */
-	unsigned long lock;		/* spinlock_t: "protects all fields above" */
+	/* spinlock_t: "protects all fields above".  4 bytes; the hole after
+	 * it keeps the 8-byte slot the pad below counts. */
+	struct dc_qspinlock lock;
 	struct dentry *head;		/* oldest -- the shrinker's end */
 	struct dentry *tail;		/* newest -- the add end */
 	unsigned long nr_items;
 	char pad[64 - (2 * sizeof(unsigned long) + 2 * sizeof(void *)) % 64];
 };
+_Static_assert(sizeof(struct dc_lru_one) == 64, "one shard per cache line");
 
 /*
  * Field placement follows the kernel's, because it decides what a rename costs
@@ -437,8 +441,8 @@ static inline void bl_set_first_rcu(struct dc_bucket *b, struct dc_hnode *n)
 
 /*
  * Bit spinlock on bit 0 of the head word (the kernel's bit_spin_lock(0, &first)).
- * The atomic fetch_or/fetch_and touch the whole word but only ever flip bit 0;
- * the holder's chain stores (bl_set_first_rcu, hlist_del_rcu's *pprev) preserve
+ * The lock's fetch_or touches the whole word but only ever sets bit 0; the
+ * holder's chain stores (bl_set_first_rcu, hlist_del_rcu's *pprev) preserve
  * that bit by value, so lock and data never clobber each other.
  *
  * Test-and-TEST-and-set, as bit_spin_lock is: one test_and_set_bit, then wait
@@ -458,11 +462,20 @@ static inline void bl_lock(struct dc_bucket *b)
 		} while (__atomic_load_n(p, __ATOMIC_RELAXED) & DC_BL_LOCK);
 }
 
+/*
+ * The kernel's hlist_bl_unlock -> __bit_spin_unlock -> __clear_bit_unlock: a
+ * NON-atomic clear with release ordering (x86: btr, no lock prefix), not an
+ * atomic RMW.  Only the holder writes this word while bit 0 is set -- a
+ * contender's fetch_or sets a bit already set, so it changes nothing -- hence a
+ * plain load and a release store lose no update and skip the locked RMW (an
+ * atomic fetch_and until 2026-10-02).
+ */
 static inline void bl_unlock(struct dc_bucket *b)
 {
 	uintptr_t *p = (uintptr_t *) &b->first;
 
-	__atomic_fetch_and(p, ~DC_BL_LOCK, __ATOMIC_RELEASE);
+	__atomic_store_n(p, __atomic_load_n(p, __ATOMIC_RELAXED) & ~DC_BL_LOCK,
+			 __ATOMIC_RELEASE);
 }
 
 /* ---- RCU hlist (writer side runs under the bucket's bit lock) ----------- */
@@ -520,30 +533,17 @@ static void dc_test_retain_delay(void)
 #ifndef DC_NO_LRU
 
 /*
- * list_lru_one.lock -- a plain spinlock, as in the kernel.
- *
- * Test-and-TEST-and-set: one cmpxchg, then wait with plain loads until the word
- * reads free.  The kernel's spinlock_t (a qspinlock) never RMWs the lock word
- * while it waits either; a waiter that cmpxchg'd on every spin (what this was
- * until 2026-09-30) stole the line from the holder on every iteration.  Not a
- * FIFO lock like the qspinlock: a queued lock hands the lock to a waiter that
- * may be descheduled, and the kernel prevents that by disabling preemption
- * while spinning -- this harness cannot, and co-pins each writer's call_rcu
- * worker (which takes this lock on the fold and free paths) on its writer's
- * CPU, so a FIFO handoff would convoy behind it for a timeslice.
+ * list_lru_one.lock -- a spinlock_t, as in the kernel: the queued spinlock of
+ * dcache_qspinlock.h, the same lock every engine's shard uses.
  */
 static inline void lru_lock(struct dc_lru_one *l)
 {
-	while (uatomic_cmpxchg(&l->lock, 0UL, 1UL) != 0UL)
-		do {
-			caa_cpu_relax();
-		} while (uatomic_load(&l->lock, CMM_RELAXED) != 0UL);
-	cmm_smp_mb();
+	dc_qspin_lock(&l->lock);
 }
 
 static inline void lru_unlock(struct dc_lru_one *l)
 {
-	uatomic_store(&l->lock, 0UL, CMM_RELEASE);
+	dc_qspin_unlock(&l->lock);
 }
 
 /*

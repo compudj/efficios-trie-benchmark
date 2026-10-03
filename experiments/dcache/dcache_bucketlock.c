@@ -502,10 +502,21 @@ static inline void bl_lock(struct urcu_txn_sw_hlist_head *h)
 		} while (__atomic_load_n(p, __ATOMIC_RELAXED) & DC_BL_LOCK);
 }
 
+/*
+ * Release as the kernel's __bit_spin_unlock does: a NON-atomic clear with
+ * release ordering (x86: btr, no lock prefix), not an atomic RMW.  Only the
+ * holder writes the word while the bit is set -- a contender's fetch_or sets a
+ * bit already set and changes nothing, and every transacted store to a head
+ * slot (install, settle) runs under the lock and keeps the bit by value -- so
+ * a plain load and a release store lose no update and skip the locked RMW (an
+ * atomic fetch_and until 2026-10-02).
+ */
 static inline void bl_unlock(struct urcu_txn_sw_hlist_head *h)
 {
-	__atomic_fetch_and((uintptr_t *) &h->first, ~DC_BL_LOCK,
-			   __ATOMIC_RELEASE);
+	uintptr_t *p = (uintptr_t *) &h->first;
+
+	__atomic_store_n(p, __atomic_load_n(p, __ATOMIC_RELAXED) & ~DC_BL_LOCK,
+			 __ATOMIC_RELEASE);
 }
 
 /* Two-head acquire/release in ADDRESS ORDER (deadlock-free) for rename/exchange

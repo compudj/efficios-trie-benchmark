@@ -223,6 +223,8 @@
 #define DC_TP_COMMIT(n, a, b, op, st)			do { } while (0)
 #endif
 
+#include "dcache_qspinlock.h"	/* the lock arm's shard lock */
+
 struct dc_lru_shard {
 #ifdef DC_LRU_MCAS
 	/*
@@ -247,7 +249,9 @@ struct dc_lru_shard {
 	struct urcu_txn_deque deque;
 	char pad[64 - sizeof(struct urcu_txn_deque) % 64];
 #else
-	unsigned long lock;		/* test-and-set; see fold_lock */
+	struct dc_qspinlock lock;	/* see lru_lock(); 4 bytes, the hole
+					 * after it keeps the 8-byte slot the
+					 * pad below counts */
 	struct dentry *head;		/* oldest -- the shrinker's end */
 	struct dentry *tail;		/* newest -- the enqueue end */
 	unsigned long count;
@@ -255,6 +259,8 @@ struct dc_lru_shard {
 	char pad[64 - (2 * sizeof(unsigned long) + 2 * sizeof(void *)) % 64];
 #endif
 };
+_Static_assert(sizeof(struct dc_lru_shard) % 64 == 0,
+	       "shards on their own lines");
 
 
 /*
@@ -1090,30 +1096,18 @@ long dc_lru_check(struct dcache *dc) { (void) dc; return 0; }
 /* ---- PHASE 3: the sharded LRU ------------------------------------------- */
 
 /*
- * The shard's spinlock (the kernel's list_lru_one.lock).
- *
- * Test-and-TEST-and-set: one cmpxchg, then wait with plain loads until the word
- * reads free.  The kernel's spinlock_t (a qspinlock) never RMWs the lock word
- * while it waits either; a waiter that cmpxchg'd on every spin (what this was
- * until 2026-09-30) stole the line from the holder on every iteration.  Not a
- * FIFO lock like the qspinlock: a queued lock hands the lock to a waiter that
- * may be descheduled, and the kernel prevents that by disabling preemption
- * while spinning -- this harness cannot, and co-pins each writer's call_rcu
- * worker (which takes this lock on the fold and free paths) on its writer's
- * CPU, so a FIFO handoff would convoy behind it for a timeslice.
+ * The shard's spinlock (the kernel's list_lru_one.lock, a spinlock_t): the
+ * queued spinlock of dcache_qspinlock.h, the same lock the seqlock baseline's
+ * shards use.
  */
 static inline void lru_lock(struct dc_lru_shard *sh)
 {
-	while (uatomic_cmpxchg(&sh->lock, 0UL, 1UL) != 0UL)
-		do {
-			caa_cpu_relax();
-		} while (uatomic_load(&sh->lock, CMM_RELAXED) != 0UL);
-	cmm_smp_mb();
+	dc_qspin_lock(&sh->lock);
 }
 
 static inline void lru_unlock(struct dc_lru_shard *sh)
 {
-	uatomic_store(&sh->lock, 0UL, CMM_RELEASE);
+	dc_qspin_unlock(&sh->lock);
 }
 
 /*
