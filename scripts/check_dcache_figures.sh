@@ -33,6 +33,7 @@ declare -A INPUTS=(
 	[dcache_sat]="dcache_sweep"
 	[dcache_height]="dcache_height"
 	[dcache_churn]="dcache_churn"
+	[dcache_churn_share]="dcache_churn"
 	[dcache_churn_scaling]="dcache_churn_scaling"
 	[dcache_namewidth]="dcache_namewidth"
 	[dcache_optaxonomy]="dcache_optaxonomy"

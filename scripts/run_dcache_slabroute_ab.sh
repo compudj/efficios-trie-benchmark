@@ -125,7 +125,9 @@ cc -O2 $ri -o "$WORK/rseqchk" "$WORK/rseqchk.c" $rl -Wl,-rpath,${rl#-L} -lrseq |
 [[ "$("$WORK/rseqchk")" == rseq-active ]] || die "rseq runtime: $("$WORK/rseqchk")"
 
 field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< "$1"; }
-churn_args() { echo "--readers 0 --writers $1 --ndirs $((16 * $1)) --slots 32 --nbuckets 1048576"; }
+# private directories (bench --share 1): --ndirs 16xW, used until 2026-10-02,
+# paired writer i with i+W/2 -- on another NUMA node from 16 writers on.
+churn_args() { echo "--readers 0 --writers $1 --share 1 --slots 32 --nbuckets 1048576"; }
 
 # batch routes must retire in batches: counted, untimed, 4 writers, txn-mark
 for rt in $ROUTES; do

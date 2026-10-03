@@ -28,7 +28,7 @@ mkdir -p "$LOGDIR"
 # where the engines still differ in ways we act on, so its numbers come first
 # and an interrupted run still leaves them complete.
 declare -a CHURN_SWEEPS=(
-	"run_dcache_churn.sh:plot_dcache_churn.py"
+	"run_dcache_churn.sh:plot_dcache_churn.py plot_dcache_churn_share.py"
 	"run_dcache_churn_scaling.sh:plot_dcache_churn_scaling.py"
 )
 declare -a OTHER_SWEEPS=(

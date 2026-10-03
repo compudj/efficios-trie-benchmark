@@ -1,35 +1,27 @@
 #!/usr/bin/env python3
 """Plot scripts/dcache_churn_scaling.csv -> figures/dcache_churn_scaling.png.
 
-Insert/remove WRITER scaling to 192.  The seqlock baseline's write path is now
-kernel-faithful and FINE-GRAINED -- a per-bucket hlist_bl bit lock (bit 0 of the
-bucket head word) plus the per-directory rwsem, exactly the kernel's add/unlink
-locking, NOT one global mutator lock.  So add/unlink in different dirs and buckets
-proceed in parallel, and this figure measures the write path, not a serialization
-artifact.  (Renames still take rename_lock + a cross-dir s_vfs_rename_mutex, as
-the kernel does -- but churn is add/unlink, which take neither.)
+Insert/remove WRITER scaling to 192, on the ALLOCATING path (dc_unlink + dc_add
+per toggle).  The seqlock baseline's write path is kernel-faithful and
+FINE-GRAINED -- a per-bucket hlist_bl bit lock (bit 0 of the bucket head word)
+plus the per-directory rwsem, exactly the kernel's add/unlink locking, NOT one
+global mutator lock -- so this figure measures the write path, not a
+serialization artifact.  Every engine's LRU shard lock is the same queued
+spinlock (dcache_qspinlock.h), as the kernel's list_lru_one.lock is.
 
-Two stacked bottlenecks the naive fixed-ndirs glibc run hides are removed:
-default jemalloc for the allocator, and ndirs scaled WITH the writer count for
-the shared child-hlist HEADS.  Linear axes.
+The axis is WHO SHARES A DIRECTORY (column `share`, bench --share).  Each writer
+toggles 32 slots spread over 32 directories, one slot each:
+  private     nobody else uses them
+  same-node   one other writer, on the same NUMA node
+  cross-node  one other writer, on another node (8-core nodes, one per CCX)
+  all         every writer uses the same 32
+Until 2026-10-02 this axis was ndirs = writers/16, writers, 16*writers through
+the bench's modulo mapping, which made the sharers -- and whether they were on
+one node or several -- a side effect of the writer count.
 
-Left panel: one engine (the seqlock baseline) across three ndirs -- how much
-decontention buys (matched ndirs=writers is child-hlist-head bound; 16*writers
-lifts it ~6x at the top).  Right panel: the widest ndirs (16*writers), every engine -- who scales, on the
-ALLOCATING path (dc_unlink + dc_add per toggle).  Churn is BUMP-FREE (add never
-bumped; unlink no longer does), so the three txn arms are indistinguishable.
-The seqlock baseline leads here.
-
-Read that as a statement about the allocating path, not about create/delete in
-general.  Profiled 2026-09-29, this path spends 39-57% of its cycles on the
-per-NUMA-node LRU shard lock (one list per node, as the kernel's list_lru; 24
-nodes on this machine), which every engine takes on each add and unlink.  The
-MW txn engines additionally pay a descriptor per commit: batch retirement
-(URCU_TXN_SLAB_BATCH, figures/dcache_slabroute.png) recovers part of that at
-1-4 writers and nothing from 8 up.  On the path a kernel takes when a name is
-removed and created again -- d_delete to a negative, then d_instantiate, no
-allocation and no LRU operation -- the order reverses: every txn arm and the
-bucket lock beat seqlock, by up to 2.4x (dcache_churn.png, top row).
+Left panel: one engine (the seqlock baseline) across the four arms -- what
+sharing costs.  Right panel: private directories, every engine -- who scales.
+Default jemalloc, linear axes.
 
 Env: ENGINES / OUT overrides as usual.
 """
@@ -41,7 +33,7 @@ import dcache_plotlib as dp
 from matplotlib.ticker import FixedLocator, FixedFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CSV = os.path.join(HERE, "dcache_churn_scaling.csv")
+CSV = os.environ.get("CSV", os.path.join(HERE, "dcache_churn_scaling.csv"))
 OUT = os.environ.get("OUT",
                      os.path.join(HERE, os.pardir, "figures",
                                   "dcache_churn_scaling.png"))
@@ -49,8 +41,7 @@ OUT = os.environ.get("OUT",
 rows = [r for r in csv.DictReader(open(CSV)) if r["conserved"] == "OK"]
 d = collections.defaultdict(dict)
 for r in rows:
-    d[(r["dirmul"], int(r["writers"]))][r["engine"]] = float(r["mchurn_s"])
-Ws = sorted({int(r["writers"]) for r in rows})
+    d[(r["share"], int(r["writers"]))][r["engine"]] = float(r["mchurn_s"])
 
 COLOR = {"seqlock": "#D55E00", "txn-global": "#0072B2",
          "txn-pernode": "#009E73", "txn-mark": "#CC79A7", "bucketlock": "#000000"}
@@ -61,11 +52,20 @@ ELAB = {"seqlock": "seqlock (kernel baseline)",
         "txn-pernode": "txn — PER-NODE host gen",
         "txn-mark": "txn — deletion MARK",
         "bucketlock": "bucket lock + SW txn"}
-DCOL = {"writers/16": "#CC79A7", "writers": "#E69F00", "16*writers": "#009E73"}
-DMARK = {"writers/16": "v", "writers": "o", "16*writers": "D"}
-DLAB = {"writers/16": "ndirs = writers ÷ 16", "writers": "ndirs = writers",
-        "16*writers": "ndirs = 16×writers"}
+SHARES = ("private", "same-node", "cross-node", "all")
+DCOL = {"private": "#009E73", "same-node": "#56B4E9", "cross-node": "#E69F00",
+        "all": "#CC79A7"}
+DMARK = {"private": "D", "same-node": "o", "cross-node": "^", "all": "v"}
+DLAB = {"private": "private — each writer's own 32 directories",
+        "same-node": "shared by a pair on ONE node",
+        "cross-node": "shared by a pair on TWO nodes",
+        "all": "all writers share the same 32"}
 DECON_ENGINE = "seqlock"
+
+
+def pts(share, eng):
+    ws = sorted(w for (sh, w), v in d.items() if sh == share and eng in v)
+    return ws, [d[(share, w)][eng] for w in ws]
 
 
 def linx(ax):
@@ -78,15 +78,15 @@ def linx(ax):
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7.6))
 
-for dm in ("writers/16", "writers", "16*writers"):
-    ys = [d[(dm, w)][DECON_ENGINE] for w in Ws]
-    ax1.plot(Ws, ys, color=DCOL[dm], marker=DMARK[dm], lw=2.2, ms=6.5,
-             label=DLAB[dm])
+for sh in SHARES:
+    ws, ys = pts(sh, DECON_ENGINE)
+    if ws:
+        ax1.plot(ws, ys, color=DCOL[sh], marker=DMARK[sh], lw=2.2, ms=6.5,
+                 label=DLAB[sh])
 linx(ax1)
-ax1.set_title("Directory decontention unlocks the write path (seqlock)\n"
-              "insert+remove Mops/s vs writers, at three directory counts\n"
-              "each writer toggles 32 slots; the shared child-hlist HEADS are\n"
-              "the contention removed as ndirs grows past the writer count",
+ax1.set_title("What sharing a directory costs (seqlock)\n"
+              "insert+remove Mops/s vs writers, by who shares each writer's\n"
+              "32 directories (child-list heads, directory locks)",
               fontsize=9.5)
 ax1.set_xlabel("writer threads")
 ax1.set_ylabel("insert+remove Mops/s   (higher is better)")
@@ -94,14 +94,14 @@ ax1.grid(alpha=0.3, ls=":")
 ax1.legend(fontsize=9, loc="upper left")
 
 for e in ("seqlock", "txn-mark", "bucketlock", "txn-pernode", "txn-global"):
-    ys = [d[("16*writers", w)][e] for w in Ws]
-    ax2.plot(Ws, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6.5,
-             label=ELAB[e])
+    ws, ys = pts("private", e)
+    if ws:
+        ax2.plot(ws, ys, color=COLOR[e], marker=MARK[e], lw=2.2, ms=6.5,
+                 label=ELAB[e])
 linx(ax2)
-ax2.set_title("Decontended (ndirs = 16×writers, jemalloc) — who scales\n"
-              "insert+remove Mops/s vs writers.  Churn is BUMP-FREE, so the\n"
-              "three txn arms coincide; the bit-lock baseline leads on this\n"
-              "ALLOCATING path, LRU-lock bound -- in place it reverses (strip: every engine\n"
+ax2.set_title("Private directories (jemalloc) — who scales\n"
+              "insert+remove Mops/s vs writers, ALLOCATING path.  Churn is\n"
+              "BUMP-FREE, so the three txn arms coincide (strip: every engine\n"
               "÷ seqlock; dashed = parity)", fontsize=9.5)
 ax2.set_xlabel("writer threads")
 ax2.set_ylabel("insert+remove Mops/s   (higher is better)")
@@ -109,7 +109,7 @@ ax2.grid(alpha=0.3, ls=":")
 ax2.legend(fontsize=9, loc="upper left")
 dp.ratio_strip(ax2, rows, "writers", "mchurn_s",
                ("seqlock", "txn-mark", "bucketlock", "txn-pernode", "txn-global"),
-               COLOR, MARK, dirmul="16*writers")
+               COLOR, MARK, share="private")
 
 fig.suptitle("Userspace dcache — INSERT/REMOVE writer scaling to 192 "
              "(default jemalloc, linear axes)   ·   2×96-core EPYC", fontsize=12)

@@ -20,6 +20,18 @@
 #                W.  Isolates what create/delete load does to the READ path,
 #                which is where a shared version counter shows up.
 #   churn_scale  8 churn writers fixed, sweep the reader count.
+#   churn_share  WRITERS ONLY again, but each directory shared by a PAIR of
+#                writers: on one NUMA node (dirs=same-node), then on two
+#                (dirs=cross-node).  Plotted against churn_w's private dirs
+#                (scripts/plot_dcache_churn_share.py).
+#
+# DIRECTORY SHARING is a stated axis (column `dirs`), never a side effect.  Each
+# writer spreads its 32 slots over 32 directories; the first three panels give
+# every writer its OWN (dirs=private, bench --share 1).  Until 2026-10-02 they ran
+# --ndirs 16xW instead, which paired writer i with writer i+W/2 -- same node up
+# to 8 writers, another node from 16 on -- and cross-node sharing alone moved
+# the allocating ratios ~6%.  Each run's `share:` line (the bench classifies every
+# directory from the pinned CPUs' nodes) is checked against the intended `dirs`.
 #
 # NOTE the binaries are built -DDC_SPLIT_KEEPID (a re-added dentry is a new
 # allocation, so the harness's id checks need logical ids).  Reader rates here
@@ -71,9 +83,12 @@ else
   echo ">> hwloc-calc unavailable; unpinned" >&2
 fi
 
-# ndirs is decontended per-run (16 x writers); jemalloc removes the
-# allocator ceiling.  This is the corrected methodology (see
-# run_dcache_churn_scaling.sh / dcache_optype.png for why).
+# Directories come from --share (see DIRECTORY SHARING above); jemalloc removes
+# the allocator ceiling (see run_dcache_churn_scaling.sh / dcache_optype.png).
+# CPN = cores per NUMA node in that CPU list's order: a stride of CPN puts the
+# two writers of a cross-node pair on different nodes.
+CPN=$(hwloc-calc --number-of core node:0 2>/dev/null)
+[[ "$CPN" =~ ^[0-9]+$ && "$CPN" -gt 0 ]] || CPN=8
 COMMON="--slots $SLOTS --nbuckets 1048576 --duration $DUR $PIN"
 [[ -f "$JE" ]] || { echo "jemalloc not at $JE"; exit 1; }
 
@@ -99,7 +114,7 @@ field() { awk -v L="$2" '{for(i=1;i<=NF;i++) if($i==L){print $(i+1);exit}}' <<< 
 # RUNS) without disturbing the others.
 PANELS="${PANELS:-}"
 want() { [[ -z "$PANELS" || " $PANELS " == *" $1 "* ]]; }
-HDR="panel,mode,engine,readers,writers,rate_target,mchurn_s,mlookups_s,paced,conserved,src"
+HDR="panel,mode,dirs,engine,readers,writers,rate_target,mchurn_s,mlookups_s,paced,conserved,src"
 if [[ -z "$PANELS" ]]; then
   echo "$HDR" > "$CSV"
 else
@@ -112,6 +127,24 @@ else
   for p in $PANELS; do grep -v "^$p," "$CSV" > "$CSV.tmp" && mv "$CSV.tmp" "$CSV"; done
 fi
 
+# DIRS (set per panel): which writers share a directory -> bench --share args.
+DIRS=private
+share_args() {
+  case "$DIRS" in
+    private)    echo "--share 1" ;;
+    same-node)  echo "--share 2 --share-stride 1" ;;
+    cross-node) echo "--share 2 --share-stride $CPN" ;;
+  esac
+}
+# Did the bench get the geometry DIRS asked for?  Every directory must be in
+# the DIRS class of its `share:` line (e.g. cross-node=256 of dirs=256).
+share_ok() {
+  awk -v want="$DIRS" '/^share:/ { for (i = 2; i <= NF; i++) {
+        split($i, kv, "="); v[kv[1]] = kv[2] }
+      ok = (v["dirs"] > 0 && v[want] == v["dirs"]) }
+    END { exit !ok }' <<< "$1"
+}
+
 # run <panel> <engine> <readers> <writers> [rate] -> best-of-RUNS, appends a
 # CSV row.  [rate] (adds+unlinks/s, aggregate) paces the writers; omitted or 0
 # runs them flat out.  With no readers the writers ARE the measurement, so the
@@ -123,9 +156,13 @@ run() {
   [[ "$rate" != 0 ]] && pace="--churn-rate $rate"
   [[ "$MODE" == inplace ]] && how="--in-place"
   for r in $(seq 1 $RUNS); do
-    local nd=$(( 16 * (w < 1 ? 1 : w) ))
     out=$(cd "$BIN" && env LD_PRELOAD="$JE" ./"$(basename "$bin")" \
-          --readers "$rd" --writers "$w" --ndirs "$nd" $how $pace $COMMON 2>/dev/null)
+          --readers "$rd" --writers "$w" $(share_args) $how $pace $COMMON 2>/dev/null)
+    if ! share_ok "$out"; then
+      cons=SHARE
+      echo "!! $panel/$MODE/$eng w=$w: not $DIRS: $(grep '^share:' <<< "$out")" >&2
+      continue
+    fi
     if ! grep -q "conservation: OK" <<< "$out"; then
       cons=FAIL
       echo "!! $panel/$MODE/$eng rd=$rd w=$w rate=$rate CHURN INVARIANT FAILED" >&2
@@ -137,9 +174,9 @@ run() {
   done
   read -r key best_ch best_lk paced < <(pick_run "$rate" <<< "$runs")
   [[ "$paced" == "" ]] && { paced=$best_lk; best_lk=0; }	# no conserved run
-  echo "$panel,$MODE,$eng,$rd,$w,$rate,$best_ch,$best_lk,$paced,$cons,$SRC_ID" >> "$CSV"
-  printf "  %-12s %-8s %-11s rd=%-4s w=%-3s rate=%-7s churn=%8s Mops/s  rd=%8s Mlk/s  %-5s %s\n" \
-    "$panel" "$MODE" "$eng" "$rd" "$w" "$rate" "$best_ch" "$best_lk" "$paced" "$cons" >&2
+  echo "$panel,$MODE,$DIRS,$eng,$rd,$w,$rate,$best_ch,$best_lk,$paced,$cons,$SRC_ID" >> "$CSV"
+  printf "  %-12s %-8s %-10s %-11s rd=%-4s w=%-3s rate=%-7s churn=%8s Mops/s  rd=%8s Mlk/s  %-5s %s\n" \
+    "$panel" "$MODE" "$DIRS" "$eng" "$rd" "$w" "$rate" "$best_ch" "$best_lk" "$paced" "$cons" >&2
 }
 
 # MODES (env): which toggle each panel runs.  inplace = the kernel's same-name
@@ -159,6 +196,18 @@ echo ">> churn_w panel: writers only, raw insert/remove scaling" >&2
 for w in $WPTS; do
   for e in $ENGINES; do run churn_w "$e" 0 "$w"; done
 done
+fi
+
+if want churn_share; then
+echo ">> churn_share panel: writers only, each directory shared by a pair of writers" >&2
+for DIRS in same-node cross-node; do
+  step=2; [[ $DIRS == cross-node ]] && step=$((2 * CPN))
+  for w in $WPTS; do
+    (( w % step == 0 )) || continue	# a pair needs both writers (on two nodes)
+    for e in $ENGINES; do run churn_share "$e" 0 "$w"; done
+  done
+done
+DIRS=private
 fi
 
 if want churn_rd; then

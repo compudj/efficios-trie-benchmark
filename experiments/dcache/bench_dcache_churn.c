@@ -61,6 +61,7 @@
  * real cold d_id, and is therefore exact in BOTH builds.
  *
  * Usage: bench_dcache_churn [--readers R] [--writers W] [--ndirs N]
+ *                           [--share K [--share-stride S]]
  *                           [--slots S] [--duration MS] [--warmup MS]
  *                           [--cpulist c0,c1,...]
  *                           [--prefix-depth D]
@@ -74,6 +75,7 @@
 #define _GNU_SOURCE
 #define _LGPL_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -146,6 +148,28 @@ static int nwriters = 8;
 static double churn_rate = 0.0;
 static int ndirs = 16;
 static int slots = 32;			/* slots owned per writer */
+/*
+ * --share K [--share-stride S]: WHICH writers share a directory, stated rather
+ * than left to fall out of --ndirs.
+ *
+ * Every writer spreads its slots over `slots` directories, one slot each.
+ * Without --share, writer i's slot j goes in directory (i*slots + j) % ndirs,
+ * so how many writers share a directory, and WHICH ones, depends on ndirs, the
+ * writer count and the CPU list together.  That hid a confound for a long time:
+ * the sweeps ran ndirs = 16 x writers, which pairs writer i with writer i+W/2 --
+ * on the same NUMA node up to 8 writers, on ANOTHER node from 16 on (8-core
+ * nodes) -- and cross-node sharing alone moved the allocating-churn ratios by
+ * ~6% (2026-10-02).
+ *
+ * With --share, the writers form groups of K that share one set of `slots`
+ * directories (ndirs = slots * writers / K), and S picks the members: writers
+ * i, i+S, ..., i+(K-1)S.  K=1 is private; S=1 groups neighbours in the CPU list
+ * (one node, with an hwloc core order); S = cores per node puts every member on
+ * a different node.  The run prints what it actually got (see share_report()),
+ * classified from the pinned CPUs' nodes, so a script can verify it.
+ */
+static int share_k = 0;			/* 0: the --ndirs modulo mapping */
+static int share_stride = 1;
 static long duration_ms = 1000;
 static long warmup_ms = WARMUP_MS_DEFAULT;	/* untimed, before it */
 static int prefix_depth = 2;
@@ -259,6 +283,38 @@ static void pin_thread(int idx)
 
 	if (c >= 0)
 		pin_cpu(c);
+}
+
+/* Which directory set writer @i uses under --share (see share_k). */
+static int writer_dir_set(int i)
+{
+	int blk = share_k * share_stride;
+
+	return (i / blk) * share_stride + i % share_stride;
+}
+
+/* The NUMA node of @cpu, from sysfs; -1 when unknown (or unpinned). */
+static int cpu_node(int cpu)
+{
+	char path[64];
+	struct dirent *e;
+	int node = -1;
+	DIR *d;
+
+	if (cpu < 0)
+		return -1;
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", cpu);
+	d = opendir(path);
+	if (!d)
+		return -1;
+	while ((e = readdir(d)))
+		if (!strncmp(e->d_name, "node", 4) &&
+		    e->d_name[4] >= '0' && e->d_name[4] <= '9') {
+			node = atoi(e->d_name + 4);
+			break;
+		}
+	closedir(d);
+	return node;
 }
 
 /* /p0/../d{dir}/S{gid} */
@@ -854,10 +910,61 @@ static void build_tree(void)
 	}
 }
 
+/*
+ * Print who shares each churned directory, from the actual mapping and the
+ * writers' pinned CPUs: "private" (one writer), "same-node" (several, all on
+ * one NUMA node), "cross-node" (writers on two or more nodes).  Counts are of
+ * directories; a script asserts on them rather than trusting its arithmetic.
+ */
+static void share_report(const struct warg *wa)
+{
+	int *nw = calloc(ndirs, sizeof(int)), *last = malloc(ndirs * sizeof(int));
+	int *node0 = malloc(ndirs * sizeof(int)), *cross = calloc(ndirs, sizeof(int));
+	int i, j, maxw = 0, priv = 0, same = 0, xnode = 0, unused = 0, unknown = 0;
+
+	for (i = 0; i < ndirs; i++)
+		last[i] = -1;
+	for (i = 0; i < nwriters; i++) {
+		int node = cpu_node(thread_cpu(i));
+
+		if (node < 0)
+			unknown = 1;
+		for (j = 0; j < slots; j++) {
+			int d = wa[i].dir[j];
+
+			if (last[d] == i)
+				continue;	/* this writer already counted here */
+			last[d] = i;
+			if (nw[d]++ == 0)
+				node0[d] = node;
+			else if (node != node0[d])
+				cross[d] = 1;
+		}
+	}
+	for (i = 0; i < ndirs; i++) {
+		if (nw[i] > maxw)
+			maxw = nw[i];
+		if (nw[i] == 0)
+			unused++;
+		else if (nw[i] == 1)
+			priv++;
+		else if (cross[i])
+			xnode++;
+		else
+			same++;
+	}
+	printf("share: writers/dir=%d dirs=%d private=%d same-node=%d "
+	       "cross-node=%d unused=%d%s  (%s)\n", maxw, ndirs, priv, same, xnode,
+	       unused, unknown ? " [nodes unknown: unpinned]" : "",
+	       share_k ? "--share" : "--ndirs modulo");
+	free(nw); free(last); free(node0); free(cross);
+}
+
 static void usage(const char *p)
 {
 	fprintf(stderr,
 	    "usage: %s [--readers R] [--writers W] [--ndirs N] [--slots S]\n"
+	    "          [--share K [--share-stride S]]\n"
 	    "          [--duration MS] [--warmup MS] [--prefix-depth D] [--nbuckets N]\n"
 	    "          [--cpulist c0,c1,...] [--churn-rate R]\n"
 	    "  writers TOGGLE their own slots (present -> unlink, absent -> add);\n"
@@ -866,7 +973,11 @@ static void usage(const char *p)
 	    "                    d_delete to negative + d_instantiate) instead of\n"
 	    "                    dc_unlink / dc_add: no allocation, no LRU traffic.\n"
 	    "  --churn-rate R => pace the writers to R adds+unlinks/s in aggregate\n"
-	    "                    (\"250k\", \"1M\"); default flat out.\n", p);
+	    "                    (\"250k\", \"1M\"); default flat out.\n"
+	    "  --share K      => groups of K writers share one set of S directories\n"
+	    "                    (overrides --ndirs); --share-stride S picks writers\n"
+	    "                    i, i+S, ... (1 = neighbours, cores/node = one per\n"
+	    "                    node).  Without it: dir = (writer*S + j) %% ndirs.\n", p);
 	exit(2);
 }
 
@@ -915,6 +1026,8 @@ int main(int argc, char **argv)
 			}
 		}
 		else if (!strcmp(argv[i], "--ndirs"))         ndirs = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--share"))         share_k = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--share-stride"))  share_stride = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--slots"))         slots = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--duration"))      duration_ms = atol(argv[++i]);
 		else if (!strcmp(argv[i], "--warmup"))        warmup_ms = atol(argv[++i]);
@@ -939,8 +1052,17 @@ int main(int argc, char **argv)
 		else usage(argv[0]);
 	}
 	if (nwriters < 1 || slots < 1 || ndirs < 1 || prefix_depth < 1 ||
-	    prefix_depth > 8 || nreaders < 0)
+	    prefix_depth > 8 || nreaders < 0 || share_k < 0 || share_stride < 1)
 		usage(argv[0]);
+	if (share_k) {
+		if (nwriters % (share_k * share_stride)) {
+			fprintf(stderr, "--share %d --share-stride %d: the writer "
+				"count (%d) must be a multiple of %d\n", share_k,
+				share_stride, nwriters, share_k * share_stride);
+			return 2;
+		}
+		ndirs = slots * (nwriters / share_k);	/* overrides --ndirs */
+	}
 	total_slots = nwriters * slots;
 
 	/* Setup memory lives on the first worker's node, from exec on (see
@@ -979,7 +1101,8 @@ int main(int argc, char **argv)
 		for (j = 0; j < slots; j++) {
 			struct dc_path p;
 
-			wa[i].dir[j] = (wa[i].base + j) % ndirs;
+			wa[i].dir[j] = share_k ? writer_dir_set(i) * slots + j
+					       : (wa[i].base + j) % ndirs;
 			mk_slot_path(&p, wa[i].dir[j], wa[i].base + j);
 			if ((j & 1) == 0) {		/* starts absent */
 				/* in place, an absent name is a cached negative,
@@ -998,6 +1121,7 @@ int main(int argc, char **argv)
 			wa[i].present[j] = 1;
 		}
 	}
+	share_report(wa);
 	for (i = 0; i < nreaders; i++) {
 		ra[i].idx = nwriters + i;
 		ra[i].seed = 0xdeadbeefULL ^ ((uint64_t) (i + 1) * 0x2545F4914F6CDD1DULL);
