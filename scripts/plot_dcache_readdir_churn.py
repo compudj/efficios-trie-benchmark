@@ -16,13 +16,14 @@ wins, listing starves) -- the shaded band between them -- and the VENDORED Linux
 kernel rw_semaphore, the lock the kernel actually uses for inode->i_rwsem and
 the seqlock baseline's default everywhere else.
 
-Measured 2026-09-30: the kernel rwsem lands INSIDE the band for churn under
-listing, but BELOW BOTH glibc biases for listing under paced churn from 8
+Measured 2026-10-02: the kernel rwsem lands INSIDE the band for churn under
+listing, but BELOW BOTH glibc biases for listing under paced churn from 2
 writers up (listing readers queue behind the writers; its absolute height also
 carries the userspace port's overhead, a naive wait_lock + futex).  The txn /
 bucket-lock engines take no per-dir lock at all (lock-free RCU readdir + a
-bit-lock add/unlink splice), so they escape the trade-off: listing 3.3-13x the
-kernel rwsem, churn at 184 listers 3.22 against its 0.40 Mops/s.
+bit-lock add/unlink splice), so they escape the trade-off: listing 4.8-12.4x
+the kernel rwsem under paced churn, and churn at 184 listers 2.07 (bucket
+lock) and 1.24 (txn-mark) against its 0.42 Mops/s.
 
 Data: scripts/dcache_readdir_churn.csv (best-of-5, conservation-gated).  Linear
 axes.  2x96-core EPYC.

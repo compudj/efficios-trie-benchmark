@@ -17,9 +17,9 @@ IS the version (the structural edit is the signal) -- so they neither skip nor
 fire a bump.  seqlock bumps d_seq regardless of type (kernel-faithful: no
 file/dir distinction), so its two panels match.  Linear axes.
 
-Measured 2026-09-30 at 100k renames/s (÷ seqlock, 8-184 readers): file ops --
-every txn arm 1.09-1.26x, global included; directory ops -- per-node, mark and
-bucket lock 1.00-1.23x, global only 1.03-1.08x.  The global arm's file/dir drop
+Measured 2026-10-02 at 100k renames/s (÷ seqlock, 8-184 readers): file ops --
+every txn arm 1.04-1.20x, global included; directory ops -- per-node, mark and
+bucket lock 1.07-1.20x, global only 1.01-1.13x.  The global arm's file/dir drop
 is real but MILD at a matched load: the "collapse" earlier versions of this
 figure showed came from flat-out writers renaming several times faster under
 the txn arms than under seqlock.

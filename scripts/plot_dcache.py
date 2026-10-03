@@ -20,6 +20,16 @@ writers gets its readers measured on a quieter machine; that comparison lives
 in plot_dcache_sat.py, labelled as such.  Hollow markers: the writers could not
 sustain the offered rate (see dcache_plotlib).
 
+The homogeneous-mix panel is the one place many renaming threads span NUMA
+nodes (48 threads, 6 nodes).  There the queued LRU shard lock -- the kernel's
+spinlock_t, dcache_qspinlock.h -- costs the txn and bucket-lock engines'
+renames 7-14% at a 10% rename fraction and 25-34% at 50%, against a TTAS lock
+(2026-10-02 A/B).  Part of it is a harness convoy: their shell folds run in
+call_rcu callbacks on a worker co-pinned with its writer, which can preempt
+the writer while it is queued; the kernel's BH-disabled locking rules that
+out.  The rest is FIFO handoffs crossing nodes.  Every other rename panel runs
+8 writers on one node and is within 5% of TTAS.
+
 Data: scripts/dcache_sweep.csv (best-of-N, one run's numbers per row,
 conservation-gated).  2x96 EPYC.
 """
@@ -160,7 +170,10 @@ if ax1.has_data():
 ax1.set_title("Homogeneous mix (48 threads) — lookup Mops/s vs rename fraction\n"
               "every thread both renames and looks up, unpaced: the curve is\n"
               "WRITER-bound (a rename costs ~50 lookups) -- a mixed-workload\n"
-              "throughput, not a reader-path comparison", fontsize=9.5)
+              "throughput, not a reader-path comparison.  ⚠ 6 nodes renaming at\n"
+              "once: the queued LRU shard lock (the kernel's) costs txn and\n"
+              "bucket-lock renames 7-14% at 10%, 25-34% at 50% vs TTAS, part of\n"
+              "it a harness convoy (dcache_qspinlock.h)", fontsize=9.5)
 ax1.set_xlabel("rename fraction   (leftmost = 0)")
 ax1.set_ylabel("lookup Mops/s   (higher is better)")
 

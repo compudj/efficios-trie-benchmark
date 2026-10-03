@@ -28,6 +28,7 @@ nothing, not from an engine that was slow.
 | `dcache_bucketlock.c` | per-bucket lock + SW txn |
 | `krwsem/` | vendored Linux `rw_semaphore` (GPL-2.0): the seqlock baseline's default per-directory lock (`i_rwsem`) |
 | `dcache_node.h` | LRU shard axis: this CPU's NUMA node (rseq, else `getcpu()`) |
+| `dcache_qspinlock.h` | every engine's LRU shard lock: a port of the kernel's queued spinlock (`list_lru_one.lock` is a `spinlock_t`) |
 | `dcache_bench_rand.h` / `dcache_bench_pace.h` | the harnesses' PRNG (xorshift64* + multiply-shift) and writer pacer (`--rename-rate` / `--churn-rate`) |
 | `dcache_bench_setup.h` | the harnesses' setup placement: seeded namespace on the first worker's node (memory policy across a re-exec) |
 | `dcache_bench_run.h` | the harnesses' run phases: an untimed `--warmup` (200 ms) before the timed window |
@@ -38,7 +39,7 @@ nothing, not from an engine that was slow.
 | `repro_dcache.c` | deterministic 1-writer/1-walker repro of the walk-causality race (`make repro`) |
 | `stress_dcache*.c` | concurrent stress: namespace, cross-dir moves, exchange, shared renamers (`stress_dcache_shared.c`: several writers rename the same objects, so one entry's folds run concurrently), directory unlink vs adds under it (`stress_dcache_rmdir.c`, with must-fail mutation arms) (ASan/TSAN arms) |
 | `bench_dcache.c` | path-lookup bench: role-split readers/writers, `--op-mix`, conservation-gated |
-| `bench_dcache_churn.c` | add/unlink churn + `readdir`; `--readdir-names` builds a real per-dirent `qstr` |
+| `bench_dcache_churn.c` | add/unlink churn + `readdir`; `--readdir-names` builds a real per-dirent `qstr`; `--share K --share-stride S` states which writers share a directory, and each run prints how its directories split into private / same-node / cross-node |
 | `bench_dcache_height.c` | directory-op bench at a chosen subtree height (`--op`) |
 | `Makefile` | `make check` builds+runs; `ENGINE=` swaps engine; `check-*` are the gates |
 
@@ -124,7 +125,7 @@ seqlock engine degrades on *both* the reader path (global-retry storms) and the
 writer path (serialized renames), while the txn engine stays local and
 lock-free on both.
 
-## Results (re-swept 2026-10-01)
+## Results (re-swept 2026-10-02)
 
 Every `figures/dcache_*.png` comes from one sweep of the current code
 (provenance id in each CSV row's `src`; `scripts/check_dcache_figures.sh`
@@ -148,13 +149,19 @@ strip under its panel.
 - churn has a kernel-faithful **in-place** mode (`d_delete` to a negative +
   `d_instantiate`, no allocation, no LRU traffic) beside the allocating one;
 - the baseline's per-directory lock is the vendored kernel `rw_semaphore`;
-- every spinlock waits with plain loads, as the kernel's do: the bucket bit
-  locks test-and-test-and-set like `bit_spin_lock`, and the `spinlock_t`
-  analogs (LRU locks) likewise — not queued like
-  the qspinlock, because a FIFO handoff convoys behind a preempted waiter and
-  this harness co-pins each writer's `call_rcu` worker, which takes the LRU
-  lock, on its writer's CPU.  The old test-and-set spins RMW'd the lock word
-  every iteration;
+- the locks are the kernel's: the bucket bit locks test-and-test-and-set like
+  `bit_spin_lock` and release with a plain store like `__bit_spin_unlock`
+  (an atomic RMW until 2026-10-02), and every engine's LRU shard lock — the
+  kernel's `list_lru_one.lock`, a `spinlock_t` — is a port of the queued
+  spinlock (`dcache_qspinlock.h`).  It was test-and-test-and-set until
+  2026-10-02, which COLLAPSED as waiters grew: one shard ran 15.2 M
+  allocating toggles/s with 4 writers and 7.1 with 8.  The queued lock holds
+  ~11.5 from 4 to 8, but it has one cost the kernel's does not, below;
+- churn's directory sharing is a stated axis (`bench_dcache_churn --share`,
+  column `dirs`), checked against the bench's own classification of every
+  directory from the pinned CPUs' NUMA nodes.  The old `--ndirs 16×writers`
+  paired writer i with writer i+W/2 — on one node up to 8 writers, on two
+  from 16 — and cross-node sharing alone moved the allocating ratios ~6%;
 - the setup's memory lives on the benchmark's first node: a preferred-node
   memory policy set before a re-exec (the allocator's first chunks are faulted
   in before `main()`), reset before the workers start.  Left to the scheduler,
@@ -169,7 +176,18 @@ strip under its panel.
   small (every engine within ~3% between 0.25 s and 4 s windows) except in
   flat-out runs at high rename fractions.
 
-**The engines changed in this sweep: rename shells no longer chain.**  An
+**Changed in this sweep (2026-10-02).**  Besides the two locks above: the
+seqlock baseline's LRU and unlink had races the kernel's `d_lock`, victim
+`i_rwsem` and `S_DEAD` close — a walk could re-arm a dentry being killed, an
+add could link a child under a directory being unlinked (6726 children lost
+under `stress_dcache_rmdir`, which had never run on seqlock) — fixed with an
+LRU membership state word, the victim directory lock and an `IS_DEADDIR`
+check, at 1–8% of its allocating churn and gated by `make check-rmdir`; the
+bucket lock enqueues a new dentry on the LRU before publishing it, under the
+locks it publishes with; and liburcu (`c21f5a38`) retires txn descriptors in
+batches by default.
+
+**Changed in the previous sweep (2026-10-01): rename shells no longer chain.**  An
 entry is now its host plus at most one shell naming it (the host's `d_top`); a
 shell's fold either hands the name back to the host or, if a later rename
 demoted it or an unlink removed it, just frees it
@@ -185,7 +203,7 @@ land under a directory being unlinked (the kernel's `vfs_rmdir` locks the
 victim too) — ~5% of empty-directory churn against 32–64 concurrent listers,
 ~1% without.
 
-**And the bucket lock's hash-chain decode tests instead of masking.**  Every
+**And (2026-10-01) the bucket lock's hash-chain decode tests instead of masking.**  Every
 link of a bucket walk used to clear the lock and mark bits with two ANDs before
 the next load went through the pointer; it now tests them (they are almost
 never set) and uses the word as loaded, with an empty asm keeping GCC from
@@ -195,15 +213,15 @@ and under renames; writers unchanged.  The same test on `d_iparent`, whose tag
 bits are data, lost 11–15% under renames and was not kept.
 
 **Readers** (184 readers, 8 writers, `dcache_s3.png`): at a realistic 10k
-renames/s every arm is at parity (1.00–1.02×).  The localized arms (per-node,
-mark, bucket lock) pull ahead as the rename rate climbs — 1.17–1.21× at 100k/s,
-1.78–1.90× at 300k/s — and seqlock's writers cannot carry 1M/s at all.  At a
-fixed 100k/s the localized arms lead 1.05–1.20× from 8 readers up.
+renames/s every arm is at parity (1.00–1.03×).  The localized arms (per-node,
+mark, bucket lock) pull ahead as the rename rate climbs — 1.16–1.20× at 100k/s,
+1.72–1.83× at 300k/s — and seqlock's writers cannot carry 1M/s at all.  At a
+fixed 100k/s the localized arms lead 1.02–1.20× from 8 readers up.
 
 Where seqlock still LEADS is where every lookup lands on an object being
 renamed (`dcache_hit.png`): up to 32 readers txn-global is at parity
-(0.95–1.00×), txn-mark 0.87–0.93×, per-node 0.83–0.90× and the bucket lock
-0.83–0.89×.  A
+(0.96–0.99×), txn-mark 0.88–0.93×, per-node 0.83–0.90× and the bucket lock
+0.84–0.89×.  A
 rename shell that has not folded yet turns a hit into three cachelines instead
 of one (the shell, its host pointer, the host), and shells live ~5 ms (the
 `call_rcu` worker's batching; the grace period itself is ~20 µs), so at 100k
@@ -212,34 +230,36 @@ L1-capacity cost each reader pays privately; seqlock's in-place rename costs
 every reader a coherence miss instead, cheap with few readers and growing with
 them.  Per-node and the bucket lock also pay 10–15% at rest (per-hop generation
 sampling; per-hop pointer decoding).  Above 32 readers the arms sit at
-0.88–1.00×.  At 128–184 readers the bucket lock sits at 0.88–0.91×:
-readers holding a stale path miss on the name a rename just vacated and all
-cache a negative at once, on the bucket and child-list locks its renamers need
-(0.95× without negative caching).  With the old test-and-set spin that herd
-cost it 0.67–0.75× and pushed its writers below the offered rate.
+0.86–1.04×.  At 128–184 readers the bucket lock sits at 0.77–0.86× (its writers
+fall short of the offered rate at 160): readers holding a stale path miss on
+the name a rename just vacated and all cache a negative at once, on the bucket
+and child-list locks its renamers need (0.95× without negative caching).  It
+was 0.88–0.91× in the previous sweep, before the bit locks' release became a
+plain store; this region is noisy and the cause is not established.  With the
+old test-and-set spin the herd cost it 0.67–0.75×.
 
 The reverse walk (`dcache_dpath.png`): every txn arm now leads at every reader
-count — 1.10–1.45× at 2 readers, 1.61–2.09× at 16, 5.1–7.2× at 32–64 (from 48
+count — 1.12–1.46× at 2 readers, 1.65–2.14× at 16, 5.3–7.2× at 32–64 (from 48
 readers seqlock's reverse walks starve its own renamers).  Until the chain was
 retired seqlock led at 2–8 readers (0.63–0.75×): a txn reverse walk climbed one
 shell per unfolded rename of the object, 2–3 of them at 100k renames/s.
-readdir: txn 1.09–1.31× at 2–8 readers, 1.85–1.92× at 16 and 2.40–2.48× at 32;
+readdir: txn 1.08–1.27× at 2–8 readers, 1.82–1.89× at 16 and 2.25–2.35× at 32;
 beyond that seqlock's renamers cannot keep up (`dcache_readdir.png`).
-Directory exchanges at every height: lookups within 0.88–1.09× at 100k/s
+Directory exchanges at every height: lookups within 0.90–1.14× at 100k/s
 (`dcache_height.png`).
 
 **At rest** (`dcache_idle.png`: the same four reader panels with the writers
 idle, same namespace and placement, no rename in the timed window).  Probing
-lookups: every engine within 0.95–1.07× of seqlock, parity from 32 readers.
-Positive hits: txn-global 1.08–1.11×, txn-mark 0.97–1.01×, per-node 0.91–0.95×,
-the bucket lock 0.91–0.96× — so under renames txn-mark's hit gap is the shell
+lookups: every engine within 0.96–1.09× of seqlock, parity from 32 readers.
+Positive hits: txn-global 1.08–1.10×, txn-mark 0.97–1.00×, per-node 0.90–0.94×,
+the bucket lock 0.90–0.95× — so under renames txn-mark's hit gap is the shell
 (the trade above), while per-node pays its generation sampling at rest too.
 Most of the bucket lock's at-rest gap (it was 0.83–0.88×) was its hash-chain
 decode masking every link's pointer before the next load; it tests the bits
 instead since 2026-10-01 (above).  Reverse walk: every
-txn arm leads at every reader count, 1.10–1.56×, with nothing to defend
-against.  readdir: txn 1.24–1.26× at 2 readers, 2.2× at 16, 4–5.6× at
-128–184 — seqlock's readdir stops scaling at ~400 Mreaddir/s from 96 readers
+txn arm leads at every reader count, 1.12–1.56×, with nothing to defend
+against.  readdir: txn 1.24–1.26× at 2 readers, 2.1× at 16, 3.7–5.0× at
+128–184 — seqlock's readdir stops scaling at ~420–440 Mreaddir/s from 96 readers
 with no writer at all: its readers RMW the directory's rwsem count (as the
 kernel's `iterate_shared` takes `i_rwsem` shared), so the readdir wall of the
 loaded panel is the rwsem's read side, not the renames.
@@ -256,26 +276,54 @@ the readers one per CCD for more L3 does the opposite of helping: seqlock −35%
 lines, and spreading turns same-CCD transfers into cross-CCD ones.  The sweeps
 fix the home on the benchmark's own node, seqlock's favourable case.
 
-**Writers**: flat out, the bucket lock renames 4.0–22.0× the seqlock baseline
-(6.4–22.0× on leaf ops, 4.0–4.7× on directory ops) and txn-mark 2.2–4.7×
-(`dcache_optaxonomy.png`; exchanges at height 3.7–4.9× and 2.0–2.7×);
-txn-pernode reaches 20.5× on leaf exchanges, twice what it did with the chain.
+**Writers**: flat out, the bucket lock renames 4.1–21.5× the seqlock baseline
+(6.3–21.5× on leaf ops, 4.1–4.5× on directory ops) and txn-mark 2.6–5.5×
+(`dcache_optaxonomy.png`; exchanges at height 3.2–5.1× and 1.7–2.8×);
+txn-pernode reaches 20.1× on leaf exchanges.
 Part of that gap is the per-directory rwsem and cross-directory rename mutex the
 baseline takes (the kernel's `i_rwsem`, `s_vfs_rename_mutex`) and the txn
 designs do not need: their readdir is lock-free, so no writer has a reader to
 exclude — a legitimate improvement axis, not an accounting artifact.
 
-**Create/delete** (`dcache_churn.png`): in place — the kernel's path for a name
-removed and created again — txn-global/per-node 1.20–1.82×, bucket lock
-1.19–1.67×, txn-mark 0.96–1.36× the baseline, growing with writers; the rwsem
-is 74–79% of the bucket lock's lead at 16–48 writers (seqlock without it: 1.50×
-faster).  Allocating, the baseline leads (txn 0.55–0.86×, bucket lock
-0.74–0.98×): that path spends
-39–57% of its cycles on the per-node LRU lock, and the MW txn engines add a
-descriptor per commit, which batch retirement recovers only at 1–4 writers
-(`dcache_slabroute.png`).  Readers under churn: within ±10% in both modes.
+The queued shard lock's one cost the kernel does not pay: where many threads
+rename across NUMA nodes — only the homogeneous-mix panel of `dcache_s3.png`
+does that, 48 threads on 6 nodes — the txn and bucket-lock engines' renames
+run at 0.86–0.93× of a test-and-test-and-set lock's rate at a 10% rename
+fraction and 0.66–0.75× at 50% (2026-10-02 A/B on one build).  Part of it is a
+harness convoy: those engines fold shells in `call_rcu` callbacks, which
+delist them, on a worker co-pinned with its writer, so the worker can preempt
+its writer while the writer is queued; the kernel takes a lock that RCU
+callbacks also take with bottom halves disabled, which rules this out.  With
+the workers on the writers' SMT siblings the gap at a 20% fraction closes from
+0.75× to 0.97× (per-node) and from 0.73× to 0.82× (bucket lock); the rest is
+FIFO handoffs crossing nodes.  Every other rename panel runs 8 writers on one
+node and is within 5% of the old lock.
 
-**Controls**: the matched-name-width control sits at 0.97–1.05× of the shipped
+**Create/delete** (`dcache_churn.png`, private directories): in place — the
+kernel's path for a name removed and created again — txn-global/per-node
+1.24–1.29×, bucket lock 1.14–1.23×, txn-mark 0.93–0.99× the baseline, flat
+across 1–48 writers; on 2026-09-30 the rwsem was 74–79% of the bucket lock's
+lead at 16–48 writers.  Allocating, the bucket lock is at parity (0.99–1.03×
+from 1 to 48 writers, 0.98–1.04× to 192 in `dcache_churn_scaling.png`) and
+the MW txn engines trail at 0.65–0.69× with 1–2 writers and 0.93–0.97× from 8
+up: a descriptor per commit, which batch retirement now cuts at every writer
+count (1.09–1.39× over one `call_rcu` per descriptor, `dcache_slabroute.png`).
+The "allocating churn is LRU-bound" of the previous sweeps was largely the
+test-and-test-and-set shard lock collapsing, and its bucket-lock gap (0.91×)
+was cross-node directory sharing.  Readers under churn: 0.91–1.07× in both
+modes.
+
+**Directory sharing** (`dcache_churn_share.png`, `dcache_churn_scaling.png`):
+a pair of writers sharing directories on ONE node costs every engine little
+(the bucket lock 0.98–1.09× the baseline); on TWO nodes it costs everyone,
+seqlock most when toggling in place (138 → 94 M toggles/s at 16 writers), where
+txn-global then leads 1.84× and the bucket lock 1.65–1.69×; allocating, the
+bucket lock goes from 0.95× at 16 writers to 1.02–1.04× from 64 up.  When every writer shares
+one set of directories, seqlock's create/delete stops scaling (15 M toggles/s
+at 48 writers, 9.7 at 192) and txn-global and the bucket lock run 2.4–3.4× and
+2.4–2.9× from 48 writers up.
+
+**Controls**: the matched-name-width control sits at 0.98–1.02× of the shipped
 arm (median of 7 runs, `dcache_namewidth.png`).
 
 Before the setup placement was fixed, seqlock's churn throughput swung ~25%

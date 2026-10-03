@@ -27,9 +27,10 @@ readers.  (Taken from one flat-out run, the reader row compared each engine's
 readers under its own writers' rate.)  Hatched: the writers could not sustain
 the offered rate.  Linear axes.
 
-Measured 2026-09-30: flat out, the bucket lock renames 3.8-26x the seqlock
-baseline (7-26x on the leaf ops, 3.8-5.6x on the directory ops) and txn-mark
-2.2-4.7x; paced to 100k/s, the txn readers run 1.04-1.16x seqlock's.  Part of the writer gap is the per-directory
+Measured 2026-10-02: flat out, the bucket lock renames 4.1-21.5x the seqlock
+baseline (6.3-21.5x on the leaf ops, 4.1-4.5x on the directory ops) and
+txn-mark 2.6-5.5x; paced to 100k/s, the localized readers (per-node, mark,
+bucket lock) run 1.05-1.19x seqlock's and txn-global's 0.90-1.17x.  Part of the writer gap is the per-directory
 rwsem and cross-dir rename mutex the seqlock baseline takes (the kernel's
 i_rwsem and s_vfs_rename_mutex) and the txn designs do not need.
 """

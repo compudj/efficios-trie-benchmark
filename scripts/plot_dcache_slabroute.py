@@ -30,14 +30,17 @@ LEFT panel is throughput.  RIGHT is the speedup of each route over one call_rcu
 per descriptor, for the three txn engines, and the control band says what "no
 effect" looks like on the same axes.
 
-Measured 2026-09-30: batch retirement lifts the txn engines 1.10-1.26x at 1-4
-writers and does nothing from 8 up (0.98-1.03x); rseq local lists add a few
-percent on top.  So the descriptor slab is a low-concurrency cost; the
-allocating path's cost at scale is the per-node LRU lock every engine takes
-(dcache_churn.png).  The control band is tight (seqlock and bucketlock stay
-within 4% across routes) -- it was not before 2026-09-29, when the rseq routes'
-librseq reported no NUMA node ids to seqlock's threads and its LRU collapsed
-onto one shard (fixed: dcache_node.h falls back to getcpu()).
+Measured 2026-10-02: batch retirement (liburcu's default since c21f5a38) lifts
+the txn engines 1.09-1.39x over one call_rcu per descriptor at EVERY writer
+count, still 1.25-1.27x at 48; rseq local lists add 5-6% at 1-2 writers and
+nothing beyond.  The previous sweep saw no gain from 8 writers up because the
+LRU shard lock, then test-and-test-and-set, collapsed past 4 waiters per shard
+and capped every engine there; it is the kernel's queued spinlock now
+(dcache_qspinlock.h).  The control band (seqlock and bucketlock across routes)
+is within ~4% except one seqlock point on the rseq route, 1.20x at 4 writers,
+not explained.  Before 2026-09-29 the rseq routes' librseq reported no NUMA
+node ids to seqlock's threads and its LRU collapsed onto one shard (fixed:
+dcache_node.h falls back to getcpu()).
 
 NOT a dual-axis chart: footprint is a different measure on a different scale and
 belongs in its own figure, not on a second y-axis here.

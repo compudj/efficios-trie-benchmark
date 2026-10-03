@@ -13,24 +13,26 @@ TWO ROWS, because "create/delete" means two different paths:
     hash-chain edit (bench --in-place: dc_delete / dc_instantiate).
   ALLOCATING (bottom) -- dc_unlink + dc_add per toggle: allocation, LRU
     enqueue/dequeue and a free on every pair.  The path of ever-NEW names, or of
-    a dropping dentry-negative policy.  It spends 39-57% of its cycles on the
-    per-node LRU shard lock (perf, 2026-09-29) -- one list per NUMA node, as the
-    kernel's list_lru, and this machine has 24 nodes (one per 8-core CCD) -- so
-    its writer panel measures that lock as much as any engine.
+    a dropping dentry-negative policy.  Every engine's LRU shard lock is the
+    kernel's queued spinlock (dcache_qspinlock.h); until 2026-10-02 it was a
+    test-and-test-and-set lock that collapsed past 4 waiters per shard, and the
+    "allocating churn is LRU-bound" of earlier captions was largely that.
 
-Measured 2026-09-30 (writers flat out, ÷ seqlock):
-  in place    txn-global / txn-pernode 1.19-2.37x, bucketlock 1.20-2.16x,
-              txn-mark 0.98-1.78x -- growing with the writer count.  Most of it
-              at scale is the per-directory rwsem (the kernel's i_rwsem) the
-              seqlock baseline takes and the txn designs do not need (their
-              readdir is lock-free, so no writer has a reader to exclude): with
-              the rwsem removed seqlock gains 1.72x at 16 writers.  The rest is
-              the d_seq write bracket against one cmpxchg, and the walk.
-  allocating  seqlock leads (txn 0.60-0.87x, bucketlock 0.74-1.01x): the LRU
-              lock above, plus the MW txn engines' per-commit descriptor --
-              batch retirement recovers some of that at 1-4 writers only
+Every writer's directories are its OWN here (bench --share 1, column dirs =
+private); directories shared by pairs of writers, on one node or two, are
+dcache_churn_share.png.
+
+Measured 2026-10-02 (÷ seqlock, 1-48 writers):
+  in place    txn-global / txn-pernode 1.24-1.29x, bucketlock 1.14-1.23x,
+              txn-mark 0.93-0.99x, flat across writer counts.  Much of it is
+              the per-directory rwsem (the kernel's i_rwsem) the seqlock
+              baseline takes and the txn designs do not need (their readdir is
+              lock-free, so no writer has a reader to exclude).
+  allocating  bucketlock 0.99-1.03x (parity); the MW txn engines 0.65-0.69x
+              at 1-2 writers, 0.94-0.97x from 8: their per-commit descriptor,
+              which batch retirement cuts at every writer count
               (figures/dcache_slabroute.png).
-  readers     within +-10% of seqlock in both modes, every arm.
+  readers     0.91-1.07x of seqlock in both modes, every arm.
 
 The seqlock baseline's per-directory lock is the vendored Linux kernel
 rw_semaphore (dcache_seqlock.c), its hash chains per-bucket bit locks, as the
