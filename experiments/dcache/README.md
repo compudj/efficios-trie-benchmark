@@ -129,7 +129,10 @@ lock-free on both.
 
 Every `figures/dcache_*.png` comes from one sweep of the current code
 (provenance id in each CSV row's `src`; `scripts/check_dcache_figures.sh`
-checks it).  Ratios are an engine's throughput ÷ the seqlock baseline's at the
+checks it).  `dcache_bucketlock_summary.png` puts the bucket lock + SW txn
+engine against the seqlock baseline on one page: every benchmark's ratio
+range, grouped into on par / faster / slower, with flat-out writer capacity
+apart from the reader comparisons.  Ratios are an engine's throughput ÷ the seqlock baseline's at the
 same point; every comparison figure draws that ratio for every engine in a
 strip under its panel.
 

@@ -34,6 +34,7 @@ declare -A INPUTS=(
 	[dcache_height]="dcache_height"
 	[dcache_churn]="dcache_churn"
 	[dcache_churn_share]="dcache_churn"
+	[dcache_bucketlock_summary]="dcache_sweep dcache_churn dcache_churn_scaling dcache_height dcache_optaxonomy dcache_optype dcache_readdir_churn"
 	[dcache_churn_scaling]="dcache_churn_scaling"
 	[dcache_namewidth]="dcache_namewidth"
 	[dcache_optaxonomy]="dcache_optaxonomy"

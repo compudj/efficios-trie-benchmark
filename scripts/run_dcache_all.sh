@@ -112,6 +112,12 @@ run_sweeps "${CHURN_SWEEPS[@]}"
 run_routes
 run_sweeps "${OTHER_SWEEPS[@]}"
 
+# Figures drawn from several sweeps' CSVs, once they have all run.
+for p in plot_dcache_bucketlock_summary.py; do
+	python3 "$S/$p" >> "$LOGDIR/plots.log" 2>&1 ||
+		{ echo "!! $p failed" >&2; failed="$failed $p"; }
+done
+
 echo ">> figure freshness:" >&2
 "$S/check_dcache_figures.sh" 2>&1 | tee "$LOGDIR/freshness.log" >&2
 [[ -n "$failed" ]] && echo "!! failed:$failed" >&2
