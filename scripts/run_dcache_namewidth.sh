@@ -59,7 +59,7 @@ SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 INC="-I$Bd/include -I$BIN"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread"
 CC=${CC:-gcc}
-CFLAGS="-O2 -g -pthread -march=native"
+CFLAGS="-O2 -g -DNDEBUG -pthread -march=native"	# no assertions: see the dcache Makefile
 
 # URCU_SLAB_RSEQ is header-inline and rcu-txn-slab.h requires it to be IDENTICAL
 # in every TU of the process (a TU without it takes the arena pop lock while one

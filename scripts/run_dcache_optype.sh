@@ -80,7 +80,7 @@ LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -
 printf '>> liburcu %s (%s)  slab: %s\n' \
   "$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)" "$Bd" "$SLABMODE" >&2
 CC=${CC:-gcc}
-CFLAGS="-O2 -g -pthread -march=native"
+CFLAGS="-O2 -g -DNDEBUG -pthread -march=native"	# no assertions: see the dcache Makefile
 # seqlock's per-directory lock is the vendored kernel rwsem by default
 # (dcache_seqlock.c); link its archive (ignored by the engines that do not
 # reference it).

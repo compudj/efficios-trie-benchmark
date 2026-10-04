@@ -57,6 +57,14 @@ endif
 
 CC       ?= gcc
 CFLAGS   ?= -O2 -g -pthread -Wall -Wextra -march=native
+# BENCHMARKS ARE BUILT WITHOUT ASSERTIONS.  The engines are header-inline, so
+# this flag decides whether liburcu's urcu_posix_assert() runs on their hot
+# paths: without -DNDEBUG every engine arm paid the assertions the seqlock
+# baseline -- which has none -- did not (every bench_dcache_*txn* and
+# *bucketlock* binary referenced __assert_fail, bench_dcache_*seqlock* none),
+# and every sweep up to c03704139064-c21f5a38 was measured that way.  The
+# tests, repros and stress targets keep them: only what a sweep runs loses them.
+bench_dcache%: CFLAGS += -DNDEBUG
 CPPFLAGS := -I$(URCU_TXN_INC) -I. $(SLAB_CPP)
 LDFLAGS  := -L$(URCU_TXN_LIB) -Wl,-rpath,$(URCU_TXN_LIB) $(SLAB_LD)
 # Phase 3's LRU shards by NUMA node, read from the rseq ABI page

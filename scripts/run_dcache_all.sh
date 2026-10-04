@@ -81,7 +81,7 @@ done
 # Only churn_w, allocating toggles, runs there: the one panel and mode the
 # slab-route figure reads (in-place toggles commit no descriptor on the lock
 # engines).
-ROUTES=${ROUTES-"rseq:urcu-txn-build-rseq-c21f5a38 nobatch:urcu-txn-build-nobatch-c21f5a38 nobatch_rseq:urcu-txn-build-nobatch-rseq-c21f5a38"}
+ROUTES=${ROUTES-"rseq:urcu-txn-build-rseq-2793224e nobatch:urcu-txn-build-nobatch-2793224e nobatch_rseq:urcu-txn-build-nobatch-rseq-2793224e"}
 run_routes() {
 if [[ -n "$ROUTES" && -z "${ONLY:-}" ]]; then
 	for r in $ROUTES; do

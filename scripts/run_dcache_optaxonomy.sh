@@ -70,7 +70,7 @@ SRC_ID=$("$REPO/scripts/dcache_src_id.sh" "$Bd")
 INC="-I$Bd/include -I$BIN"
 LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -lpthread"
 CC=${CC:-gcc}
-CFLAGS="-O2 -g -pthread -march=native"
+CFLAGS="-O2 -g -DNDEBUG -pthread -march=native"	# no assertions: see the dcache Makefile
 # seqlock's per-directory lock is the vendored kernel rwsem by default
 # (dcache_seqlock.c); link its archive (ignored by the engines that do not
 # reference it).

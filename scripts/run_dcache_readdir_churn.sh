@@ -75,7 +75,7 @@ LIB="-L$Bd/src/.libs -Wl,-rpath,$Bd/src/.libs -lurcu-qsbr -lurcu-common -lrseq -
 printf '>> liburcu %s (%s)  slab: %s\n' \
   "$(git -C "$Bd" log -1 --format=%h 2>/dev/null || echo unknown)" "$Bd" "$SLABMODE" >&2
 CC=${CC:-gcc}
-CFLAGS="-O2 -g -pthread -march=native -DDC_SPLIT_KEEPID"
+CFLAGS="-O2 -g -DNDEBUG -pthread -march=native -DDC_SPLIT_KEEPID"	# no assertions: see the dcache Makefile
 
 CPULIST=$(hwloc-calc --li --po -I PU core:all.pu:0 2>/dev/null)
 if [[ -n "$CPULIST" ]]; then
