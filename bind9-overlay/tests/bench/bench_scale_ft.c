@@ -545,9 +545,51 @@ static void ft_churn_insert(unsigned int idx)
 }
 
 /*
- * Mutator-benchmark op.  FT has no in-place value update, so REPLACE swaps the
- * leaf for a fresh node (remove old + RCU-free, then insert new) — the natural
- * "replace" cost for an RCU trie.  churn_entries[] tracks the live node so the
+ * Replace the node at churn key @idx (must be present) by a fresh one, with
+ * cds_ft_replace(): the trie's own value update.  It swaps the leaf under the
+ * same key and leaves the node structure alone; the old leaf is RCU-freed.
+ */
+static void ft_churn_replace(struct cds_ft_iter *it, unsigned int idx)
+{
+	struct ft_entry *old = churn_entries[idx];
+	struct ft_entry *e = calloc(1, sizeof(*e) + churn_lens[idx]);
+	enum cds_ft_status ls, rs;
+
+	if (!e) {
+		fprintf(stderr, "OOM\n");
+		abort();
+	}
+	memcpy(e->key, churn_keys[idx], churn_lens[idx]);
+	e->key_len = churn_lens[idx];
+	cds_ft_node_init(&e->ft_node);
+
+	/* Fresh-search reposition: set_key clears the cached position. */
+	ls = cds_ft_iter_set_key(it, (const uint8_t *)churn_keys[idx],
+		churn_lens[idx]);
+	if (ls < 0) {
+		fprintf(stderr, "iter_set_key error: %d\n", ls);
+		abort();
+	}
+	ls = cds_ft_lookup(g_ft, it);
+	if (ls != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "lookup failed: %d\n", ls);
+		abort();
+	}
+	rs = cds_ft_replace(g_ft, it, &old->ft_node, &e->ft_node);
+	if (rs != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "replace failed: %d\n", rs);
+		abort();
+	}
+	churn_entries[idx] = e;
+	call_rcu(&old->rcu_head, free_ft_entry_rcu);
+}
+
+/*
+ * Mutator-benchmark op.  REPLACE is cds_ft_replace(), FT's value update: a
+ * fresh leaf takes the old one's place under the same key.  (It used to be a
+ * remove followed by an insert of the same key, which is two structural
+ * updates and not what the trie offers for this.)  A REPLACE of an absent key
+ * inserts it, as an upsert would.  churn_entries[] tracks the live node so the
  * driver's drain can empty the churn set between reader-count points.  Single
  * mutator, so the (uncontended) g_ft_mutex only mirrors the read-sweep writer;
  * FT readers stay lock-free throughout.
@@ -563,8 +605,9 @@ static void ft_writer_op(void *ctx, int op, unsigned int idx)
 		break;
 	case BENCH_OP_REPLACE:
 		if (churn_entries[idx])
-			ft_churn_remove(it, idx);
-		ft_churn_insert(idx);
+			ft_churn_replace(it, idx);
+		else
+			ft_churn_insert(idx);
 		break;
 	case BENCH_OP_REMOVE:
 		if (churn_entries[idx])
