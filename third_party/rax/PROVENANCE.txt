@@ -1,0 +1,9 @@
+rax (rax.c, rax.h) and serverassert.h vendored verbatim from https://github.com/valkey-io/valkey (BSD-3-Clause), src/ at tag 9.2.0-rc1 (f01ed55e8c3d8a7d0c1d12661e9818edec758d42), on 2026-10-03.  LICENSE is that tree's COPYING.
+Valkey's copy rather than the standalone antirez/rax: it is the one Valkey ships, and it carries the memchr() child-edge search and raxFindLongestPrefix / raxForEachPrefix that the standalone repository lacks.
+Local change: rax_malloc.h maps the allocator onto libc malloc/realloc/free and malloc_usable_size instead of Valkey's zmalloc (jemalloc).  That is the file upstream designates for selecting the allocator; nothing else is modified.
+serverassert.h's assert() is always armed (it is not NDEBUG-controlled) and reports through _serverAssert(), which src/bench_one_st.c defines.  Keep it that way: rax.c wraps a call with a side effect in one (the OOM rollback's raxRemove).
+
+sha256 of the verbatim files:
+4d09cef390fac1a4888d71cdeaf34aba0c0b0a72ce0d6e9079f7eb78b6e9b291  rax.c
+1d4e2d5653266b01125387338a7ce6a6570ea69d727124360ac064d1d612bdb2  rax.h
+e33ae53d01b731126477632fcaa5f53d035fbeeaf057f2dbeca958fbca4fb191  serverassert.h

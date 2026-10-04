@@ -5,7 +5,8 @@
 #   src/                single- and multi-threaded benchmark harnesses
 #   third_party/qp-trie vendored Tony Finch qp-trie (CC0) — Tbl dispatch + qp backend
 #   third_party/libart  vendored libart ART (BSD-2-Clause)
-#   urcu-build/         our liburcu clone (fractal-trie-dev), built in-tree
+#   third_party/rax     vendored Valkey rax radix tree (BSD-3-Clause)
+#   urcu-build/        our liburcu clone (fractal-trie-dev), built in-tree
 #   config.mk           local paths / feature flags (edit this, not the Makefile)
 #
 # Quick start:
@@ -28,7 +29,7 @@ URCU_CPPFLAGS := -I$(URCU_INC)
 # The harnesses define _GNU_SOURCE / _LGPL_SOURCE / the RCU flavor themselves,
 # so we only add the FT feature flags and include paths here.
 CPPFLAGS_COMMON := $(FT_FEATURES) $(URCU_CPPFLAGS) \
-                   -Ithird_party/qp-trie -Ithird_party/libart
+                   -Ithird_party/qp-trie -Ithird_party/libart -Ithird_party/rax
 
 CFLAGS := $(OPTFLAGS) -Wall
 
@@ -54,6 +55,19 @@ ART_OBJS := third_party/libart/art.o
 # whereas qp/HOT/ART-OLC/FT all saturate at -O2.  So, like Cuckoo, it gets its
 # own opt level instead of the global -O2 OPTFLAGS.  LTO adds nothing (single TU).
 ART_CF   := -O3 -DNDEBUG -march=native -mpopcnt -Wall
+
+# rax (third_party/rax, BSD-3-Clause): the radix tree Valkey uses internally,
+# vendored verbatim from Valkey with the allocator mapped onto libc (see its
+# PROVENANCE.txt).  Built with Valkey's own default flags (src/Makefile:
+# -O3 -flto, -std=gnu11) plus the bench's -march=native, and WITHOUT the
+# -fno-omit-frame-pointer Valkey also adds, so it is measured at its best, like
+# Cuckoo.  -DNDEBUG is for uniformity only: rax.c asserts through
+# serverassert.h, which is always armed, as Valkey ships it.
+# -Wno-use-after-free: gcc flags raxIteratorAddChars reusing the old pointer
+# after a FAILED realloc, which is valid; the file is verbatim upstream.
+RAX_OBJS := third_party/rax/rax.o
+RAX_CF   := -O3 -DNDEBUG -march=native -mpopcnt -flto -std=gnu11 -Wall \
+            -Wno-use-after-free
 
 BENCHES := bench_one_st
 
@@ -99,7 +113,7 @@ src/bench_cuckoo.o: src/bench_cuckoo.c
 	$(CC) $(CUCKOO_CF) -c -o $@ $<
 
 # Single-threaded, single-engine benchmark:
-#   ft_* / judy / qp / art / hot / cuckoo / masstree / artolc.
+#   ft_* / judy / qp / art / rax / hot / cuckoo / masstree / artolc.
 # -flto at link lets the Cuckoo objects (compiled -flto) be optimized together.
 # Masstree (MIT) and ART-OLC (Apache-2.0) are linked single-threaded via thin
 # shims over their vendored sources (+ oneTBB for ART-OLC's epoch).  The masstree
@@ -115,7 +129,7 @@ src/bench_masstree_st.o: src/bench_masstree_st.cpp
 src/bench_artolc_st.o: src/bench_artolc_st.cpp
 	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
 
-bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(HOT_OBJS) $(CUCKOO_OBJS) $(ST_MT_OBJS) | check-urcu
+bench_one_st: src/bench_one_st.c $(QP_OBJS) $(ART_OBJS) $(RAX_OBJS) $(HOT_OBJS) $(CUCKOO_OBJS) $(ST_MT_OBJS) | check-urcu
 	$(CC) $(CFLAGS) $(CPPFLAGS_COMMON) -flto -o $@ $^ $(LDFLAGS) $(LDLIBS) -lstdc++ -lm -ltbb
 
 # Vendored competitor sources: compile with the same opt flags, but only their
@@ -125,6 +139,9 @@ third_party/qp-trie/%.o: third_party/qp-trie/%.c
 
 third_party/libart/%.o: third_party/libart/%.c
 	$(CC) $(ART_CF) -Ithird_party/libart -c -o $@ $<
+
+third_party/rax/%.o: third_party/rax/%.c
+	$(CC) $(RAX_CF) -Ithird_party/rax -c -o $@ $<
 
 # ---------------------------------------------------------------------------
 # Wormhole (GPL-3.0) — SEPARATE, GPL-licensed binary.
@@ -581,7 +598,7 @@ clean-urcu-txn:
 	rm -rf "$(URCU_TXN_BUILD)"
 
 clean:
-	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) bench_list_scale \
+	rm -f $(BENCHES) $(QP_OBJS) $(ART_OBJS) $(RAX_OBJS) bench_list_scale \
 	  bench_txn_3hash src/bench_txn_3hash.o \
 	  bench_txn_3skiplist src/bench_txn_3skiplist.o \
 	  src/bench_list_scale.o src/rlu.o src/bench_iscrw.o src/iscrw.o src/bench_topology_list.o

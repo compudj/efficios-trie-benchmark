@@ -4,7 +4,7 @@
  *
  * Usage: bench_one <dataset> <engine>
  *   dataset: u32d u32s u64d u64s dns dict paths
- *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs qp art hot cuckoo masstree artolc
+ *   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs qp art rax hot cuckoo masstree artolc
  *
  * Output: <ns/op> <RSS_kB>
  */
@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <pthread.h>
@@ -25,6 +26,7 @@
 #include <Judy.h>
 #include "Tbl.h"
 #include "art.h"
+#include "rax.h"
 
 #ifndef N_KEYS
 #define N_KEYS 1000000
@@ -996,6 +998,107 @@ static void run_art(void)
 }
 
 /*
+ * rax.c asserts through Valkey's serverassert.h, whose assert() is always armed
+ * (not NDEBUG-controlled) and reports through this hook.  It must stay armed:
+ * one of rax.c's asserts wraps a call with a side effect (the OOM rollback's
+ * raxRemove).
+ */
+void _serverAssert(const char *estr, const char *file, int line);
+
+void _serverAssert(const char *estr, const char *file, int line)
+{
+	fprintf(stderr, "rax: assertion failed: %s (%s:%d)\n", estr, file, line);
+	abort();
+}
+
+/*
+ * rax — the radix tree Valkey uses internally, vendored verbatim from Valkey
+ * (third_party/rax, BSD-3-Clause).  Keys are binary-safe and length-delimited,
+ * and a key may be a prefix of another, so key_at()'s bytes go in as they are:
+ * no NUL terminator on strings (unlike ART).  rax keeps the key bytes in its
+ * own nodes and compares them during the descent; the value is a cold kv_entry
+ * in the dense arena, force-read by the harness, as for qp / ART.
+ */
+static void run_rax(void)
+{
+	rax *rt = raxNew();
+	long rss;
+	double best = 1e18;
+	uint8_t ibuf[8];
+	struct kv_entry **entries = calloc(n_keys, sizeof(struct kv_entry *));
+	struct cds_ft_external_arena *leaf_arena = cds_ft_external_arena_create(NULL);
+
+	if (!rt) {
+		fprintf(stderr, "raxNew failed\n");
+		exit(1);
+	}
+	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		entries[i] = cds_ft_external_arena_alloc(leaf_arena,
+			sizeof(struct kv_entry) + kl);
+		entries[i]->key_len = kl;
+		memcpy(entries[i]->key, kp, kl);
+		/* 0 with errno 0 is a duplicate key, whose value was replaced. */
+		if (!raxInsert(rt, (unsigned char *)kp, kl, (void *)entries[i], NULL) &&
+		    errno == ENOMEM) {
+			fprintf(stderr, "raxInsert failed at i=%u\n", i);
+			exit(1);
+		}
+	}
+	rss = get_rss_kb();
+
+	for (int w = 0; w < WARMUP; w++)
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = NULL;
+			raxFind(rt, (unsigned char *)kp, kl, &sink);
+			FORCE_READ_LEAF(sink);
+		}
+
+	for (int r = 0; r < RUNS; r++) {
+		uint64_t t0, t1;
+		t0 = now_ns();
+		for (unsigned int i = 0; i < n_keys; i++) {
+			size_t kl;
+			const void *kp = key_at(i, ibuf, &kl);
+			void *sink = NULL;
+			raxFind(rt, (unsigned char *)kp, kl, &sink);
+			FORCE_READ_LEAF(sink);
+		}
+		t1 = now_ns();
+		double ns = (double)(t1 - t0) / n_keys;
+		if (ns < best) best = ns;
+	}
+
+	/*
+	 * Untimed: every key must resolve to an entry holding that key (a
+	 * duplicate key resolves to the entry that replaced it).  The timed
+	 * loops above never inspect what they found.
+	 */
+	for (unsigned int i = 0; i < n_keys; i++) {
+		size_t kl;
+		const void *kp = key_at(i, ibuf, &kl);
+		void *v = NULL;
+		const struct kv_entry *e;
+
+		if (!raxFind(rt, (unsigned char *)kp, kl, &v) || !v) {
+			fprintf(stderr, "rax: key %u not found\n", i);
+			exit(1);
+		}
+		e = v;
+		if (e->key_len != kl || memcmp(e->key, kp, kl) != 0) {
+			fprintf(stderr, "rax: key %u resolved to another key\n", i);
+			exit(1);
+		}
+	}
+	printf("%.1f %ld\n", best, rss);
+	cds_ft_external_arena_destroy(leaf_arena);
+	free(entries);
+}
+
+/*
  * HOT (Height Optimized Trie) engine — implemented in src/bench_hot.cpp, a
  * C++ shim over the ISC-licensed header-only HOT library (third_party/hot).
  */
@@ -1250,7 +1353,7 @@ int main(int argc, char **argv)
 	if (argc != 3) {
 		fprintf(stderr, "Usage: %s <dataset> <engine>\n"
 			"  dataset: u32d u32s u64d u64s dns dict paths\n"
-			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs qp art hot cuckoo masstree artolc\n", argv[0]);
+			"  engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs qp art rax hot cuckoo masstree artolc\n", argv[0]);
 		return 1;
 	}
 
@@ -1281,6 +1384,7 @@ int main(int argc, char **argv)
 	else if (strcmp(argv[2], "judyhs") == 0)  run_judyhs();
 	else if (strcmp(argv[2], "qp") == 0)      run_qp();
 	else if (strcmp(argv[2], "art") == 0)     run_art();
+	else if (strcmp(argv[2], "rax") == 0)     run_rax();
 	else if (strcmp(argv[2], "hot") == 0)     run_hot();
 	else if (strcmp(argv[2], "cuckoo") == 0)  run_cuckoo();
 	else if (strcmp(argv[2], "masstree") == 0) run_masstree();
