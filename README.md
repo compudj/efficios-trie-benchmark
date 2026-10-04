@@ -54,7 +54,7 @@ Single dataset, single engine, run in its own process for accurate RSS:
 ./bench_one_st <dataset> <engine>
 #   dataset: u32d u32s u64d u64s dns dict paths   (all generated synthetically)
 #   engine:  ft_eager ft_eager_on_spec ft_cand ft_spec judy judyl judysl judyhs
-#            qp art hot cuckoo masstree artolc
+#            qp art rax hot cuckoo masstree artolc
 # output: <ns/op> <RSS_kB>   ('-' where an engine does not apply: judysl on
 #         integers, judyl on strings)
 ```
@@ -62,19 +62,43 @@ Single dataset, single engine, run in its own process for accurate RSS:
 Example sweep (all engines that apply, on one dataset):
 
 ```sh
-for e in ft_eager ft_spec judyl judysl judyhs qp art hot cuckoo masstree artolc; do \
-  printf '%-10s ' "$e"; ./bench_one_st dns "$e"; done
+for e in ft_eager ft_spec judyl judysl judyhs qp art rax hot cuckoo masstree artolc; do \
+  printf '%-10s ' "$e"; numactl --physcpubind=40 --membind=5 ./bench_one_st dns "$e"; done
 ```
+
+**Pin it and bind its memory** (`numactl --physcpubind=<cpu> --membind=<that
+cpu's node>`), as above. The benchmark does not pin itself, and on this
+2-socket box an unpinned run is a NUMA lottery: with all memory on the other
+socket every engine is ~50% slower (`dns`: `ft_spec` 123 → 182 ns, `qp`
+116 → 174 ns). FT is the most exposed, because by default it interleaves its
+node arena across all NUMA nodes, and so does the `cds_ft_external_arena`
+that holds the string query keys and most engines' leaves; an explicit process
+policy such as `--membind` is honored instead. Unpinned and unbound, the same
+`ft_spec` binary measured anywhere from 134 to 178 ns on `dns`.
 
 Useful env vars (see `src/bench_one_st.c`): `FT_BENCH_COMPACT` (compact between
 build and query), `FT_DUMP_STATS`, `N_KEYS` / `WARMUP` / `RUNS` (compile-time).
 
 ### Results across datasets (1M keys, single thread)
 
-Lookup time, ns/op (best of `RUNS` timed passes after `WARMUP`), on the hardware
-below (2× EPYC 9654; `cuckoo`, `art`, `masstree` built `-O3` — `cuckoo` also
-`-flto` + 2 MiB hugepages; every other engine, including FT, is `-O2`, which it
-saturates: `-O3`/LTO move them <2% — see opt-level note below).
+Lookup time, ns/op: the median of 3 runs, each the best of `RUNS` timed passes
+after `WARMUP`, every run pinned and node-bound (`numactl --physcpubind=40
+--membind=5`), on the hardware below (2× EPYC 9654; `cuckoo`, `art`,
+`masstree`, `rax` built `-O3` — `cuckoo` and `rax` also `-flto`, `cuckoo` with
+2 MiB hugepages; every other engine, including FT, is `-O2`, which it
+saturates: `-O3`/LTO move them <2% — see opt-level note below). FT is the
+transaction-engine tree, `ft-txn-integ` @ 9484d87e. Raw per-run data:
+`scripts/one_st_lookup.csv` (its `ft_*_june` rows are the same harness linked
+against the June `fractal-trie-dev` library, 80a7013f, as an A/B).
+**How to read these tables.** The comparison that matters is among the engines
+that support concurrent readers and writers: `ft_spec` / `ft_eager` (RCU),
+`artolc`, `masstree` and `cuckoo` (built `MULTITHREADING`; its API has no
+delete). The rest — `hot` (its single-threaded variant), `wormhole` (through
+its thread-unsafe API), `qp`, `art`, the Judy variants and `rax` — are
+single-threaded structures, there as upper-bound references for what a lookup
+costs without any concurrency support. The concurrent variants of HOT, ART and
+qp are measured in the multithreaded sections below.
+
 Every engine now runs on every dataset — the byte-keyed engines key integers as
 big-endian bytes; `judysl` (string radix) and `judyl` (integer array) are the
 two split-out Judy variants, `judyhs` is Judy's hash array.
@@ -82,44 +106,47 @@ two split-out Judy variants, `judyhs` is Judy's hash array.
 **String keys** (`dns` DNS names, `dict` words, `paths` filesystem paths),
 fastest-first by `dns`:
 
-![Single-threaded string-key lookup latency: hot fastest (77–106 ns) with
-wormhole, qp and ft_spec close behind; cuckoo slowest at ~3×; FT's ft_spec beats
-ft_eager on every dataset](figures/st_lookup_strings.png)
+![Single-threaded string-key lookup latency: hot fastest (74–108 ns) with
+wormhole, qp and ft_spec close behind; rax and cuckoo slowest at ~3×; FT's
+ft_spec beats ft_eager on every dataset](figures/st_lookup_strings.png)
 
 | Engine     | `dns` | `dict` | `paths` |
 |------------|------:|-------:|--------:|
-| `hot`      |    99 |    106 |      77 |
-| `wormhole`†|   113 |    101 |     114 |
-| `qp`       |   118 |    127 |     177 |
-| `ft_spec`  |   119 |    112 |     143 |
-| `judyhs`‡  |   145 |    121 |     149 |
-| `art`      |   183 |    167 |     223 |
-| `ft_eager` |   185 |    158 |     202 |
-| `judysl`   |   202 |    250 |     263 |
-| `artolc`   |   218 |    212 |     238 |
-| `masstree` |   231 |    193 |     207 |
-| `cuckoo`   |   335 |    301 |     332 |
+| `hot`      |    98 |    108 |      74 |
+| `wormhole`†|   114 |    102 |     113 |
+| `qp`       |   117 |    128 |     177 |
+| `ft_spec`  |   123 |    115 |     145 |
+| `judyhs`‡  |   143 |    120 |     147 |
+| `ft_eager` |   166 |    169 |     210 |
+| `art`      |   184 |    168 |     219 |
+| `judysl`   |   201 |    249 |     263 |
+| `artolc`   |   212 |    210 |     243 |
+| `masstree` |   232 |    190 |     208 |
+| `rax`      |   297 |    277 |     326 |
+| `cuckoo`   |   334 |    301 |     330 |
 
 **Integer keys** (`u32/u64` × `d`ense sequential / `s`parse random),
 fastest-first by `u64d`:
 
 ![Single-threaded integer-key lookup latency: judyl and art win dense keys
 (11 ns) but degrade 4–6× on sparse; qp is flat at ~13 ns on all four sets;
-ft_spec runs 14–33 ns; masstree and cuckoo trail](figures/st_lookup_ints.png)
+ft_spec runs 16–35 ns; rax sits mid-pack; masstree and cuckoo
+trail](figures/st_lookup_ints.png)
 
 | Engine     | `u32d` | `u32s` | `u64d` | `u64s` |
 |------------|-------:|-------:|-------:|-------:|
 | `judyl`    |     11 |     38 |     11 |     64 |
-| `art`      |     11 |     46 |     12 |     47 |
+| `art`      |     11 |     46 |     12 |     48 |
 | `qp`       |     13 |     13 |     13 |     13 |
-| `ft_spec`  |     14 |     33 |     15 |     33 |
-| `ft_eager` |     13 |     42 |     16 |     44 |
-| `hot`      |     20 |     49 |     20 |     49 |
-| `artolc`   |     22 |     96 |     24 |     98 |
-| `judyhs`‡  |     24 |     46 |     38 |     78 |
-| `wormhole`†|     34 |     88 |     38 |     92 |
-| `masstree` |     46 |    172 |     46 |    168 |
-| `cuckoo`   |     96 |    114 |    118 |    117 |
+| `ft_spec`  |     16 |     35 |     17 |     35 |
+| `ft_eager` |     14 |     43 |     17 |     45 |
+| `hot`      |     20 |     50 |     20 |     49 |
+| `artolc`   |     22 |     97 |     23 |     99 |
+| `rax`      |     29 |     85 |     29 |     94 |
+| `judyhs`‡  |     24 |     47 |     38 |     78 |
+| `wormhole`†|     35 |     88 |     38 |     91 |
+| `masstree` |     46 |    173 |     47 |    171 |
+| `cuckoo`   |     95 |     98 |    117 |     98 |
 
 † `wormhole` is the separate **GPL-3.0** binary (`bench_wormhole_gpl [dataset]`),
 never linked into `bench_one_st`; shown here for comparison. A trie of hash
@@ -134,37 +161,61 @@ in a sorted linked list and exposes `ct_iter_goto` lower-bound seek +
 `ct_iter_next` forward iteration).
 
 Takeaways:
+- **Among the concurrency-capable engines FT is the fastest on every
+  dataset** (`ft_spec` on six, `ft_eager` on `u32d`), winning all seven
+  against each of `artolc`, `masstree` and `cuckoo`; the next-fastest of those
+  is 1.4–2.8× slower (`dns`: `artolc` 212 vs 123; `u64s`: `cuckoo` 98 vs 35).
+  Against the single-threaded upper bound, `ft_spec` is 1.1–1.3× on `dns` /
+  `dict`, 1.9× on `paths`, 1.5× on dense integers and 2.7–2.8× on sparse
+  integers.
 - **FT's two validating modes**: `ft_spec` (speculative — skip-compressed
   encoding, one end-of-walk `memcmp`) is the better default, beating `ft_eager`
   (eager-optimized — per-step exact compares on compressed bytes) on strings
-  (`dns` 119 vs 185), sparse integers (`u64s` 33 vs 44) and dense integers
-  (`u64d` 15 vs 16). Both return validated results — `ft_cand` (the raw,
+  (`dns` 123 vs 166) and sparse integers (`u64s` 35 vs 45); on dense integers
+  the two are level (`u64d` 17 vs 17) or `ft_eager` is ahead (`u32d` 14 vs
+  16). Both return validated results — `ft_cand` (the raw,
   *unvalidated* candidate primitive) is excluded from these tables since it skips
   the compare every other engine pays.
 - **`qp` is uniquely distribution-insensitive on integers** — ~12–13 ns on *all
   four* sets, including the sparse random ones where everything else degrades 2–6×
-  (`judyl` 11→64, `ft` 15→33, `art` 12→47). Its bit-popcount nodes don't care
+  (`judyl` 11→64, `ft` 17→35, `art` 12→48). Its bit-popcount nodes don't care
   whether keys cluster.
 - **`judyl` wins dense integers** (11 ns) but collapses on sparse (64); **`judyhs`
   beats `judysl` on strings** (hash suits these distributions better than the
-  radix tree), and **`hot` has the fastest string lookups** (77–106 ns).
-- **`cuckoo` is slowest throughout** (its trie nodes live in a cuckoo hash
-  table — extra hashing and bucket probes per descent step);
+  radix tree), and **`hot` has the fastest string lookups** (74–108 ns).
+- **`rax` (Valkey's radix tree) is second-slowest on strings** (277–326 ns,
+  2.3–2.4× `ft_spec`) and in the lower half on integers (29 ns dense, 85–94
+  sparse): a byte-at-a-time descent over individually `malloc`'d nodes, with a
+  `memchr` over each node's edge bytes. Its RSS is lower — 230 MB on `dns`
+  against `ft_spec`'s 404 MB (glibc `malloc` here, not Valkey's jemalloc) —
+  but RSS is not the cache-hot working set: FT's strided allocator keeps
+  per-node metadata in separate pages that a lookup never touches, so what
+  decides speed is already in the latency column.
+- **`cuckoo` is slowest on strings and dense integers** (its trie nodes live in
+  a cuckoo hash table — extra hashing and bucket probes per descent step);
   **Masstree and ART-OLC carry their concurrency machinery** even single-threaded,
   so they trail the dedicated ST engines (ART-OLC the closer of the two).
 - **Opt level: only `art` profits from `-O3`** (~11% on strings, ~18% on dense
   integers — its node-256 scan and path-compression loops unroll/vectorize), so
   it's built `-O3` like `cuckoo`; at `-O3` it even edges past FT on dense ints
-  (`u64d` 12 vs FT's 15–16). `masstree` gains a marginal ~3% (also `-O3`).
+  (`u64d` 12 vs FT's 17). `masstree` gains a marginal ~3% (also `-O3`).
   `qp`, `hot`, ART-OLC, **and FT** are flat (<2% across `-O2`/`-O3`/`-flto`,
   measured interleaved 30×) — pointer-chasing radix walks are latency/cache-bound
   and already saturated at `-O2`; FT additionally hand-codes its `popcnt`/`bmi`
   hot path. LTO buys nothing (each engine is effectively a single TU).
-- Single snapshot, best-of-`RUNS` (figures move a few % run to run).
+- Median of 3 pinned, node-bound runs, each best-of-`RUNS`; the spread across
+  a cell's three runs has a median of 0.9% (90% of cells under 4.2%; worst
+  15%, `judyl` `u64s`).
+- **The transaction-engine FT costs lookups little**: against the June
+  `fractal-trie-dev` library (80a7013f) on the same harness, `ft_spec` is
+  +1–2% on strings (`dns` 120.5 → 123.2), +4–6% on dense integers (`u32d`
+  15.4 → 16.3) and unchanged on sparse integers. Its footprint did grow: RSS
+  350 → 404 MB on `dns`, 162 → 206 MB on `u32d`.
 
 > **Validation fairness.** Every engine stores its own **copy** of each key
 > (FT/qp/ART/Masstree/ART-OLC in a dense `cds_ft_external_arena`; Judy/Cuckoo
-> internally; HOT in the same arena) and the timed loop consumes the lookup
+> internally; rax in its own nodes, returning a cold arena `kv_entry` like
+> qp/ART; HOT in the same arena) and the timed loop consumes the lookup
 > status and force-reads the returned leaf (`FORCE_READ_LEAF`), so each pays a
 > real validating compare against cold memory and no validation is dead-code-
 > eliminated. HOT (integer) uses map-mode (value = a pointer to the key record),
@@ -1675,6 +1726,7 @@ src/bench_scale_artrowex.cpp     ART-ROWEX (concurrent ART) MT engine; same driv
 third_party/masstree/            vendored Masstree, C++ (MIT) + generated config.h
 third_party/artolc/              vendored ART-OLC + ART-ROWEX, C++ (Apache-2.0)
 third_party/{qp-trie,libart}/    vendored competitors (permissive)
+third_party/rax/                 vendored Valkey rax radix tree, C (BSD-3-Clause)
 third_party/hot/                 vendored HOT, header-only C++14 (ISC);
                                    single-threaded + rowex (concurrent) headers
 src/bench_hot.cpp                C++ shim exposing HOT to bench_one_st
@@ -1702,6 +1754,13 @@ scripts/plot_trie_tables.py      renders the trie result tables above as the
 
 - `third_party/qp-trie` — CC0 / public domain (Tony Finch). See `NOTICE`.
 - `third_party/libart` — BSD-2-Clause (Armon Dadgar). See `LICENSE`.
+- `third_party/rax` — **BSD-3-Clause** (Redis Ltd. / Valkey contributors). The
+  radix tree Valkey uses internally; `rax.c`, `rax.h` and `serverassert.h` are
+  vendored verbatim from Valkey 9.2.0-rc1 and linked into `bench_one_st`'s
+  `rax` engine. **Local change:** `rax_malloc.h` maps the allocator onto libc
+  `malloc` instead of Valkey's `zmalloc` (jemalloc), so its lookup time is
+  comparable but its RSS is glibc's per-node footprint, not jemalloc's. Built
+  with Valkey's own `-O3 -flto`. See `LICENSE` / `PROVENANCE.txt`.
 - `third_party/hot` — ISC (Robert Binna et al.). Header-only C++14; linked into
   `bench_one_st`'s `hot` engine via the `src/bench_hot.cpp` shim. See `LICENSE`.
 - `third_party/cuckoo-trie` — Unlicense / public domain (Zeitak & Morrison). C;
