@@ -51,12 +51,16 @@ endforeach
 # build's .libs first on the library path, otherwise an older system
 # liburcu-cds wins and FT symbols go missing:
 #   LD_LIBRARY_PATH=@URCU_LIBDIR@ ./tests/bench/load-names <names.csv>
+# liburcu-common is named explicitly: on the transaction-engine tree
+# liburcu-cds takes urcu_txn_* symbols from it, and bind9's own libraries
+# pull in the SYSTEM liburcu-common, which does not have them.
 urcu_cds_dep = declare_dependency(
     include_directories: include_directories('@URCU_INC@'),
     link_args: [
         '-L@URCU_LIBDIR@',
         '-Wl,-rpath,@URCU_LIBDIR@',
         '@URCU_LIBDIR@/liburcu-cds.so',
+        '@URCU_LIBDIR@/liburcu-common.so',
     ],
 )
 
@@ -70,6 +74,7 @@ urcu_ft_dep = declare_dependency(
         '-L@URCU_LIBDIR@',
         '-Wl,-rpath,@URCU_LIBDIR@',
         '@URCU_LIBDIR@/liburcu-cds.so',
+        '@URCU_LIBDIR@/liburcu-common.so',
         '@URCU_LIBDIR@/liburcu.so',
     ],
 )
@@ -85,6 +90,7 @@ urcu_ft_qsbr_dep = declare_dependency(
         '-L@URCU_LIBDIR@',
         '-Wl,-rpath,@URCU_LIBDIR@',
         '@URCU_LIBDIR@/liburcu-cds.so',
+        '@URCU_LIBDIR@/liburcu-common.so',
         '@URCU_LIBDIR@/liburcu-qsbr.so',
     ],
 )
