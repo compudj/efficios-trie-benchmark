@@ -649,8 +649,25 @@ int bench_scale_main(int argc, char **argv, const struct bench_engine *eng)
 	if (getenv("BENCH_ITERATE") != NULL && eng->iterate != NULL) {
 		int counts[] = { 1, 2, 4, 8, 16, 32, 64, 96, 128, 192 };
 		size_t nrc = sizeof(counts) / sizeof(counts[0]);
+		const char *ibt = getenv("BENCH_THREADS");
+
 		printf("# readers next_mops\n");
 		fflush(stdout);
+		/*
+		 * BENCH_THREADS=N: one reader count instead of the sweep, as in
+		 * the read/write mode below.  It is also the only way to reach
+		 * 192 on the b9qp engine: libisc caps thread ids at 512 (tid.c),
+		 * and the sweep has started 543 readers by its last point.
+		 */
+		if (ibt) {
+			int nr = atoi(ibt);
+
+			if (nr > 0 && nr <= max_threads) {
+				printf("%d %.1f\n", nr, iterate_run_bench(nr));
+				fflush(stdout);
+			}
+			return 0;
+		}
 		for (size_t i = 0; i < nrc; i++) {
 			int nr = counts[i];
 			if (nr > max_threads)
