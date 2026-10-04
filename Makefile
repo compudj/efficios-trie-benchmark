@@ -185,8 +185,13 @@ src/bench_scale_hotrowex.o: src/bench_scale_hotrowex.cpp
 # Compiled as C (gcc), not as C++ (g++ would treat the .c source as C++).
 bench_scale_common.o: $(SCALE_COMMON_SRC)
 	$(CC) $(CFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
-bench_scale_hotrowex: src/bench_scale_hotrowex.o bench_scale_common.o
-	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
+# The shared driver pins its workers through bench_topology (hwloc, one PU per
+# physical core), so every standalone engine links it and libhwloc as well.
+bench_scale_topology.o: bind9-overlay/tests/bench/bench_topology.c
+	$(CC) $(CFLAGS) $(HWLOC_CFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
+SCALE_COMMON_OBJS := bench_scale_common.o bench_scale_topology.o
+bench_scale_hotrowex: src/bench_scale_hotrowex.o $(SCALE_COMMON_OBJS)
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma $(HWLOC_LIBS)
 
 # ---------------------------------------------------------------------------
 # Masstree MT engine — concurrent B+tree-of-tries (kohler/masstree-beta, MIT)
@@ -209,8 +214,8 @@ $(MASSTREE_DIR)/%.o: $(MASSTREE_DIR)/%.cc
 	$(CXX) $(MASSTREE_CXXFLAGS) -c -o $@ $<
 src/bench_scale_masstree.o: src/bench_scale_masstree.cpp
 	$(CXX) $(MASSTREE_CXXFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
-bench_scale_masstree: src/bench_scale_masstree.o $(MASSTREE_OBJS) bench_scale_common.o
-	$(CXX) $(OPTFLAGS) -o $@ $^ -lpthread -lnuma
+bench_scale_masstree: src/bench_scale_masstree.o $(MASSTREE_OBJS) $(SCALE_COMMON_OBJS)
+	$(CXX) $(OPTFLAGS) -o $@ $^ -lpthread -lnuma $(HWLOC_LIBS)
 
 # ---------------------------------------------------------------------------
 # ART-OLC MT engine — concurrent adaptive radix tree, Optimistic Lock Coupling
@@ -230,8 +235,8 @@ $(ARTOLC_DIR)/OptimisticLockCoupling/Tree.o: $(ARTOLC_DIR)/OptimisticLockCouplin
 	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
 src/bench_scale_artolc.o: src/bench_scale_artolc.cpp
 	$(CXX) $(ARTOLC_CXXFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
-bench_scale_artolc: src/bench_scale_artolc.o $(ARTOLC_OBJS) bench_scale_common.o
-	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
+bench_scale_artolc: src/bench_scale_artolc.o $(ARTOLC_OBJS) $(SCALE_COMMON_OBJS)
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma $(HWLOC_LIBS)
 
 # ART-ROWEX: same vendored repo (third_party/artolc), the Read-Optimized Write
 # EXclusion variant.  Unity build like OLC: ROWEX/Tree.cpp #includes N.cpp
@@ -245,8 +250,8 @@ $(ARTOLC_DIR)/ROWEX/Tree.o: $(ARTOLC_DIR)/ROWEX/Tree.cpp
 	$(CXX) $(ARTOLC_CXXFLAGS) -c -o $@ $<
 src/bench_scale_artrowex.o: src/bench_scale_artrowex.cpp
 	$(CXX) $(ARTOLC_CXXFLAGS) -Ibind9-overlay/tests/bench -c -o $@ $<
-bench_scale_artrowex: src/bench_scale_artrowex.o $(ARTROWEX_OBJS) bench_scale_common.o
-	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma
+bench_scale_artrowex: src/bench_scale_artrowex.o $(ARTROWEX_OBJS) $(SCALE_COMMON_OBJS)
+	$(CXX) $(OPTFLAGS) -o $@ $^ -ltbb -lpthread -lnuma $(HWLOC_LIBS)
 
 # ---------------------------------------------------------------------------
 # Our Fractal Trie checkout: a git clone of $(URCU_UPSTREAM) on $(URCU_BRANCH),
