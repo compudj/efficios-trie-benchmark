@@ -1,0 +1,5 @@
+engine,buckets,keys,rss_kb
+txn_hlist,1000000,10000,10900
+rlu_hlist,1000000,10000,79748
+rcu_hlist,1000000,10000,151428
+lfht,1000000,10000,27396
