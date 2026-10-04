@@ -42,7 +42,12 @@ static void load_key(TID tid, Key &key)
 static ART_OLC::Tree *g_tree;
 static ART::ThreadInfo *g_main_ti;
 static struct bench_arena g_arena;	/* lookup-key copies */
-static volatile uint64_t g_sink;
+/*
+ * Per-thread: every reader stores to the sink once per batch, and as one shared
+ * global it can share a cache line with state every lookup loads (it did in
+ * the HOTRowex and FT engines: about -20% at 192 readers).
+ */
+static thread_local volatile uint64_t g_sink;
 
 /* Pre-allocated churn key copies (reused across insert/remove) + presence. */
 static artolc_kv *churn_kv[CHURN_KEYS];

@@ -315,8 +315,15 @@ static void ft_reader_teardown(void *ctx)
 	rcu_unregister_thread();
 }
 
-/* Sink so the optimizer cannot drop the validating memcmp (result unused). */
-static volatile unsigned long ft_reader_sink;
+/*
+ * Sink so the optimizer cannot drop the validating memcmp (result unused).
+ * Per-thread: every reader stores to it once per batch.  As one shared global
+ * it sat on the cache line of g_ft / g_ft_cand, which every lookup loads, so
+ * the readers kept invalidating each other's copy of that line -- 435 instead
+ * of 545 Mops/s at 192 readers, and which builds were hit depended on link
+ * layout (the membarrier build was, the QSBR build was not).
+ */
+static __thread volatile unsigned long ft_reader_sink;
 
 static void ft_reader_batch(void *ctx, uint64_t *seed)
 {

@@ -48,7 +48,12 @@ typedef Masstree::basic_table<mt_params> table_type;
 static table_type g_table;
 static threadinfo *g_main_ti;
 static struct bench_arena g_mt_arena;	/* lookup-key copies */
-static volatile uint64_t g_sink;
+/*
+ * Per-thread: every reader stores to the sink once per batch, and as one shared
+ * global it can share a cache line with state every lookup loads (it did in
+ * the HOTRowex and FT engines: about -20% at 192 readers).
+ */
+static thread_local volatile uint64_t g_sink;
 
 /* Distinct threadinfo index per worker. */
 static int g_thread_idx;

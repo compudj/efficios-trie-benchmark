@@ -37,7 +37,12 @@ using HotRowex =
 static HotRowex *g_hr;
 
 /* Sink so the optimizer cannot elide the lookup loop. */
-static volatile uint64_t g_sink;
+/*
+ * Per-thread: every reader stores to the sink once per batch, and as one shared
+ * global it can share a cache line with state every lookup loads (it did in
+ * the HOTRowex and FT engines: about -20% at 192 readers).
+ */
+static thread_local volatile uint64_t g_sink;
 
 /*
  * External nodes: a compact arena of key COPIES that the stored values point
