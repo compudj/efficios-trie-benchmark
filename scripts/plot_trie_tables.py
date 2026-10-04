@@ -140,8 +140,8 @@ lookup_bar_panels(
 # ══ 3. load-names — FT vs BIND9 QP-trie @ 192 cores (median of 5, min–max) ════
 fig, ax = plt.subplots(figsize=(8.0, 2.6), dpi=150)
 data = [  # (label, median, lo, hi, color)
-    ("ft_spec_il", 1246, 1227, 1273, ENG["ft"][0]),
-    ("qp_il",       938,  804,  976, ENG["b9qp"][0]),
+    ("ft_spec_il", 1241, 1212, 1264, ENG["ft"][0]),
+    ("qp_il",       902,  842, 1084, ENG["b9qp"][0]),
 ]
 ypos = [1, 0]
 for (label, med, lo, hi, color), y in zip(data, ypos):
@@ -154,7 +154,7 @@ ax.set_yticks(ypos, [d[0] for d in data], fontsize=11)
 ax.tick_params(axis="y", length=0)
 ax.set_xlim(0, 1600)
 ax.set_xlabel("query throughput @ 192 cores (Mops/s, higher is better)", fontsize=10)
-ax.text(1246 / 2, 1, "≈ 1.3× BIND9-QP", va="center", ha="center",
+ax.text(1241 / 2, 1, "≈ 1.4× BIND9-QP", va="center", ha="center",
         fontsize=10.5, color="white", fontweight="bold", zorder=6)
 style_ax(ax, ygrid=False, xgrid=True)
 ax.set_title("load-names @ 192 cores — Fractal Trie vs BIND9 dns_qpmulti",
@@ -164,13 +164,13 @@ ax.text(0.0, 1.12, "1M DNS names, both NUMA-interleaved + cache-primed · "
         transform=ax.transAxes, fontsize=9, color="#666666")
 save(fig, "loadnames_ft_vs_qp.png")
 
-# ══ 4. load-names — thread sweep, 5 concurrent engines (median of 4) ══════════
+# ══ 4. load-names — thread sweep, 5 concurrent engines (median of 5) ══════════
 LOADNAMES = [  # (engine key, label, [64, 128, 192])
-    ("ft",       "ft_spec_il", [317, 758, 1212]),
-    ("hotrowex", "hotrowex",   [355, 719, 1021]),
-    ("artolc",   "artolc",     [208, 428, 685]),
-    ("artrowex", "artrowex",   [203, 424, 701]),
-    ("masstree", "masstree",   [166, 262, 267]),
+    ("ft",       "ft_spec_il", [289, 710, 1241]),
+    ("hotrowex", "hotrowex",   [258, 501, 760]),
+    ("artolc",   "artolc",     [165, 309, 457]),
+    ("artrowex", "artrowex",   [164, 307, 453]),
+    ("masstree", "masstree",   [156, 251, 178]),
 ]
 fig, ax = plt.subplots(figsize=(8.6, 5.2), dpi=150)
 xs = [64, 128, 192]
@@ -178,7 +178,7 @@ for key, label, ys in LOADNAMES:
     color, marker = ENG[key]
     ax.plot(xs, ys, color=color, lw=2.0, marker=marker, ms=7,
             markeredgecolor="white", markeredgewidth=1.1, zorder=4, label=label)
-ax.annotate("crossover ≈ 128 threads", xy=(128, 740), xytext=(76, 950),
+ax.annotate("FT 1.6× HOTRowex at 192", xy=(192, 1241), xytext=(118, 1120),
             fontsize=9.5, color="#333333",
             arrowprops=dict(arrowstyle="-|>", color="#555555", lw=1.1,
                             connectionstyle="arc3,rad=-0.2"))
@@ -193,19 +193,19 @@ leg.get_frame().set_edgecolor("#dddddd")
 ax.set_title("load-names lookup scaling — FT vs HOTRowex vs ART-OLC/ROWEX vs Masstree",
              fontsize=12.5, fontweight="bold", pad=26)
 ax.text(0.0, 1.03, "1M DNS names, sequential lookups, all engines validating · "
-        "median of 4 · Masstree plateaus past 128", transform=ax.transAxes,
+        "median of 5 · Masstree falls back past 128", transform=ax.transAxes,
         fontsize=9.5, color="#666666")
 save(fig, "loadnames_scaling.png")
 
 # ══ 5. bench_scale — read throughput vs readers (+RSS), 6 engines ═════════════
 #      two tables → two line panels (1 writer + N readers / readers only) + RSS
 SCALE_RW = [  # (key, label, w=[64,96,128,191], ro=[64,96,128,192], rss MB)
-    ("ft",       "ft",       [160, 226, 286, 380], [166, 236, 298, 396], 320),
-    ("ft2",      "ft_qsbr",  [166, 234, 290, 377], [173, 248, 301, 393], 320),
-    ("hotrowex", "hotrowex", [177, 252, 320, 426], [179, 259, 323, 431], 110),
-    ("artolc",   "artolc",   [127, 188, 250, 367], [129, 192, 255, 378], 141),
-    ("artrowex", "artrowex", [123, 182, 243, 356], [127, 188, 251, 372], 141),
-    ("masstree", "masstree", [116, 171, 227, 330], [116, 172, 228, 333], 185),
+    ("ft",       "ft",       [188, 280, 364, 529], [193, 289, 382, 560], 434),
+    ("ft2",      "ft_qsbr",  [179, 268, 359, 532], [194, 291, 383, 561], 419),
+    ("hotrowex", "hotrowex", [202, 309, 410, 598], [202, 302, 402, 610], 113),
+    ("artolc",   "artolc",   [128, 191, 256, 377], [138, 209, 276, 409], 144),
+    ("artrowex", "artrowex", [129, 192, 255, 373], [134, 199, 266, 402], 144),
+    ("masstree", "masstree", [127, 187, 249, 363], [136, 202, 261, 373], 186),
 ]
 fig, axes = plt.subplots(1, 3, figsize=(12.5, 4.8), dpi=150,
                          gridspec_kw={"width_ratios": [1, 1, 0.62]})
@@ -219,7 +219,7 @@ for ax, xs, col, ptitle in [
                 markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
     ax.set_xlim(56, 200)
     ax.xaxis.set_major_locator(FixedLocator(xs))
-    ax.set_ylim(0, 460)
+    ax.set_ylim(0, 650)
     ax.set_xlabel("reader threads", fontsize=10)
     ax.set_title(ptitle, fontsize=11, fontweight="bold")
     style_ax(ax)
@@ -231,7 +231,7 @@ for y, r in zip(ypos, SCALE_RW):
     axes[2].text(r[4] + 8, y, f"{r[4]} MB", va="center", fontsize=8.5, color="#333333")
 axes[2].set_yticks(ypos, [r[1] for r in SCALE_RW], fontsize=9)
 axes[2].tick_params(axis="y", length=0)
-axes[2].set_xlim(0, 420)
+axes[2].set_xlim(0, 540)
 axes[2].set_xlabel("RSS after build (MB)", fontsize=10)
 axes[2].set_title("footprint", fontsize=11, fontweight="bold")
 style_ax(axes[2], ygrid=False, xgrid=True)
@@ -245,15 +245,16 @@ save(fig, "scale_rw_reads.png")
 
 # ══ 6. mutator insert throughput vs reader count (the rwlock cliff) ═══════════
 INSERT = [  # (key, label, [0, 1, 16, 64, 191] readers, kops/s)
-    ("masstree", "masstree (optimistic)", [11272, 11123, 10589, 10508, 9494]),
-    ("hotrowex", "hotrowex (ROWEX)",      [5680, 5610, 5235, 4713, 4152]),
-    ("artolc",   "artolc (OLC)",          [4091, 3272, 2160, 1796, 1457]),
-    ("artrowex", "artrowex (ROWEX)",      [3421, 2849, 2087, 1639, 1469]),
-    ("ft",       "ft (RCU)",              [1340, 592, 666, 326, 498]),
-    ("b9qp",     "b9qp (RCU)",            [441, 419, 288, 268, 191]),
-    ("judy",     "judy (rwlock)",         [10628, 2.8, 19, 92, 429]),
-    ("qp",       "qp (rwlock)",           [9170, 3.8, 33, 134, 513]),
-    ("art",      "art (rwlock)",          [10197, 2.8, 34, 113, 461]),
+    ("masstree", "masstree (optimistic)", [11251, 11166, 10745, 10269, 9062]),
+    ("hotrowex", "hotrowex (ROWEX)",      [5700, 5712, 5543, 5395, 5142]),
+    ("artolc",   "artolc (OLC)",          [3886, 3586, 2374, 1931, 1442]),
+    ("artrowex", "artrowex (ROWEX)",      [3264, 3065, 2108, 1770, 1374]),
+    ("ft2",      "ft, list off (RCU)",    [749, 711, 624, 525, 313]),
+    ("ft",       "ft (RCU)",              [493, 474, 427, 366, 239]),
+    ("b9qp",     "b9qp (RCU)",            [452, 437, 355, 306, 208]),
+    ("judy",     "judy (rwlock)",         [10713, 2, 12, 133, 496]),
+    ("qp",       "qp (rwlock)",           [9242, 3, 18, 116, 544]),
+    ("art",      "art (rwlock)",          [10356, 2, 10, 103, 500]),
 ]
 READERS = ["0", "1", "16", "64", "191"]
 fig, ax = plt.subplots(figsize=(9.6, 5.8), dpi=150)
@@ -263,7 +264,7 @@ for key, label, ys in INSERT:
     ls = (0, (4, 2.2)) if key in RWLOCK else "-"
     ax.plot(xp, ys, color=color, lw=1.9, ls=ls, marker=marker, ms=6.5,
             markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
-ax.annotate("rwlock cliff: ~10M → 3 kops/s the instant\none reader appears "
+ax.annotate("rwlock cliff: ~10M → 2–3 kops/s the instant\none reader appears "
             "(readers hold the rdlock\nacross 1000-lookup batches)",
             xy=(1, 3.0), xytext=(1.42, 1.7), fontsize=9.5, color="#333333",
             arrowprops=dict(arrowstyle="-|>", color="#555555", lw=1.2,
@@ -288,15 +289,16 @@ save(fig, "mutator_insert.png", rect=(0, 0, 1, 0.89))
 
 # ══ 7. replace / remove at the endpoints (0 vs 191 readers) — dumbbells ═══════
 REPL = [  # (label, replace0, replace191, remove0, remove191)  None = n/a
-    ("masstree", 12913, 12183, 12175, 9207),
-    ("hotrowex", 6185, 4516, None, None),
-    ("artolc",   1243, 1170, 1193, 1057),
-    ("artrowex", 790, 702, 1144, 929),
-    ("ft",       1057, 375, 2412, 754),
-    ("b9qp",     446, 196, 471, 206),
-    ("judy",     14923, 669, 9015, 358),
-    ("qp",       17265, 1358, 16343, 1050),
-    ("art",      15361, 800, 12311, 482),
+    ("masstree", 13060, 11765, 12217, 8498),
+    ("hotrowex", 6258, 5570, None, None),
+    ("ft, list off", 2346, 1202, 921, 497),
+    ("ft",       1410, 720, 711, 364),
+    ("artolc",   1220, 1131, 1191, 1036),
+    ("artrowex", 780, 699, 1142, 904),
+    ("b9qp",     461, 206, 485, 219),
+    ("judy",     15390, 801, 9045, 416),
+    ("qp",       17547, 1349, 16406, 1107),
+    ("art",      15328, 877, 12301, 533),
 ]
 C0, C191 = "#b3b3b3", "#0072B2"
 fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), dpi=150, sharey=True)
@@ -333,21 +335,21 @@ legend_items = [
 fig.legend(handles=legend_items, loc="upper center", ncol=2, fontsize=10.5,
            frameon=False, bbox_to_anchor=(0.5, 1.02))
 fig.suptitle("Replace & remove throughput, 0 → 191 concurrent readers — "
-             "the rwlock engines lose 10–25×, RCU/optimistic engines degrade gently",
+             "the rwlock engines lose 13–23×, RCU/optimistic engines degrade gently",
              fontsize=12, fontweight="bold", y=1.1)
 save(fig, "mutator_replace_remove.png")
 
 # ══ 8. ordered iteration throughput vs reader threads ═════════════════════════
 ITER = [  # (key, label, [1, 16, 64, 192] next-Mops/s)
-    ("ft",       "ft (batched cell gather)", [510, 8168, 32678, 88124]),
-    ("hotrowex", "hotrowex",                 [175, 2540, 9759, 27471]),
-    ("b9qp",     "b9qp",                     [91, 1467, 5851, 15072]),
-    ("art",      "art",                      [22, 339, 1243, 3745]),
-    ("masstree", "masstree",                 [19, 261, 1065, 2972]),
-    ("artolc",   "artolc",                   [18, 224, 840, 2532]),
-    ("artrowex", "artrowex",                 [15, 194, 818, 2227]),
-    ("judy",     "judy",                     [5.2, 82, 337, 968]),
-    ("qp",       "qp",                       [4.3, 65, 263, 785]),
+    ("ft",       "ft (batched cell gather)", [443, 7062, 28266, 79298]),
+    ("hotrowex", "hotrowex",                 [172, 2821, 10836, 29024]),
+    ("b9qp",     "b9qp",                     [92, 1466, 5608, 14955]),
+    ("art",      "art",                      [22, 322, 1275, 3776]),
+    ("masstree", "masstree",                 [17, 274, 1095, 3044]),
+    ("artolc",   "artolc",                   [14, 225, 883, 2568]),
+    ("artrowex", "artrowex",                 [12, 200, 793, 2271]),
+    ("judy",     "judy",                     [5.3, 88, 355, 991]),
+    ("qp",       "qp",                       [4.2, 68, 285, 809]),
 ]
 XT = ["1", "16", "64", "192"]
 fig, ax = plt.subplots(figsize=(9.6, 5.8), dpi=150)
@@ -358,7 +360,7 @@ for key, label, ys in ITER:
     ax.plot(xp, ys, color=color, lw=1.9, ls=ls, marker=marker, ms=6.5,
             markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
 ax.text(0.03, 0.96, "ft = batched cell gather (FT_ORD + compaction + FT_BATCH=64):\n"
-        "~3.2× hotrowex at 192T",
+        "~2.7× hotrowex at 192T",
         transform=ax.transAxes, fontsize=9.5, color="#333333", va="top")
 ax.set_yscale("log")
 ax.set_ylim(3, 300000)
@@ -381,10 +383,10 @@ save(fig, "ordered_iteration.png", rect=(0, 0, 1, 0.89))
 
 # ══ 9. FT ordered-scan configuration steps @ 192T ═════════════════════════════
 STEPS = [  # (label, Mops/s) — sequential blues: one hue, light→dark (magnitude)
-    ("cds_ft_next descent (pre-cell)", 350, "#b8d4ea"),
-    ("+ ordered cell list (FT_ORD)", 3641, "#7fb2d9"),
-    ("+ compaction (FT_BENCH_COMPACT)", 20008, "#3d8bc4"),
-    ("+ batched gather (FT_BATCH=64)", 88124, "#0072B2"),
+    ("cds_ft_next descent (pre-cell, June)", 350, "#b8d4ea"),
+    ("+ ordered cell list (FT_ORD)", 7184, "#7fb2d9"),
+    ("+ compaction (FT_BENCH_COMPACT)", 18929, "#3d8bc4"),
+    ("+ batched gather (FT_BATCH=64)", 79298, "#0072B2"),
 ]
 fig, ax = plt.subplots(figsize=(9.0, 3.0), dpi=150)
 ypos = [3, 2, 1, 0]
@@ -404,7 +406,7 @@ ax.grid(axis="x", which="major", color="#ececec", lw=0.7, zorder=0)
 ax.set_axisbelow(True)
 for s in ("top", "right"):
     ax.spines[s].set_visible(False)
-ax.set_title("How FT ordered iteration got 252× faster — each step, same 1M-key set",
+ax.set_title("How FT ordered iteration got 227× faster — each step, same 1M-key set",
              fontsize=12, fontweight="bold", pad=10)
 save(fig, "ft_iter_steps.png")
 
@@ -413,20 +415,20 @@ QPM = {
     "Read-only": {
         "xticks": ["1", "16", "64", "192"],
         "series": [  # (key, label, values Mops/s)
-            ("b9qp", "qp (dns_qpmulti)", [2.3, 42.7, 170, 508]),
-            ("ft",   "FT speculative",   [2.3, 40.3, 161, 462]),
-            ("ft2",  "FT eager",         [2.2, 39.9, 159, 443]),
+            ("b9qp", "qp (dns_qpmulti)", [2.6, 45.0, 180, 534]),
+            ("ft",   "FT speculative",   [2.4, 44.0, 175, 515]),
+            ("ft2",  "FT eager",         [2.4, 43.2, 172, 498]),
         ],
-        "note": "miss-heavy (~50%): qp exits early on a miss — FT trails ~9%",
+        "note": "miss-heavy (~50%): qp exits early on a miss — FT trails ~4%",
     },
     "Mutate + read": {
         "xticks": ["1", "16", "64", "191"],
         "series": [
-            ("b9qp", "qp (dns_qpmulti)", [1.3, 34.2, 133, 450]),
-            ("ft",   "FT speculative",   [1.7, 35.8, 148, 450]),
-            ("ft2",  "FT eager",         [1.5, 34.6, 140, 430]),
+            ("b9qp", "qp (dns_qpmulti)", [1.4, 36.1, 149, 455]),
+            ("ft",   "FT speculative",   [2.0, 38.2, 152, 466]),
+            ("ft2",  "FT eager",         [1.8, 37.3, 149, 452]),
         ],
-        "note": "under write contention FT pulls level/ahead (1.0–1.31×)",
+        "note": "under write contention FT pulls level/ahead (1.0–1.4×)",
     },
 }
 fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.8), dpi=150, sharey=True)
