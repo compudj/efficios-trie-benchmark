@@ -215,6 +215,21 @@ static void ft_build(void)
 		cds_ft_group_attr_set_ordered_list(attr, true);
 		fprintf(stderr, "[ft_build] ordered cell list ENABLED (FT_ORD)\n");
 	}
+	/*
+	 * FT_NO_ORD: turn the ordered cell list OFF.  It is on by default in
+	 * the library and every insert / remove maintains it, so a mutator
+	 * figure taken without this knob includes a feature the other engines
+	 * do not have.  With it off the trie mutates faster and uses 32 B per
+	 * key less, and gives up ordered iteration -- hence no BENCH_ITERATE.
+	 */
+	if (getenv("FT_NO_ORD")) {
+		if (getenv("FT_ORD") || getenv("BENCH_ITERATE")) {
+			fprintf(stderr, "FT_NO_ORD excludes FT_ORD and BENCH_ITERATE\n");
+			abort();
+		}
+		cds_ft_group_attr_set_ordered_list(attr, false);
+		fprintf(stderr, "[ft_build] ordered cell list DISABLED (FT_NO_ORD)\n");
+	}
 	if (getenv("FT_BATCH")) {
 		g_ft_batch = atoi(getenv("FT_BATCH"));
 		if (g_ft_batch < 1) g_ft_batch = 1;
