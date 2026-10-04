@@ -245,16 +245,16 @@ save(fig, "scale_rw_reads.png")
 
 # ══ 6. mutator insert throughput vs reader count (the rwlock cliff) ═══════════
 INSERT = [  # (key, label, [0, 1, 16, 64, 191] readers, kops/s)
-    ("masstree", "masstree (optimistic)", [11251, 11166, 10745, 10269, 9062]),
+    ("masstree", "masstree (optimistic)", [11246, 11191, 10787, 10346, 9133]),
     ("hotrowex", "hotrowex (ROWEX)",      [5700, 5712, 5543, 5395, 5142]),
-    ("artolc",   "artolc (OLC)",          [3886, 3586, 2374, 1931, 1442]),
-    ("artrowex", "artrowex (ROWEX)",      [3264, 3065, 2108, 1770, 1374]),
+    ("artolc",   "artolc (OLC)",          [3872, 3544, 2398, 1915, 1444]),
+    ("artrowex", "artrowex (ROWEX)",      [3263, 3007, 2183, 1830, 1395]),
     ("ft2",      "ft, list off (RCU)",    [749, 711, 624, 525, 313]),
     ("ft",       "ft (RCU)",              [493, 474, 427, 366, 239]),
-    ("b9qp",     "b9qp (RCU)",            [452, 437, 355, 306, 208]),
-    ("judy",     "judy (rwlock)",         [10713, 2, 12, 133, 496]),
-    ("qp",       "qp (rwlock)",           [9242, 3, 18, 116, 544]),
-    ("art",      "art (rwlock)",          [10356, 2, 10, 103, 500]),
+    ("b9qp",     "b9qp (RCU)",            [446, 438, 346, 290, 210]),
+    ("judy",     "judy (rwlock)",         [10728, 2, 14, 130, 492]),
+    ("qp",       "qp (rwlock)",           [9262, 3, 19, 109, 513]),
+    ("art",      "art (rwlock)",          [10250, 2, 11, 120, 470]),
 ]
 READERS = ["0", "1", "16", "64", "191"]
 fig, ax = plt.subplots(figsize=(9.6, 5.8), dpi=150)
@@ -289,16 +289,16 @@ save(fig, "mutator_insert.png", rect=(0, 0, 1, 0.89))
 
 # ══ 7. replace / remove at the endpoints (0 vs 191 readers) — dumbbells ═══════
 REPL = [  # (label, replace0, replace191, remove0, remove191)  None = n/a
-    ("masstree", 13060, 11765, 12217, 8498),
+    ("masstree", 13071, 11799, 12239, 8530),
     ("hotrowex", 6258, 5570, None, None),
     ("ft, list off", 2346, 1202, 921, 497),
     ("ft",       1410, 720, 711, 364),
-    ("artolc",   1220, 1131, 1191, 1036),
-    ("artrowex", 780, 699, 1142, 904),
-    ("b9qp",     461, 206, 485, 219),
-    ("judy",     15390, 801, 9045, 416),
-    ("qp",       17547, 1349, 16406, 1107),
-    ("art",      15328, 877, 12301, 533),
+    ("artolc",   1221, 1097, 1191, 1002),
+    ("artrowex", 781, 756, 1142, 982),
+    ("b9qp",     464, 210, 484, 221),
+    ("judy",     15385, 769, 9086, 404),
+    ("qp",       17509, 1363, 16431, 1100),
+    ("art",      15342, 851, 12399, 520),
 ]
 C0, C191 = "#b3b3b3", "#0072B2"
 fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), dpi=150, sharey=True)
@@ -341,15 +341,15 @@ save(fig, "mutator_replace_remove.png")
 
 # ══ 8. ordered iteration throughput vs reader threads ═════════════════════════
 ITER = [  # (key, label, [1, 16, 64, 192] next-Mops/s)
-    ("ft",       "ft (batched cell gather)", [443, 7062, 28266, 79298]),
-    ("hotrowex", "hotrowex",                 [172, 2821, 10836, 29024]),
-    ("b9qp",     "b9qp",                     [92, 1466, 5608, 14955]),
-    ("art",      "art",                      [22, 322, 1275, 3776]),
-    ("masstree", "masstree",                 [17, 274, 1095, 3044]),
-    ("artolc",   "artolc",                   [14, 225, 883, 2568]),
-    ("artrowex", "artrowex",                 [12, 200, 793, 2271]),
-    ("judy",     "judy",                     [5.3, 88, 355, 991]),
-    ("qp",       "qp",                       [4.2, 68, 285, 809]),
+    ("ft",       "ft (batched cell gather)", [500, 7979, 32081, 89855]),
+    ("hotrowex", "hotrowex",                 [176, 2846, 10977, 29007]),
+    ("b9qp",     "b9qp",                     [92, 1468, 5609, 14963]),
+    ("art",      "art",                      [22, 322, 1272, 3772]),
+    ("masstree", "masstree",                 [17, 270, 1078, 3041]),
+    ("artolc",   "artolc",                   [14, 226, 889, 2583]),
+    ("artrowex", "artrowex",                 [12, 198, 787, 2258]),
+    ("judy",     "judy",                     [5.3, 88, 355, 981]),
+    ("qp",       "qp",                       [4.4, 72, 298, 844]),
 ]
 XT = ["1", "16", "64", "192"]
 fig, ax = plt.subplots(figsize=(9.6, 5.8), dpi=150)
@@ -360,7 +360,7 @@ for key, label, ys in ITER:
     ax.plot(xp, ys, color=color, lw=1.9, ls=ls, marker=marker, ms=6.5,
             markeredgecolor="white", markeredgewidth=1.0, zorder=4, label=label)
 ax.text(0.03, 0.96, "ft = batched cell gather (FT_ORD + compaction + FT_BATCH=64):\n"
-        "~2.7× hotrowex at 192T",
+        "~3.1× hotrowex at 192T",
         transform=ax.transAxes, fontsize=9.5, color="#333333", va="top")
 ax.set_yscale("log")
 ax.set_ylim(3, 300000)
@@ -384,9 +384,9 @@ save(fig, "ordered_iteration.png", rect=(0, 0, 1, 0.89))
 # ══ 9. FT ordered-scan configuration steps @ 192T ═════════════════════════════
 STEPS = [  # (label, Mops/s) — sequential blues: one hue, light→dark (magnitude)
     ("cds_ft_next descent (pre-cell, June)", 350, "#b8d4ea"),
-    ("+ ordered cell list (FT_ORD)", 7184, "#7fb2d9"),
-    ("+ compaction (FT_BENCH_COMPACT)", 18929, "#3d8bc4"),
-    ("+ batched gather (FT_BATCH=64)", 79298, "#0072B2"),
+    ("+ ordered cell list (FT_ORD)", 7260, "#7fb2d9"),
+    ("+ compaction (FT_BENCH_COMPACT)", 18351, "#3d8bc4"),
+    ("+ batched gather (FT_BATCH=64)", 89855, "#0072B2"),
 ]
 fig, ax = plt.subplots(figsize=(9.0, 3.0), dpi=150)
 ypos = [3, 2, 1, 0]
@@ -406,7 +406,7 @@ ax.grid(axis="x", which="major", color="#ececec", lw=0.7, zorder=0)
 ax.set_axisbelow(True)
 for s in ("top", "right"):
     ax.spines[s].set_visible(False)
-ax.set_title("How FT ordered iteration got 227× faster — each step, same 1M-key set",
+ax.set_title("How FT ordered iteration got 257× faster — each step, same 1M-key set",
              fontsize=12, fontweight="bold", pad=10)
 save(fig, "ft_iter_steps.png")
 

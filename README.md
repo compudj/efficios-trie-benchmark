@@ -660,20 +660,20 @@ staying within one order of magnitude out to 191 readers](figures/mutator_insert
 
 | Engine | 0 | 1 | 16 | 64 | 191 | sync |
 |------------|------:|----:|-----:|----:|----:|:-----|
-| `masstree` | 11251 |11166|10745 |10269| 9062| optimistic |
+| `masstree` | 11246 |11191|10787 |10346| 9133| optimistic |
 | `hotrowex` |  5700 | 5712| 5543 | 5395| 5142| ROWEX |
-| `artolc`   |  3886 | 3586| 2374 | 1931| 1442| OLC |
-| `artrowex` |  3264 | 3065| 2108 | 1770| 1374| ROWEX |
+| `artolc`   |  3872 | 3544| 2398 | 1915| 1444| OLC |
+| `artrowex` |  3263 | 3007| 2183 | 1830| 1395| ROWEX |
 | `ft` (list off) | 749 | 711 | 624 | 525 | 313 | **RCU** |
 | `ft`       |   493 |  474|  427 |  366|  239| **RCU** |
-| `b9qp`     |   452 |  437|  355 |  306|  208| **RCU** |
-| `judy`     | 10713 |**2**|   12 |  133|  496| rwlock |
-| `qp`       |  9242 |**3**|   18 |  116|  544| rwlock |
-| `art`      | 10356 |**2**|   10 |  103|  500| rwlock |
+| `b9qp`     |   446 |  438|  346 |  290|  210| **RCU** |
+| `judy`     | 10728 |**2**|   14 |  130|  492| rwlock |
+| `qp`       |  9262 |**3**|   19 |  109|  513| rwlock |
+| `art`      | 10250 |**2**|   11 |  120|  470| rwlock |
 
 **The cliff is the result.** The three **rwlock** engines have the *fastest*
 single-thread mutation (~9–11M ops/s), then **fall off a cliff the instant a
-reader appears** — judy `10713 → 2`, art `10356 → 2`, qp `9242 → 3` kops, a
+reader appears** — judy `10728 → 2`, art `10250 → 2`, qp `9262 → 3` kops, a
 ~3000–5000× collapse — because the writer-preferring rwlock writer must wait for readers, and
 each reader holds the rdlock across a whole 1000-lookup batch. (The noisy partial
 "recovery" at higher reader counts is scheduling churn in the starved regime, not
@@ -685,7 +685,7 @@ Masstree is barely touched (−19% over the whole sweep) and HOTRowex less still
 (−10%); FT halves between 0 and 191 readers (493 → 239) and never starves.
 
 ![Replace and remove throughput from 0 to 191 readers, log-scale dumbbells:
-the rwlock engines lose 13–23×, RCU and the optimistic engines degrade gently;
+the rwlock engines lose 13–24×, RCU and the optimistic engines degrade gently;
 Masstree's in-place replace barely moves and HOTRowex has no
 remove](figures/mutator_replace_remove.png)
 
@@ -693,16 +693,16 @@ remove](figures/mutator_replace_remove.png)
 
 | Engine | replace 0 | replace 191 | remove 0 | remove 191 |
 |------------|----------:|------------:|---------:|-----------:|
-| `masstree` |     13060 |       11765 |    12217 |       8498 |
+| `masstree` |     13071 |       11799 |    12239 |       8530 |
 | `hotrowex` |      6258 |        5570 |   *n/a*  |     *n/a*  |
 | `ft` (list off) | 2346 |       1202 |      921 |        497 |
 | `ft`       |      1410 |         720 |      711 |        364 |
-| `artolc`   |      1220 |        1131 |     1191 |       1036 |
-| `artrowex` |       780 |         699 |     1142 |        904 |
-| `b9qp`     |       461 |         206 |      485 |        219 |
-| `judy`     |     15390 |         801 |     9045 |        416 |
-| `qp`       |     17547 |        1349 |    16406 |       1107 |
-| `art`      |     15328 |         877 |    12301 |        533 |
+| `artolc`   |      1221 |        1097 |     1191 |       1002 |
+| `artrowex` |       781 |         756 |     1142 |        982 |
+| `b9qp`     |       464 |         210 |      484 |        221 |
+| `judy`     |     15385 |         769 |     9086 |        404 |
+| `qp`       |     17509 |        1363 |    16431 |       1100 |
+| `art`      |     15342 |         851 |    12399 |        520 |
 
 Per-op shape follows the mechanism: **Masstree's in-place update makes replace its
 *cheapest* op** (13.1M ops/s, above its own insert and remove — no node split or
@@ -755,8 +755,8 @@ LD_LIBRARY_PATH=urcu-build/src/.libs FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64 \
 ```
 
 ![Ordered iteration scaling, log scale: every engine is near-linear from 1 to
-192 threads; FT's batched cell gather leads at 79,298 next-Mops/s at 192
-threads, ~2.7× HOTRowex and ~5.3× BIND9-QP; the key-materializing judy/qp
+192 threads; FT's batched cell gather leads at 89,855 next-Mops/s at 192
+threads, ~3.1× HOTRowex and ~6.0× BIND9-QP; the key-materializing judy/qp
 cursors sit lowest](figures/ordered_iteration.png)
 
 Median of 3, next Mops/s — readers across the top (FT at `ft-txn-integ` @
@@ -764,35 +764,43 @@ Median of 3, next Mops/s — readers across the top (FT at `ft-txn-integ` @
 
 | Engine | 1 | 16 | 64 | 192 | traversal |
 |------------|------:|------:|-------:|-------:|:----------|
-| **`ft`**   | **443** | **7062** | **28266** | **79298** | **batched cell gather, compacted (phys-next MLP; cell-native, no node touch)** |
-| `hotrowex` |   172 |  2821 | 10836 | 29024 | inlined header-template + contiguous leaves |
-| `b9qp`     |    92 |  1466 |   5608 |  14955 | `dns_qpiter` `.so` call + DFS-compacted chunks |
-| `art`      |    22 |   322 |   1275 |   3776 | recursive callback |
-| `masstree` |    17 |   274 |   1095 |   3044 | B+tree leaf scan |
-| `artolc`   |    14 |   225 |    883 |   2568 | range-into-buffer |
-| `artrowex` |    12 |   200 |    793 |   2271 | range-into-buffer |
-| `judy`     |   5.3 |    88 |    355 |    991 | JSLN cursor (materializes key) |
-| `qp`       |   4.2 |    68 |    285 |    809 | Tnextl cursor (materializes key) |
+| **`ft`**   | **500** | **7979** | **32081** | **89855** | **batched cell gather, compacted (phys-next MLP; cell-native, no node touch)** |
+| `hotrowex` |   176 |  2846 | 10977 | 29007 | inlined header-template + contiguous leaves |
+| `b9qp`     |    92 |  1468 |   5609 |  14963 | `dns_qpiter` `.so` call + DFS-compacted chunks |
+| `art`      |    22 |   322 |   1272 |   3772 | recursive callback |
+| `masstree` |    17 |   270 |   1078 |   3041 | B+tree leaf scan |
+| `artolc`   |    14 |   226 |    889 |   2583 | range-into-buffer |
+| `artrowex` |    12 |   198 |    787 |   2258 | range-into-buffer |
+| `judy`     |   5.3 |    88 |    355 |    981 | JSLN cursor (materializes key) |
+| `qp`       |   4.4 |    72 |    298 |    844 | Tnextl cursor (materializes key) |
 
 (`b9qp`'s 192-reader point is a separate `BENCH_THREADS=192` run: libisc caps
 thread ids at 512, which the sweep's cumulative reader count passes there.)
 
-**FT is the fastest ordered iterator** — ~2.7× over hotrowex at 192T, a full
+**The batched FT row moves with where the linker puts the caller's loop.** The
+harness's `ft_iterate()` is the same 208 instructions in two builds of this
+benchmark that differ only in an unrelated writer function ahead of it, which
+shifted its address by 0x120 bytes. Same library, same pinning, three runs
+each within 0.3%: 443 and 500 Mops/s on one thread, 79,298 and 89,855 at 192.
+The table is the current build. The two un-batched FT configurations moved by
+1% and 3% between the same two builds.
+
+**FT is the fastest ordered iterator** — ~3.1× over hotrowex at 192T, a full
 reversal of the original result (FT was *last*, 365 Mops/s). It got there in four
 steps on the same 1M-key set; the first row is the June measurement of the
 pre-cell cursor, which today's library no longer has a configuration for, and
 the other three are current:
 
-![How FT ordered iteration got 227× faster, log-scale bars: cds_ft_next descent
-350 → ordered cell list 7,184 (×20.5) → compaction 18,929 (×2.6) → batched
-gather 79,298 Mops/s (×4.2)](figures/ft_iter_steps.png)
+![How FT ordered iteration got 257× faster, log-scale bars: cds_ft_next descent
+350 → ordered cell list 7,260 (×20.7) → compaction 18,351 (×2.5) → batched
+gather 89,855 Mops/s (×4.9)](figures/ft_iter_steps.png)
 
 | FT ordered-scan config | 192T Mops/s | what changed |
 |---|--:|:--|
 | `cds_ft_next` descent (pre-cell, June) | 350 | re-descend per step (the old result) |
-| + ordered cell list (`FT_ORD`) | 7184 | O(1) cell hop; cells still in insert order |
-| + compaction (`FT_BENCH_COMPACT`) | 18929 | cells packed in key order → contiguous walk |
-| + batched gather (`FT_BATCH=64`) | **79298** | one call per batch + phys-next MLP; cell-native (no node touch) |
+| + ordered cell list (`FT_ORD`) | 7260 | O(1) cell hop; cells still in insert order |
+| + compaction (`FT_BENCH_COMPACT`) | 18351 | cells packed in key order → contiguous walk |
+| + batched gather (`FT_BATCH=64`) | **89855** | one call per batch + phys-next MLP; cell-native (no node touch) |
 
 The final step folds three things into `cds_ft_cell_next_batch`: it amortizes the
 library-call boundary over a whole batch; it predicts the physically-next cell
@@ -828,7 +836,7 @@ step — exactly the call boundary FT's batched iterator amortizes away.
 **The cell scheme + compaction are required for the headline number.** It is the
 *batched, compacted* path (`FT_ORD=1 FT_BENCH_COMPACT=1 FT_BATCH=64`, lib built
 `-DFEATURE_FT_ORD_CELL`); the plain `cds_ft_for_each_rcu` cursor on an
-un-compacted trie is ~11× slower (the 7184 row). Compaction trades RSS and a
+un-compacted trie is ~12× slower (the 7260 row). Compaction trades RSS and a
 one-time pack for the scan speed, so it suits read-mostly / snapshot scans rather
 than churning tries. The batched walk is hidden behind a drop-in macro,
 `cds_ft_for_each_batched_rcu(ft, cell, buf, cap)` (iterator-free: a hidden cell
