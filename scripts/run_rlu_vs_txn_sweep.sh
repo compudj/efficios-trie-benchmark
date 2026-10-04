@@ -22,7 +22,11 @@ cd /mnt/data/efficios/git/efficios-trie-benchmark
 export DURATION_SEC=3
 RUNS=2
 OUT=scripts/rlu_vs_txn.csv
-TXN_TREE=/mnt/data/efficios/git/userspace-rcu-txn
+# The engine is built from this repo's own clone, urcu-txn-build (`make urcu-txn`:
+# urcu-txn-dev, -O2 -DNDEBUG).  The reference tree it is derived from is a
+# development tree: its in-tree library can be older than its headers and is not
+# built -DNDEBUG, so linking it mixes two engine versions.  TXN_TREE overrides.
+TXN_TREE=${TXN_TREE:-$PWD/urcu-txn-build}
 
 echo ">> building JEMALLOC=1 against the local txn tree (forced clean) ..." >&2
 rm -f bench_list_scale src/bench_list_scale.o

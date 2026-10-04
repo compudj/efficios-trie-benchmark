@@ -14,7 +14,11 @@
 # The engine hint is urcu_txn_declare_disjoint() (userspace-rcu-txn commit
 # 72ae6027).  Writes scripts/disjoint_hash.csv; plot with plot_disjoint_hash.py.
 set -eu
-DEV=${DEV:-/home/efficios/git/userspace-rcu-txn}
+BENCH0=$(cd "$(dirname "$0")/.." && pwd)
+# This repo's own engine build (make urcu-txn), not the development tree: see
+# the note in run_list_scale_alloc.sh.  -DNDEBUG below: see TXN3_CFLAGS in the
+# Makefile.
+DEV=${DEV:-$BENCH0/urcu-txn-build}
 HERE=$(cd "$(dirname "$0")" && pwd)
 BENCH=$(cd "$HERE/.." && pwd)
 JE=${JE:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
@@ -25,7 +29,7 @@ OUT=$HERE/disjoint_hash.csv
 # The shipping default engine already IS this config (spinlatch install, age-0
 # flat install, k=3 / 1024-bit filter), so no engine -D flags are needed; only
 # the runtime --disjoint variant below differs across the two curves.
-cc -O2 -pthread -I"$DEV/include" -I"$DEV/src" "$BENCH/src/bench_txn_3hash.c" \
+cc -O2 -DNDEBUG -pthread -I"$DEV/include" -I"$DEV/src" "$BENCH/src/bench_txn_3hash.c" \
 	-o "$BIN" -L"$DEV/src/.libs" -Wl,-rpath,"$DEV/src/.libs" \
 	-lurcu-qsbr -lurcu-cds -lurcu-common -lpthread
 trap 'rm -f "$BIN"' EXIT

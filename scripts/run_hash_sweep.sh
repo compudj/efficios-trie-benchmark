@@ -16,8 +16,14 @@ LWN=scripts/hash_lwn.csv
 DED=scripts/hash_dedicated.csv
 CON=scripts/hash_contention.csv
 
-echo ">> rebuilding bench_list_scale against the local txn tree ..." >&2
-make bench_list_scale URCU_TXN_BUILD=/mnt/data/efficios/git/userspace-rcu-txn >/dev/null 2>&1 \
+# The engine is built from this repo's own clone, urcu-txn-build (`make urcu-txn`:
+# urcu-txn-dev, -O2 -DNDEBUG).  The reference tree it is derived from is a
+# development tree: its in-tree library can be older than its headers and is not
+# built -DNDEBUG, so linking it mixes two engine versions.  TXN_TREE overrides.
+TXN_TREE=${TXN_TREE:-$PWD/urcu-txn-build}
+echo ">> rebuilding bench_list_scale against $TXN_TREE (forced clean) ..." >&2
+rm -f bench_list_scale src/bench_list_scale.o
+make bench_list_scale URCU_TXN_BUILD="$TXN_TREE" >/dev/null 2>&1 \
   || { echo "BUILD FAILED" >&2; exit 1; }
 
 # engine-config table: label | engine | extra-env

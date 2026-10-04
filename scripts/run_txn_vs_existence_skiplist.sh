@@ -86,6 +86,9 @@ SIZES="5 10 20 40 80"		# b = keys per updater per skiplist
 READERS="1 2 4 8 16 32 64 96 191"
 
 echo ">> building both engines (make enforces -DSL_XORSHIFT_LEVEL on existence)" >&2
+# txn side forced: a change of TXN3_CFLAGS or of the engine headers is invisible to
+# make's timestamp check, and the engine is header-inline.
+rm -f "$REPO/bench_txn_3skiplist" "$REPO/src/bench_txn_3skiplist.o"
 make -C "$REPO" bench_txn_3skiplist existence_3skiplist_uperf >/dev/null || exit 1
 for b in "$TXN" "$EX"; do
 	[ -x "$b" ] || { echo "ERROR: missing $b"; exit 1; }

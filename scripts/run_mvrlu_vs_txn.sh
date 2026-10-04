@@ -51,7 +51,8 @@ RUNS=${RUNS:-2}
 MAXT=${MAXT:-192}
 OUT=scripts/mvrlu_vs_txn.csv
 
-echo ">> building bench_list_scale JEMALLOC=1 (per-CPU arenas) ..." >&2
+echo ">> building bench_list_scale JEMALLOC=1 (per-CPU arenas, forced clean) ..." >&2
+rm -f bench_list_scale src/bench_list_scale.o
 make bench_list_scale JEMALLOC=1 >/dev/null 2>&1 \
   || { echo "BUILD FAILED" >&2; exit 1; }
 ldd ./bench_list_scale | grep -qi jemalloc \

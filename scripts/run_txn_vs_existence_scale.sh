@@ -81,7 +81,10 @@ CORES="1 2 4 8 16 32 64 96 192"
 SIZES="5 10 20 40 80"		# nobjects at 192 cores => keys/table = 192*nobjects
 READERS="1 2 4 8 16 32 64 96 191"
 
-echo ">> building both engines" >&2
+echo ">> building both engines (txn side forced clean)" >&2
+# Forced: a change of TXN3_CFLAGS or of the engine headers is invisible to make's
+# timestamp check, and the engine is header-inline.
+rm -f "$REPO/bench_txn_3hash" "$REPO/src/bench_txn_3hash.o"
 make -C "$REPO" bench_txn_3hash >/dev/null || exit 1
 make -C "$REPO/perfbook/datastruct/existence" existence_3hash_uperf >/dev/null || exit 1
 for b in "$TXN" "$EX"; do

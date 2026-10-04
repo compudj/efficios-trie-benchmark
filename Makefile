@@ -534,7 +534,10 @@ bench_list_scale: src/bench_list_scale.c src/bench_iscrw.c $(RLU_DIR)/rlu.c \
 # See design/txn-vs-existence-3hash.md.  The bench defines _GNU_SOURCE/_LGPL_SOURCE
 # and the QSBR flavor itself.
 # ---------------------------------------------------------------------------
-TXN3_CFLAGS := -O2 -pthread -Wall $(TXN_TUNE_CFLAGS)
+# -DNDEBUG: the engine is header-inline, so the flag has to reach this TU and
+# not only the library build -- without it liburcu's urcu_posix_assert() is
+# live in every inlined engine path (<urcu/assert.h>).
+TXN3_CFLAGS := -O2 -DNDEBUG -pthread -Wall $(TXN_TUNE_CFLAGS)
 
 check-urcu-txn-lib:
 	@test -f "$(URCU_TXN_LIB)/liburcu-qsbr.so" || { \
