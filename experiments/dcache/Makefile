@@ -101,6 +101,7 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_ra
 	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
 	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan \
+	check-walk-holdoff \
 	check-filetype repro-samedir churn check-churn check-churn-evict \
 	check-seqlock-arms stress-seqlock-build \
 	check-deque check-deque-tsan \
@@ -878,6 +879,56 @@ check-bucketlock-tsan: stress_dcache.c stress_dcache_xchg.c stress_dcache_dirs.c
 	  -o stress_dcache_dirs_bucketlock_tsan stress_dcache_dirs.c dcache_bucketlock.c \
 	  -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_dcache_dirs_bucketlock_tsan 2 4 2 1 4000
+
+# The walk hold-off (-DDC_WALK_HOLDOFF=N, bucket lock engine only): a lookup
+# that has failed N passes raises a global count, and the commits that set a
+# deletion mark stay out until it returns (walk_hold_raise() in
+# dcache_bucketlock.c).  Opt-in: no other target builds with it.
+#   - the deterministic repro at an odd and an even N, then its CONTROL, the
+#     same source without the flag, which must take one pass per exchange;
+#   - the single-thread suite and the walk-causality and fold repros with the
+#     flag on;
+#   - the concurrent harnesses under ASan at N=1, where every lookup that
+#     fails once raises the count, with -DDC_STRESS_DEBUG: dc_destroy() then
+#     prints how often each held-off path was taken, which is what says the
+#     run reached them.
+WALK_HOLD := -DDC_MARK_GEN -DDC_WALK_HOLDOFF
+check-walk-holdoff: repro_walk_holdoff.c test_dcache.c repro_dcache.c \
+	   repro_dcache_samedir.c repro_fold.c stress_dcache.c stress_dcache_dirs.c \
+	   stress_dcache_xchg.c mixed_cycle.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) $(WALK_HOLD)=3 -DDC_TEST_HOOKS -DDC_STRESS_DEBUG $(HCPP) -o repro_walk_holdoff_n3 \
+	  repro_walk_holdoff.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_walk_holdoff_n3
+	$(CC) $(CFLAGS) $(WALK_HOLD)=2 -DDC_TEST_HOOKS -DDC_STRESS_DEBUG $(HCPP) -o repro_walk_holdoff_n2 \
+	  repro_walk_holdoff.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_walk_holdoff_n2
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_TEST_HOOKS $(HCPP) -o repro_walk_holdoff_control \
+	  repro_walk_holdoff.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_walk_holdoff_control
+	$(CC) $(CFLAGS) $(WALK_HOLD)=1 $(HCPP) -o test_dcache_walkhold \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./test_dcache_walkhold
+	$(CC) $(CFLAGS) $(WALK_HOLD)=1 -DDC_TEST_HOOKS $(HCPP) -o repro_dcache_walkhold \
+	  repro_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_dcache_walkhold
+	$(CC) $(CFLAGS) $(WALK_HOLD)=1 -DDC_TEST_HOOKS $(HCPP) -o repro_samedir_walkhold \
+	  repro_dcache_samedir.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_samedir_walkhold
+	$(CC) $(CFLAGS) $(WALK_HOLD)=1 -DDC_TEST_HOOKS $(HCPP) -o repro_fold_walkhold \
+	  repro_fold.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./repro_fold_walkhold
+	$(CC) $(ASANFLAGS) $(WALK_HOLD)=1 -DDC_STRESS_DEBUG $(HCPP) \
+	  -o stress_dcache_walkhold_asan stress_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_walkhold_asan 4 4 8 16 15000
+	$(CC) $(ASANFLAGS) $(WALK_HOLD)=1 -DDC_STRESS_DEBUG $(HCPP) \
+	  -o stress_dcache_dirs_walkhold_asan stress_dcache_dirs.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_dirs_walkhold_asan 4 8 4 2 15000
+	$(CC) $(ASANFLAGS) $(WALK_HOLD)=1 -DDC_STRESS_DEBUG $(HCPP) \
+	  -o stress_dcache_xchg_walkhold_asan stress_dcache_xchg.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./stress_dcache_xchg_walkhold_asan
+	$(CC) $(ASANFLAGS) $(WALK_HOLD)=1 -DDC_STRESS_DEBUG $(HCPP) \
+	  -o mixed_cycle_walkhold_asan mixed_cycle.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+	./mixed_cycle_walkhold_asan
 
 check-pernode: test_dcache.c dcache_txn.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_PER_NODE_GEN $(HCPP) -o test_dcache_pernode \

@@ -70,6 +70,11 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>			/* generic rcu_* names => QSBR flavor */
 #include <urcu-call-rcu.h>
+#ifdef DC_WALK_HOLDOFF
+#include <limits.h>
+#include <stdio.h>
+#include <urcu/futex.h>			/* held-off writers sleep on the count */
+#endif
 #ifndef DC_NO_LRU
 #include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
 #ifdef DC_LRU_MCAS
@@ -141,6 +146,16 @@ void (*dc_test_transfer_hook)(void);
 		if (dc_test_transfer_hook)				\
 			dc_test_transfer_hook();			\
 	} while (0)
+/*
+ * Test-only rendezvous for the walk hold-off (-DDC_WALK_HOLDOFF; see
+ * walk_hold_raise()), both fired on a rename, exchange or unlink at its entry:
+ * dc_test_held_hook when it found the count raised, just before it sleeps, and
+ * dc_test_inflight_hook once it is past that check, so a repro can keep a
+ * writer between its check and its commit while a lookup raises the count.
+ * NULL and never compiled into normal builds.
+ */
+void (*dc_test_held_hook)(void);
+void (*dc_test_inflight_hook)(void);
 #else
 #define DC_TEST_TRANSFER_HOOK()	do { } while (0)
 #endif
@@ -1092,6 +1107,17 @@ unsigned long dc_dbg_renames, dc_dbg_folds, dc_dbg_fold_retries, dc_dbg_fold_abo
 # define DC_DBG_FOLD_ABORT()   ((void) 0)
 #endif
 
+#if defined(DC_STRESS_DEBUG) && defined(DC_WALK_HOLDOFF)
+/* The walk hold-off's slow paths, counted so a stress run can show it reached
+ * them: lookups that raised the count, and what each kind of held-off commit
+ * did about it.  Printed by dc_destroy(). */
+unsigned long dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
+	      dc_dbg_hold_evict_skips;
+# define DC_DBG_HOLD(counter)	uatomic_inc(&dc_dbg_hold_ ## counter)
+#else
+# define DC_DBG_HOLD(counter)	((void) 0)
+#endif
+
 /*
  * A rename/exchange skips age-0 ONLY on the GLOBAL arm, whose single shared
  * rename_gen every rename bumps -- a hot slot whose install fail-fasts under
@@ -1180,6 +1206,18 @@ struct dcache {
 	 * engine proxy tag -- is always clear on a plain value.
 	 */
 	void *rename_gen __attribute__((aligned(64)));
+#ifdef DC_WALK_HOLDOFF
+	/*
+	 * The walk hold-off (see walk_hold_raise()): how many lookups are asking
+	 * the marking commits to stay out, and how many of those commits are
+	 * asleep waiting for it to drop.  Raised only by a lookup that has failed
+	 * DC_WALK_HOLDOFF passes; loaded by every commit that sets a deletion
+	 * mark.  Its own line, so raising it invalidates nothing a walk reads.
+	 * 32 bits: walk_hold is the futex word the sleepers wait on.
+	 */
+	int32_t walk_hold __attribute__((aligned(64)));
+	int32_t walk_hold_sleepers;
+#endif
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
@@ -1415,6 +1453,12 @@ void dc_destroy(struct dcache *dc)
 	 */
 	rcu_barrier();				/* run pending folds */
 	rcu_barrier();				/* run the frees they queued */
+#if defined(DC_STRESS_DEBUG) && defined(DC_WALK_HOLDOFF)
+	fprintf(stderr, "walk hold-off (N=%d): raises=%lu writer-sleeps=%lu "
+		"refolds=%lu evict-skips=%lu\n", DC_WALK_HOLDOFF,
+		dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
+		dc_dbg_hold_evict_skips);
+#endif
 	free_subtree(dc->root);
 	free(dc->buckets);
 #ifndef DC_NO_LRU
@@ -1568,6 +1612,114 @@ static struct dentry *txn_child_lookup_rcu(struct dcache *dc,
 # error "bucket lock engine shell ops (rename/exchange/fold) are DC_MARK_GEN-only for now"
 #endif
 
+#ifdef DC_WALK_HOLDOFF
+/*
+ * ---- the walk hold-off: a bounded lookup (-DDC_WALK_HOLDOFF=N) -------------
+ *
+ * dc_lookup re-walks whenever a top on its path is marked, and nothing bounds
+ * how often: exchanges swapping two directories that both hold the rest of the
+ * path restart it for as long as they keep coming.  With the hold-off, a lookup
+ * that has failed N passes raises dc->walk_hold and keeps walking exactly as
+ * before, and every commit that sets a deletion mark -- unlink, the rename's
+ * stack (with the negative target it drops), the fold's TRANSFER, the exchange,
+ * the shrinker's eviction -- stays out while the count is raised.  Without
+ * -DDC_WALK_HOLDOFF nothing here is compiled and the lookup is the unbounded
+ * one.
+ *
+ * THE COUNT IS A REQUEST, NOT AN EXCLUSION.  A commit that loaded it as zero
+ * just before the raise still lands, and the mark it sets still fails the pass
+ * it lands in: the up-pass re-tests every mark as it always did, and that alone
+ * is what keeps the lookup correct.  So the lookup takes no lock and waits for
+ * nothing -- no grace period -- and the writers owe no ordering between their
+ * load and their stores.  What the count buys is the bound: a thread has at
+ * most one commit past its load when the count rises, so with W threads able
+ * to mark (the mutators, the call_rcu workers running folds, a shrinker) at
+ * most W more marks land, and the lookup returns within N + W + 1 passes.
+ *
+ * The count is global: one lookup past its N passes holds off every marking
+ * commit of the cache, wherever it is in the tree.  Lookups share it and never
+ * wait for one another.  A held-off writer is not promised a turn -- the count
+ * can rise again before it looks -- which the bucket bit-locks do not promise
+ * either.
+ *
+ * What a held-off commit does:
+ *   rename, exchange, unlink: sleep at their ENTRY, where nothing is resolved
+ *     yet, offline so the sleeper holds up no grace period.  So under this flag
+ *     these three can pass through a quiescent state: the caller must hold no
+ *     RCU-protected reference of its own across them.
+ *   fold: re-queue itself, so the call_rcu worker is not put to sleep.
+ *   eviction: skip the victim, as it does one that is mid-rename.
+ */
+#if DC_WALK_HOLDOFF < 1
+# error "DC_WALK_HOLDOFF is the number of passes before the count is raised: >= 1"
+#endif
+
+static inline int walk_held_off(struct dcache *dc)
+{
+	return caa_unlikely(uatomic_load(&dc->walk_hold, CMM_RELAXED) != 0);
+}
+
+static void walk_hold_sleep(struct dcache *dc)
+{
+	unsigned long was_online = rcu_read_ongoing();
+	int32_t v;
+
+	DC_DBG_HOLD(sleeps);
+#ifdef DC_TEST_HOOKS
+	if (dc_test_held_hook)
+		dc_test_held_hook();
+#endif
+	if (was_online)
+		rcu_thread_offline();
+	/* Dekker with walk_hold_drop(): publish the sleeper, then look. */
+	uatomic_inc(&dc->walk_hold_sleepers);
+	cmm_smp_mb__after_uatomic_inc();
+	while ((v = uatomic_load(&dc->walk_hold, CMM_RELAXED)) != 0)
+		(void) futex_noasync(&dc->walk_hold, FUTEX_WAIT, v, NULL, NULL, 0);
+	uatomic_dec(&dc->walk_hold_sleepers);
+	if (was_online)
+		rcu_thread_online();
+}
+
+/* Entry of a rename, exchange or unlink, before it resolves anything. */
+static inline void walk_hold_enter(struct dcache *dc)
+{
+	if (walk_held_off(dc))
+		walk_hold_sleep(dc);
+#ifdef DC_TEST_HOOKS
+	if (dc_test_inflight_hook)
+		dc_test_inflight_hook();
+#endif
+}
+
+static inline void walk_hold_raise(struct dcache *dc)
+{
+	DC_DBG_HOLD(raises);
+	uatomic_inc(&dc->walk_hold);
+}
+
+static void walk_hold_drop(struct dcache *dc)
+{
+	if (uatomic_sub_return(&dc->walk_hold, 1) != 0)
+		return;
+	cmm_smp_mb__after_uatomic_add();
+	if (uatomic_load(&dc->walk_hold_sleepers, CMM_RELAXED))
+		(void) futex_noasync(&dc->walk_hold, FUTEX_WAKE, INT_MAX, NULL,
+				     NULL, 0);
+}
+#else
+/* No hold-off: the writers' checks compile to nothing. */
+static inline int walk_held_off(struct dcache *dc)
+{
+	(void) dc;
+	return 0;
+}
+static inline void walk_hold_enter(struct dcache *dc)
+{
+	(void) dc;
+}
+#endif
+
 #ifdef DC_LOCALIZED_GEN
 /*
  * Is @top no longer the current indexed top for its name?  A rename (demote) and
@@ -1650,6 +1802,9 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 	dc_stamp_t     seqs[DC_PATH_MAX];	/* its version, sampled on descent */
 	uint32_t nlatched;
 #endif
+#ifdef DC_WALK_HOLDOFF
+	unsigned int passes = 0;		/* walks started */
+#endif
 
 	rcu_read_lock();
 #ifndef DC_LOCALIZED_GEN
@@ -1721,6 +1876,14 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 		uint32_t i, j;
 		int stale = 0, moved = 0;
 
+#ifdef DC_WALK_HOLDOFF
+		/* DC_WALK_HOLDOFF passes have failed: ask the marking commits to
+		 * stay out from here on (walk_hold_raise()).  The walk itself
+		 * does not change; a commit already past its check can still
+		 * fail it. */
+		if (caa_unlikely(passes++ == DC_WALK_HOLDOFF))
+			walk_hold_raise(dc);
+#endif
 		res = DC_POSITIVE;
 		id = DC_FAST_ID(cur);
 		nlatched = 0;
@@ -1767,6 +1930,10 @@ enum dc_result dc_lookup(struct dcache *dc, const struct dc_path *p,
 			break;			/* every latched host stable: done */
 		/* a rename touched a node on the path mid-walk: re-walk */
 	}
+#ifdef DC_WALK_HOLDOFF
+	if (caa_unlikely(passes > DC_WALK_HOLDOFF))
+		walk_hold_drop(dc);		/* this walk had raised it */
+#endif
 #endif
 	rcu_read_unlock();
 
@@ -2251,6 +2418,7 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 	if (path->ndepth == 0)
 		return -EINVAL;
 
+	walk_hold_enter(dc);			/* may sleep: nothing resolved yet */
 	parent = resolve(dc, path, path->ndepth - 1);
 	if (!parent)
 		return -ENOENT;
@@ -2704,12 +2872,25 @@ out_free:
  * in its parent's child list, so the parent cannot be unlinked meanwhile, and
  * this RCU read-side section keeps it allocated across a race with that.
  */
+static void fold_cb(struct rcu_head *rh);
+
 static void fold(struct dcache *dc, struct dentry *n)
 {
 	struct dentry *host = host_of_rcu(n);	/* write-once d_host */
 	int reclaim_n = 1;
 	int marked = 0;
 
+	/*
+	 * Held off (walk_hold_raise()): the TRANSFER marks @n, so come back a
+	 * grace period on.  Re-queued rather than slept on, which would stop the
+	 * call_rcu worker; no lookup runs under dc_destroy()'s barriers, so they
+	 * still see every fold.
+	 */
+	if (walk_held_off(dc)) {
+		DC_DBG_HOLD(refolds);
+		call_rcu(&n->d_rcu, fold_cb);
+		return;
+	}
 	rcu_read_lock();
 	DC_DBG_FOLD_ATTEMPT();
 	(void) bl_hlist_resolve(rcu_dereference(n->d_hash.next), &marked);
@@ -2786,6 +2967,7 @@ int dc_rename(struct dcache *dc, const struct dc_path *from,
 	if (from->ndepth == 0 || to->ndepth == 0)
 		return -EINVAL;
 
+	walk_hold_enter(dc);			/* may sleep: nothing resolved yet */
 	from_parent = resolve(dc, from, from->ndepth - 1);
 	if (!from_parent)
 		return -ENOENT;
@@ -2861,6 +3043,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	if (ap->ndepth == 0 || bp->ndepth == 0)
 		return -EINVAL;
 
+	walk_hold_enter(dc);			/* may sleep: nothing resolved yet */
 	pa = resolve(dc, ap, ap->ndepth - 1);
 	if (!pa)
 		return -ENOENT;
@@ -3105,6 +3288,10 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	struct urcu_txn_sw_hlist_head *heads[3];
 	int marked = 0;
 
+	if (walk_held_off(dc)) {		/* see walk_hold_raise() */
+		DC_DBG_HOLD(evict_skips);
+		return -EAGAIN;
+	}
 	if (bl_read((void **) &d->d_top, DC_FWD_TAG) ||
 	    uatomic_load(&d->d_fwd, CMM_RELAXED))
 		return -EAGAIN;			/* renamed host, or a shell */

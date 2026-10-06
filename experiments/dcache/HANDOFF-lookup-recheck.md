@@ -307,3 +307,111 @@ memory and unchecked: kernel seqlock readers do this with
 - Claims about other systems name the design point, not the family.
 - Say what was read in the code, what a note says, and what is only reasoned,
   separately. He checks.
+
+## 10. After this file: the walk hold-off (2026-10-06, test machine)
+
+Sections 1 and 8 stop at "what is the tweak for". The thread moved on the same
+day, on the test machine, to bounding the lookup instead. **Built and tested;
+no benchmark had been run when this section was written.**
+
+### 10.1 What Mathieu decided
+
+The direction, verbatim:
+
+> I think our current conclusion is to try a "lock writers after a few retry"
+> in the reader [...] to at least become starvation free
+
+Two designs from the session were turned down before any of it was kept: a
+gate that waits a grace period to drain the writers, and a locked pass that
+takes the bucket locks along the path. His design, verbatim:
+
+> the way I envision it: the reader would never have to wait for a grace
+> period, and could increment a global "reader exclude writers reference
+> count" to temporarily prevent a steady stream of writers from making the
+> reader retry. the reader always need to be checking the mark on 2nd pass,
+> but at least it prevents a steady-flow of mutations
+
+Then, on three questions: the count is **global** (not per node), a held-off
+writer **sleeps** (does not spin), and the whole thing is **opt-in**. Bucket
+lock engine only.
+
+### 10.2 What was built
+
+`-DDC_WALK_HOLDOFF=N` in `dcache_bucketlock.c`; the comment above
+`walk_hold_raise()` is the description of record.
+
+- **Reader.** `dc_lookup()` counts its passes. Entering pass N + 1 it
+  increments `dc->walk_hold`, and decrements it on the way out. The loop and
+  the mark re-check are unchanged.
+- **Writers.** The five commits that set a mark load the count first.
+  Rename, exchange and unlink sleep at their entry, offline, on a futex
+  (`walk_hold_enter()`); the fold re-queues itself through `call_rcu`; the
+  shrinker's `lru_evict_settled()` skips its victim.
+- **Without the flag** the engine's code is byte-identical to `f930aec`
+  (`.text` and `.text.unlikely` compared, bench flags).
+
+Also new: `repro_walk_holdoff.c` and the `check-walk-holdoff` target.
+
+### 10.3 What was run (2026-10-06, machine idle, load 0.03)
+
+`make check-walk-holdoff`, all passing:
+
+- The deterministic repro, with Mathieu's own scenario (`/A/B` and `/A/C`
+  exchanged, both holding `K`). N=3: 5 passes. N=2: 4 passes. That is N
+  failing passes, one failed by a commit that was past its check when the
+  count rose, and one that stands. Control (same source, no flag): 65 passes
+  for 64 exchanges.
+- In the same repro a shrinker sweeping while the count is raised evicts 0,
+  with 4 attempts counted at the skip; the same sweep evicts 2 afterwards.
+- The single-thread suite and the three existing repros, built with N=1.
+- Four concurrent harnesses under ASan at N=1. Slow paths reached, per run:
+
+  | Harness | Raises | Writer sleeps | Fold re-queues |
+  |---|---|---|---|
+  | `stress_dcache` | 8 | 2 | 0 |
+  | `stress_dcache_dirs` | 1001 | 620 | 243 |
+  | `stress_dcache_xchg` | 371 | 71 | 131 |
+  | `mixed_cycle` | 6082 | 2941 | 1997 |
+
+Two mutations of the engine, each making the repro fail as it must: the
+eviction skip removed (the shrinker evicts the walker's leaf), and the
+exchange's entry check removed.
+
+Not run: any benchmark, TSAN, the churn harness (it is a benchmark binary).
+
+### 10.4 Reasoned only, not shown
+
+- **The bound.** A thread has at most one commit past its check when the
+  count rises, so with W threads able to mark, at most W more marks land and
+  the lookup returns within N + W + 1 passes, without waiting on anyone. The
+  repro shows the three kinds of pass, one in-flight commit included; it does
+  not exercise the bound itself. If it holds, the lookup is wait-free with a bound that
+  depends on the number of marking threads, which is stronger than what was
+  asked for. Mathieu has not reviewed this argument.
+- **Cost.** A marking commit loads one more global line; a lookup carries one
+  more counter. Neither is measured.
+
+### 10.5 Open
+
+1. No number exists for the cost, or for how often a real workload reaches
+   the threshold. Needs Mathieu's go-ahead (§9).
+2. The stress harnesses run no shrinker, so the eviction skip is covered by
+   the repro only.
+3. Under the flag, rename, exchange and unlink can pass through a quiescent
+   state at their entry. The harnesses of §10.3 tolerate it; a caller
+   holding its own RCU-protected reference across them would not.
+4. A held-off writer is not promised a turn (the count can rise again before
+   it looks). Readers get priority; one hot path under a mutation stream
+   throttles every writer of the cache. Per-directory counts were discussed
+   as the refinement and not built.
+5. `dc_dentry_path()` has the same unbounded loop and is untouched.
+6. **Found while reading, independent of the hold-off, not reproduced.**
+   `stack_shell()` and `dc_rename_exchange()` call `urcu_txn_conflict()` on
+   their retry paths. At 64 retries of one operation the next
+   `urcu_txn_begin()` takes the escalation lane and parks for it with
+   `rcu_thread_offline()` (`urcu_txn__enter_fallback()`, `rcu-txn.h`). That
+   is a quiescent state in the middle of a rename that still holds
+   `from_parent` and `new_parent`, resolved before its loop, and goes on to
+   lock their child heads. `struct dcache` calls the domain "vestigial"; the
+   `conflict()` calls still reach it. Passing a NULL domain, as `fold()`
+   does, would remove the lane, and would change the measured build.
