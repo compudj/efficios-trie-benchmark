@@ -311,8 +311,8 @@ memory and unchecked: kernel seqlock readers do this with
 ## 10. After this file: the walk hold-off (2026-10-06, test machine)
 
 Sections 1 and 8 stop at "what is the tweak for". The thread moved on the same
-day, on the test machine, to bounding the lookup instead. **Built and tested;
-no benchmark had been run when this section was written.**
+day, on the test machine, to bounding the lookup instead. **Built, tested and
+committed (`3950abf`); benchmarked once, reference only (§10.3b).**
 
 ### 10.1 What Mathieu decided
 
@@ -377,7 +377,44 @@ Two mutations of the engine, each making the repro fail as it must: the
 eviction skip removed (the shrinker evicts the walker's leaf), and the
 exchange's entry check removed.
 
-Not run: any benchmark, TSAN, the churn harness (it is a benchmark binary).
+Not run: TSAN, the churn harness (it is a benchmark binary). The benchmark
+came after the commit and is §10.3b.
+
+### 10.3b Benchmark (2026-10-06, after commit `3950abf`) -- REFERENCE ONLY
+
+Run on Mathieu's go-ahead ("commit this, then benchmark it"). The machine is
+shared, so these numbers are reference only, whatever the load said (0.07
+before the start).
+
+`scripts/run_dcache_holdoff.sh`: the default build against the hold-off at
+N=1 and N=3, all three rebuilt together with `-DNDEBUG` against liburcu
+`2793224e`, on `run_dcache.sh`'s geometry, pinning, jemalloc and 200 ms
+warm-up. 41 points over 9 panels, 5 runs per arm per point, arms interleaved,
+every run recorded (`scripts/dcache_holdoff.csv`, 615 runs, 0 conservation
+failures), plus one counting run per hold-off arm per point
+(`scripts/dcache_holdoff_counts.csv`). `scripts/dcache_holdoff_summary.py`
+prints the tables. 15 minutes.
+
+The default arm reproduces `dcache_sweep.csv` at `253d8e4` (e.g. idle_scale
+at 184 readers: 735 against 734 Mlookups/s; sat_scale: 577 against 583).
+
+- **N=3 is never reached by this suite.** The count was raised in 3 of the 41
+  points, once or twice per run (rate at 1M and 10M renames/s, sat_scale at
+  184 readers). Its throughput is never below the default's by more than a
+  point's own spread. Where the two ranges do not overlap it is 1-3% ABOVE
+  (idle_hit, hit_scale), which the session reads as code layout, not gain.
+- **So the suite shows the hold-off is free at N=3 and cannot show what it
+  buys.** No workload here makes a lookup fail three passes in a row. The
+  storm the hold-off is for (exchanges of an interior directory that many
+  lookups traverse) exists only in `repro_walk_holdoff.c`, which is not a
+  throughput test.
+- **N=1 is the extreme and it costs.** With lookups of the objects being
+  renamed and 184 readers, the count is raised about 650,000 times per run
+  (about 600 per million lookups). Readers lose 9% at 1M renames/s and 12%
+  with the writers flat out; writers lose 7-8% at the top rates. With probing
+  lookups it stays inside the spread.
+- With no rename in the window (idle_scale, idle_hit) no arm is below the
+  default: the pass counter has no measurable cost.
 
 ### 10.4 Reasoned only, not shown
 
@@ -389,12 +426,15 @@ Not run: any benchmark, TSAN, the churn harness (it is a benchmark binary).
   depends on the number of marking threads, which is stronger than what was
   asked for. Mathieu has not reviewed this argument.
 - **Cost.** A marking commit loads one more global line; a lookup carries one
-  more counter. Neither is measured.
+  more counter. Reasoned to be negligible when 3950abf was written; §10.3b
+  then measured none at N=3 (reference only).
 
 ### 10.5 Open
 
-1. No number exists for the cost, or for how often a real workload reaches
-   the threshold. Needs Mathieu's go-ahead (§9).
+1. What the hold-off buys is unmeasured: the bench suite never reaches N=3
+   (§10.3b). Measuring it needs a bench mode that builds the storm (writers
+   exchanging an interior directory that many lookups traverse). Not designed,
+   not asked for; a run needs Mathieu's go-ahead (§9).
 2. The stress harnesses run no shrinker, so the eviction skip is covered by
    the repro only.
 3. Under the flag, rename, exchange and unlink can pass through a quiescent

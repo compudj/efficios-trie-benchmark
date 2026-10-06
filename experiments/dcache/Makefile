@@ -702,6 +702,18 @@ bench_dcache_bucketlock: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
 	$(CC) $(CFLAGS) -DDC_MARK_GEN $(CPPFLAGS) -o $@ \
 	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
 
+# The walk hold-off's bench arms (scripts/run_dcache_holdoff.sh): the same
+# bench with -DDC_WALK_HOLDOFF=N, e.g. bench_dcache_bucketlock_hold3, and a
+# COUNTING twin (..._hold3_count, -DDC_STRESS_DEBUG) whose dc_destroy() line
+# says how often the count was raised.  The twin is for those counts only: its
+# debug counters are shared atomics, so its throughput is not a result.
+bench_dcache_bucketlock_hold%_count: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_WALK_HOLDOFF=$* -DDC_STRESS_DEBUG $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+bench_dcache_bucketlock_hold%: bench_dcache.c dcache_bucketlock.c $(HDRS) | check-lib
+	$(CC) $(CFLAGS) -DDC_MARK_GEN -DDC_WALK_HOLDOFF=$* $(CPPFLAGS) -o $@ \
+	  bench_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS)
+
 # Per-node A/B partner: the split layout that keeps the cold d_id read (logical
 # id, 2-CL) to isolate the d_id-elision gain.  (There is no legacy-layout
 # per-node arm: dcache_txn.c refuses DC_PER_NODE_GEN without the tag-encoded
