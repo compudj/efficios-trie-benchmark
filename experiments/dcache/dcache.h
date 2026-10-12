@@ -522,6 +522,51 @@ int dc_dentry_path(struct dcache *dc, const struct dentry *d,
 typedef void (*dc_visit_fn)(uint64_t id, const struct dc_path *path, void *arg);
 void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg);
 
+/*
+ * ---- the subtree scan: every object below a directory --------------------
+ *
+ * The kernel's d_walk() (fs/dcache.c), as shrink_dcache_parent(),
+ * d_invalidate() and path_has_submounts() call it.  Those do not ask what a
+ * name resolves to, nor where an object is.  They ask WHICH objects are below
+ * a directory -- is there a mountpoint anywhere under this one, which dentries
+ * under it are unused -- and part of the answer is "and there is nothing else".
+ *
+ * dc_scan() writes into @ids the id of every positive object below the
+ * directory at @root (not @root itself), at most @cap of them, and returns how
+ * many it wrote; -ENOENT if @root does not resolve, -ENOSPC if @cap is too
+ * small.  It runs concurrently with every mutator, under RCU alone.
+ *
+ * THE GUARANTEE: an object that is below @root for the whole call is reported,
+ * at least once.  One that arrives or leaves during the call may or may not
+ * be, and one that a move takes ahead of the scan may be reported twice.
+ *
+ * That is a statement about what the scan did NOT reach, and it is what sets
+ * this reader apart from dc_lookup() and dc_dentry_path().  A subtree that a
+ * move takes from a directory the scan has yet to read into one it has already
+ * read was never in the scan's hands: RCU kept every node it did read valid,
+ * and re-testing those nodes proves nothing about the one it never saw.  The
+ * kernel watches rename_lock for this.  The arms here (dc_scan_arm()):
+ *
+ *   soft   one pass, no validation.  The guarantee does NOT hold: this is the
+ *          control the other arms are measured against.
+ *   seq    every move that changes a parent, and every exchange, bumps one
+ *          cache-wide sequence, and the scan goes again if it moved.
+ *   mark   the scan marks each directory before it reads it.  A move bumps
+ *          the sequence only when it inserts into a marked directory, whose
+ *          mark it clears; a directory created in a marked one is born
+ *          marked.  A move that crosses no scan writes nothing shared.
+ *
+ * Only the bucket lock engine implements it, and only when asked: -DDC_SCAN
+ * (soft), -DDC_SCAN_SEQ, -DDC_SCAN_MARK.  stress_dcache_scan.c is its harness
+ * (make check-scan).
+ */
+long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
+	     long cap);
+const char *dc_scan_arm(void);
+/* How many scans, how many passes they took, how often the sequence moved. */
+void dc_scan_stats(struct dcache *dc, unsigned long *scans,
+		   unsigned long *passes, unsigned long *signals);
+
 /* ---- engine-independent path/qstr helpers (pure, inline) ---------------- */
 
 /* FNV-1a over the name; the engine mixes this with the parent ptr for a bucket. */

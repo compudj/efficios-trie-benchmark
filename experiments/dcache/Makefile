@@ -101,7 +101,7 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_ra
 	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
 	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan \
-	check-walk-holdoff \
+	check-walk-holdoff check-scan \
 	check-filetype repro-samedir churn check-churn check-churn-evict \
 	check-seqlock-arms stress-seqlock-build \
 	check-deque check-deque-tsan \
@@ -386,6 +386,54 @@ check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c dcache_seqlo
 	  else echo "  fails as it must"; fi; \
 	done
 	@echo "check-rmdir: PASS"
+
+# SUBTREE SCAN vs MOVES (stress_dcache_scan.c): dc_scan() of a directory while
+# renames and exchanges move objects below it, on the bucket lock engine, the
+# only one that has it.  Every object that stays below the root must be in
+# every scan.  The two validated arms (dcache.h: seq, mark) must PASS, at
+# natural timings and with a move sleeping between its look at the marks and
+# its commit (-DDC_TEST_SCAN_MOVE_DELAY_US), on the usual mix of moves and on
+# the one that spends most of its time on a fresh directory.  The soft arm and
+# every mutation arm must FAIL, or the harness proves nothing:
+#   soft              one pass, no validation
+#   seq_onecount      the sequence counted before the commit only
+#   mark_noxchg       an exchange tells the scans nothing
+#   mark_nolockwait   the scan does not wait for a locked child head
+#   mark_noinherit    a directory created in a marked one is not born marked
+#                     (on the fresh-directory mix: see the harness header)
+# Built with the walk hold-off, which is what bounds a scan under moves that
+# never stop.
+SCAN_ARGS ?= 3 2 6 4 120000
+SCAN_FRESH_ARGS ?= 3 2 6 4 400000 60
+SCAN_HOLD := -DDC_MARK_GEN -DDC_WALK_HOLDOFF=4
+check-scan: stress_dcache_scan.c dcache_bucketlock.c $(HDRS) | check-lib
+	@set -e; for arm in seq:-DDC_SCAN_SEQ mark:-DDC_SCAN_MARK; do \
+	  name=$${arm%%:*}; defs=$${arm#*:}; \
+	  for widen in "" -DDC_TEST_SCAN_MOVE_DELAY_US=20; do \
+	    echo "== check-scan: $$name $${widen:-(natural timings)}"; \
+	    $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $$widen $(HCPP) -o stress_scan_$$name \
+	      stress_dcache_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	    for args in "$(SCAN_ARGS)" "$(SCAN_FRESH_ARGS)"; do \
+	      out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_$$name $$args) || \
+	        { echo "$$out"; echo "check-scan: FAIL ($$name $$widen: $$args)"; exit 1; }; \
+	      echo "$$out" | grep -E '^(signals|MISSED|RESULT)'; \
+	    done; \
+	  done; \
+	done
+	@set -e; for arm in "soft:-DDC_SCAN:$(SCAN_ARGS)" \
+	    "seq_onecount:-DDC_SCAN_SEQ -DDC_TEST_SCAN_SEQ_ONE_COUNT:$(SCAN_ARGS)" \
+	    "mark_noxchg:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_XCHG:$(SCAN_ARGS)" \
+	    "mark_nolockwait:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_LOCKWAIT:$(SCAN_ARGS)" \
+	    "mark_noinherit:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_INHERIT:$(SCAN_FRESH_ARGS)"; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; args=$${rest#*:}; \
+	  echo "== check-scan MUST-FAIL control: $$name ($$defs)"; \
+	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $(HCPP) -o stress_scan_mut_$$name \
+	    stress_dcache_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  if out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_mut_$$name $$args); then \
+	    echo "check-scan: MUTANT $$name PASSED -- the harness is vacuous"; exit 1; \
+	  else echo "$$out" | grep -E '^MISSED' | sed 's/^/  fails as it must: /'; fi; \
+	done
+	@echo "check-scan: PASS"
 
 # An exchange's two names exist before AND after its commit, so a lockless
 # lookup of either must never come back ABSENT.  Two detectors, because each is
@@ -1264,4 +1312,5 @@ clean:
 	  mixed_cycle_bucketlock_asan stress_dcache_bucketlock_tsan stress_dcache_xchg_bucketlock_tsan \
 	  stress_dcache_dirs_bucketlock_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
-	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl stress_rmdir_*
+	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl stress_rmdir_* \
+	  stress_scan_*

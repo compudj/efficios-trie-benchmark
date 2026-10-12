@@ -238,6 +238,22 @@ static void dc_test_unlink_delay(void)
 #define DC_HOT1CL 1		/* SPLIT reuses all the HOT1CL tag machinery */
 #endif
 
+/*
+ * The subtree scan, dc_scan() (dcache.h has the contract and the arms).
+ * -DDC_SCAN alone is the soft arm; -DDC_SCAN_SEQ and -DDC_SCAN_MARK validate
+ * the scan against dc->scan_seq.  Without one of the three nothing of the scan
+ * is compiled, and the engine is what it was.
+ */
+#if defined(DC_SCAN_SEQ) && defined(DC_SCAN_MARK)
+# error "DC_SCAN_SEQ and DC_SCAN_MARK are two arms of dc_scan(): pick one"
+#endif
+#if defined(DC_SCAN_SEQ) || defined(DC_SCAN_MARK)
+# ifndef DC_SCAN
+#  define DC_SCAN 1
+# endif
+# define DC_SCAN_VALIDATED 1
+#endif
+
 struct dentry {
 	/* reader hot line: inline identity (+ payload under DC_HOT1CL) */
 #ifndef DC_HOT1CL
@@ -375,6 +391,17 @@ struct dentry {
 	 * node is itself the host of a move, so spine nodes keep it 0 forever (their
 	 * reads stay S-state -- no cross-CCD ping-pong). */
 	unsigned long d_moving;
+#ifdef DC_SCAN_MARK
+	/*
+	 * SCAN MARK (dc_scan(), the mark arm), on a directory's host: "a scan
+	 * has read, or is reading, this child list".  Set by the scan before it
+	 * reads the list (scan_enter()); cleared, with a bump of dc->scan_seq,
+	 * by a move that inserts into the list (scan_signal_locked()); copied to
+	 * a directory created in the list (scan_inherit_locked()).  On CL2,
+	 * with the child head it speaks for.
+	 */
+	unsigned long d_scan;
+#endif
 
 	/*
 	 * Child index (readdir fast path + -ENOTEMPTY): a per-directory
@@ -1218,6 +1245,23 @@ struct dcache {
 	int32_t walk_hold __attribute__((aligned(64)));
 	int32_t walk_hold_sleepers;
 #endif
+#ifdef DC_SCAN
+	/*
+	 * dc_scan().  scan_seq is what a validated scan watches: bumped by a
+	 * move that may have taken something from ahead of a scan to behind it
+	 * -- every move that changes a parent and every exchange on the seq arm,
+	 * only one that inserts into a marked directory on the mark arm.  Its
+	 * own line: the scans read it and, on the mark arm, almost nothing
+	 * writes it.  The two counters are statistics, on a line of their own.
+	 */
+	unsigned long scan_seq __attribute__((aligned(64)));
+#ifdef DC_SCAN_SEQ
+	/* The seq arm: how many of those moves have committed. */
+	unsigned long scan_done;
+#endif
+	unsigned long scan_calls __attribute__((aligned(64)));
+	unsigned long scan_passes;
+#endif
 };
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
@@ -1720,6 +1764,147 @@ static inline void walk_hold_enter(struct dcache *dc)
 }
 #endif
 
+/*
+ * ---- dc_scan(), the writers' side -----------------------------------------
+ *
+ * What a scan can miss is an object that a move takes from a directory it has
+ * yet to read into one it has already read.  Only the move knows it happened,
+ * so the move has to say so: it bumps dc->scan_seq, which the scan compares
+ * when it is done.
+ *
+ * WHEN.  A rename within one directory replaces the old top by the shell in
+ * place (stack_one_prepare()), and so does a fold: neither moves anything in a
+ * child list, and neither says anything.  A move to another directory inserts
+ * at the head of that directory's list, and an exchange -- within one
+ * directory too -- swaps two places: those two say so.  On the seq arm, always.
+ * On the mark arm, only when a directory they insert into is marked, i.e. when
+ * a scan has read or is reading that list.
+ *
+ * THE SEQ ARM is a sequence lock whose writers do not exclude one another, so
+ * it counts on both sides of the commit: scan_seq before it, scan_done after.
+ * A scan reads scan_done, then scan_seq.  Unequal: a move is between its two
+ * counts, and the scan waits.  Equal: no move was, and one that starts later
+ * counts in scan_seq before it commits, which the scan sees when it is done.
+ * One count before the commit is not enough, and stress_dcache_scan.c says so
+ * within a second: a scan that samples between that count and the commit
+ * reads a tree that changes under it and finds the count as it left it.
+ *
+ * THE MARK ARM'S ORDER, which is a Dekker between the scan and the writer:
+ *
+ *   scan  (scan_enter)           writer (holds the directory's child head)
+ *   ----                         ------
+ *   set the mark                 lock the child head
+ *   full barrier                 full barrier
+ *   wait while the child head    read the mark; if set: clear it, bump
+ *     is locked                    scan_seq
+ *   read the list                commit the insertion; unlock
+ *
+ * Either the writer sees the mark, and bumps BEFORE its commit -- so a scan
+ * that goes on to miss what the commit moved reads the bump after the commit,
+ * at its final check -- or it does not, and then it took the lock before the
+ * scan set the mark: the scan finds the head locked, waits, and reads a list
+ * that has the insertion.  The clear comes before the bump so that a scan
+ * which samples scan_seq after the bump finds the mark gone and sets it again.
+ *
+ * A directory created in a marked directory is behind the scan that marked
+ * it, as its parent is, and a move into it has to say so too: it is born
+ * marked, under the same child head lock and by the same argument.
+ *
+ * Marks outlive the scan that set them.  A stale one costs the first move into
+ * that directory one bump, which clears it.
+ */
+#ifdef DC_SCAN
+/*
+ * TEST-ONLY: -DDC_TEST_SCAN_MOVE_DELAY_US=N sleeps N us in a move, after it
+ * has looked at the marks and before it commits -- the window a scan must not
+ * read the destination's list in (stress_dcache_scan.c, make check-scan).
+ * Never set in a measured build.
+ */
+#ifdef DC_TEST_SCAN_MOVE_DELAY_US
+#include <time.h>
+static void dc_test_scan_move_delay(void)
+{
+	struct timespec ts = { DC_TEST_SCAN_MOVE_DELAY_US / 1000000,
+			       (DC_TEST_SCAN_MOVE_DELAY_US % 1000000) * 1000L };
+
+	(void) nanosleep(&ts, NULL);
+}
+#define DC_TEST_SCAN_MOVE_DELAY()	dc_test_scan_move_delay()
+#else
+#define DC_TEST_SCAN_MOVE_DELAY()	do { } while (0)
+#endif
+
+#ifdef DC_SCAN_MARK
+static inline int scan_marked(struct dentry *dir)
+{
+	return uatomic_load(&dir->d_scan, CMM_RELAXED) != 0;
+}
+#endif
+
+/*
+ * A move is about to insert into the child list of @a, and of @b if not NULL
+ * (hosts), both child heads locked by the caller.  Call BEFORE the commit.
+ */
+static inline void scan_signal_locked(struct dcache *dc, struct dentry *a,
+				      struct dentry *b)
+{
+#if defined(DC_SCAN_SEQ)
+	(void) a;
+	(void) b;
+	uatomic_inc(&dc->scan_seq);
+#elif defined(DC_SCAN_MARK)
+	int hit = 0;
+
+	cmm_smp_mb();		/* the lock, then the mark: see above */
+	if (scan_marked(a)) {
+		uatomic_store(&a->d_scan, 0UL, CMM_RELAXED);
+		hit = 1;
+	}
+	if (b && b != a && scan_marked(b)) {
+		uatomic_store(&b->d_scan, 0UL, CMM_RELAXED);
+		hit = 1;
+	}
+	if (hit)
+		uatomic_inc(&dc->scan_seq);	/* after the clear */
+#else
+	(void) dc;
+	(void) a;
+	(void) b;
+#endif
+	DC_TEST_SCAN_MOVE_DELAY();
+}
+
+/* The commit that scan_signal_locked() announced is over, whatever came of it. */
+static inline void scan_signal_done(struct dcache *dc)
+{
+#if defined(DC_SCAN_SEQ) && !defined(DC_TEST_SCAN_SEQ_ONE_COUNT)
+	uatomic_inc(&dc->scan_done);
+#else
+	(void) dc;
+#endif
+}
+
+/*
+ * The directory @d is about to be published in @parent's child list, whose
+ * head the caller holds locked: born marked if @parent is.
+ */
+static inline void scan_inherit_locked(struct dentry *parent, struct dentry *d)
+{
+#if defined(DC_SCAN_MARK) && !defined(DC_TEST_SCAN_NO_INHERIT)
+	cmm_smp_mb();		/* the lock, then the mark */
+	if (scan_marked(parent))
+		d->d_scan = 1UL;	/* not published yet: a plain store */
+#else
+	(void) parent;
+	(void) d;
+#endif
+}
+#else
+#define scan_signal_locked(dc, a, b)	do { } while (0)
+#define scan_signal_done(dc)		do { } while (0)
+#define scan_inherit_locked(parent, d)	do { } while (0)
+#endif
+
 #ifdef DC_LOCALIZED_GEN
 /*
  * Is @top no longer the current indexed top for its name?  A rename (demote) and
@@ -2182,6 +2367,8 @@ static int dc_add_typed(struct dcache *dc, const struct dc_path *path,
 	 * the edge bucket/child-head -> shard lock; the shrinker never takes the
 	 * reverse (it evicts with the shard lock dropped). */
 	lru_add_new(dc, d);
+	if (isdir)
+		scan_inherit_locked(parent, d);
 	bl_hlist_add_head_locked(bucket, &d->d_hash);
 	bl_hlist_add_head_locked(&parent->d_child_head, &d->d_sib);
 	bl_unlock2(bucket, &parent->d_child_head);
@@ -2815,9 +3002,14 @@ static int stack_shell(struct dcache *dc,
 		}
 #endif
 
+		/* A move to another directory inserts into its child list. */
+		if (cross_parent)
+			scan_signal_locked(dc, new_parent, NULL);
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent);
 		st = urcu_txn_commit_sw(&txn);	/* pure-SW: index + demote, one commit */
+		if (cross_parent)
+			scan_signal_done(dc);
 		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
@@ -3171,6 +3363,14 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		}
 
 		/*
+		 * An exchange swaps two places in the child lists, within one
+		 * directory too: what a scan has yet to reach may land where it
+		 * has been.
+		 */
+#ifndef DC_TEST_SCAN_NO_XCHG
+		scan_signal_locked(dc, pa, pb);
+#endif
+		/*
 		 * Record the four index replaces (sb takes topa's slot, sa takes
 		 * topb's), coalescing to a two-node replace when the tops share a head.
 		 */
@@ -3204,6 +3404,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 						      DC_PARENT_TAG);
 		}
 		st = urcu_txn_commit_sw(&txn);	/* atomic swap: pure store_sw */
+#ifndef DC_TEST_SCAN_NO_XCHG
+		scan_signal_done(dc);
+#endif
 		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
@@ -3410,6 +3613,172 @@ long dc_readdir(struct dcache *dc, const struct dc_path *path,
 	rcu_read_unlock();
 	return count;
 }
+
+#ifdef DC_SCAN
+/* ---- the subtree scan (d_walk) ------------------------------------------ */
+
+/*
+ * How deep a pass goes before it gives up.  A child list never holds a cycle,
+ * but a pass reads the lists one after the other while directories move, and
+ * can be led round: into B from A's list, then into A from B's, if B left A
+ * and A went under B in between.  Each such step takes a move into a directory
+ * the pass has read, so a validated pass that hits the cap was going to be
+ * discarded anyway.
+ */
+#define DC_SCAN_DEPTH_MAX	(4 * DC_PATH_MAX)
+
+#ifdef DC_SCAN_MARK
+/*
+ * The scan is about to read @dir's child list: the scan's side of the order
+ * described above scan_signal_locked().  An existing mark is relied on as it
+ * is: whoever clears it bumps scan_seq.
+ */
+static inline void scan_enter(struct dentry *dir)
+{
+	if (!scan_marked(dir))
+		uatomic_store(&dir->d_scan, 1UL, CMM_RELAXED);
+	cmm_smp_mb();		/* the mark, then the lock and the list */
+#ifndef DC_TEST_SCAN_NO_LOCKWAIT
+	while (__atomic_load_n((uintptr_t *) &dir->d_child_head.first,
+			       __ATOMIC_RELAXED) & DC_BL_LOCK)
+		caa_cpu_relax();
+#endif
+}
+#else
+static inline void scan_enter(struct dentry *dir)
+{
+	(void) dir;
+}
+#endif
+
+/*
+ * One pass over what is below @dir, a host: every child-hlist entry is a named
+ * top, whose host is reported and, if a directory, read in turn (the children
+ * of an entry are on its host: see walk_rec()).  Returns the count so far,
+ * -ENOSPC, or -EAGAIN past DC_SCAN_DEPTH_MAX.
+ */
+static long scan_rec(struct dentry *dir, uint64_t *ids, long cap, long n,
+		     int depth)
+{
+	struct urcu_txn_sw_hlist_node *sn;
+
+	if (depth > DC_SCAN_DEPTH_MAX)
+		return -EAGAIN;
+	scan_enter(dir);
+	for (sn = bl_hlist_first_rcu(&dir->d_child_head); sn;
+	     sn = bl_hlist_next_rcu(sn)) {
+		struct dentry *host = host_of_rcu(sib_dentry(sn));
+
+		if (DC_IS_POSITIVE(host)) {
+			if (n == cap)
+				return -ENOSPC;
+			ids[n++] = host->d_id;
+		}
+		if (host->d_isdir) {
+			n = scan_rec(host, ids, cap, n, depth + 1);
+			if (n < 0)
+				return n;
+		}
+	}
+	return n;
+}
+
+/*
+ * One read-side section over every pass: nothing a pass stands on is freed
+ * under it, so a removed entry still leads back into its list.
+ *
+ * A validated arm samples scan_seq, makes a pass and compares.  A move that
+ * may have gone behind the pass bumped scan_seq before it committed, so the
+ * pass that missed something reads the bump here.  What keeps a pass from
+ * starting between a bump and its commit is, on the mark arm, the wait in
+ * scan_enter(), and on the seq arm the second count (see scan_signal_locked()).
+ * Nothing bounds how often a scan goes again, unless the hold-off is built in:
+ * then a scan that has failed DC_WALK_HOLDOFF passes asks the moves to stay
+ * out, as a lookup does.
+ */
+long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
+	     long cap)
+{
+	long n;
+#if defined(DC_SCAN_VALIDATED) && defined(DC_WALK_HOLDOFF)
+	unsigned int passes = 0;
+#endif
+
+	uatomic_inc(&dc->scan_calls);
+	rcu_read_lock();
+	for (;;) {
+		struct dentry *dir = dc->root;
+		uint32_t i;
+#ifdef DC_SCAN_VALIDATED
+		unsigned long seq;
+
+#ifdef DC_WALK_HOLDOFF
+		if (caa_unlikely(passes++ == DC_WALK_HOLDOFF))
+			walk_hold_raise(dc);
+#endif
+#ifdef DC_SCAN_SEQ
+		for (;;) {
+			unsigned long done = uatomic_load(&dc->scan_done,
+							  CMM_RELAXED);
+
+			cmm_smp_rmb();	/* scan_done before scan_seq */
+			seq = uatomic_load(&dc->scan_seq, CMM_RELAXED);
+#ifdef DC_TEST_SCAN_SEQ_ONE_COUNT
+			(void) done;
+			break;
+#endif
+			if (seq == done)
+				break;
+			caa_cpu_relax();	/* a move is in its commit */
+		}
+#else
+		seq = uatomic_load(&dc->scan_seq, CMM_RELAXED);
+#endif
+		cmm_smp_mb();		/* the sample before anything is read */
+#endif
+		uatomic_inc(&dc->scan_passes);
+		for (i = 0; i < root->ndepth && dir; i++)
+			dir = txn_child_lookup_rcu(dc, dir, &root->comp[i]);
+		if (!dir) {
+			n = -ENOENT;
+			break;
+		}
+		n = dir->d_isdir ? scan_rec(dir, ids, cap, 0, 0) : 0;
+#ifdef DC_SCAN_VALIDATED
+		cmm_smp_rmb();		/* the pass before the second look */
+		if (uatomic_load(&dc->scan_seq, CMM_RELAXED) != seq ||
+		    n == -EAGAIN)
+			continue;	/* a move may have gone behind the pass */
+#endif
+		break;
+	}
+#if defined(DC_SCAN_VALIDATED) && defined(DC_WALK_HOLDOFF)
+	if (caa_unlikely(passes > DC_WALK_HOLDOFF))
+		walk_hold_drop(dc);	/* this scan had raised it */
+#endif
+	rcu_read_unlock();
+	return n;
+}
+
+const char *dc_scan_arm(void)
+{
+#if defined(DC_SCAN_MARK)
+	return "mark";
+#elif defined(DC_SCAN_SEQ)
+	return "seq";
+#else
+	return "soft";
+#endif
+}
+
+void dc_scan_stats(struct dcache *dc, unsigned long *scans,
+		   unsigned long *passes, unsigned long *signals)
+{
+	*scans = uatomic_load(&dc->scan_calls, CMM_RELAXED);
+	*passes = uatomic_load(&dc->scan_passes, CMM_RELAXED);
+	*signals = uatomic_load(&dc->scan_seq, CMM_RELAXED);
+}
+#endif	/* DC_SCAN */
 
 /* ---- reverse walk (dentry_path_raw) ------------------------------------- */
 
