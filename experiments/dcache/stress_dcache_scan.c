@@ -34,6 +34,14 @@
  * missing one is a MISS -- an object that was below /r throughout and was not
  * reported.  An id reported twice is counted, and is allowed.
  *
+ * The other way round: the file of no account must NOT be in a scan during
+ * which it was outside the root from start to end.  Its mover keeps a word
+ * that is odd while it moves the file and says where the file is otherwise;
+ * a scanner that reads the same even "outside" on both sides of a scan and
+ * finds the file reported counts a FALSE REPORT.  Only an arm that keeps an
+ * entry where the object no longer is can make one (the linger arm, if it did
+ * not check what it reaches through a lingering entry).
+ *
  * Three rounds, to see when a move has to tell the scans:
  *   A  moves, no scan has ever run;
  *   B  moves and scans;
@@ -43,16 +51,24 @@
  * and every exchange.  On the mark arm it should not move in A, and in C only
  * as often as B left marks behind.
  *
- * The gate (make check-scan) runs the correct arms at natural timings and
- * with -DDC_TEST_SCAN_MOVE_DELAY_US=N, which sleeps in a move between its look
- * at the marks and its commit, and each MUTATION ARM once, which must FAIL or
- * the harness proves nothing:
+ * The gate (make check-scan) runs the correct arms at natural timings, seq and
+ * mark also with -DDC_TEST_SCAN_MOVE_DELAY_US=N, which sleeps in a move between
+ * its look at the marks and its commit, and each of these MUTATION ARMS once,
+ * which must FAIL or the harness proves nothing:
  *   -DDC_SCAN                      the soft arm: one pass, no validation
+ *   -DDC_TEST_SCAN_SEQ_ONE_COUNT   the sequence counted before the commit only
  *   -DDC_TEST_SCAN_NO_INHERIT      a new directory is not born marked
  *   -DDC_TEST_SCAN_NO_XCHG         an exchange tells the scans nothing
  *   -DDC_TEST_SCAN_NO_LOCKWAIT     the scan does not wait for the child head
- *                                  (with the move delay: the window is a few
- *                                  instructions otherwise)
+ *   -DDC_TEST_LINGER_NO_WAIT       a lingering entry is unlinked at once
+ *   -DDC_TEST_LINGER_NO_CHECK      what is reached through a lingering entry
+ *                                  is reported unchecked (false reports)
+ *   -DDC_TEST_LINGER_NO_XCHG       an exchange leaves no lingering entry
+ *                                  (with patient operations, below)
+ * Three more mutations of the linger arm are out of this harness's reach, and
+ * repro_scan.c has a case for each: a directory that holds lingering entries
+ * removed without leaving one, a climb that ends in a removed directory and is
+ * not looked at again, a scan that enters a directory it is in.
  *
  * Why the last argument.  A move into a fresh directory is caught through the
  * mark that the directory was born with, and a miss by that road takes a pass
@@ -63,7 +79,17 @@
  * in ten on the fresh directory and 400000 per mover it loses a hundred or
  * more (make check-scan runs it that way).
  *
- * Usage: ./stress_dcache_scan [movers [scanners [dirs [files [moves [fresh%]]]]]]
+ * Why the argument after it.  A mutation that leaves no lingering entry where
+ * it should is hidden by the lingering entries that are there already: a file
+ * that moves a hundred thousand times a second has some twenty of them in
+ * every directory, and a scan that loses one way to it has the others.  A
+ * PATIENT operation waits for every callback queued so far (rcu_barrier()),
+ * which takes those away from the mover's own objects, and is made then.  The
+ * argument is how many operations in a thousand are patient, while scans run;
+ * 0 unless given.
+ *
+ * Usage: ./stress_dcache_scan [movers [scanners [dirs [files [moves [fresh%
+ *                              [patient/1000]]]]]]]
  * Exit 0 = no miss, census clean; 1 = anomaly.
  */
 
@@ -90,6 +116,7 @@ static int D = 6;			/* directories /r/d0../r/d(D-1) */
 static int F = 4;			/* tracked files per mover */
 static long MOVES = 40000;		/* operations per mover, over the 3 rounds */
 static int FRESH_PCT = 10;		/* of them, on the fresh directory */
+static int PATIENT_PM;			/* per mille made after a drain */
 
 static struct dcache *g_dc;
 static int g_stop;
@@ -105,6 +132,13 @@ static struct dc_path g_root;
 /* Tracked per mover: F files, then g<m>, then h<m>. */
 #define PER_MOVER	(F + 2)
 #define NTRACKED	(M * PER_MOVER)
+
+/*
+ * Room for one scan's ids.  An object may be reported more than once: where it
+ * was and where it is, and on the linger arm once more for every lingering
+ * entry that leads to it, of which a grace period's worth of moves leaves many.
+ */
+#define SCAN_CAP	(1L << 20)
 
 static void mkpath(struct dc_path *p, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -126,6 +160,7 @@ struct mover {
 	int m;
 	uint64_t rng;
 	long todo;			/* operations this round */
+	int scanned;			/* scans run this round */
 	/* Where each file is: a directory index, or -1 for the fresh one. */
 	int *loc;
 	unsigned char *alt;		/* which of its two names it has */
@@ -133,7 +168,8 @@ struct mover {
 	int fresh_in;			/* which directory holds n<m>, or -1 */
 	int fresh_k;			/* which file's name is in it */
 	int noise_in;			/* where z<m> is, or -1 for /o */
-	long moves, dirmoves, xchgs, renames, fresh, noise, errs;
+	unsigned long *noise_state;	/* odd: moving; else 2 * moves + inside */
+	long moves, dirmoves, xchgs, renames, fresh, noise, patient, errs;
 };
 
 static void file_path(const struct mover *mv, int k, struct dc_path *p)
@@ -192,6 +228,17 @@ static void *mover(void *arg)
 		int k = (int) xrange(&mv->rng, (uint32_t) F);
 		struct dc_path a, b;
 
+		/*
+		 * A patient operation: every callback queued so far has run,
+		 * so no lingering entry leads to this mover's objects any
+		 * more.  What the operation takes out of a directory is then
+		 * found through the entry it leaves there, or not at all.
+		 */
+		if (PATIENT_PM && mv->scanned &&
+		    (int) xrange(&mv->rng, 1000) < PATIENT_PM) {
+			rcu_barrier();
+			mv->patient++;
+		}
 		if (on_fresh && mv->fresh_in >= 0) {	/* out of it again */
 			move_file(mv, mv->fresh_k,
 				  other_dir(mv, mv->fresh_in));
@@ -253,10 +300,17 @@ static void *mover(void *arg)
 				mkpath(&b, "/o/z%d", mv->m);
 			else
 				mkpath(&b, "/r/d%d/z%d", to, mv->m);
+			/* Odd while it moves, then where it is: see check_scan(). */
+			uatomic_store(mv->noise_state,
+				      uatomic_load(mv->noise_state, CMM_RELAXED) | 1UL,
+				      CMM_SEQ_CST);
 			if (dc_rename(g_dc, &a, &b) != 0)
 				mv->errs++;
 			mv->noise_in = to;
 			mv->noise++;
+			uatomic_store(mv->noise_state,
+				      4UL * (unsigned long) mv->noise + (to >= 0 ? 2UL : 0UL),
+				      CMM_SEQ_CST);
 		}
 		dc_quiescent();
 	}
@@ -267,11 +321,19 @@ static void *mover(void *arg)
 struct scanner {
 	long scans, missed, miss_file, miss_dir, miss_child, dups, errs;
 	long first_miss;		/* index of the first one, or -1 */
+	long false_reports, outside;	/* of the scans it stayed outside for */
 };
 
-/* Check one scan's @n ids: every tracked object, at least once. */
+static unsigned long *g_noise_state;	/* [M], see struct mover */
+
+/*
+ * Check one scan's @n ids: every tracked object, at least once; and no file
+ * of no account that was outside the root from before the scan (@before) to
+ * after it (@after, NULL at rest).
+ */
 static void check_scan(struct scanner *sc, const uint64_t *ids, long n,
-		       unsigned char *seen)
+		       unsigned char *seen, const unsigned long *before,
+		       const unsigned long *after)
 {
 	long i;
 
@@ -279,11 +341,25 @@ static void check_scan(struct scanner *sc, const uint64_t *ids, long n,
 	for (i = 0; i < n; i++) {
 		uint64_t id = ids[i];
 
+		if (before && id >= NOISE_ID_BASE &&
+		    id < NOISE_ID_BASE + (uint64_t) M) {
+			unsigned long b = before[id - NOISE_ID_BASE];
+
+			if (!(b & 3UL) && (!after || after[id - NOISE_ID_BASE] == b))
+				sc->false_reports++;
+			continue;
+		}
 		if (id < TRACK_ID_BASE || id >= TRACK_ID_BASE + (uint64_t) NTRACKED)
 			continue;
-		if (seen[id - TRACK_ID_BASE]++)
+		/* A flag, not a count: a scan may come to one object hundreds
+		 * of times through lingering entries, and a byte wraps. */
+		if (seen[id - TRACK_ID_BASE])
 			sc->dups++;
+		seen[id - TRACK_ID_BASE] = 1;
 	}
+	for (i = 0; before && after && i < M; i++)
+		if (!(before[i] & 3UL) && after[i] == before[i])
+			sc->outside++;
 	for (i = 0; i < NTRACKED; i++) {
 		int what = (int) (i % PER_MOVER);
 
@@ -303,28 +379,38 @@ static void check_scan(struct scanner *sc, const uint64_t *ids, long n,
 static void *scanner(void *arg)
 {
 	struct scanner *sc = arg;
-	long cap = 4L * (NTRACKED + 2 * M + D + 8);
+	long cap = SCAN_CAP;
 	uint64_t *ids = calloc((size_t) cap, sizeof(*ids));
 	unsigned char *seen = calloc((size_t) NTRACKED, 1);
+	unsigned long *before = calloc((size_t) M, sizeof(*before));
+	unsigned long *after = calloc((size_t) M, sizeof(*after));
+	int i;
 
-	if (!ids || !seen) {
+	if (!ids || !seen || !before || !after) {
 		sc->errs++;
 		return NULL;
 	}
 	dc_register_thread();
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		long n = dc_scan(g_dc, &g_root, ids, cap);
+		long n;
 
+		for (i = 0; i < M; i++)
+			before[i] = uatomic_load(&g_noise_state[i], CMM_SEQ_CST);
+		n = dc_scan(g_dc, &g_root, ids, cap);
+		for (i = 0; i < M; i++)
+			after[i] = uatomic_load(&g_noise_state[i], CMM_SEQ_CST);
 		sc->scans++;
 		if (n < 0)
 			sc->errs++;
 		else
-			check_scan(sc, ids, n, seen);
+			check_scan(sc, ids, n, seen, before, after);
 		dc_quiescent();
 	}
 	dc_unregister_thread();
 	free(ids);
 	free(seen);
+	free(before);
+	free(after);
 	return NULL;
 }
 
@@ -336,10 +422,11 @@ static void census_cb(uint64_t id, const struct dc_path *p, void *arg)
 
 	(void) p;
 	if (id >= TRACK_ID_BASE && id < TRACK_ID_BASE + (uint64_t) NTRACKED) {
-		if (c->seen[id - TRACK_ID_BASE]++)
+		if (c->seen[id - TRACK_ID_BASE])
 			c->dups++;
 		else
 			c->tracked++;
+		c->seen[id - TRACK_ID_BASE] = 1;
 	} else if (id != ROOT_ID && id != OUT_ID &&
 		   !(id >= DIR_ID_BASE && id < DIR_ID_BASE + (uint64_t) D) &&
 		   !(id >= FRESH_ID_BASE && id < FRESH_ID_BASE + (uint64_t) M) &&
@@ -348,9 +435,12 @@ static void census_cb(uint64_t id, const struct dc_path *p, void *arg)
 	}
 }
 
+/* Three rounds: a fold or a lingering entry, what it queued, what that freed. */
 static void drain(void)
 {
 	rcu_quiescent_state();
+	synchronize_rcu();
+	rcu_barrier();
 	synchronize_rcu();
 	rcu_barrier();
 	synchronize_rcu();
@@ -370,6 +460,7 @@ static void round_run(struct mover *mv, struct scanner *sc, int scanners,
 		pthread_create(&st[i], NULL, scanner, &sc[i]);
 	for (i = 0; i < M; i++) {
 		mv[i].todo = todo;
+		mv[i].scanned = scanners > 0;
 		pthread_create(&mt[i], NULL, mover, &mv[i]);
 	}
 	rcu_thread_offline();		/* main only blocks in join */
@@ -386,10 +477,10 @@ static void round_run(struct mover *mv, struct scanner *sc, int scanners,
 
 static unsigned long signals_now(void)
 {
-	unsigned long scans, passes, signals;
+	struct dc_scan_stats st;
 
-	dc_scan_stats(g_dc, &scans, &passes, &signals);
-	return signals;
+	dc_scan_stats(g_dc, &st);
+	return st.signals;
 }
 
 int main(int argc, char **argv)
@@ -398,9 +489,12 @@ int main(int argc, char **argv)
 	struct scanner *sc;
 	struct census c;
 	struct dc_path p;
-	unsigned long scans, passes, sig_a, sig_b, sig_c;
+	struct dc_scan_stats st;
+	unsigned long sig_a, sig_b, sig_c;
+	unsigned long *rest_state;
+	long false_reports = 0, outside = 0;
 	long moves = 0, dirmoves = 0, xchgs = 0, renames = 0, fresh = 0;
-	long noise = 0, merrs = 0, per_round[3];
+	long noise = 0, patient = 0, merrs = 0, per_round[3];
 	long nscans = 0, missed = 0, mfile = 0, mdir = 0, mchild = 0, dups = 0;
 	long serrs = 0, first_miss = -1, rest_n, cap;
 	uint64_t *ids;
@@ -414,9 +508,10 @@ int main(int argc, char **argv)
 	if (argc > 4) F = atoi(argv[4]);
 	if (argc > 5) MOVES = atol(argv[5]);
 	if (argc > 6) FRESH_PCT = atoi(argv[6]);
+	if (argc > 7) PATIENT_PM = atoi(argv[7]);
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a sanitizer exit skips stdio's flush */
 	if (M < 1 || S < 1 || D < 2 || F < 2 || MOVES < 4 || FRESH_PCT < 1 ||
-	    FRESH_PCT > 99) {
+	    FRESH_PCT > 99 || PATIENT_PM < 0 || PATIENT_PM > 1000) {
 		fprintf(stderr, "bad config\n");
 		return 2;
 	}
@@ -425,7 +520,8 @@ int main(int argc, char **argv)
 	printf("== stress_dcache_scan (engine: %s, scan arm: %s) ==\n",
 	       dc_engine_name(), dc_scan_arm());
 	printf("movers=%d scanners=%d dirs=%d files/mover=%d moves/mover=%ld"
-	       " fresh=%d%%\n", M, S, D, F, MOVES, FRESH_PCT);
+	       " fresh=%d%% patient=%d/1000\n", M, S, D, F, MOVES, FRESH_PCT,
+	       PATIENT_PM);
 
 	mkpath(&g_root, "/r");
 	mkpath(&p, "/o");
@@ -442,6 +538,7 @@ int main(int argc, char **argv)
 	}
 	mv = calloc((size_t) M, sizeof(*mv));
 	sc = calloc((size_t) S, sizeof(*sc));
+	g_noise_state = calloc((size_t) M, sizeof(*g_noise_state));
 	for (i = 0; i < M; i++) {
 		uint64_t base = TRACK_ID_BASE + (uint64_t) (i * PER_MOVER);
 		int err = 0;
@@ -453,6 +550,7 @@ int main(int argc, char **argv)
 		mv[i].alt = calloc((size_t) F, 1);
 		mv[i].fresh_in = -1;
 		mv[i].noise_in = -1;
+		mv[i].noise_state = &g_noise_state[i];
 		for (k = 0; k < F; k++) {
 			mv[i].loc[k] = (i + k) % D;
 			file_path(&mv[i], k, &p);
@@ -481,8 +579,8 @@ int main(int argc, char **argv)
 	round_run(mv, sc, S, per_round[1]);	/* B: moves and scans */
 	sig_b = signals_now();
 	round_run(mv, sc, 0, per_round[2]);	/* C: the scans are over */
-	dc_scan_stats(g_dc, &scans, &passes, &sig_c);
-	(void) scans;
+	dc_scan_stats(g_dc, &st);
+	sig_c = st.signals;
 
 	for (i = 0; i < M; i++) {
 		moves += mv[i].moves;
@@ -491,6 +589,7 @@ int main(int argc, char **argv)
 		renames += mv[i].renames;
 		fresh += mv[i].fresh;
 		noise += mv[i].noise;
+		patient += mv[i].patient;
 		merrs += mv[i].errs;
 	}
 	for (i = 0; i < S; i++) {
@@ -501,6 +600,8 @@ int main(int argc, char **argv)
 		mchild += sc[i].miss_child;
 		dups += sc[i].dups;
 		serrs += sc[i].errs;
+		false_reports += sc[i].false_reports;
+		outside += sc[i].outside;
 		if (first_miss < 0)
 			first_miss = sc[i].first_miss;
 	}
@@ -512,16 +613,20 @@ int main(int argc, char **argv)
 	dc_walk(g_dc, census_cb, &c);
 	if (c.tracked != NTRACKED || c.dups || c.stray)
 		anomaly++;
-	cap = 4L * (NTRACKED + 2 * M + D + 8);
+	cap = SCAN_CAP;
 	ids = calloc((size_t) cap, sizeof(*ids));
+	rest_state = calloc((size_t) M, sizeof(*rest_state));
+	for (i = 0; i < M; i++)
+		rest_state[i] = g_noise_state[i];
 	rest_n = dc_scan(g_dc, &g_root, ids, cap);
 	if (rest_n < 0) {
 		anomaly++;
 	} else {
-		check_scan(&rest, ids, rest_n, seen);
-		if (rest.missed || rest.dups)
+		check_scan(&rest, ids, rest_n, seen, rest_state, NULL);
+		if (rest.missed || rest.dups || rest.false_reports)
 			anomaly++;
 	}
+	free(rest_state);
 
 	printf("file moves           : %ld (into a fresh directory: %ld)\n",
 	       moves, fresh);
@@ -529,10 +634,15 @@ int main(int argc, char **argv)
 	printf("exchanges            : %ld\n", xchgs);
 	printf("renames in place     : %ld\n", renames);
 	printf("moves across the root: %ld\n", noise);
-	printf("scans                : %ld, %lu passes\n", nscans, passes);
+	printf("patient operations   : %ld\n", patient);
+	printf("scans                : %ld, %lu passes\n", nscans, st.passes);
 	printf("signals              : %lu before any scan, %lu during, %lu after\n",
 	       sig_a, sig_b - sig_a, sig_c - sig_b);
+	printf("lingering entries    : %lu gone through, %lu objects checked\n",
+	       st.lingerers, st.checked);
 	printf("reported twice       : %ld (allowed)\n", dups);
+	printf("FALSE REPORTS        : %ld (expect 0), of %ld scans a file stayed"
+	       " outside for\n", false_reports, outside);
 	printf("MISSED               : %ld (expect 0): %ld files, %ld directories,"
 	       " %ld files in them\n", missed, mfile, mdir, mchild);
 	if (first_miss >= 0)
@@ -555,11 +665,12 @@ int main(int argc, char **argv)
 	}
 	free(mv);
 	free(sc);
+	free(g_noise_state);
 	if (!nscans || !moves || !xchgs || !dirmoves || !fresh) {
 		printf("RESULT: VACUOUS (no scan, or a kind of move never ran)\n");
 		return 1;
 	}
-	if (missed || merrs || serrs || anomaly) {
+	if (missed || false_reports || merrs || serrs || anomaly) {
 		printf("RESULT: FAIL\n");
 		return 1;
 	}

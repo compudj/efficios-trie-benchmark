@@ -555,17 +555,32 @@ void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg);
  *          the sequence only when it inserts into a marked directory, whose
  *          mark it clears; a directory created in a marked one is born
  *          marked.  A move that crosses no scan writes nothing shared.
+ *   linger an object that leaves a directory leaves a lingering entry in its
+ *          place there, which is unlinked a grace period later: within one
+ *          read-side section a child list never loses an object.  One pass,
+ *          nothing to validate, and a move tells nobody anything.  What the
+ *          scan reaches through a lingering entry it checks with the reverse
+ *          walk, since an earlier move may have left that entry behind.  A
+ *          scan goes through every lingering entry that is still linked: its
+ *          cost grows with the moves of the last grace period, where the
+ *          cost of the two arms above grows with the moves made during it.
  *
  * Only the bucket lock engine implements it, and only when asked: -DDC_SCAN
- * (soft), -DDC_SCAN_SEQ, -DDC_SCAN_MARK.  stress_dcache_scan.c is its harness
- * (make check-scan).
+ * (soft), -DDC_SCAN_SEQ, -DDC_SCAN_MARK, -DDC_SCAN_LINGER.  repro_scan.c and
+ * stress_dcache_scan.c are its harnesses (make check-scan).
  */
 long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 	     long cap);
 const char *dc_scan_arm(void);
-/* How many scans, how many passes they took, how often the sequence moved. */
-void dc_scan_stats(struct dcache *dc, unsigned long *scans,
-		   unsigned long *passes, unsigned long *signals);
+/*
+ * How many scans, how many passes they took, how often the sequence moved
+ * (seq, mark); how many lingering entries the scans went through and how many
+ * objects they checked for it (linger).
+ */
+struct dc_scan_stats {
+	unsigned long scans, passes, signals, lingerers, checked;
+};
+void dc_scan_stats(struct dcache *dc, struct dc_scan_stats *st);
 
 /* ---- engine-independent path/qstr helpers (pure, inline) ---------------- */
 

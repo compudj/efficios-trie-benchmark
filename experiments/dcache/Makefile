@@ -387,36 +387,100 @@ check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c dcache_seqlo
 	done
 	@echo "check-rmdir: PASS"
 
-# SUBTREE SCAN vs MOVES (stress_dcache_scan.c): dc_scan() of a directory while
-# renames and exchanges move objects below it, on the bucket lock engine, the
-# only one that has it.  Every object that stays below the root must be in
-# every scan.  The two validated arms (dcache.h: seq, mark) must PASS, at
-# natural timings and with a move sleeping between its look at the marks and
-# its commit (-DDC_TEST_SCAN_MOVE_DELAY_US), on the usual mix of moves and on
-# the one that spends most of its time on a fresh directory.  The soft arm and
-# every mutation arm must FAIL, or the harness proves nothing:
-#   soft              one pass, no validation
-#   seq_onecount      the sequence counted before the commit only
-#   mark_noxchg       an exchange tells the scans nothing
-#   mark_nolockwait   the scan does not wait for a locked child head
-#   mark_noinherit    a directory created in a marked one is not born marked
-#                     (on the fresh-directory mix: see the harness header)
-# Built with the walk hold-off, which is what bounds a scan under moves that
-# never stop.
+# SUBTREE SCAN vs MOVES: dc_scan() of a directory while renames and exchanges
+# move objects below it, on the bucket lock engine, the only one that has it.
+# Every object that stays below the root must be in every scan, and none that
+# stayed outside.  Two harnesses, because each is blind where the other is not:
+#
+#   repro_scan.c  one scan at a time, parked by a hook while one or two
+#     operations go behind it, from a tree at rest.  Each case is one way to
+#     lose an object, and names the mutation that loses it that way.
+#   stress_dcache_scan.c  scans against movers at full speed.  It reaches the
+#     windows inside a commit, which no hook stands in, and whatever the cases
+#     did not think of.  On the linger arm, most single mutations are hidden
+#     from it by the lingering entries that earlier moves left: hence its
+#     patient operations (see its header) and the cases above.
+#
+# The three exact arms (dcache.h: seq, mark, linger) must PASS both.  seq and
+# mark also with a move sleeping between its look at the marks and its commit
+# (-DDC_TEST_SCAN_MOVE_DELAY_US), which has no counterpart on the linger arm: a
+# move there tells the scans nothing.  The stress test runs on the usual mix,
+# on the one that spends most of its time on a fresh directory, and the linger
+# arm on one with patient operations.
+#
+# The soft arm and every mutation arm must FAIL, or the harnesses prove
+# nothing.  By the case of repro_scan that it loses an object in:
+#   soft                move-behind      one pass, no validation
+#   mark_noxchg         exchange-behind  an exchange tells the scans nothing
+#   mark_noinherit      into-fresh       a directory created in a marked one
+#                                        is not born marked
+#   linger_nowait       move-behind      a lingering entry is unlinked at once
+#   linger_noxchg       exchange-behind  an exchange leaves no lingering entry
+#   linger_normdir      out-then-rmdir   a directory holding lingering entries
+#                                        is removed without leaving one
+#   linger_deadnolook   dead-end-climb   a climb that ends in a removed
+#                                        directory is not looked at again
+#   linger_nocheck      left-before      what a lingering entry leads to is
+#                                        reported unchecked
+#   linger_noloopcheck  linger-loop      the scan enters a directory it is in
+# and by the stress test alone, being windows inside a commit:
+#   seq_onecount        the sequence counted before the commit only
+#   mark_nolockwait     the scan does not wait for a locked child head
+# The stress test also has to fail soft, mark_noxchg, mark_noinherit (on the
+# fresh-directory mix), linger_nowait, linger_nocheck and, with patient
+# operations, linger_noxchg.
+# Built with the walk hold-off, which is what bounds a seq or mark scan under
+# moves that never stop.
+#
+# Last, the engine's own suites with the linger arm built in: it changes what a
+# move to another directory, an exchange across two and the removal of a
+# directory write, whether a scan runs or not.
 SCAN_ARGS ?= 3 2 6 4 120000
 SCAN_FRESH_ARGS ?= 3 2 6 4 400000 60
+SCAN_PATIENT_ARGS ?= 3 2 6 4 40000 10 20
 SCAN_HOLD := -DDC_MARK_GEN -DDC_WALK_HOLDOFF=4
-check-scan: stress_dcache_scan.c dcache_bucketlock.c $(HDRS) | check-lib
-	@set -e; for arm in seq:-DDC_SCAN_SEQ mark:-DDC_SCAN_MARK; do \
+SCAN_SRCS := repro_scan.c stress_dcache_scan.c dcache_bucketlock.c test_dcache.c \
+	stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
+	stress_dcache_rmdir.c
+check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
+	@set -e; for arm in seq:-DDC_SCAN_SEQ mark:-DDC_SCAN_MARK linger:-DDC_SCAN_LINGER; do \
 	  name=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-scan: $$name, one interleaving at a time"; \
+	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_TEST_HOOKS $$defs $(HCPP) -o repro_scan_$$name \
+	    repro_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./repro_scan_$$name) || \
+	    { echo "$$out"; echo "check-scan: FAIL (repro_scan $$name)"; exit 1; }; \
+	  echo "$$out" | grep -E '^RESULT'; \
+	done
+	@set -e; for arm in "soft:-DDC_SCAN:move-behind" \
+	    "mark_noxchg:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_XCHG:exchange-behind" \
+	    "mark_noinherit:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_INHERIT:into-fresh" \
+	    "linger_nowait:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_WAIT:move-behind" \
+	    "linger_noxchg:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_XCHG:exchange-behind" \
+	    "linger_normdir:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_RMDIR:out-then-rmdir" \
+	    "linger_deadnolook:-DDC_SCAN_LINGER -DDC_TEST_LINGER_DEAD_NO_LOOK:dead-end-climb" \
+	    "linger_nocheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_CHECK:left-before" \
+	    "linger_noloopcheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_LOOPCHECK:linger-loop"; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; which=$${rest#*:}; \
+	  echo "== check-scan MUST-FAIL control: $$name in $$which"; \
+	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_TEST_HOOKS $$defs $(HCPP) -o repro_scan_mut_$$name \
+	    repro_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./repro_scan_mut_$$name $$which) || \
+	    { echo "$$out"; echo "check-scan: MUTANT $$name PASSED $$which -- the case is vacuous"; exit 1; }; \
+	  echo "$$out" | grep -E "^$$which " | sed 's/^/  fails as it must: /'; \
+	done
+	@set -e; for arm in "seq:-DDC_SCAN_SEQ:1" "mark:-DDC_SCAN_MARK:1" "linger:-DDC_SCAN_LINGER:0"; do \
+	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; delay=$${rest#*:}; \
 	  for widen in "" -DDC_TEST_SCAN_MOVE_DELAY_US=20; do \
-	    echo "== check-scan: $$name $${widen:-(natural timings)}"; \
+	    [ -z "$$widen" ] || [ $$delay = 1 ] || continue; \
+	    echo "== check-scan: $$name under movers $${widen:-(natural timings)}"; \
 	    $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $$widen $(HCPP) -o stress_scan_$$name \
 	      stress_dcache_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
-	    for args in "$(SCAN_ARGS)" "$(SCAN_FRESH_ARGS)"; do \
+	    for args in "$(SCAN_ARGS)" "$(SCAN_FRESH_ARGS)" "$(SCAN_PATIENT_ARGS)"; do \
+	      [ "$$args" != "$(SCAN_PATIENT_ARGS)" ] || [ $$name = linger ] || continue; \
 	      out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_$$name $$args) || \
 	        { echo "$$out"; echo "check-scan: FAIL ($$name $$widen: $$args)"; exit 1; }; \
-	      echo "$$out" | grep -E '^(signals|MISSED|RESULT)'; \
+	      echo "$$out" | grep -E '^(signals|lingering|FALSE|MISSED|RESULT)'; \
 	    done; \
 	  done; \
 	done
@@ -424,14 +488,30 @@ check-scan: stress_dcache_scan.c dcache_bucketlock.c $(HDRS) | check-lib
 	    "seq_onecount:-DDC_SCAN_SEQ -DDC_TEST_SCAN_SEQ_ONE_COUNT:$(SCAN_ARGS)" \
 	    "mark_noxchg:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_XCHG:$(SCAN_ARGS)" \
 	    "mark_nolockwait:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_LOCKWAIT:$(SCAN_ARGS)" \
-	    "mark_noinherit:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_INHERIT:$(SCAN_FRESH_ARGS)"; do \
+	    "mark_noinherit:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_INHERIT:$(SCAN_FRESH_ARGS)" \
+	    "linger_nowait:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_WAIT:$(SCAN_ARGS)" \
+	    "linger_nocheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_CHECK:$(SCAN_ARGS)" \
+	    "linger_noxchg:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_XCHG:$(SCAN_PATIENT_ARGS)"; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; args=$${rest#*:}; \
-	  echo "== check-scan MUST-FAIL control: $$name ($$defs)"; \
+	  echo "== check-scan MUST-FAIL control under movers: $$name ($$defs)"; \
 	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $(HCPP) -o stress_scan_mut_$$name \
 	    stress_dcache_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
 	  if out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_mut_$$name $$args); then \
 	    echo "check-scan: MUTANT $$name PASSED -- the harness is vacuous"; exit 1; \
-	  else echo "$$out" | grep -E '^MISSED' | sed 's/^/  fails as it must: /'; fi; \
+	  else echo "$$out" | grep -E '^(FALSE|MISSED)' | sed 's/^/  fails as it must: /'; fi; \
+	done
+	@echo "== check-scan: the engine's own suites with the linger arm built in"
+	@set -e; $(CC) $(CFLAGS) $(SCAN_HOLD) -DDC_SCAN_LINGER $(HCPP) -o stress_scan_engine_test \
+	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	./stress_scan_engine_test | tail -1; \
+	for t in "stress_dcache:4 4 8 16 15000" "stress_dcache_dirs:4 8 4 2 15000" \
+	    "stress_dcache_xchg:" "mixed_cycle:" "stress_dcache_rmdir:$(RMDIR_ARGS)"; do \
+	  src=$${t%%:*}; args=$${t#*:}; \
+	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_SCAN_LINGER $(HCPP) -o stress_scan_engine_$$src \
+	    $$src.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_engine_$$src $$args) || \
+	    { echo "$$out"; echo "check-scan: FAIL ($$src with the linger arm)"; exit 1; }; \
+	  echo "$$out" | grep -E '^RESULT' | sed "s/^/$$src: /"; \
 	done
 	@echo "check-scan: PASS"
 
@@ -1313,4 +1393,4 @@ clean:
 	  stress_dcache_dirs_bucketlock_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
 	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl stress_rmdir_* \
-	  stress_scan_*
+	  stress_scan_* repro_scan_*
