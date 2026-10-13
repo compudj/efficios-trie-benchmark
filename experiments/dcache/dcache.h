@@ -579,6 +579,7 @@ void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg);
 long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 	     long cap);
 const char *dc_scan_arm(void);
+int dc_scan_on_demand(void);	/* entries linger only while a scan is under way */
 /*
  * How many scans, how many passes they took, how often the sequence moved
  * (seq, mark); how many lingering entries the scans went through and how many

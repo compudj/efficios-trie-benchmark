@@ -161,6 +161,17 @@ void (*dc_test_scan_climb_hook)(uint64_t dir_id);
  * the lists no longer hold (repro_scan.c, for scan_walk()'s walk_entry()).
  */
 void (*dc_test_folded_hook)(void);
+/*
+ * Test-only rendezvous in a move to another directory (repro_scan.c): with 0
+ * when it has decided, with no lock held, whether to get a lingering entry
+ * ready, and with 1 under its four locks, when it has decided what it leaves
+ * and before it commits.
+ */
+void (*dc_test_scan_move_hook)(int locked);
+#define DC_TEST_SCAN_MOVE_HOOK(locked)	do {				\
+		if (dc_test_scan_move_hook)				\
+			dc_test_scan_move_hook(locked);			\
+	} while (0)
 #define DC_TEST_SCAN_DIR_HOOK(dir)	do {				\
 		if (dc_test_scan_dir_hook)				\
 			dc_test_scan_dir_hook((dir)->d_id);		\
@@ -183,6 +194,7 @@ void (*dc_test_inflight_hook)(void);
 #define DC_TEST_TRANSFER_HOOK()	do { } while (0)
 #define DC_TEST_SCAN_DIR_HOOK(dir)	do { } while (0)
 #define DC_TEST_SCAN_CLIMB_HOOK(dir)	do { } while (0)
+#define DC_TEST_SCAN_MOVE_HOOK(locked)	do { } while (0)
 #endif
 
 /*
@@ -271,6 +283,9 @@ static void dc_test_unlink_delay(void)
  */
 #if defined(DC_SCAN_WALK) && !defined(DC_SCAN_LINGER)
 # define DC_SCAN_LINGER 1	/* the same entries linger: the scan differs */
+#endif
+#if defined(DC_LINGER_ON_DEMAND) && !defined(DC_SCAN_LINGER)
+# error "DC_LINGER_ON_DEMAND is for the arms where entries linger: DC_SCAN_LINGER, DC_SCAN_WALK"
 #endif
 #if (defined(DC_SCAN_SEQ) + defined(DC_SCAN_MARK) + defined(DC_SCAN_LINGER)) > 1
 # error "DC_SCAN_SEQ, DC_SCAN_MARK and DC_SCAN_LINGER are arms of dc_scan(): pick one"
@@ -1310,6 +1325,7 @@ unsigned long dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
  * (rename_gen is written by the counter arms).  dc_create allocates the struct
  * 64-byte aligned.
  */
+
 struct dcache {
 	struct dc_lru_shard *lru;		/* nlru shards; see lru_shard_index */
 	unsigned int nlru;
@@ -1387,6 +1403,10 @@ struct dcache {
 	/* The linger arm: lingering entries gone through, objects checked. */
 	unsigned long scan_lingerers;
 	unsigned long scan_checked;
+#endif
+#ifdef DC_LINGER_ON_DEMAND
+	/* How many scans are under way: see linger_needed_locked(). */
+	unsigned long scan_inflight;
 #endif
 #ifdef DC_SCAN_WALK
 	/* The walk arm: frames noted, moves under a scan, scans that fell back. */
@@ -1601,6 +1621,7 @@ struct dcache *dc_create(unsigned int nbuckets)
 	dc->root->d_iparent = dc->root;
 	return dc;
 }
+
 
 /* Quiescent teardown: recurse the child-hlist, free every node. */
 static void free_subtree(struct dentry *d)
@@ -2438,6 +2459,59 @@ static int children_gone(struct dentry *d)
 }
 
 /*
+ * ON DEMAND (-DDC_LINGER_ON_DEMAND).  An entry has to linger for the scans
+ * that are under way when its object leaves, and for no other: a scan that
+ * begins after the move finds the object where it is.  So a scan says that it
+ * is under way (dc->scan_inflight), and a move leaves a lingering entry only
+ * if one is.  With no scan a move is what it was before there were scans.
+ *
+ * The two can cross: the move looks, sees no scan, and a scan begins and reads
+ * the destination before the move commits there.  The lock of the destination's
+ * list settles it.  The move looks while it holds that lock, and a scan waits
+ * for the lock to be free before it reads the list from its head
+ * (linger_first_rcu()).  A scan that read the list before the move locked it
+ * had said so before, and the move sees it.  A scan that reads it after waits
+ * for the commit and finds the object there.
+ *
+ * A move gets its lingering entry ready before it takes its locks, going by
+ * what it sees then.  If a scan has begun by the time it holds them and it has
+ * none ready, it lets go, gets one and comes back.
+ */
+static inline int linger_wanted(struct dcache *dc)
+{
+#ifdef DC_LINGER_ON_DEMAND
+	return uatomic_load(&dc->scan_inflight, CMM_RELAXED) != 0;
+#else
+	(void) dc;
+	return 1;
+#endif
+}
+
+/* The same, under the lock of the list that the object moves into. */
+static inline int linger_needed_locked(struct dcache *dc, int ready)
+{
+#if defined(DC_LINGER_ON_DEMAND) && !defined(DC_TEST_ONDEMAND_NO_RECHECK)
+	(void) ready;
+	cmm_smp_mb();		/* the lock, then the scans */
+	return uatomic_load(&dc->scan_inflight, CMM_RELAXED) != 0;
+#else
+	(void) dc;
+	return ready;
+#endif
+}
+
+/* The first entry of @dir's list, for a scan. */
+static inline struct urcu_txn_sw_hlist_node *linger_first_rcu(struct dentry *dir)
+{
+#if defined(DC_LINGER_ON_DEMAND) && !defined(DC_TEST_ONDEMAND_NO_LOCKWAIT)
+	while (__atomic_load_n((uintptr_t *) &dir->d_child_head.first,
+			       __ATOMIC_RELAXED) & DC_BL_LOCK)
+		caa_cpu_relax();
+#endif
+	return bl_hlist_first_rcu(&dir->d_child_head);
+}
+
+/*
  * A lingering entry for the list of @dir, to take the place of an entry named
  * @name there.  Not armed yet: linger_arm() says which host it leads to.
  */
@@ -3102,6 +3176,7 @@ static int cross_cycle_check(struct dcache *dc, struct dentry *host,
 	return 0;
 }
 
+
 /*
  * STACK one entry into an ALREADY-OPEN txn (records only -- no cycle check, no
  * commit).  Removes @top from BOTH indexes and inserts @shell -- the new named
@@ -3168,10 +3243,11 @@ static void stack_one_prepare(dc_swtxn_t *txn,
 	} else {
 #ifdef DC_SCAN_LINGER
 		/* The entry lingers where it was: see linger_alloc(). */
-		bl_sw_replace(txn, &top->d_sib, &lg->d_sib);
-#else
-		bl_sw_del_marked(txn, &top->d_sib);
+		if (lg)
+			bl_sw_replace(txn, &top->d_sib, &lg->d_sib);
+		else
 #endif
+			bl_sw_del_marked(txn, &top->d_sib);
 		bl_sw_add_head(txn, &shell->d_sib, &new_parent->d_child_head);
 	}
 	(void) urcu_txn_store_sw(txn, (void **) &host->d_top,
@@ -3254,6 +3330,7 @@ static int stack_shell(struct dcache *dc,
 	int ret;
 #ifdef DC_SCAN_LINGER
 	struct dentry *lg = NULL;	/* what stays behind in @from_parent */
+	int lingers = 0;		/* @lg is in the list */
 #endif
 
 	if (!shell)
@@ -3263,7 +3340,7 @@ static int stack_shell(struct dcache *dc,
 		((uintptr_t) shell->d_iparent | DC_TAG_SHELL);
 #endif
 #ifdef DC_SCAN_LINGER
-	if (cross_parent) {
+	if (cross_parent && linger_wanted(dc)) {
 		lg = linger_alloc(dc, from_parent, from_name);
 		if (!lg) {
 			free(shell);
@@ -3271,6 +3348,8 @@ static int stack_shell(struct dcache *dc,
 		}
 	}
 #endif
+	if (cross_parent)
+		DC_TEST_SCAN_MOVE_HOOK(0);
 
 	rcu_read_lock();			/* keeps top/host alive across the commit */
 	urcu_txn_init(&txn, &dc->domain);
@@ -3308,7 +3387,6 @@ static int stack_shell(struct dcache *dc,
 			linger_arm(lg, host);
 #endif
 #ifdef DC_SCAN_WALK
-		shell->d_left = lg;
 		shell->d_nmoves = (top != host ? top->d_nmoves : 0) + 1;
 #endif
 
@@ -3365,6 +3443,25 @@ static int stack_shell(struct dcache *dc,
 			urcu_txn_end(&txn);
 			continue;		/* re-find the current top */
 		}
+#ifdef DC_SCAN_LINGER
+		/* Does a scan need what this move leaves?  linger_wanted(). */
+		lingers = cross_parent && linger_needed_locked(dc, lg != NULL);
+		if (lingers && !lg) {
+			bl_unlock_n(heads, 4);
+			uatomic_and(&host->d_moving, ~1UL);
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			lg = linger_alloc(dc, from_parent, from_name);
+			if (!lg) {
+				ret = -ENOMEM;
+				goto out_free;
+			}
+			continue;	/* ready now: look again */
+		}
+#ifdef DC_SCAN_WALK
+		shell->d_left = lingers ? lg : NULL;
+#endif
+#endif
 		/* See the other stack_shell: a negative destination directory
 		 * must refuse a rename INTO it, checked under its child head. */
 		if (!DC_IS_POSITIVE(new_parent)) {
@@ -3393,14 +3490,16 @@ static int stack_shell(struct dcache *dc,
 		/* A move to another directory inserts into its child list. */
 		if (cross_parent)
 			scan_signal_locked(dc, new_parent, NULL);
+		if (cross_parent)
+			DC_TEST_SCAN_MOVE_HOOK(1);
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent
-				  DC_LINGER_ARG(lg));
+				  DC_LINGER_ARG(lingers ? lg : NULL));
 		st = urcu_txn_commit_sw(&txn);	/* pure-SW: index + demote, one commit */
 		if (cross_parent)
 			scan_signal_done(dc);
 #ifdef DC_SCAN_LINGER
-		if (lg && st == URCU_TXN_STATUS_OK)	/* under the heads still */
+		if (lingers && st == URCU_TXN_STATUS_OK)	/* under the heads still */
 			linger_publish(lg, from_parent, host);
 #endif
 		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
@@ -3419,8 +3518,10 @@ static int stack_shell(struct dcache *dc,
 	rcu_read_unlock();
 	dest_reclaim(dc, neg);
 #ifdef DC_SCAN_LINGER
-	if (lg)
+	if (lingers)
 		linger_start(lg);
+	else
+		free(lg);		/* ready, and no scan needed it */
 #endif
 	*out_shell = shell;
 	if (out_host)
@@ -3640,6 +3741,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	struct dentry *pa, *pb, *hosta, *hostb, *sa, *sb;
 #ifdef DC_SCAN_LINGER
 	struct dentry *ga = NULL, *gb = NULL;
+	struct dentry *ua = NULL, *ub = NULL;	/* the two, if they go in the lists */
 #endif
 	struct urcu_txn_sw_hlist_head *bucket_a, *bucket_b;
 	const struct qstr *na, *nb;
@@ -3679,7 +3781,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		return -ENOMEM;
 	}
 #if defined(DC_SCAN_LINGER) && !defined(DC_TEST_LINGER_NO_XCHG)
-	if (cross) {		/* what A leaves in pa, and B in pb */
+	if (cross && linger_wanted(dc)) {	/* what A leaves in pa, and B in pb */
 		ga = linger_alloc(dc, pa, na);
 		gb = linger_alloc(dc, pb, nb);
 		if (!ga || !gb) {
@@ -3728,9 +3830,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		}
 #endif
 #ifdef DC_SCAN_WALK
-		sa->d_left = ga;
 		sa->d_nmoves = (topa != hosta ? topa->d_nmoves : 0) + 1;
-		sb->d_left = gb;
 		sb->d_nmoves = (topb != hostb ? topb->d_nmoves : 0) + 1;
 #endif
 
@@ -3801,6 +3901,33 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			continue;		/* re-find + retry (marked top) */
 		}
 
+#if defined(DC_SCAN_LINGER) && !defined(DC_TEST_LINGER_NO_XCHG)
+		/* Does a scan need what this exchange leaves?  linger_wanted(). */
+		if (cross && linger_needed_locked(dc, ga != NULL)) {
+			if (!ga) {
+				bl_unlock_n(heads, 4);
+				uatomic_and(&hosta->d_moving, ~1UL);
+				uatomic_and(&hostb->d_moving, ~1UL);
+				urcu_txn_conflict(&txn);
+				urcu_txn_end(&txn);
+				ga = linger_alloc(dc, pa, na);
+				gb = linger_alloc(dc, pb, nb);
+				if (!ga || !gb) {
+					ret = -ENOMEM;
+					goto out_free;
+				}
+				continue;	/* ready now: look again */
+			}
+			ua = ga;
+			ub = gb;
+		} else {
+			ua = ub = NULL;
+		}
+#endif
+#ifdef DC_SCAN_WALK
+		sa->d_left = ua;
+		sb->d_left = ub;
+#endif
 		/*
 		 * An exchange swaps two places in the child lists, within one
 		 * directory too: what a scan has yet to reach may land where it
@@ -3830,10 +3957,10 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		if (!cross)
 			bl_sw_replace2(&txn, &topa->d_sib, &sa->d_sib,
 					&topb->d_sib, &sb->d_sib);
-		else if (ga) {
-			bl_sw_replace_by2(&txn, &topa->d_sib, &ga->d_sib,
+		else if (ua) {
+			bl_sw_replace_by2(&txn, &topa->d_sib, &ua->d_sib,
 					  &sb->d_sib);
-			bl_sw_replace_by2(&txn, &topb->d_sib, &gb->d_sib,
+			bl_sw_replace_by2(&txn, &topb->d_sib, &ub->d_sib,
 					  &sa->d_sib);
 		} else
 #else
@@ -3866,9 +3993,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		scan_signal_done(dc);
 #endif
 #ifdef DC_SCAN_LINGER
-		if (ga && st == URCU_TXN_STATUS_OK) {	/* under the heads still */
-			linger_publish(ga, pa, hosta);
-			linger_publish(gb, pb, hostb);
+		if (ua && st == URCU_TXN_STATUS_OK) {	/* under the heads still */
+			linger_publish(ua, pa, hosta);
+			linger_publish(ub, pb, hostb);
 		}
 #endif
 		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
@@ -3893,9 +4020,12 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	call_rcu(&sa->d_rcu, fold_cb);
 	call_rcu(&sb->d_rcu, fold_cb);
 #ifdef DC_SCAN_LINGER
-	if (ga) {
-		linger_start(ga);
-		linger_start(gb);
+	if (ua) {
+		linger_start(ua);
+		linger_start(ub);
+	} else {
+		free(ga);		/* ready, and no scan needed them */
+		free(gb);
 	}
 #endif
 	return 0;
@@ -4249,8 +4379,7 @@ static int scan_linger_rec(struct scan_linger *c, struct dentry *dir,
 
 	c->path[depth] = dir;
 	DC_TEST_SCAN_DIR_HOOK(dir);
-	for (sn = bl_hlist_first_rcu(&dir->d_child_head); sn;
-	     sn = bl_hlist_next_rcu(sn)) {
+	for (sn = linger_first_rcu(dir); sn; sn = bl_hlist_next_rcu(sn)) {
 		struct dentry *e = sib_dentry(sn);
 		struct dentry *host = host_of_rcu(e);
 		int v = via, i, ret;
@@ -4458,7 +4587,7 @@ static long scan_walk(struct dcache *dc, struct dentry *root, uint64_t *ids,
 	w.nf = 0;
 	w.nlinger = 0;
 	DC_TEST_SCAN_DIR_HOOK(dir);
-	sn = bl_hlist_first_rcu(&dir->d_child_head);
+	sn = linger_first_rcu(dir);
 	for (;;) {
 		struct dentry *h, *top, *parent, *left;
 		struct walk_frame *fr;
@@ -4525,7 +4654,7 @@ in:
 #endif
 			dir = host;
 			DC_TEST_SCAN_DIR_HOOK(dir);
-			sn = bl_hlist_first_rcu(&dir->d_child_head);
+			sn = linger_first_rcu(dir);
 		}
 
 		/* The list of @dir is read: back to where the walk was. */
@@ -4613,6 +4742,10 @@ long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 
 	uatomic_inc(&dc->scan_calls);
 	rcu_read_lock();
+#ifdef DC_LINGER_ON_DEMAND
+	uatomic_inc(&dc->scan_inflight);
+	cmm_smp_mb();			/* under way, then the lists */
+#endif
 	for (;;) {
 		struct dentry *dir = dc->root;
 		uint32_t i;
@@ -4669,8 +4802,20 @@ long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 	if (caa_unlikely(passes > DC_WALK_HOLDOFF))
 		walk_hold_drop(dc);	/* this scan had raised it */
 #endif
+#ifdef DC_LINGER_ON_DEMAND
+	uatomic_dec(&dc->scan_inflight);
+#endif
 	rcu_read_unlock();
 	return n;
+}
+
+int dc_scan_on_demand(void)
+{
+#ifdef DC_LINGER_ON_DEMAND
+	return 1;
+#else
+	return 0;
+#endif
 }
 
 const char *dc_scan_arm(void)
@@ -4816,3 +4961,4 @@ int dc_dentry_path(struct dcache *dc, const struct dentry *d,
 	out->ndepth = n;
 	return 0;
 }
+

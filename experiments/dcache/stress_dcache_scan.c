@@ -96,8 +96,14 @@
  * argument is how many operations in a thousand are patient, while scans run;
  * 0 unless given.
  *
+ * And the one after that.  Where entries linger on demand
+ * (-DDC_LINGER_ON_DEMAND), what matters is a scan that begins or ends while a
+ * move is on its way, and scanners that scan back to back are always under
+ * way.  With this argument each sleeps a random time between two scans, up to
+ * so many microseconds.
+ *
  * Usage: ./stress_dcache_scan [movers [scanners [dirs [files [moves [fresh%
- *                              [patient/1000]]]]]]]
+ *                              [patient/1000 [scan-pause-us]]]]]]]]
  * Exit 0 = no miss, census clean; 1 = anomaly.
  */
 
@@ -111,6 +117,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <urcu-qsbr.h>
 #include <urcu/uatomic.h>
@@ -125,6 +132,7 @@ static int F = 4;			/* tracked files per mover */
 static long MOVES = 40000;		/* operations per mover, over the 3 rounds */
 static int FRESH_PCT = 10;		/* of them, on the fresh directory */
 static int PATIENT_PM;			/* per mille made after a drain */
+static int SCAN_PAUSE_US;		/* a scanner sleeps up to this between scans */
 
 static struct dcache *g_dc;
 static int g_stop;
@@ -348,6 +356,7 @@ static void *mover(void *arg)
 }
 
 struct scanner {
+	uint64_t rng;
 	long scans, missed, miss_file, miss_dir, miss_child, dups, errs;
 	long first_miss;		/* index of the first one, or -1 */
 	long false_reports, outside;	/* of the scans it stayed outside for */
@@ -434,6 +443,12 @@ static void *scanner(void *arg)
 		else
 			check_scan(sc, ids, n, seen, before, after);
 		dc_quiescent();
+		if (SCAN_PAUSE_US) {	/* scans come and go: see the header */
+			rcu_thread_offline();
+			usleep((useconds_t) xrange(&sc->rng,
+						   (uint32_t) SCAN_PAUSE_US));
+			rcu_thread_online();
+		}
 	}
 	dc_unregister_thread();
 	free(ids);
@@ -538,19 +553,22 @@ int main(int argc, char **argv)
 	if (argc > 5) MOVES = atol(argv[5]);
 	if (argc > 6) FRESH_PCT = atoi(argv[6]);
 	if (argc > 7) PATIENT_PM = atoi(argv[7]);
+	if (argc > 8) SCAN_PAUSE_US = atoi(argv[8]);
 	setvbuf(stdout, NULL, _IOLBF, 0);	/* a sanitizer exit skips stdio's flush */
 	if (M < 1 || S < 1 || D < 2 || F < 2 || MOVES < 4 || FRESH_PCT < 1 ||
-	    FRESH_PCT > 99 || PATIENT_PM < 0 || PATIENT_PM > 1000) {
+	    FRESH_PCT > 99 || PATIENT_PM < 0 || PATIENT_PM > 1000 ||
+	    SCAN_PAUSE_US < 0) {
 		fprintf(stderr, "bad config\n");
 		return 2;
 	}
 	rcu_register_thread();
 	g_dc = dc_create(4096);
-	printf("== stress_dcache_scan (engine: %s, scan arm: %s) ==\n",
-	       dc_engine_name(), dc_scan_arm());
+	printf("== stress_dcache_scan (engine: %s, scan arm: %s%s) ==\n",
+	       dc_engine_name(), dc_scan_arm(),
+	       dc_scan_on_demand() ? ", on demand" : "");
 	printf("movers=%d scanners=%d dirs=%d files/mover=%d moves/mover=%ld"
-	       " fresh=%d%% patient=%d/1000\n", M, S, D, F, MOVES, FRESH_PCT,
-	       PATIENT_PM);
+	       " fresh=%d%% patient=%d/1000 scan-pause=%dus\n", M, S, D, F, MOVES,
+	       FRESH_PCT, PATIENT_PM, SCAN_PAUSE_US);
 
 	mkpath(&g_root, "/r");
 	mkpath(&p, "/o");
@@ -600,8 +618,11 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
-	for (i = 0; i < S; i++)
+	for (i = 0; i < S; i++) {
 		sc[i].first_miss = -1;
+		sc[i].rng = 0x2545f4914f6cdd1dULL ^
+			    ((uint64_t) (i + 1) * 0x9e3779b97f4a7c15ULL);
+	}
 
 	per_round[0] = MOVES / 4;
 	per_round[1] = MOVES / 2;
