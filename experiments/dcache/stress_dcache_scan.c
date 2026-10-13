@@ -15,12 +15,13 @@
  * while anything moved: dc_walk() runs at quiescence only, and no test looks
  * at what a dc_readdir() under renames left out.
  *
- * Workload.  One root /r with D directories /r/d<i>.  Each MOVER owns F files
- * and one directory g<m> holding a file h<m>; all of them are TRACKED, and
- * the mover keeps every one of them below /r for the whole run.  It picks
- * among:
+ * Workload.  One root /r with D directories /r/d<i>.  Each MOVER owns F files,
+ * a directory g<m>, a directory k<m> that is in g<m> or in some /r/d<i>, and a
+ * file h<m> in k<m>; all of them are TRACKED, and the mover keeps every one of
+ * them below /r for the whole run.  It picks among:
  *   - a file to another directory;
- *   - its directory g<m>, with what is in it, to another directory;
+ *   - its directory g<m>, with what is in it, to another directory; or k<m>
+ *     out of g<m> into some /r/d<i>, or back into g<m>;
  *   - an exchange of two of its files, in two directories or in one;
  *   - a file renamed where it is;
  *   - a FRESH directory n<m> created in some /r/d<i>, and a file moved into
@@ -65,10 +66,17 @@
  *                                  is reported unchecked (false reports)
  *   -DDC_TEST_LINGER_NO_XCHG       an exchange leaves no lingering entry
  *                                  (with patient operations, below)
+ *   -DDC_TEST_WALK_NO_SHELL_FRAME  the scan without a stack notes nothing
+ *                                  when it enters a directory that a shell
+ *                                  names (with patient operations)
  * Three more mutations of the linger arm are out of this harness's reach, and
  * repro_scan.c has a case for each: a directory that holds lingering entries
  * removed without leaving one, a climb that ends in a removed directory and is
- * not looked at again, a scan that enters a directory it is in.
+ * not looked at again, a scan that enters a directory it is in.  So are the
+ * other six of the walk arm: a directory moves under a scan a few hundred
+ * times in a run, and the walk arm prints how often, with how many frames it
+ * noted and how many scans fell back.  It runs once more with one frame
+ * (-DDC_SCAN_WALK_FRAMES=1), which makes most scans fall back.
  *
  * Why the last argument.  A move into a fresh directory is caught through the
  * mark that the directory was born with, and a miss by that road takes a pass
@@ -129,8 +137,8 @@ static struct dc_path g_root;
 #define FRESH_ID_BASE	4000000ULL
 #define NOISE_ID_BASE	5000000ULL
 
-/* Tracked per mover: F files, then g<m>, then h<m>. */
-#define PER_MOVER	(F + 2)
+/* Tracked per mover: F files, then g<m>, h<m> and k<m>. */
+#define PER_MOVER	(F + 3)
 #define NTRACKED	(M * PER_MOVER)
 
 /*
@@ -165,6 +173,7 @@ struct mover {
 	int *loc;
 	unsigned char *alt;		/* which of its two names it has */
 	int g_loc;			/* where g<m> is */
+	int k_loc;			/* where k<m> is, or -1: in g<m> */
 	int fresh_in;			/* which directory holds n<m>, or -1 */
 	int fresh_k;			/* which file's name is in it */
 	int noise_in;			/* where z<m> is, or -1 for /o */
@@ -182,6 +191,15 @@ static void file_path(const struct mover *mv, int k, struct dc_path *p)
 		mkpath(p, "/r/d%d/%s", mv->loc[k], name);
 	else
 		mkpath(p, "/r/d%d/n%d/%s", mv->fresh_in, mv->m, name);
+}
+
+/* Where k<m> is: in g<m>, or in one of the D directories. */
+static void k_path(const struct mover *mv, struct dc_path *p)
+{
+	if (mv->k_loc < 0)
+		mkpath(p, "/r/d%d/g%d/k%d", mv->g_loc, mv->m, mv->m);
+	else
+		mkpath(p, "/r/d%d/k%d", mv->k_loc, mv->m);
 }
 
 /* Somewhere else than @here among the D directories. */
@@ -272,7 +290,8 @@ static void *mover(void *arg)
 			if (dc_rename_exchange(g_dc, &a, &b) != 0)
 				mv->errs++;
 			mv->xchgs++;
-		} else if (op == 6) {		/* the directory, with its file */
+		} else if (op == 6 && xrange(&mv->rng, 2)) {
+			/* The directory, with what is in it. */
 			int to = other_dir(mv, mv->g_loc);
 
 			mkpath(&a, "/r/d%d/g%d", mv->g_loc, mv->m);
@@ -280,6 +299,16 @@ static void *mover(void *arg)
 			if (dc_rename(g_dc, &a, &b) != 0)
 				mv->errs++;
 			mv->g_loc = to;
+			mv->dirmoves++;
+		} else if (op == 6) {		/* the directory inside, out or in */
+			int to = mv->k_loc < 0 ?
+				 (int) xrange(&mv->rng, (uint32_t) D) : -1;
+
+			k_path(mv, &a);
+			mv->k_loc = to;
+			k_path(mv, &b);
+			if (dc_rename(g_dc, &a, &b) != 0)
+				mv->errs++;
 			mv->dirmoves++;
 		} else if (op == 7) {		/* a file renamed where it is */
 			file_path(mv, k, &a);
@@ -369,7 +398,7 @@ static void check_scan(struct scanner *sc, const uint64_t *ids, long n,
 			sc->first_miss = i;
 		if (what < F)
 			sc->miss_file++;
-		else if (what == F)
+		else if (what != F + 1)
 			sc->miss_dir++;
 		else
 			sc->miss_child++;
@@ -559,7 +588,10 @@ int main(int argc, char **argv)
 		mv[i].g_loc = i % D;
 		mkpath(&p, "/r/d%d/g%d", mv[i].g_loc, i);
 		err |= dc_add(g_dc, &p, base + (uint64_t) F);
-		mkpath(&p, "/r/d%d/g%d/h%d", mv[i].g_loc, i, i);
+		mv[i].k_loc = -1;
+		mkpath(&p, "/r/d%d/g%d/k%d", mv[i].g_loc, i, i);
+		err |= dc_add(g_dc, &p, base + (uint64_t) F + 2);
+		mkpath(&p, "/r/d%d/g%d/k%d/h%d", mv[i].g_loc, i, i, i);
 		err |= dc_add_file(g_dc, &p, base + (uint64_t) F + 1);
 		mkpath(&p, "/o/z%d", i);
 		err |= dc_add_file(g_dc, &p, NOISE_ID_BASE + (uint64_t) i);
@@ -640,6 +672,8 @@ int main(int argc, char **argv)
 	       sig_a, sig_b - sig_a, sig_c - sig_b);
 	printf("lingering entries    : %lu gone through, %lu objects checked\n",
 	       st.lingerers, st.checked);
+	printf("frames               : %lu noted; %lu directories moved under a"
+	       " scan; %lu scans fell back\n", st.frames, st.moved, st.fallbacks);
 	printf("reported twice       : %ld (allowed)\n", dups);
 	printf("FALSE REPORTS        : %ld (expect 0), of %ld scans a file stayed"
 	       " outside for\n", false_reports, outside);
@@ -649,8 +683,8 @@ int main(int argc, char **argv)
 		printf("first miss           : mover %ld, %s\n",
 		       first_miss / PER_MOVER,
 		       first_miss % PER_MOVER < F ? "a file" :
-		       first_miss % PER_MOVER == F ? "its directory" :
-		       "the file in its directory");
+		       first_miss % PER_MOVER != F + 1 ? "a directory of its own" :
+		       "the file in its directories");
 	printf("errors               : %ld mover, %ld scanner (expect 0)\n",
 	       merrs, serrs);
 	printf("at rest              : census %ld of %d tracked, %ld twice, %ld stray;"

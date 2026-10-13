@@ -39,6 +39,35 @@
  * has to be reported.  In left-before, z was outside for the whole scan and
  * must not be.  linger-loop also bounds how many ids the scan reports.
  *
+ * The cases that follow are for the scan without a stack (the walk arm), which
+ * comes back from a directory through what that directory is now, and the
+ * directory may have moved.  Every arm runs them.  In each, g is a directory
+ * that holds h, x is in EARLY behind g and y is in MID; all have to be
+ * reported.  "At g" is the scan about to read the list of g.
+ *
+ *   dir-ahead        g is in EARLY.  At g, it moves to LATE.
+ *   dir-twice        g is in EARLY.  At g, it moves to MID and then to LATE.
+ *                    The walk arm cannot tell where it was: it falls back.
+ *   dir-renamed      g is in EARLY.  At g, it is renamed where it is.
+ *   dir-shelled      g moves from MID to EARLY before the scan, as z does in
+ *                    left-before: a shell names it when the scan comes to it.
+ *   dir-shelled-ahead  the same, and at g it moves on to LATE.
+ *   dir-shelled-twice  the same, and at g it moves to NEXT and then to LATE:
+ *                    the walk arm falls back.
+ *   exchange-ahead   g is in EARLY and the file q in LATE.  At g, the two are
+ *                    exchanged.
+ *   deep-shelled     five directories, one in the other, each moved into the
+ *                    one above before the scan, and the first into EARLY: a
+ *                    shell names each.  z is in the last.
+ *   deep-frames      ten of them: more than the walk arm has frames for.  It
+ *                    falls back.
+ *   fold-under       g moves from MID to EARLY before the scan, and its fold
+ *                    is parked where it has put g itself in the lists and has
+ *                    not let go of the shell yet.  The scan runs then.  (On
+ *                    the linger and walk arms only.)
+ *
+ * The walk arm also has to fall back in those three cases and in no other.
+ *
  * Which arm fails which (make check-scan runs them all):
  *   soft                              move-behind, and the four after it
  *   -DDC_TEST_SCAN_NO_XCHG            exchange-behind
@@ -49,6 +78,20 @@
  *   -DDC_TEST_LINGER_DEAD_NO_LOOK     dead-end-climb
  *   -DDC_TEST_LINGER_NO_CHECK         left-before
  *   -DDC_TEST_LINGER_NO_LOOPCHECK     linger-loop
+ * and of the walk arm:
+ *   -DDC_TEST_WALK_MOVED_UNSEEN       dir-ahead: back to where the directory
+ *                                     is now
+ *   -DDC_TEST_WALK_TWICE_AS_ONCE      dir-twice: two moves taken for one
+ *   -DDC_TEST_WALK_NO_SHELL_FRAME     dir-shelled: no frame for a directory
+ *                                     that a shell names
+ *   -DDC_TEST_WALK_FROM_ELSEWHERE     dir-shelled-twice: a last move that
+ *                                     left another directory than the frame's
+ *   -DDC_TEST_WALK_NO_FRAME_LEFT      deep-frames: in without a frame when
+ *                                     none is left
+ *   -DDC_TEST_WALK_NO_WALK_IN         linger-loop: round the circle until the
+ *                                     frames run out
+ *   -DDC_TEST_WALK_FOLD_UNSEEN        fold-under: a shell that the lists no
+ *                                     longer hold taken for a move
  * The two mutations of a window inside a commit (the sequence counted once,
  * the scan not waiting for a locked list) are out of the reach of these
  * hooks: the stress test has them.
@@ -75,6 +118,7 @@
 
 extern void (*dc_test_scan_dir_hook)(uint64_t dir_id);
 extern void (*dc_test_scan_climb_hook)(uint64_t dir_id);
+extern void (*dc_test_folded_hook)(void);
 
 #define NDIRS		4
 #define ROOT_ID		1ULL
@@ -90,6 +134,11 @@ extern void (*dc_test_scan_climb_hook)(uint64_t dir_id);
 #define LA_ID		500ULL
 #define LB_ID		501ULL
 #define LC_ID		502ULL
+#define X_ID		600ULL
+#define Y_ID		601ULL
+#define Q_ID		602ULL
+#define DEEP_ID_BASE	700ULL
+#define DEEP_Z_ID	799ULL
 
 #define SCAN_CAP	4096
 
@@ -250,6 +299,8 @@ static void drain(void)
 static uint64_t g_ids[SCAN_CAP];
 static long g_n;
 static unsigned long g_lingerers;	/* entries this scan went through */
+static unsigned long g_frames;		/* frames it noted (the walk arm) */
+static unsigned long g_fallbacks;	/* 1 if it fell back */
 
 static void scan(uint64_t dir_at, void (*dir_step)(void),
 		 uint64_t climb_at, void (*climb_step)(void))
@@ -265,6 +316,8 @@ static void scan(uint64_t dir_at, void (*dir_step)(void),
 	g_n = dc_scan(g_dc, &g_root, g_ids, SCAN_CAP);
 	dc_scan_stats(g_dc, &after);
 	g_lingerers = after.lingerers - before.lingerers;
+	g_frames = after.frames - before.frames;
+	g_fallbacks = after.fallbacks - before.fallbacks;
 	g_dir_step = g_climb_step = NULL;
 }
 
@@ -278,9 +331,16 @@ static int reported(uint64_t id)
 	return 0;
 }
 
+/* An arm on which entries linger: scanned with a stack, or without one. */
 static int linger_arm(void)
 {
-	return !strcmp(dc_scan_arm(), "linger");
+	return !strcmp(dc_scan_arm(), "linger") || !strcmp(dc_scan_arm(), "walk");
+}
+
+/* The scan without a stack, which has frames and may fall back. */
+static int walk_arm(void)
+{
+	return !strcmp(dc_scan_arm(), "walk");
 }
 
 /* ---- the cases ---- */
@@ -487,18 +547,264 @@ static void case_linger_loop(struct verdict *v)
 	RM("%s/b", LATE);
 }
 
+/* The walk arm fell back, or did not, as the case has it. */
+static void expect_fallback(struct verdict *v, unsigned long want)
+{
+	if (!walk_arm())
+		return;
+	if (g_fallbacks != want)
+		fail(v, want ? "the walk did not fall back" :
+			       "the walk fell back");
+}
+
+/* g with h in it in @dir, x behind g in EARLY, y in MID. */
+static void setup_g(const char *dir)
+{
+	MKFILE(X_ID, "%s/x", EARLY);
+	MKDIR(G_ID, "%s/g", dir);
+	MKFILE(H_ID, "%s/g/h", dir);
+	MKFILE(Y_ID, "%s/y", MID);
+	drain();
+}
+
+static void expect_g(struct verdict *v)
+{
+	if (!g_dir_fired && g_dir_at)
+		fail(v, "the scan never came to g");
+	expect(v, G_ID, "g");
+	expect(v, H_ID, "h");
+	expect(v, X_ID, "x");
+	expect(v, Y_ID, "y");
+}
+
+/* g is at @where by now, under the name @name. */
+static void cleanup_g(const char *where, const char *name)
+{
+	drain();
+	RM("%s/%s/h", where, name);
+	RM("%s/%s", where, name);
+	RM("%s/x", EARLY);
+	RM("%s/y", MID);
+}
+
+static void step_g_early_late(void)
+{
+	mv(S("%s/g", EARLY), S("%s/g", LATE));
+}
+
+static void case_dir_ahead(struct verdict *v)
+{
+	setup_g(EARLY);
+	scan(G_ID, step_g_early_late, 0, NULL);
+	expect_g(v);
+	cleanup_g(LATE, "g");
+}
+
+static void step_g_early_mid_late(void)
+{
+	mv(S("%s/g", EARLY), S("%s/g", MID));
+	mv(S("%s/g", MID), S("%s/g", LATE));
+}
+
+static void case_dir_twice(struct verdict *v)
+{
+	setup_g(EARLY);
+	scan(G_ID, step_g_early_mid_late, 0, NULL);
+	expect_g(v);
+	cleanup_g(LATE, "g");
+}
+
+static void step_g_renamed(void)
+{
+	mv(S("%s/g", EARLY), S("%s/g2", EARLY));
+}
+
+static void case_dir_renamed(struct verdict *v)
+{
+	setup_g(EARLY);
+	scan(G_ID, step_g_renamed, 0, NULL);
+	expect_g(v);
+	cleanup_g(EARLY, "g2");
+}
+
+static void step_g_mid_early(void)
+{
+	mv(S("%s/g", MID), S("%s/g", EARLY));
+}
+
+static void case_dir_shelled(struct verdict *v)
+{
+	setup_g(MID);
+	mover_do(step_g_mid_early);	/* on line from here to the scan's end */
+	scan(0, NULL, 0, NULL);
+	expect_g(v);
+	if (walk_arm() && !g_frames)
+		fail(v, "no shell named g when the scan came to it");
+	cleanup_g(EARLY, "g");
+}
+
+static void case_dir_shelled_ahead(struct verdict *v)
+{
+	setup_g(MID);
+	mover_do(step_g_mid_early);
+	scan(G_ID, step_g_early_late, 0, NULL);
+	expect_g(v);
+	cleanup_g(LATE, "g");
+}
+
+static void step_g_early_next_late(void)
+{
+	mv(S("%s/g", EARLY), S("%s/g", NEXT));
+	mv(S("%s/g", NEXT), S("%s/g", LATE));
+}
+
+static void case_dir_shelled_twice(struct verdict *v)
+{
+	setup_g(MID);
+	mover_do(step_g_mid_early);
+	scan(G_ID, step_g_early_next_late, 0, NULL);
+	expect_g(v);
+	cleanup_g(LATE, "g");
+}
+
+static void step_g_exchanged(void)
+{
+	struct dc_path a, b;
+
+	must(dc_rename_exchange(g_dc, P(&a, "%s/g", EARLY), P(&b, "%s/q", LATE)),
+	     "exchange");
+}
+
+static void case_exchange_ahead(struct verdict *v)
+{
+	MKFILE(Q_ID, "%s/q", LATE);
+	setup_g(EARLY);
+	scan(G_ID, step_g_exchanged, 0, NULL);
+	expect_g(v);
+	expect(v, Q_ID, "q");
+	drain();
+	RM("%s/g", EARLY);		/* the file q, under the name g */
+	cleanup_g(LATE, "q");		/* the directory g, under the name q */
+}
+
+/*
+ * @g_deep directories c0, c1, ... made side by side in NEXT, then each moved
+ * into the one before it, from the last, and c0 into EARLY: a shell names
+ * each of them where it is, and what each left lingers in NEXT.
+ */
+static int g_deep;
+
+static char *deep_path(int depth)
+{
+	static char buf[DC_NAME_MAX * 4];
+	int i, off = snprintf(buf, sizeof(buf), "%s", EARLY);
+
+	for (i = 0; i <= depth; i++)
+		off += snprintf(buf + off, sizeof(buf) - (size_t) off, "/c%d", i);
+	return buf;
+}
+
+static void step_deep(void)
+{
+	int i;
+
+	for (i = g_deep - 1; i > 0; i--)
+		mv(S("%s/c%d", NEXT, i), S("%s/c%d/c%d", NEXT, i - 1, i));
+	mv(S("%s/c0", NEXT), S("%s/c0", EARLY));
+}
+
+static void deep(struct verdict *v, int n)
+{
+	int i;
+
+	g_deep = n;
+	MKFILE(X_ID, "%s/x", EARLY);
+	for (i = 0; i < n; i++)
+		MKDIR(DEEP_ID_BASE + (uint64_t) i, "%s/c%d", NEXT, i);
+	MKFILE(DEEP_Z_ID, "%s/c%d/z", NEXT, n - 1);
+	drain();
+	mover_do(step_deep);
+	scan(0, NULL, 0, NULL);
+	expect(v, X_ID, "x");
+	expect(v, DEEP_Z_ID, "z");
+	for (i = 0; i < n; i++)
+		expect(v, DEEP_ID_BASE + (uint64_t) i, "a directory of the chain");
+	if (walk_arm() && g_frames < (unsigned long) (n < 8 ? n : 8))
+		fail(v, "%lu frames for %d directories that shells name",
+		     g_frames, n);
+	drain();
+	RM("%s/z", deep_path(n - 1));
+	for (i = n - 1; i >= 0; i--)
+		RM("%s", deep_path(i));
+	RM("%s/x", EARLY);
+}
+
+static void case_deep_shelled(struct verdict *v)
+{
+	deep(v, 5);
+}
+
+static void case_deep_frames(struct verdict *v)
+{
+	deep(v, 10);
+}
+
+/* The fold of the case below, parked between its commit and the rest. */
+static sem_t g_folded, g_fold_go;
+static int g_fold_parked;
+
+static void folded_hook(void)
+{
+	if (g_fold_parked)
+		return;
+	g_fold_parked = 1;
+	sem_post(&g_folded);
+	sem_wait(&g_fold_go);		/* on line: no grace period meanwhile */
+}
+
+static void case_fold_under(struct verdict *v)
+{
+	/*
+	 * Where entries linger only.  The parked fold holds the lock of
+	 * EARLY's list, which a scan of the mark arm waits for.
+	 */
+	if (!linger_arm())
+		return;
+	setup_g(MID);
+	g_fold_parked = 0;
+	dc_test_folded_hook = folded_hook;
+	mover_do(step_g_mid_early);
+	sem_wait_quiescent(&g_folded);	/* a grace period, then the fold */
+	scan(0, NULL, 0, NULL);
+	sem_post(&g_fold_go);
+	dc_test_folded_hook = NULL;
+	expect_g(v);
+	cleanup_g(EARLY, "g");
+}
+
 static const struct {
 	const char *name;
 	void (*run)(struct verdict *v);
+	unsigned long fallbacks;	/* of the walk arm, in the scan of the case */
 } cases[] = {
-	{ "move-behind", case_move_behind },
-	{ "exchange-behind", case_exchange_behind },
-	{ "out-then-rmdir", case_out_then_rmdir },
-	{ "dir-behind", case_dir_behind },
-	{ "into-fresh", case_into_fresh },
-	{ "dead-end-climb", case_dead_end_climb },
-	{ "left-before", case_left_before },
-	{ "linger-loop", case_linger_loop },
+	{ "move-behind", case_move_behind, 0 },
+	{ "exchange-behind", case_exchange_behind, 0 },
+	{ "out-then-rmdir", case_out_then_rmdir, 0 },
+	{ "dir-behind", case_dir_behind, 0 },
+	{ "into-fresh", case_into_fresh, 0 },
+	{ "dead-end-climb", case_dead_end_climb, 0 },
+	{ "left-before", case_left_before, 0 },
+	{ "linger-loop", case_linger_loop, 0 },
+	{ "dir-ahead", case_dir_ahead, 0 },
+	{ "dir-twice", case_dir_twice, 1 },
+	{ "dir-renamed", case_dir_renamed, 0 },
+	{ "dir-shelled", case_dir_shelled, 0 },
+	{ "dir-shelled-ahead", case_dir_shelled_ahead, 0 },
+	{ "dir-shelled-twice", case_dir_shelled_twice, 1 },
+	{ "exchange-ahead", case_exchange_ahead, 0 },
+	{ "deep-shelled", case_deep_shelled, 0 },
+	{ "deep-frames", case_deep_frames, 1 },
+	{ "fold-under", case_fold_under, 0 },
 };
 #define NCASES	((int) (sizeof(cases) / sizeof(cases[0])))
 
@@ -534,6 +840,8 @@ int main(int argc, char **argv)
 
 	sem_init(&g_go, 0, 0);
 	sem_init(&g_done, 0, 0);
+	sem_init(&g_folded, 0, 0);
+	sem_init(&g_fold_go, 0, 0);
 	pthread_create(&t, NULL, mover, NULL);
 	dc_test_scan_dir_hook = dir_hook;
 	dc_test_scan_climb_hook = climb_hook;
@@ -561,7 +869,8 @@ int main(int argc, char **argv)
 		struct verdict v = { 0, "" };
 
 		cases[i].run(&v);
-		printf("%-16s: %s%s%s\n", cases[i].name, v.fail ? "FAIL" : "ok",
+		expect_fallback(&v, cases[i].fallbacks);
+		printf("%-18s: %s%s%s\n", cases[i].name, v.fail ? "FAIL" : "ok",
 		       v.fail ? " -- " : "", v.why);
 		failed += v.fail != 0;
 		if (must_fail && !strcmp(must_fail, cases[i].name))
@@ -572,7 +881,7 @@ int main(int argc, char **argv)
 	drain();
 	scan(0, NULL, 0, NULL);
 	if (g_n != NDIRS || g_lingerers) {
-		printf("at rest         : FAIL -- %ld ids, %lu lingering entries"
+		printf("at rest            : FAIL -- %ld ids, %lu lingering entries"
 		       " (expected %d, 0)\n", g_n, g_lingerers, NDIRS);
 		failed++;
 	}

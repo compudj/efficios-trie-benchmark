@@ -564,10 +564,17 @@ void dc_walk(struct dcache *dc, dc_visit_fn fn, void *arg);
  *          scan goes through every lingering entry that is still linked: its
  *          cost grows with the moves of the last grace period, where the
  *          cost of the two arms above grows with the moves made during it.
+ *   walk   the same lingering entries, scanned as the kernel's d_walk() would
+ *          have to: with no stack.  The linger arm calls itself for each
+ *          directory, and so remembers where it was in each list.  This one
+ *          comes back from a directory through what that directory is now,
+ *          and it may have moved: see scan_walk() in dcache_bucketlock.c for
+ *          what it notes on the way in, what it reads on the way back, and
+ *          when it gives up and falls back on the linger arm's scan.
  *
  * Only the bucket lock engine implements it, and only when asked: -DDC_SCAN
- * (soft), -DDC_SCAN_SEQ, -DDC_SCAN_MARK, -DDC_SCAN_LINGER.  repro_scan.c and
- * stress_dcache_scan.c are its harnesses (make check-scan).
+ * (soft), -DDC_SCAN_SEQ, -DDC_SCAN_MARK, -DDC_SCAN_LINGER, -DDC_SCAN_WALK.
+ * repro_scan.c and stress_dcache_scan.c are its harnesses (make check-scan).
  */
 long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 	     long cap);
@@ -575,10 +582,13 @@ const char *dc_scan_arm(void);
 /*
  * How many scans, how many passes they took, how often the sequence moved
  * (seq, mark); how many lingering entries the scans went through and how many
- * objects they checked for it (linger).
+ * objects they checked for it (linger, walk); how many frames the scans noted,
+ * how many times a directory had moved when a scan came back from it, and how
+ * many scans fell back (walk).
  */
 struct dc_scan_stats {
 	unsigned long scans, passes, signals, lingerers, checked;
+	unsigned long frames, moved, fallbacks;
 };
 void dc_scan_stats(struct dcache *dc, struct dc_scan_stats *st);
 

@@ -155,6 +155,12 @@ void (*dc_test_transfer_hook)(void);
  */
 void (*dc_test_scan_dir_hook)(uint64_t dir_id);
 void (*dc_test_scan_climb_hook)(uint64_t dir_id);
+/*
+ * Test-only rendezvous in the fold, when its commit has put the host in both
+ * indexes and before it clears d_top: the host still points to a shell that
+ * the lists no longer hold (repro_scan.c, for scan_walk()'s walk_entry()).
+ */
+void (*dc_test_folded_hook)(void);
 #define DC_TEST_SCAN_DIR_HOOK(dir)	do {				\
 		if (dc_test_scan_dir_hook)				\
 			dc_test_scan_dir_hook((dir)->d_id);		\
@@ -263,6 +269,9 @@ static void dc_test_unlink_delay(void)
  * the scan against dc->scan_seq.  Without one of the three nothing of the scan
  * is compiled, and the engine is what it was.
  */
+#if defined(DC_SCAN_WALK) && !defined(DC_SCAN_LINGER)
+# define DC_SCAN_LINGER 1	/* the same entries linger: the scan differs */
+#endif
 #if (defined(DC_SCAN_SEQ) + defined(DC_SCAN_MARK) + defined(DC_SCAN_LINGER)) > 1
 # error "DC_SCAN_SEQ, DC_SCAN_MARK and DC_SCAN_LINGER are arms of dc_scan(): pick one"
 #endif
@@ -437,6 +446,16 @@ struct dentry {
 	 * a top.  On CL2, with the d_sib those readers come by.
 	 */
 	unsigned long d_linger;
+#endif
+#ifdef DC_SCAN_WALK
+	/*
+	 * On a SHELL, for the scan without a stack (scan_walk()): the lingering
+	 * entry that the move which made this shell left behind, NULL for a
+	 * rename within one directory; and how many moves made the shell that
+	 * the host has, counted from the last time it had none.
+	 */
+	struct dentry *d_left;
+	unsigned int d_nmoves;
 #endif
 
 	/*
@@ -908,7 +927,13 @@ static inline void bl_sw_replace(dc_swtxn_t *txn,
 	uintptr_t lk = (uintptr_t) __atomic_load_n((uintptr_t *) ppv,
 			__ATOMIC_RELAXED) & DC_BL_LOCK;		/* head? preserve it */
 
-	newn->next = next;			/* pre-publish: newn takes oldn's succ */
+	/* pre-publish: newn takes oldn's succ */
+#ifdef DC_SCAN_WALK
+	/* A scan reads this link of a host that a shell names: walk_entry(). */
+	__atomic_store_n(&newn->next, next, __ATOMIC_RELAXED);
+#else
+	newn->next = next;
+#endif
 	newn->pprev = ppv;
 	(void) dc_sw_record(txn, (void **) ppv,	/* predecessor -> newn */
 		(void *) ((uintptr_t) oldn | lk),
@@ -1362,6 +1387,12 @@ struct dcache {
 	/* The linger arm: lingering entries gone through, objects checked. */
 	unsigned long scan_lingerers;
 	unsigned long scan_checked;
+#endif
+#ifdef DC_SCAN_WALK
+	/* The walk arm: frames noted, moves under a scan, scans that fell back. */
+	unsigned long scan_frames;
+	unsigned long scan_moved;
+	unsigned long scan_fallbacks;
 #endif
 #endif
 };
@@ -3276,6 +3307,10 @@ static int stack_shell(struct dcache *dc,
 		if (lg)
 			linger_arm(lg, host);
 #endif
+#ifdef DC_SCAN_WALK
+		shell->d_left = lg;
+		shell->d_nmoves = (top != host ? top->d_nmoves : 0) + 1;
+#endif
 
 		/*
 		 * Gray host for the cross-dir cycle Dekker, AFTER begin.  test-and-set
@@ -3482,11 +3517,22 @@ static void fold(struct dcache *dc, struct dentry *n)
 				st = urcu_txn_commit_sw(&txn);
 				DC_TS_COMMIT(DC_TS_FOLD, &txn, st);
 				urcu_txn_end(&txn);
+#ifdef DC_TEST_HOOKS
+				if (st == URCU_TXN_STATUS_OK && dc_test_folded_hook)
+					dc_test_folded_hook();
+#endif
 				if (st == URCU_TXN_STATUS_OK)
 					uatomic_store(&host->d_top, NULL,
 						      CMM_RELEASE);	/* host names itself */
 				else		/* OOM: nothing published, n still indexed */
 					reclaim_n = 0;	/* do NOT free a live top */
+#ifdef DC_SCAN_WALK
+				/* The host is not in the list after all: its link says so. */
+				if (st != URCU_TXN_STATUS_OK)
+					__atomic_store_n((uintptr_t *) &host->d_sib.next,
+						(uintptr_t) host->d_sib.next |
+						URCU_TXN_HLIST_MARK, __ATOMIC_RELAXED);
+#endif
 			}
 		}
 		bl_unlock_n(heads, 2);
@@ -3680,6 +3726,12 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			linger_arm(ga, hosta);
 			linger_arm(gb, hostb);
 		}
+#endif
+#ifdef DC_SCAN_WALK
+		sa->d_left = ga;
+		sa->d_nmoves = (topa != hosta ? topa->d_nmoves : 0) + 1;
+		sb->d_left = gb;
+		sb->d_nmoves = (topb != hostb ? topb->d_nmoves : 0) + 1;
 #endif
 
 		/*
@@ -4261,6 +4313,283 @@ static long scan_linger(struct dcache *dc, struct dentry *root, uint64_t *ids,
 }
 #endif
 
+#ifdef DC_SCAN_WALK
+/*
+ * ---- the scan without a stack (dc_scan(), the walk arm) -------------------
+ *
+ * scan_linger_rec() calls itself for each directory, and each call keeps the
+ * place where it left its list.  The kernel's d_walk() has no stack to keep
+ * that on, a tree being as deep as it likes: it reads a directory's list,
+ * enters a child, and comes back through the parent pointer of that child to
+ * go on after it.  This is that walk, over the same lingering entries, and of
+ * an object it uses what the kernel has of a dentry:
+ *
+ *	its entry in a list now		named_top_rcu(): d_sib there
+ *	the directory it is in now	parent_of_rcu(): d_parent
+ *	the shell of its last move	its named top, when that is not the
+ *					host, with what that move left behind
+ *					(d_left) and how many moves made the
+ *					shell (d_nmoves)
+ *
+ * and not what this engine alone keeps until the fold: the host's own link in
+ * the list that it left, and the host's own d_iparent.
+ *
+ * COMING BACK from a directory whose list is read:
+ *
+ *   - It was entered through a lingering entry.  Nothing of the directory
+ *     says where that was.  The walk noted it in a FRAME when it went in, and
+ *     goes on after that lingering entry.
+ *   - It was entered through its own entry, and a shell named it then: it
+ *     had moved less than a grace period before, more or less.  The shell it
+ *     has when the walk comes back does not say whether it moved meanwhile, so
+ *     a frame notes the shell it had, and the directory.  The same shell, or
+ *     none now that the fold has been: go on after its entry.
+ *   - It was entered through its own entry and had no shell: no frame.  If it
+ *     has none now it did not move, since a move leaves a shell for a grace
+ *     period and the walk is one read-side section.  Go on after its entry.
+ *
+ * Otherwise it MOVED UNDER THE WALK.  A move leaves a lingering entry where
+ * the directory was, or is a rename where it is.  With no frame, and one move:
+ * the shell says which, and the walk goes on after what was left.  With a
+ * frame: if the last move left the directory of the frame, the walk goes on
+ * after what that move left there, which is at the place it came from or
+ * nearer the head of the list, where entries are added.  It then reads again
+ * some of what it has read, and misses nothing.
+ *
+ * In every other case the walk does not know where it was, and FALLS BACK: two
+ * moves and no frame, a last move from somewhere else, no frame left to note
+ * in (DC_SCAN_WALK_FRAMES).  The frames also bound a walk that lingering
+ * entries lead in a circle when walk_in() does not see it.
+ *
+ * Falling back is scan_linger() here.  In the kernel it is the pass of
+ * d_walk() with rename_lock held.
+ */
+#ifndef DC_SCAN_WALK_FRAMES
+#define DC_SCAN_WALK_FRAMES	8
+#endif
+
+struct walk_frame {
+	struct dentry *host;	/* the directory that was entered */
+	struct dentry *lg;	/* through this lingering entry; or, if NULL, */
+	struct dentry *shell;	/* through its own entry, which was this shell */
+	struct dentry *dir;	/* in the list of this directory */
+};
+
+struct scan_walk {
+	struct dentry *root;
+	unsigned int nf;	/* frames in use */
+	unsigned int nlinger;	/* of them, for a lingering entry */
+	struct walk_frame frame[DC_SCAN_WALK_FRAMES];
+};
+
+/*
+ * Is the walk in @host, coming to it again from the list of @dir?  It goes up
+ * the way the walk would go back: through the frames where it has them, and
+ * through the directory that each object is in now elsewhere.  That is not the
+ * way the walk came if something moved under it, and then this may answer no
+ * for a directory that the walk is in: the frames run out, and it falls back.
+ */
+#ifndef DC_TEST_WALK_NO_WALK_IN
+static int walk_in(const struct scan_walk *w, struct dentry *dir,
+		   struct dentry *host)
+{
+	unsigned int f = w->nf, depth = 0;
+	struct dentry *d = dir;
+
+	while (d && depth++ < DC_SCAN_DEPTH_MAX) {
+		if (d == host)
+			return 1;
+		if (d == w->root)
+			return 0;
+		if (f && w->frame[f - 1].host == d) {
+			f--;
+			d = w->frame[f].lg ? w->frame[f].lg->d_parent :
+					     w->frame[f].dir;
+		} else {
+			d = parent_of_rcu(d);
+		}
+	}
+	return 0;
+}
+#endif
+
+/*
+ * The entry of @h in a list now: the shell that names it, or @h itself.  With
+ * it, in *@parent, the directory that @h is in.
+ *
+ * A move stores both, and the place in the list, in one commit: they are read
+ * of one commit here.  The fold does not.  It puts the host in the list where
+ * its shell was, and lets go of the shell after (d_top): in between the host
+ * still points to a shell that the list has not.  The host's own link tells:
+ * it is marked from the move that gave the host a shell until the fold.
+ *
+ * The kernel's walk has none of this to do: it reads the two under the d_lock
+ * of the dentry, which a move and a fold both hold.
+ */
+static struct dentry *walk_entry(struct dentry *h, struct dentry **parent)
+{
+	for (;;) {
+		struct dentry *top = named_top_rcu(h);
+		int shelled = 0;
+
+		*parent = parent_of_rcu(h);
+#ifndef DC_TEST_WALK_FOLD_UNSEEN
+		if (top != h)
+			(void) bl_hlist_resolve(rcu_dereference(h->d_sib.next),
+						&shelled);
+#else
+		shelled = top != h;
+#endif
+		if (named_top_rcu(h) == top)
+			return shelled ? top : h;
+	}
+}
+
+static long scan_walk(struct dcache *dc, struct dentry *root, uint64_t *ids,
+		      long cap)
+{
+	unsigned long lingerers = 0, checked = 0, frames = 0, moved = 0;
+	struct urcu_txn_sw_hlist_node *sn;
+	struct dentry *dir = root;
+	struct scan_walk w;
+	long n = 0;
+
+	w.root = root;
+	w.nf = 0;
+	w.nlinger = 0;
+	DC_TEST_SCAN_DIR_HOOK(dir);
+	sn = bl_hlist_first_rcu(&dir->d_child_head);
+	for (;;) {
+		struct dentry *h, *top, *parent, *left;
+		struct walk_frame *fr;
+
+		while (sn) {
+			struct dentry *e = sib_dentry(sn);
+			struct dentry *host = host_of_rcu(e);
+			int lingers = node_lingers(e);
+
+			lingerers += lingers;
+			if (DC_IS_POSITIVE(host) && !host_is_dead(host)) {
+				int below = 1;
+
+#ifndef DC_TEST_LINGER_NO_CHECK
+				if (w.nlinger || lingers) {
+					checked++;
+					below = host_below_rcu(dc, host, root);
+				}
+#endif
+				if (below) {
+					if (n == cap) {
+						n = -ENOSPC;
+						goto out;
+					}
+					ids[n++] = host->d_id;
+				}
+			}
+			if (!host->d_isdir) {
+				sn = bl_hlist_next_rcu(sn);
+				continue;
+			}
+			/*
+			 * Only a lingering entry leads back up, to a directory
+			 * that the walk is in: its own, or one on the way here.
+			 */
+#ifndef DC_TEST_WALK_NO_WALK_IN
+			if ((lingers || w.nlinger) && walk_in(&w, dir, host)) {
+				sn = bl_hlist_next_rcu(sn);
+				continue;
+			}
+#endif
+			fr = &w.frame[w.nf];
+#ifdef DC_TEST_WALK_NO_SHELL_FRAME
+			if (lingers) {
+#else
+			if (lingers || e != host) {
+#endif
+				if (w.nf == DC_SCAN_WALK_FRAMES) {
+#ifdef DC_TEST_WALK_NO_FRAME_LEFT
+					goto in;	/* mutation arm: unnoted */
+#endif
+					goto fallback;
+				}
+				fr->host = host;
+				fr->lg = lingers ? e : NULL;
+				fr->shell = e;
+				fr->dir = dir;
+				w.nf++;
+				w.nlinger += lingers;
+				frames++;
+			}
+#ifdef DC_TEST_WALK_NO_FRAME_LEFT
+in:
+#endif
+			dir = host;
+			DC_TEST_SCAN_DIR_HOOK(dir);
+			sn = bl_hlist_first_rcu(&dir->d_child_head);
+		}
+
+		/* The list of @dir is read: back to where the walk was. */
+		if (dir == root)
+			break;
+		h = dir;
+		fr = w.nf && w.frame[w.nf - 1].host == h ? &w.frame[w.nf - 1] :
+							   NULL;
+		if (fr && fr->lg) {
+			w.nf--;
+			w.nlinger--;
+			dir = fr->lg->d_parent;
+			sn = bl_hlist_next_rcu(&fr->lg->d_sib);
+			continue;
+		}
+		top = walk_entry(h, &parent);
+		left = top != h ? top->d_left : NULL;
+		if (fr) {
+			w.nf--;
+			if (top == fr->shell || top == h) {
+				dir = fr->dir;		/* it did not move */
+				sn = bl_hlist_next_rcu(&top->d_sib);
+				continue;
+			}
+#ifndef DC_TEST_WALK_FROM_ELSEWHERE
+			if ((left ? left->d_parent : parent) != fr->dir)
+				goto fallback;
+#endif
+			dir = fr->dir;
+		} else if (top == h) {
+			dir = parent;			/* it did not move */
+			sn = bl_hlist_next_rcu(&h->d_sib);
+			continue;
+		} else {
+#ifdef DC_TEST_WALK_MOVED_UNSEEN
+			left = NULL;
+#endif
+#ifndef DC_TEST_WALK_TWICE_AS_ONCE
+			if (top->d_nmoves != 1)
+				goto fallback;
+#endif
+			dir = left ? left->d_parent : parent;
+		}
+		/* It moved under the walk: on after what it left, or itself. */
+		moved++;
+		sn = bl_hlist_next_rcu(left ? &left->d_sib : &top->d_sib);
+	}
+out:
+	if (lingerers)
+		uatomic_add(&dc->scan_lingerers, lingerers);
+	if (checked)
+		uatomic_add(&dc->scan_checked, checked);
+	if (frames)
+		uatomic_add(&dc->scan_frames, frames);
+	if (moved)
+		uatomic_add(&dc->scan_moved, moved);
+	return n;
+fallback:
+	uatomic_inc(&dc->scan_fallbacks);
+	n = scan_linger(dc, root, ids, cap);
+	goto out;
+}
+#endif
+
 /*
  * One read-side section over every pass: nothing a pass stands on is freed
  * under it, so a removed entry still leads back into its list.
@@ -4321,7 +4650,9 @@ long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 			n = -ENOENT;
 			break;
 		}
-#ifdef DC_SCAN_LINGER
+#if defined(DC_SCAN_WALK)
+		n = dir->d_isdir ? scan_walk(dc, dir, ids, cap) : 0;
+#elif defined(DC_SCAN_LINGER)
 		n = dir->d_isdir ? scan_linger(dc, dir, ids, cap) : 0;
 #else
 		n = dir->d_isdir ? scan_rec(dir, ids, cap, 0, 0) : 0;
@@ -4344,7 +4675,9 @@ long dc_scan(struct dcache *dc, const struct dc_path *root, uint64_t *ids,
 
 const char *dc_scan_arm(void)
 {
-#if defined(DC_SCAN_LINGER)
+#if defined(DC_SCAN_WALK)
+	return "walk";
+#elif defined(DC_SCAN_LINGER)
 	return "linger";
 #elif defined(DC_SCAN_MARK)
 	return "mark";
@@ -4364,6 +4697,11 @@ void dc_scan_stats(struct dcache *dc, struct dc_scan_stats *st)
 #ifdef DC_SCAN_LINGER
 	st->lingerers = uatomic_load(&dc->scan_lingerers, CMM_RELAXED);
 	st->checked = uatomic_load(&dc->scan_checked, CMM_RELAXED);
+#endif
+#ifdef DC_SCAN_WALK
+	st->frames = uatomic_load(&dc->scan_frames, CMM_RELAXED);
+	st->moved = uatomic_load(&dc->scan_moved, CMM_RELAXED);
+	st->fallbacks = uatomic_load(&dc->scan_fallbacks, CMM_RELAXED);
 #endif
 }
 #endif	/* DC_SCAN */

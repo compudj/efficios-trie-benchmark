@@ -401,12 +401,15 @@ check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c dcache_seqlo
 #     from it by the lingering entries that earlier moves left: hence its
 #     patient operations (see its header) and the cases above.
 #
-# The three exact arms (dcache.h: seq, mark, linger) must PASS both.  seq and
-# mark also with a move sleeping between its look at the marks and its commit
-# (-DDC_TEST_SCAN_MOVE_DELAY_US), which has no counterpart on the linger arm: a
-# move there tells the scans nothing.  The stress test runs on the usual mix,
-# on the one that spends most of its time on a fresh directory, and the linger
-# arm on one with patient operations.
+# The four exact arms (dcache.h: seq, mark, linger, walk) must PASS both.  seq
+# and mark also with a move sleeping between its look at the marks and its
+# commit (-DDC_TEST_SCAN_MOVE_DELAY_US), which has no counterpart where entries
+# linger: a move there tells the scans nothing.  The stress test runs on the
+# usual mix, on the one that spends most of its time on a fresh directory, and
+# the linger and walk arms on one with patient operations.  The walk arm, the
+# scan without a stack, runs once more with a single frame
+# (-DDC_SCAN_WALK_FRAMES=1): three scans in four then fall back, and have to
+# be as exact.
 #
 # The soft arm and every mutation arm must FAIL, or the harnesses prove
 # nothing.  By the case of repro_scan that it loses an object in:
@@ -423,18 +426,34 @@ check-rmdir: stress_dcache_rmdir.c dcache_txn.c dcache_bucketlock.c dcache_seqlo
 #   linger_nocheck      left-before      what a lingering entry leads to is
 #                                        reported unchecked
 #   linger_noloopcheck  linger-loop      the scan enters a directory it is in
+#   walk_movedunseen    dir-ahead        the walk comes back to where a
+#                                        directory is now, not where it was
+#   walk_twiceasonce    dir-twice        two moves under the walk taken for one
+#   walk_noshellframe   dir-shelled      no frame for a directory that a shell
+#                                        names when the walk enters it
+#   walk_fromelsewhere  dir-shelled-twice  a last move that left another
+#                                        directory than the frame's
+#   walk_noframeleft    deep-frames      in without a frame when none is left
+#   walk_nowalkin       linger-loop      round a circle of lingering entries
+#                                        until the frames run out
+#   walk_foldunseen     fold-under       a shell that the lists no longer hold,
+#                                        its fold being half done, taken for a
+#                                        move under the walk
 # and by the stress test alone, being windows inside a commit:
 #   seq_onecount        the sequence counted before the commit only
 #   mark_nolockwait     the scan does not wait for a locked child head
 # The stress test also has to fail soft, mark_noxchg, mark_noinherit (on the
 # fresh-directory mix), linger_nowait, linger_nocheck and, with patient
-# operations, linger_noxchg.
+# operations, linger_noxchg and walk_noshellframe.  The other mutations of the
+# walk arm pass it or fail it by a handful: a directory moves under a scan a
+# few hundred times in a run, and what a wrong way back skips is mostly
+# reached again through lingering entries.
 # Built with the walk hold-off, which is what bounds a seq or mark scan under
 # moves that never stop.
 #
-# Last, the engine's own suites with the linger arm built in: it changes what a
-# move to another directory, an exchange across two and the removal of a
-# directory write, whether a scan runs or not.
+# Last, the engine's own suites with the walk arm built in: with the linger
+# arm it changes what a move to another directory, an exchange across two and
+# the removal of a directory write, whether a scan runs or not.
 SCAN_ARGS ?= 3 2 6 4 120000
 SCAN_FRESH_ARGS ?= 3 2 6 4 400000 60
 SCAN_PATIENT_ARGS ?= 3 2 6 4 40000 10 20
@@ -443,7 +462,8 @@ SCAN_SRCS := repro_scan.c stress_dcache_scan.c dcache_bucketlock.c test_dcache.c
 	stress_dcache.c stress_dcache_dirs.c stress_dcache_xchg.c mixed_cycle.c \
 	stress_dcache_rmdir.c
 check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
-	@set -e; for arm in seq:-DDC_SCAN_SEQ mark:-DDC_SCAN_MARK linger:-DDC_SCAN_LINGER; do \
+	@set -e; for arm in seq:-DDC_SCAN_SEQ mark:-DDC_SCAN_MARK linger:-DDC_SCAN_LINGER \
+	    walk:-DDC_SCAN_WALK; do \
 	  name=$${arm%%:*}; defs=$${arm#*:}; \
 	  echo "== check-scan: $$name, one interleaving at a time"; \
 	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_TEST_HOOKS $$defs $(HCPP) -o repro_scan_$$name \
@@ -460,7 +480,14 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	    "linger_normdir:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_RMDIR:out-then-rmdir" \
 	    "linger_deadnolook:-DDC_SCAN_LINGER -DDC_TEST_LINGER_DEAD_NO_LOOK:dead-end-climb" \
 	    "linger_nocheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_CHECK:left-before" \
-	    "linger_noloopcheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_LOOPCHECK:linger-loop"; do \
+	    "linger_noloopcheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_LOOPCHECK:linger-loop" \
+	    "walk_movedunseen:-DDC_SCAN_WALK -DDC_TEST_WALK_MOVED_UNSEEN:dir-ahead" \
+	    "walk_twiceasonce:-DDC_SCAN_WALK -DDC_TEST_WALK_TWICE_AS_ONCE:dir-twice" \
+	    "walk_noshellframe:-DDC_SCAN_WALK -DDC_TEST_WALK_NO_SHELL_FRAME:dir-shelled" \
+	    "walk_fromelsewhere:-DDC_SCAN_WALK -DDC_TEST_WALK_FROM_ELSEWHERE:dir-shelled-twice" \
+	    "walk_noframeleft:-DDC_SCAN_WALK -DDC_TEST_WALK_NO_FRAME_LEFT:deep-frames" \
+	    "walk_nowalkin:-DDC_SCAN_WALK -DDC_TEST_WALK_NO_WALK_IN:linger-loop" \
+	    "walk_foldunseen:-DDC_SCAN_WALK -DDC_TEST_WALK_FOLD_UNSEEN:fold-under"; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; which=$${rest#*:}; \
 	  echo "== check-scan MUST-FAIL control: $$name in $$which"; \
 	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_TEST_HOOKS $$defs $(HCPP) -o repro_scan_mut_$$name \
@@ -469,7 +496,8 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	    { echo "$$out"; echo "check-scan: MUTANT $$name PASSED $$which -- the case is vacuous"; exit 1; }; \
 	  echo "$$out" | grep -E "^$$which " | sed 's/^/  fails as it must: /'; \
 	done
-	@set -e; for arm in "seq:-DDC_SCAN_SEQ:1" "mark:-DDC_SCAN_MARK:1" "linger:-DDC_SCAN_LINGER:0"; do \
+	@set -e; for arm in "seq:-DDC_SCAN_SEQ:1" "mark:-DDC_SCAN_MARK:1" "linger:-DDC_SCAN_LINGER:0" \
+	    "walk:-DDC_SCAN_WALK:0" "walk_oneframe:-DDC_SCAN_WALK -DDC_SCAN_WALK_FRAMES=1:0"; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; delay=$${rest#*:}; \
 	  for widen in "" -DDC_TEST_SCAN_MOVE_DELAY_US=20; do \
 	    [ -z "$$widen" ] || [ $$delay = 1 ] || continue; \
@@ -477,10 +505,10 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	    $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $$widen $(HCPP) -o stress_scan_$$name \
 	      stress_dcache_scan.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
 	    for args in "$(SCAN_ARGS)" "$(SCAN_FRESH_ARGS)" "$(SCAN_PATIENT_ARGS)"; do \
-	      [ "$$args" != "$(SCAN_PATIENT_ARGS)" ] || [ $$name = linger ] || continue; \
+	      [ "$$args" != "$(SCAN_PATIENT_ARGS)" ] || [ $$delay = 0 ] || continue; \
 	      out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_$$name $$args) || \
 	        { echo "$$out"; echo "check-scan: FAIL ($$name $$widen: $$args)"; exit 1; }; \
-	      echo "$$out" | grep -E '^(signals|lingering|FALSE|MISSED|RESULT)'; \
+	      echo "$$out" | grep -E '^(signals|lingering|frames|FALSE|MISSED|RESULT)'; \
 	    done; \
 	  done; \
 	done
@@ -491,7 +519,8 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	    "mark_noinherit:-DDC_SCAN_MARK -DDC_TEST_SCAN_NO_INHERIT:$(SCAN_FRESH_ARGS)" \
 	    "linger_nowait:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_WAIT:$(SCAN_ARGS)" \
 	    "linger_nocheck:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_CHECK:$(SCAN_ARGS)" \
-	    "linger_noxchg:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_XCHG:$(SCAN_PATIENT_ARGS)"; do \
+	    "linger_noxchg:-DDC_SCAN_LINGER -DDC_TEST_LINGER_NO_XCHG:$(SCAN_PATIENT_ARGS)" \
+	    "walk_noshellframe:-DDC_SCAN_WALK -DDC_TEST_WALK_NO_SHELL_FRAME:$(SCAN_PATIENT_ARGS)"; do \
 	  name=$${arm%%:*}; rest=$${arm#*:}; defs=$${rest%%:*}; args=$${rest#*:}; \
 	  echo "== check-scan MUST-FAIL control under movers: $$name ($$defs)"; \
 	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) $$defs $(HCPP) -o stress_scan_mut_$$name \
@@ -500,17 +529,17 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	    echo "check-scan: MUTANT $$name PASSED -- the harness is vacuous"; exit 1; \
 	  else echo "$$out" | grep -E '^(FALSE|MISSED)' | sed 's/^/  fails as it must: /'; fi; \
 	done
-	@echo "== check-scan: the engine's own suites with the linger arm built in"
-	@set -e; $(CC) $(CFLAGS) $(SCAN_HOLD) -DDC_SCAN_LINGER $(HCPP) -o stress_scan_engine_test \
+	@echo "== check-scan: the engine's own suites with the walk arm built in"
+	@set -e; $(CC) $(CFLAGS) $(SCAN_HOLD) -DDC_SCAN_WALK $(HCPP) -o stress_scan_engine_test \
 	  test_dcache.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
 	./stress_scan_engine_test | tail -1; \
 	for t in "stress_dcache:4 4 8 16 15000" "stress_dcache_dirs:4 8 4 2 15000" \
 	    "stress_dcache_xchg:" "mixed_cycle:" "stress_dcache_rmdir:$(RMDIR_ARGS)"; do \
 	  src=$${t%%:*}; args=$${t#*:}; \
-	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_SCAN_LINGER $(HCPP) -o stress_scan_engine_$$src \
+	  $(CC) $(ASANFLAGS) $(SCAN_HOLD) -DDC_SCAN_WALK $(HCPP) -o stress_scan_engine_$$src \
 	    $$src.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
 	  out=$$(timeout $(SHARED_TIMEOUT) ./stress_scan_engine_$$src $$args) || \
-	    { echo "$$out"; echo "check-scan: FAIL ($$src with the linger arm)"; exit 1; }; \
+	    { echo "$$out"; echo "check-scan: FAIL ($$src with the walk arm)"; exit 1; }; \
 	  echo "$$out" | grep -E '^RESULT' | sed "s/^/$$src: /"; \
 	done
 	@echo "check-scan: PASS"
