@@ -74,8 +74,12 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #include <limits.h>
 #include <stdio.h>
 #include <urcu/futex.h>			/* held-off writers sleep on the count */
+#if defined(DC_MOUNT_INLINE) && !defined(DC_MOUNT_COUNT)
+# define DC_MOUNT_COUNT 1	/* the same operations, the count in the dentry */
+#endif
 #ifdef DC_MOUNT_COUNT
 #include <pthread.h>
+#include <urcu/list.h>
 #include <urcu/rcuhlist.h>		/* the counts, hashed by dentry */
 #endif
 #endif
@@ -469,6 +473,15 @@ struct dentry {
 	 * and mnt_freeze() sets it under that lock.  The kernel has d_flags.
 	 */
 	unsigned long d_mnt;
+#ifdef DC_MOUNT_INLINE
+	/*
+	 * The count itself (dcache_mount_inline.h): mountpoints at or below
+	 * this one.  The kernel has room for it in the directory's inode.
+	 * d_mnt_shadow is dc_mount_check()'s.
+	 */
+	long d_mnt_n;
+	long d_mnt_shadow;
+#endif
 #endif
 #ifdef DC_SCAN_MARK
 	/*
@@ -1356,7 +1369,7 @@ unsigned long dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
  * (rename_gen is written by the counter arms).  dc_create allocates the struct
  * 64-byte aligned.
  */
-#ifdef DC_MOUNT_COUNT
+#if defined(DC_MOUNT_COUNT) && !defined(DC_MOUNT_INLINE)
 /* A bucket of the mount counts (dcache_mount.h), on a line of its own. */
 struct dc_mnt_bkt {
 	struct cds_hlist_head head;
@@ -1454,6 +1467,16 @@ struct dcache {
 #endif
 #endif
 #ifdef DC_MOUNT_COUNT
+#ifdef DC_MOUNT_INLINE
+	/*
+	 * The mount count kept in the dentries (dcache_mount_inline.h): the
+	 * lock of those who change one.  mnt_list is dc_mount_check()'s.
+	 */
+	pthread_mutex_t mnt_lock __attribute__((aligned(64)));
+	struct cds_list_head mnt_list;
+	long mnt_sum;				/* all the counts, added up */
+	long mnt_objs __attribute__((aligned(64)));	/* dentries with one */
+#else
 	/*
 	 * The mount count (dcache_mount.h): the table of the counts, a lock to
 	 * a bucket.  A rename with nothing mounted below touches none of this.
@@ -1463,6 +1486,7 @@ struct dcache {
 	pthread_rwlock_t mnt_check_lock;	/* see mnt_shift_enter() */
 #endif
 	unsigned long mnt_objs __attribute__((aligned(64)));	/* counts hashed */
+#endif
 	unsigned long mnt_mounts, mnt_umounts;
 	unsigned long mnt_moves;		/* moves that took a count along */
 	unsigned long mnt_frozen;		/* dentries that an operation froze */
@@ -1672,7 +1696,10 @@ struct dcache *dc_create(unsigned int nbuckets)
 #endif
 	/* vestigial (pure-SW commits), see struct dcache */
 	urcu_txn_domain_init(&dc->domain);
-#ifdef DC_MOUNT_COUNT
+#ifdef DC_MOUNT_INLINE
+	pthread_mutex_init(&dc->mnt_lock, NULL);
+	CDS_INIT_LIST_HEAD(&dc->mnt_list);
+#elif defined(DC_MOUNT_COUNT)
 	if (posix_memalign((void **) &dc->mnt_bkt, 64,
 			   sizeof(*dc->mnt_bkt) << DC_MNT_HASH_BITS) != 0)
 		return NULL;
@@ -3298,7 +3325,9 @@ static int cross_cycle_check(struct dcache *dc, struct dentry *host,
 	return 0;
 }
 
-#ifdef DC_MOUNT_COUNT
+#ifdef DC_MOUNT_INLINE
+#include "dcache_mount_inline.h" /* a count of mountpoints, in the dentry */
+#elif defined(DC_MOUNT_COUNT)
 #include "dcache_mount.h"	/* a count of mountpoints at or below a dentry */
 #endif
 
@@ -3686,7 +3715,7 @@ static int stack_shell(struct dcache *dc,
 #ifdef DC_TEST_MNT_COUNT_AFTER
 				(void) mnt_shift_commit(&ms);
 #endif
-				mnt_shift_drop(dc, &ms);  /* under the buckets */
+				mnt_shift_done(dc, &ms);
 			}
 			mnt_shift_unlock(&ms);
 		}
@@ -4222,7 +4251,7 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 			if (st == URCU_TXN_STATUS_OK && (ms.c_a || ms.c_b))
 				DC_MNT_STAT_INC(dc, mnt_moves);
 			if (st == URCU_TXN_STATUS_OK)
-				mnt_shift_drop(dc, &ms);  /* under the buckets */
+				mnt_shift_done(dc, &ms);
 			mnt_shift_unlock(&ms);
 		}
 #endif
@@ -4370,7 +4399,7 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
 	if (marked || !children_empty(d) ||
 #ifdef DC_MOUNT_COUNT
-	    uatomic_load(&d->d_mnt, CMM_RELAXED) ||	/* a mountpoint, or frozen */
+	    mnt_counted(d) || mnt_here(d) ||	/* a mountpoint, or frozen */
 #endif
 	    bl_read((void **) &d->d_top, DC_FWD_TAG)) {
 		bl_unlock_n(heads, 3);
@@ -5198,5 +5227,9 @@ int dc_dentry_path(struct dcache *dc, const struct dentry *d,
 
 #ifdef DC_MOUNT_COUNT
 #define DCACHE_MOUNT_OPS
+#ifdef DC_MOUNT_INLINE
+#include "dcache_mount_inline.h"
+#else
 #include "dcache_mount.h"	/* the operations: after everything they use */
+#endif
 #endif

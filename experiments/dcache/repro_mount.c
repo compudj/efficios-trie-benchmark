@@ -21,6 +21,8 @@
  *                    p's bucket, and then takes k's count along to /z.
  *   mount-under-move      m is mounted in /p/q.  When the mount has frozen p,
  *                    p moves to /z: the mount works its counts out again.
+ *   reader-before-commit  the same move, about to commit: /a/x, which k is
+ *                    still in, counts it.
  *   reader-at-commit      k has a mountpoint below it and moves from /a/x to
  *                    /a/y.  Once the move has committed, and before it lets go
  *                    of its buckets, another thread reads the counts: they are
@@ -76,6 +78,18 @@ extern void (*dc_test_scan_move_hook)(int locked);
 
 static struct dcache *g_dc;
 static int g_errs;			/* operations that failed */
+
+/*
+ * Two arms (dc_mount_arm()): the counts in a table, dcache_mount.h, which
+ * looks again under its locks and starts over when something moved; and the
+ * counts in the dentries, dcache_mount_inline.h, where whoever would move
+ * something that counts waits for the one lock.  The same cases, and where a
+ * thread is parked the two differ in who waits for whom.
+ */
+static int inline_arm(void)
+{
+	return !strcmp(dc_mount_arm(), "inline");
+}
 
 /* ---- the other thread ---- */
 
@@ -706,14 +720,19 @@ static void case_ancestor_moves_first(struct verdict *v)
 	sound(v);
 }
 
+/*
+ * p counts k already when it moves.  In the table that is a count of zero
+ * and p moves under its bucket, which is free: the rename finds p elsewhere
+ * and starts over.  In the dentries p counts what k has, and its move waits.
+ */
 static void case_ancestor_moves_late(struct verdict *v)
 {
 	mount("/a/x/k/h");
-	arm(PP, step_mv_p, 0);
+	arm(PP, step_mv_p, inline_arm());
 	mv("/a/x/k", "/p/q/k");
-	settle(v, 0);
+	settle(v, inline_arm());
 	want_k_below_z(v);
-	if (!again())
+	if (!inline_arm() && !again())
 		fail(v, "the rename did not work its counts out again");
 	sound(v);
 }
@@ -734,15 +753,15 @@ static void case_ancestor_move_waits(struct verdict *v)
 static void case_mount_under_move(struct verdict *v)
 {
 	mkfile(M, "/p/q/m");
-	arm(PP, step_mv_p, 0);
+	arm(PP, step_mv_p, inline_arm());
 	mount("/p/q/m");
-	settle(v, 0);
+	settle(v, inline_arm());
 	want_ret(v, "the move of p", g_step_ret, 0);
 	want(v, "/z", 1);
 	want(v, "/z/p/q/m", 1);
 	want(v, "/", 1);
 	want_counts(v, 5);
-	if (!again())
+	if (!inline_arm() && !again())
 		fail(v, "the mount did not work its counts out again");
 	sound(v);
 }
@@ -769,11 +788,32 @@ static void case_reader_at_commit(struct verdict *v)
 	dc_test_mnt_moved_hook = moved_hook;
 	mv("/a/x/k", "/a/y/k");
 	dc_test_mnt_moved_hook = NULL;
+	/*
+	 * The new directory counts it.  The old one does not, where the count
+	 * went with the move in one commit; where it is taken away after, it
+	 * may still.
+	 */
 	if (!g_fired)
 		fail(v, "the hook did not fire");
-	else if (g_read_x != 0 || g_read_y != 1)
+	else if (g_read_y != 1 || (!inline_arm() && g_read_x != 0))
 		fail(v, "once the move had committed a reader found %ld in "
 		     "the old directory and %ld in the new", g_read_x, g_read_y);
+	want(v, "/a/x", 0);
+	want(v, "/a/y", 1);
+	sound(v);
+}
+
+/* About to commit: k is still in /a/x, which has to count it. */
+static void case_reader_before_commit(struct verdict *v)
+{
+	mount("/a/x/k/h");
+	g_read_x = g_read_y = -1;
+	arm_locked(step_read, 0);
+	mv("/a/x/k", "/a/y/k");
+	settle(v, 0);
+	if (g_read_x != 1)
+		fail(v, "before the move had committed a reader found %ld in "
+		     "the directory it was still in", g_read_x);
 	sound(v);
 }
 
@@ -957,36 +997,38 @@ static void case_find_moved(struct verdict *v)
 static const struct {
 	const char *name;
 	void (*run)(struct verdict *v);
+	int table_only;		/* about pins and buckets, which one arm has */
 } cases[] = {
-	{ "mount-counts",		case_mount_counts },
-	{ "move-inside",		case_move_inside },
-	{ "move-across",		case_move_across },
-	{ "move-two",			case_move_two },
-	{ "move-in-place",		case_move_in_place },
-	{ "move-up-down",		case_move_up_down },
-	{ "exchange",			case_exchange },
-	{ "cycle",			case_cycle },
-	{ "busy",			case_busy },
-	{ "deep",			case_deep },
-	{ "find",			case_find },
-	{ "ancestor-moves-first",	case_ancestor_moves_first },
-	{ "ancestor-moves-late",	case_ancestor_moves_late },
-	{ "ancestor-move-waits",	case_ancestor_move_waits },
-	{ "mount-under-move",		case_mount_under_move },
-	{ "reader-at-commit",		case_reader_at_commit },
-	{ "unlink-waits",		case_unlink_waits },
-	{ "exists",			case_exists },
-	{ "pin-keeps-frozen",		case_pin_keeps_frozen },
-	{ "freeze-under-move",		case_freeze_under_move },
-	{ "move-holds-bucket",		case_move_holds_bucket },
-	{ "find-moved",			case_find_moved },
+	{ "mount-counts",		case_mount_counts, 0 },
+	{ "move-inside",		case_move_inside, 0 },
+	{ "move-across",		case_move_across, 0 },
+	{ "move-two",			case_move_two, 0 },
+	{ "move-in-place",		case_move_in_place, 0 },
+	{ "move-up-down",		case_move_up_down, 0 },
+	{ "exchange",			case_exchange, 0 },
+	{ "cycle",			case_cycle, 0 },
+	{ "busy",			case_busy, 0 },
+	{ "deep",			case_deep, 0 },
+	{ "find",			case_find, 0 },
+	{ "ancestor-moves-first",	case_ancestor_moves_first, 0 },
+	{ "ancestor-moves-late",	case_ancestor_moves_late, 0 },
+	{ "ancestor-move-waits",	case_ancestor_move_waits, 0 },
+	{ "mount-under-move",		case_mount_under_move, 0 },
+	{ "reader-before-commit",	case_reader_before_commit, 0 },
+	{ "reader-at-commit",		case_reader_at_commit, 0 },
+	{ "unlink-waits",		case_unlink_waits, 0 },
+	{ "exists",			case_exists, 0 },
+	{ "pin-keeps-frozen",		case_pin_keeps_frozen, 1 },
+	{ "freeze-under-move",		case_freeze_under_move, 0 },
+	{ "move-holds-bucket",		case_move_holds_bucket, 1 },
+	{ "find-moved",			case_find_moved, 0 },
 };
 #define NCASES	((int) (sizeof(cases) / sizeof(cases[0])))
 
 int main(int argc, char **argv)
 {
 	const char *must_fail = argc > 1 ? argv[1] : NULL;
-	int failed = 0, wanted = 0, known = 0, i;
+	int failed = 0, wanted = 0, known = 0, ran = 0, i;
 	pthread_t t;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1011,6 +1053,9 @@ int main(int argc, char **argv)
 		/* a build that takes a rule away may not survive the others */
 		if (must_fail && strcmp(must_fail, cases[i].name))
 			continue;
+		if (cases[i].table_only && inline_arm())
+			continue;
+		ran++;
 		g_errs = 0;
 		tree();
 		cases[i].run(&v);
@@ -1034,6 +1079,6 @@ int main(int argc, char **argv)
 		return wanted ? 0 : 1;
 	}
 	printf("RESULT: %s (%d of %d cases failed)\n", failed ? "FAIL" : "PASS",
-	       failed, NCASES);
+	       failed, ran);
 	return failed != 0;
 }

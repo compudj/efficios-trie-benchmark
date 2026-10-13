@@ -552,7 +552,7 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 # lock: an operation holds the buckets of the counts it changes for its commit.
 # -DDC_MOUNT_COUNT; nothing else is touched by it.
 #
-# repro_mount: what every count is after each kind of operation, and eleven cases
+# repro_mount: what every count is after each kind of operation, and twelve cases
 # in which one thread is parked in the middle of an operation while another
 # acts.  stress_dcache_mount: everything at once, held to what is true whatever
 # the interleaving (see its header).  Each rule of dcache_mount.h has a build
@@ -578,6 +578,19 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 #                   the engine's budget of retries set to one; and it does not
 #                   fail, it hangs.
 #
+# -DDC_MOUNT_INLINE is the other arm, dcache_mount_inline.h: the count kept in
+# the dentry, as the kernel could keep it in the directory's inode.  No table,
+# nothing to allocate, one lock for those who change a count, and the count
+# added where a rename goes before its commit and taken from where it was
+# after.  The same cases and the same stress; its rules and their builds:
+#
+#   NO_FLAG_CHECK   as above
+#   ADD_NO_LOCK     a count is raised, and the dentry above read, without the
+#                   lock that a move of the dentry holds
+#   ADD_AFTER       the count is added where the rename goes after the commit
+#   SUB_BEFORE      and taken from where it was before it
+#   XCHG_PLAIN, UNLINK_NO_CHECK, MOUNT_SHORT, FIND_NO_CHECK, KEEP_LANE as above
+#
 # The stress builds have -DDC_TEST_MNT_CHECK_ONLINE, for the thread that counts
 # again while the rest runs; one build is without, as it would be used.  The
 # stress has no way to tell where a mountpoint that a search hands back was
@@ -594,7 +607,8 @@ MOUNT_HOLD := -DDC_MARK_GEN -DDC_WALK_HOLDOFF=4
 MOUNT_LANE := -DURCU_TXN_FALLBACK_MIN=1 -DURCU_TXN_FALLBACK_MAX=1
 MOUNT_ONLINE := -DDC_TEST_MNT_CHECK_ONLINE
 MOUNT_MUT_TIMEOUT ?= 20
-check-mount: repro_mount.c stress_dcache_mount.c dcache_bucketlock.c dcache_mount.h $(HDRS) | check-lib
+check-mount: repro_mount.c stress_dcache_mount.c dcache_bucketlock.c dcache_mount.h \
+		dcache_mount_inline.h $(HDRS) | check-lib
 	@set -e; for arm in "count:" "count_walk:-DDC_SCAN_WALK"; do \
 	  name=$${arm%%:*}; defs=$${arm#*:}; \
 	  echo "== check-mount: $$name, one case at a time"; \
@@ -645,6 +659,49 @@ check-mount: repro_mount.c stress_dcache_mount.c dcache_bucketlock.c dcache_moun
 	    echo "  fails as it must: no result (it hangs, or it is killed)"; \
 	  else echo "$$out" | grep -E '^(WRONG|AT REST)' | head -1 | sed 's/^/  fails as it must: /'; fi; \
 	done
+	@echo "== check-mount: the count kept in the dentries (-DDC_MOUNT_INLINE)"
+	@set -e; $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_TEST_HOOKS -DDC_MOUNT_INLINE $(HCPP) \
+	  -o repro_mount_inline repro_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	out=$$(timeout $(SHARED_TIMEOUT) ./repro_mount_inline) || \
+	  { echo "$$out"; echo "check-mount: FAIL (repro_mount inline)"; exit 1; }; \
+	echo "$$out" | grep -E '^RESULT'
+	@set -e; for arm in "NO_FLAG_CHECK:move-inside" "ADD_NO_LOCK:freeze-under-move" \
+	    "ADD_AFTER:reader-at-commit" "SUB_BEFORE:reader-before-commit" \
+	    "XCHG_PLAIN:exchange" "UNLINK_NO_CHECK:busy" "MOUNT_SHORT:mount-counts" \
+	    "FIND_NO_CHECK:find-moved"; do \
+	  mut=$${arm%%:*}; which=$${arm#*:}; \
+	  echo "== check-mount MUST-FAIL control, inline: $$mut in $$which"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_TEST_HOOKS -DDC_MOUNT_INLINE -DDC_TEST_MNT_$$mut \
+	    $(HCPP) -o repro_mount_inline_mut_$$mut repro_mount.c dcache_bucketlock.c \
+	    $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./repro_mount_inline_mut_$$mut $$which 2>/dev/null) || \
+	    { echo "$$out"; echo "check-mount: MUTANT $$mut PASSED $$which -- the case is vacuous"; exit 1; }; \
+	  echo "$$out" | grep -E "^$$which " | sed 's/^/  fails as it must: /'; \
+	done
+	@set -e; for arm in "inline:" "inline_lane:$(MOUNT_LANE)" "inline_walk:-DDC_SCAN_WALK"; do \
+	  name=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-mount: $$name under moves"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_INLINE $$defs $(HCPP) -o stress_mount_$$name \
+	    stress_dcache_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  for args in "$(MOUNT_ARGS)" "$(MOUNT_MANY_ARGS)"; do \
+	    out=$$(timeout $(SHARED_TIMEOUT) ./stress_mount_$$name $$args) || \
+	      { echo "$$out"; echo "check-mount: FAIL ($$name: $$args)"; exit 1; }; \
+	    echo "$$out" | grep -E '^(counts|too high|WRONG|RESULT)'; \
+	  done; \
+	done
+	@set -e; for arm in "NO_FLAG_CHECK:" "ADD_NO_LOCK:" "ADD_AFTER:" "SUB_BEFORE:" \
+	    "XCHG_PLAIN:" "MOUNT_SHORT:" "KEEP_LANE:$(MOUNT_LANE)"; do \
+	  mut=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-mount MUST-FAIL control under moves, inline: $$mut"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_INLINE -DDC_TEST_MNT_$$mut \
+	    $$defs $(HCPP) -o stress_mount_inline_mut_$$mut stress_dcache_mount.c \
+	    dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  if out=$$(timeout $(MOUNT_MUT_TIMEOUT) ./stress_mount_inline_mut_$$mut $(MOUNT_ARGS) 2>/dev/null); then \
+	    echo "check-mount: MUTANT $$mut PASSED -- the harness is vacuous"; exit 1; \
+	  elif [ -z "$$out" ] || ! echo "$$out" | grep -q '^RESULT'; then \
+	    echo "  fails as it must: no result (it hangs, or it is killed)"; \
+	  else echo "$$out" | grep -E '^(WRONG|AT REST)' | head -1 | sed 's/^/  fails as it must: /'; fi; \
+	done
 	@echo "== check-mount: the same moves without the count (what it is compared with)"
 	@set -e; $(CC) $(ASANFLAGS) $(MOUNT_HOLD) $(HCPP) -o stress_mount_none \
 	  stress_dcache_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
@@ -661,6 +718,10 @@ check-mount-tsan: stress_dcache_mount.c dcache_bucketlock.c dcache_mount.h $(HDR
 	  -I$(URCU_TSAN_INC) -I. -o stress_mount_tsan stress_dcache_mount.c \
 	  dcache_bucketlock.c -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
 	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_mount_tsan 4 3 1 2 5000
+	$(CC) $(TSANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_INLINE $(KEEPID) $(TSAN_SLAB_CPP) \
+	  -I$(URCU_TSAN_INC) -I. -o stress_mount_inline_tsan stress_dcache_mount.c \
+	  dcache_bucketlock.c -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_mount_inline_tsan 4 3 1 2 5000
 
 # An exchange's two names exist before AND after its commit, so a lockless
 # lookup of either must never come back ABSENT.  Two detectors, because each is

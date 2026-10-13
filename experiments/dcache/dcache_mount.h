@@ -428,6 +428,12 @@ static void mnt_shift_drop(struct dcache *dc, struct mnt_shift *ms)
 	ms->c_a = ms->c_b = 0;
 }
 
+/* The move has committed: its set has done its work. */
+static inline void mnt_shift_done(struct dcache *dc, struct mnt_shift *ms)
+{
+	mnt_shift_drop(dc, ms);		/* under the buckets */
+}
+
 /* The operation is over, committed or not. */
 static void mnt_shift_end(struct dcache *dc, struct mnt_shift *ms)
 {

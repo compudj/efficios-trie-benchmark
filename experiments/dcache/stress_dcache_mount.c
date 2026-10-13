@@ -37,17 +37,21 @@
  *   /quiet   counts nothing, ever.
  *   /        counts every mountpoint: the carriers, and no more than the
  *            files the mounters have beside.  Exactly the carriers when there
- *            is no mounter.
+ *            is no mounter.  "No more" is for the counts kept in a table,
+ *            which go with a move in one commit; kept in the dentries they
+ *            are added before a move and taken away after, and a reader may
+ *            find one too high meanwhile, which is counted and printed.
  *   dc_mount_find(/in) finds a mountpoint, and what it hands back is one.
  *   A mountpoint that a lookup finds below a directory is in the count of
  *            that directory read next, unless its carrier has begun another
  *            move meanwhile: the count goes with the move, in one commit.
  *
- * In a build with -DDC_TEST_MNT_CHECK_ONLINE a thread of its own runs
- * dc_mount_check() throughout: every count is what is below its dentry.  (That
- * build shuts the operations that change counts out while it counts again, so
- * it is not the one to time.)  At the end everything is unmounted and no
- * dentry has a count left.
+ * A thread of its own runs dc_mount_check() throughout: every count is what
+ * is below its dentry.  With the counts in the dentries it always can.  With
+ * the counts in a table it needs -DDC_TEST_MNT_CHECK_ONLINE, a build that
+ * shuts the operations that change counts out while it counts again and is
+ * not the one to time.  At the end everything is unmounted and no dentry has
+ * a count left.
  *
  * A move may fail with -ENOENT, and only that: a thread knows where its own
  * object is, and reads where the racks are from what their movers publish
@@ -103,6 +107,7 @@ static int g_big_loc[MAXT];		/* a fixed directory */
 static int g_rack_loc[2 * MAXT];	/* a fixed directory, or NFIXED + a big rack */
 
 static unsigned long g_bad_in, g_bad_quiet, g_bad_root, g_bad_find, g_bad_check;
+static unsigned long g_high_in, g_high_root;	/* above the most there can be */
 static unsigned long g_bad_under, g_samples;
 static long g_seen_in_min = 1L << 30;
 
@@ -248,6 +253,7 @@ struct carrier {
 	 */
 	unsigned long dst __attribute__((aligned(64)));
 	unsigned long started;
+	unsigned long cur;	/* where the mountpoint is, as DST(): after the fact */
 };
 #define DST(loc, slot, alt)	(((unsigned long) (loc) << 2) | \
 				 ((unsigned long) (slot) << 1) | (unsigned long) (alt))
@@ -326,6 +332,8 @@ static void *carrier_thread(void *arg)
 			st->stale++;
 		else
 			st->ok++;
+		uatomic_store(&c->cur, DST(c->loc[c->mounted], c->mounted,
+					   c->alt[c->mounted]), CMM_RELAXED);
 		dc_quiescent();
 	}
 	dc_unregister_thread();
@@ -454,14 +462,18 @@ static void *reader_thread(void *arg)
 		long in = count_at("/in"), quiet = count_at("/quiet");
 		long root = count_at("/");
 
-		if (in < g_nin || in > most)
+		if (in < g_nin)
 			uatomic_inc(&g_bad_in);
+		else if (in > most)
+			uatomic_inc(&g_high_in);
 		if (in < seen_min)
 			seen_min = in;
 		if (quiet != 0)
 			uatomic_inc(&g_bad_quiet);
-		if (root < g_ncar || root > most)
+		if (root < g_ncar)
 			uatomic_inc(&g_bad_root);
+		else if (root > most)
+			uatomic_inc(&g_high_root);
 		st->reads += 3;
 		/*
 		 * A lookup finds a mountpoint below a directory, and a count
@@ -496,6 +508,26 @@ static void *reader_thread(void *arg)
 				}
 			}
 			st->reads += 2;
+			/*
+			 * And where it is before the operation commits: found
+			 * there, the directory's count read, found there
+			 * still.  It was there when the count was read, and a
+			 * count taken away before the move would not say so.
+			 */
+			d = uatomic_load(&c->cur, CMM_RELAXED);
+			place_path(dir, (int) (d >> 2));
+			sprintf(file, "%s/%c%d/h%d", dir,
+				"kgKG"[((d >> 1) & 1) + 2 * (d & 1)], c->c, c->c);
+			if (dc_lookup_dentry(g_dc, P(&p, file))) {
+				cnt = count_at(dir);
+				if (cnt != -ENOENT &&
+				    dc_lookup_dentry(g_dc, P(&p, file))) {
+					st->samples++;
+					if (cnt < 1)
+						uatomic_inc(&g_bad_under);
+				}
+			}
+			st->reads += 3;
 		}
 		if (g_nin && g_find_every && n % g_find_every == 0) {
 			struct dc_path p;
@@ -518,7 +550,12 @@ static void *reader_thread(void *arg)
 	return NULL;
 }
 
-#ifdef DC_TEST_MNT_CHECK_ONLINE
+/* dc_mount_check() can run with everything else: see dcache.h. */
+#if defined(DC_TEST_MNT_CHECK_ONLINE) || defined(DC_MOUNT_INLINE)
+# define CHECK_ONLINE 1
+#endif
+
+#ifdef CHECK_ONLINE
 static unsigned long g_checks;
 
 static void *checker_thread(void *arg)
@@ -542,7 +579,7 @@ static void *checker_thread(void *arg)
 	dc_unregister_thread();
 	return NULL;
 }
-#endif /* DC_TEST_MNT_CHECK_ONLINE */
+#endif /* CHECK_ONLINE */
 #endif /* DC_MOUNT_COUNT */
 
 /* ---- */
@@ -567,7 +604,7 @@ int main(int argc, char **argv)
 	pthread_t tcar[MAXT], tshuf[MAXT];
 #ifdef DC_MOUNT_COUNT
 	pthread_t tmnt[MAXT], tread[MAXT];
-#ifdef DC_TEST_MNT_CHECK_ONLINE
+#ifdef CHECK_ONLINE
 	pthread_t tcheck;
 #endif
 	struct dc_mount_stats ms;
@@ -629,6 +666,7 @@ int main(int argc, char **argv)
 		c->loc[0] = pick_fixed(&r, c->kind);
 		c->loc[1] = pick_fixed(&r, c->kind);
 		c->dst = DST(c->loc[0], 0, 0);
+		c->cur = c->dst;
 		slot_path(path, c, 0, c->loc[0], 0);
 		mkdir_(ID_K + (uint64_t) i, path);
 		sprintf(path + strlen(path), "/h%d", i);
@@ -682,7 +720,7 @@ int main(int argc, char **argv)
 	for (i = 0; i < g_nread; i++)
 		pthread_create(&tread[i], NULL, reader_thread,
 			       (void *) (intptr_t) i);
-#ifdef DC_TEST_MNT_CHECK_ONLINE
+#ifdef CHECK_ONLINE
 	pthread_create(&tcheck, NULL, checker_thread, NULL);
 #endif
 #endif
@@ -700,7 +738,7 @@ int main(int argc, char **argv)
 		pthread_join(tmnt[i], NULL);
 	for (i = 0; i < g_nread; i++)
 		pthread_join(tread[i], NULL);
-#ifdef DC_TEST_MNT_CHECK_ONLINE
+#ifdef CHECK_ONLINE
 	pthread_join(tcheck, NULL);
 #endif
 #endif
@@ -735,7 +773,7 @@ int main(int argc, char **argv)
 	printf("mounters: %lu mounts and unmounts (%lu stale); readers: %lu "
 	       "reads, %.0f k/s\n", mok, mstale, reads,
 	       (double) reads / dt / 1e3);
-#ifdef DC_TEST_MNT_CHECK_ONLINE
+#ifdef CHECK_ONLINE
 	printf("counted again from the mountpoints %lu times while it ran\n",
 	       g_checks);
 #endif
@@ -749,6 +787,19 @@ int main(int argc, char **argv)
 	if (g_nread)
 		printf("found below a directory, then that directory's count "
 		       "read: %lu times\n", g_samples);
+	/*
+	 * A count above the most there can be is wrong where the count goes
+	 * with the move in one commit.  Where it is added before the move and
+	 * taken away after, it is what a reader may find for the length of one
+	 * operation, and is said, not held against it.
+	 */
+	if (!strcmp(dc_mount_arm(), "inline")) {
+		printf("too high, as it may be while a rename is under way: "
+		       "/in %lu, / %lu of the reads\n", g_high_in, g_high_root);
+	} else {
+		g_bad_in += g_high_in;
+		g_bad_root += g_high_root;
+	}
 	printf("WRONG: /in %lu, /quiet %lu, / %lu, find %lu, check %lu, "
 	       "found and not counted %lu\n", g_bad_in, g_bad_quiet,
 	       g_bad_root, g_bad_find, g_bad_check, g_bad_under);

@@ -626,7 +626,19 @@ void dc_scan_stats(struct dcache *dc, struct dc_scan_stats *st);
  * dc_mount_check() counts again from the mountpoints and returns how many
  * counts are wrong, saying which on @stream (a FILE *, or NULL).  With nothing
  * else running, unless the engine is built with -DDC_TEST_MNT_CHECK_ONLINE.
+ *
+ * -DDC_MOUNT_INLINE is the other arm, dcache_mount_inline.h: the same
+ * operations with the count kept in the dentry, where the kernel would have
+ * it in the directory's inode.  No table and nothing to allocate; one lock
+ * for those who change a count; and the count is added where a rename is
+ * going before its commit and taken from where it was after, so that it is
+ * never short and, for the length of one operation, may be too high.  There
+ * dc_mount_count() returns a count that was not below the true one at an
+ * instant during the call, and dc_mount_check() runs with everything else.
  */
+#if defined(DC_MOUNT_INLINE) && !defined(DC_MOUNT_COUNT)
+# define DC_MOUNT_COUNT 1
+#endif
 int dc_mount(struct dcache *dc, const struct dc_path *path);
 int dc_umount(struct dcache *dc, const struct dc_path *path);
 long dc_mount_count(struct dcache *dc, const struct dc_path *path);
