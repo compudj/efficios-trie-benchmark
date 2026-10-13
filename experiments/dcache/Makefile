@@ -101,7 +101,7 @@ HDRS     := dcache.h seqcount.h dcache_lru.h dcache_lru_shrink.h dcache_bench_ra
 	stress-dirs-tsan xchg xchg-asan xchg-tsan check-xchg-absent repro-rename-dup \
 	bench bench-check bench-asan \
 	check-pernode check-mark check-bucketlock check-bucketlock-tsan \
-	check-walk-holdoff check-scan \
+	check-walk-holdoff check-scan check-mount check-mount-tsan \
 	check-filetype repro-samedir churn check-churn check-churn-evict \
 	check-seqlock-arms stress-seqlock-build \
 	check-deque check-deque-tsan \
@@ -543,6 +543,124 @@ check-scan: $(SCAN_SRCS) $(HDRS) | check-lib
 	  echo "$$out" | grep -E '^RESULT' | sed "s/^/$$src: /"; \
 	done
 	@echo "check-scan: PASS"
+
+# The mount count (dcache_mount.h): "is there a mountpoint below this
+# directory", kept as a count in place of the search that the kernel makes with
+# d_walk().  A dentry with a mountpoint at or below it has a count, hashed by
+# the dentry as a struct mountpoint is, and the count goes with a rename in the
+# rename's transaction.  The table has a lock to a bucket and there is no other
+# lock: an operation holds the buckets of the counts it changes for its commit.
+# -DDC_MOUNT_COUNT; nothing else is touched by it.
+#
+# repro_mount: what every count is after each kind of operation, and eleven cases
+# in which one thread is parked in the middle of an operation while another
+# acts.  stress_dcache_mount: everything at once, held to what is true whatever
+# the interleaving (see its header).  Each rule of dcache_mount.h has a build
+# that takes it away, and that build has to fail:
+#
+#   NO_FLAG_CHECK   a rename does not look for a count on what it moves
+#   FREEZE_NO_LOCK  an ancestor is frozen, but not under the lock that a move
+#                   of it holds
+#   NO_VALIDATE     what was worked out with no lock held is not looked at
+#                   again under the buckets
+#   NO_SELF_LOCK    a rename of a frozen dentry does not hold its bucket
+#   NO_PIN          a count of zero is unhashed while an operation has it
+#   COUNT_AFTER     the count follows the move in a second commit
+#   XCHG_PLAIN      an exchange moves no count
+#   UNLINK_NO_CHECK a mountpoint can be removed
+#   MOUNT_SHORT     a mount counts in its parent and no further up
+#   FIND_NO_CHECK   a search hands back what it came to without checking that
+#                   it is below where it started
+#   KEEP_LANE       (test builds only) the lock that lets dc_mount_check() run
+#                   with everything else is waited for with the engine's
+#                   fallback lane held.  It shows only when renames take the
+#                   lane, so it runs, as the build that has the rule does, with
+#                   the engine's budget of retries set to one; and it does not
+#                   fail, it hangs.
+#
+# The stress builds have -DDC_TEST_MNT_CHECK_ONLINE, for the thread that counts
+# again while the rest runs; one build is without, as it would be used.  The
+# stress has no way to tell where a mountpoint that a search hands back was
+# during the search, so FIND_NO_CHECK has its control in repro_mount only.
+# A build without a rule gives up on counts that are wrong after 2000 looks,
+# where the others look a million times, so that it fails and does not spin.
+# In one case, unlink-waits under UNLINK_NO_CHECK, the removal goes through and
+# the rename lands in a directory that is gone: the model's own hole (a rename
+# into a directory being removed), which ASan reports.  The control for that
+# rule is the case "busy".
+MOUNT_ARGS ?= 4 3 1 2 20000
+MOUNT_MANY_ARGS ?= 8 6 2 4 10000
+MOUNT_HOLD := -DDC_MARK_GEN -DDC_WALK_HOLDOFF=4
+MOUNT_LANE := -DURCU_TXN_FALLBACK_MIN=1 -DURCU_TXN_FALLBACK_MAX=1
+MOUNT_ONLINE := -DDC_TEST_MNT_CHECK_ONLINE
+MOUNT_MUT_TIMEOUT ?= 20
+check-mount: repro_mount.c stress_dcache_mount.c dcache_bucketlock.c dcache_mount.h $(HDRS) | check-lib
+	@set -e; for arm in "count:" "count_walk:-DDC_SCAN_WALK"; do \
+	  name=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-mount: $$name, one case at a time"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_TEST_HOOKS -DDC_MOUNT_COUNT $$defs $(HCPP) \
+	    -o repro_mount_$$name repro_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./repro_mount_$$name) || \
+	    { echo "$$out"; echo "check-mount: FAIL (repro_mount $$name)"; exit 1; }; \
+	  echo "$$out" | grep -E '^RESULT'; \
+	done
+	@set -e; for arm in "NO_FLAG_CHECK:move-inside" "FREEZE_NO_LOCK:freeze-under-move" \
+	    "NO_VALIDATE:ancestor-moves-late" "NO_VALIDATE:mount-under-move" \
+	    "NO_SELF_LOCK:move-holds-bucket" "NO_PIN:pin-keeps-frozen" \
+	    "COUNT_AFTER:reader-at-commit" "XCHG_PLAIN:exchange" \
+	    "UNLINK_NO_CHECK:busy" "MOUNT_SHORT:mount-counts" \
+	    "FIND_NO_CHECK:find-moved"; do \
+	  mut=$${arm%%:*}; which=$${arm#*:}; \
+	  echo "== check-mount MUST-FAIL control: $$mut in $$which"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_TEST_HOOKS -DDC_MOUNT_COUNT -DDC_TEST_MNT_$$mut \
+	    $(HCPP) -o repro_mount_mut_$$mut repro_mount.c dcache_bucketlock.c \
+	    $(LDFLAGS) $(LDLIBS); \
+	  out=$$(timeout $(SHARED_TIMEOUT) ./repro_mount_mut_$$mut $$which 2>/dev/null) || \
+	    { echo "$$out"; echo "check-mount: MUTANT $$mut PASSED $$which -- the case is vacuous"; exit 1; }; \
+	  echo "$$out" | grep -E "^$$which " | sed 's/^/  fails as it must: /'; \
+	done
+	@set -e; for arm in "count:$(MOUNT_ONLINE)" "count_lane:$(MOUNT_ONLINE) $(MOUNT_LANE)" \
+	    "count_walk:$(MOUNT_ONLINE) -DDC_SCAN_WALK" "count_plain:"; do \
+	  name=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-mount: $$name under moves"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_COUNT $$defs $(HCPP) -o stress_mount_$$name \
+	    stress_dcache_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  for args in "$(MOUNT_ARGS)" "$(MOUNT_MANY_ARGS)"; do \
+	    out=$$(timeout $(SHARED_TIMEOUT) ./stress_mount_$$name $$args) || \
+	      { echo "$$out"; echo "check-mount: FAIL ($$name: $$args)"; exit 1; }; \
+	    echo "$$out" | grep -E '^(counts|found|WRONG|RESULT)'; \
+	  done; \
+	done
+	@set -e; for arm in "NO_FLAG_CHECK:" "FREEZE_NO_LOCK:" "NO_VALIDATE:" "NO_SELF_LOCK:" \
+	    "NO_PIN:" "COUNT_AFTER:" "XCHG_PLAIN:" "MOUNT_SHORT:" \
+	    "KEEP_LANE:$(MOUNT_LANE)"; do \
+	  mut=$${arm%%:*}; defs=$${arm#*:}; \
+	  echo "== check-mount MUST-FAIL control under moves: $$mut"; \
+	  $(CC) $(ASANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_COUNT $(MOUNT_ONLINE) -DDC_TEST_MNT_$$mut \
+	    -DDC_MNT_TRIES_MAX=2000 $$defs $(HCPP) -o stress_mount_mut_$$mut stress_dcache_mount.c \
+	    dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	  if out=$$(timeout $(MOUNT_MUT_TIMEOUT) ./stress_mount_mut_$$mut $(MOUNT_ARGS) 2>/dev/null); then \
+	    echo "check-mount: MUTANT $$mut PASSED -- the harness is vacuous"; exit 1; \
+	  elif [ -z "$$out" ] || ! echo "$$out" | grep -q '^RESULT'; then \
+	    echo "  fails as it must: no result (it hangs, or it is killed)"; \
+	  else echo "$$out" | grep -E '^(WRONG|AT REST)' | head -1 | sed 's/^/  fails as it must: /'; fi; \
+	done
+	@echo "== check-mount: the same moves without the count (what it is compared with)"
+	@set -e; $(CC) $(ASANFLAGS) $(MOUNT_HOLD) $(HCPP) -o stress_mount_none \
+	  stress_dcache_mount.c dcache_bucketlock.c $(LDFLAGS) $(LDLIBS); \
+	./stress_mount_none $(MOUNT_ARGS) | grep -E '^RESULT'
+	@echo "check-mount: PASS"
+
+# The mount count under ThreadSanitizer (needs the TSAN liburcu: see
+# stress-tsan).
+check-mount-tsan: stress_dcache_mount.c dcache_bucketlock.c dcache_mount.h $(HDRS) | check-lib
+	@test -f "$(URCU_TSAN_LIB)/liburcu-qsbr.so" || { \
+	  echo "ERROR: TSAN liburcu not found at $(URCU_TSAN_LIB) -- see the recipe"; \
+	  echo "       in the stress-tsan comment in this Makefile."; exit 1; }
+	$(CC) $(TSANFLAGS) $(MOUNT_HOLD) -DDC_MOUNT_COUNT $(MOUNT_ONLINE) $(KEEPID) $(TSAN_SLAB_CPP) \
+	  -I$(URCU_TSAN_INC) -I. -o stress_mount_tsan stress_dcache_mount.c \
+	  dcache_bucketlock.c -L$(URCU_TSAN_LIB) -Wl,-rpath,$(URCU_TSAN_LIB) $(LDLIBS)
+	TSAN_OPTIONS="halt_on_error=0 history_size=4" ./stress_mount_tsan 4 3 1 2 5000
 
 # An exchange's two names exist before AND after its commit, so a lockless
 # lookup of either must never come back ABSENT.  Two detectors, because each is
@@ -1422,4 +1540,4 @@ clean:
 	  stress_dcache_dirs_bucketlock_tsan \
 	  bench_dcache_churn_seqlock bench_dcache_churn_txn bench_dcache_churn_txn_pernode \
 	  bench_dcache_churn_txn_mark stress_shared_* repro_delete_fold_mark repro_delete_fold_bl stress_rmdir_* \
-	  stress_scan_* repro_scan_*
+	  stress_scan_* repro_scan_* stress_mount_* repro_mount_*

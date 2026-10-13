@@ -593,6 +593,58 @@ struct dc_scan_stats {
 };
 void dc_scan_stats(struct dcache *dc, struct dc_scan_stats *st);
 
+/*
+ * ---- the mount count: is there a mountpoint below this one ----------------
+ *
+ * What the kernel's d_invalidate() and path_has_submounts() ask of d_walk(),
+ * answered without a walk: each dentry that has a mountpoint at or below it
+ * has a count of them, and the count changes in the transaction of the rename
+ * that takes it to another directory.  A rename inside a subtree does not
+ * change the count of the subtree's top, so there is nothing for a reader to
+ * detect.  The counts are in a table hashed by the dentry, a lock to a bucket;
+ * an operation holds the buckets of the counts it changes for its commit, and
+ * a rename with nothing mounted below takes none.  See dcache_mount.h.  Only the bucket lock engine, with
+ * -DDC_MOUNT_COUNT; repro_mount.c and stress_dcache_mount.c are its harnesses
+ * (make check-mount).
+ *
+ * dc_mount() makes the object at @path a mountpoint: 0, -ENOENT, -EBUSY if it
+ * is one, -EINVAL for the root.  dc_umount() undoes it: 0, -ENOENT, -EINVAL if
+ * it is none.  A mountpoint cannot be removed (-EBUSY from dc_unlink() and
+ * dc_delete()) and is not evicted; it can be renamed, and so can what is
+ * above it.
+ *
+ * dc_mount_count() is the reader: how many mountpoints are at or below @path,
+ * or -ENOENT.  Under RCU alone: it takes no lock, waits for nothing and does
+ * not go again.  THE GUARANTEE: the value was the count at an instant during
+ * the call.
+ *
+ * dc_mount_find() hands back in *@id one mountpoint at or below @path and
+ * returns 1, or returns 0 if there is none, -ENOENT.  Under RCU alone too; it
+ * goes again when what it came down through moved under it.  What it hands
+ * back was a mountpoint below @path at an instant during the call.
+ *
+ * dc_mount_check() counts again from the mountpoints and returns how many
+ * counts are wrong, saying which on @stream (a FILE *, or NULL).  With nothing
+ * else running, unless the engine is built with -DDC_TEST_MNT_CHECK_ONLINE.
+ */
+int dc_mount(struct dcache *dc, const struct dc_path *path);
+int dc_umount(struct dcache *dc, const struct dc_path *path);
+long dc_mount_count(struct dcache *dc, const struct dc_path *path);
+long dc_mount_find(struct dcache *dc, const struct dc_path *path, uint64_t *id);
+long dc_mount_check(struct dcache *dc, void *stream);
+const char *dc_mount_arm(void);
+/*
+ * Mounts and unmounts; moves and exchanges that took a count to another
+ * directory; dentries that an operation froze for one; operations that worked
+ * their counts out again because something had moved, and searches that went
+ * again; looks of a removal that had to wait; counts that exist now.
+ */
+struct dc_mount_stats {
+	unsigned long mounts, umounts, moves, frozen, again, find_again;
+	unsigned long waits, counts;
+};
+void dc_mount_stats(struct dcache *dc, struct dc_mount_stats *st);
+
 /* ---- engine-independent path/qstr helpers (pure, inline) ---------------- */
 
 /* FNV-1a over the name; the engine mixes this with the parent ptr for a bucket. */

@@ -74,6 +74,10 @@ static inline void dc_ts_poison_set(void *slot, void *want, void *got);
 #include <limits.h>
 #include <stdio.h>
 #include <urcu/futex.h>			/* held-off writers sleep on the count */
+#ifdef DC_MOUNT_COUNT
+#include <pthread.h>
+#include <urcu/rcuhlist.h>		/* the counts, hashed by dentry */
+#endif
 #endif
 #ifndef DC_NO_LRU
 #include <rseq/rseq.h>			/* phase 3: NUMA node id for LRU sharding */
@@ -161,6 +165,23 @@ void (*dc_test_scan_climb_hook)(uint64_t dir_id);
  * the lists no longer hold (repro_scan.c, for scan_walk()'s walk_entry()).
  */
 void (*dc_test_folded_hook)(void);
+#ifdef DC_MOUNT_COUNT
+/*
+ * Test-only, the mount count (dcache_mount.h).  The first is called when an
+ * operation has frozen the dentry @id, with no lock held; the second when a
+ * move that took a count with it has committed, before it lets go of the
+ * buckets of its counts.
+ */
+void (*dc_test_mnt_frozen_hook)(uint64_t id);
+void (*dc_test_mnt_moved_hook)(void);
+/*
+ * And: a move holds the buckets of its counts, and is about to commit;
+ * dc_mount_find() has come down to the dentry @id, and is about to go through
+ * its children.
+ */
+void (*dc_test_mnt_locked_hook)(void);
+void (*dc_test_mnt_found_hook)(uint64_t id);
+#endif
 /*
  * Test-only rendezvous in a move to another directory (repro_scan.c): with 0
  * when it has decided, with no lock held, whether to get a lingering entry
@@ -439,6 +460,16 @@ struct dentry {
 	 * node is itself the host of a move, so spine nodes keep it 0 forever (their
 	 * reads stay S-state -- no cross-CCD ping-pong). */
 	unsigned long d_moving;
+#ifdef DC_MOUNT_COUNT
+	/*
+	 * MOUNT COUNT (dcache_mount.h), on a host.  DC_MNT_HERE: this object
+	 * is a mountpoint.  DC_MNT_COUNTED: it has a count, in dc->mnt_bkt[],
+	 * of the mountpoints at or below it.  A move to another directory
+	 * reads the second under the child head of the directory it leaves,
+	 * and mnt_freeze() sets it under that lock.  The kernel has d_flags.
+	 */
+	unsigned long d_mnt;
+#endif
 #ifdef DC_SCAN_MARK
 	/*
 	 * SCAN MARK (dc_scan(), the mark arm), on a directory's host: "a scan
@@ -1325,6 +1356,13 @@ unsigned long dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
  * (rename_gen is written by the counter arms).  dc_create allocates the struct
  * 64-byte aligned.
  */
+#ifdef DC_MOUNT_COUNT
+/* A bucket of the mount counts (dcache_mount.h), on a line of its own. */
+struct dc_mnt_bkt {
+	struct cds_hlist_head head;
+	unsigned long lock;
+} __attribute__((aligned(64)));
+#endif
 
 struct dcache {
 	struct dc_lru_shard *lru;		/* nlru shards; see lru_shard_index */
@@ -1415,7 +1453,27 @@ struct dcache {
 	unsigned long scan_fallbacks;
 #endif
 #endif
+#ifdef DC_MOUNT_COUNT
+	/*
+	 * The mount count (dcache_mount.h): the table of the counts, a lock to
+	 * a bucket.  A rename with nothing mounted below touches none of this.
+	 */
+	struct dc_mnt_bkt *mnt_bkt;
+#ifdef DC_TEST_MNT_CHECK_ONLINE
+	pthread_rwlock_t mnt_check_lock;	/* see mnt_shift_enter() */
+#endif
+	unsigned long mnt_objs __attribute__((aligned(64)));	/* counts hashed */
+	unsigned long mnt_mounts, mnt_umounts;
+	unsigned long mnt_moves;		/* moves that took a count along */
+	unsigned long mnt_frozen;		/* dentries that an operation froze */
+	unsigned long mnt_again;		/* sets that were worked out again */
+	unsigned long mnt_find_again;		/* searches that went again */
+	unsigned long mnt_waits;		/* looks of a removal that waited */
+#endif
 };
+#ifdef DC_MOUNT_COUNT
+#define DC_MNT_HASH_BITS	8
+#endif
 
 /* Engine proxy tag for the rename_gen slot (bit 0; values stay even). */
 #define DC_GEN_TAG	URCU_TXN_TAG
@@ -1614,6 +1672,24 @@ struct dcache *dc_create(unsigned int nbuckets)
 #endif
 	/* vestigial (pure-SW commits), see struct dcache */
 	urcu_txn_domain_init(&dc->domain);
+#ifdef DC_MOUNT_COUNT
+	if (posix_memalign((void **) &dc->mnt_bkt, 64,
+			   sizeof(*dc->mnt_bkt) << DC_MNT_HASH_BITS) != 0)
+		return NULL;
+	memset(dc->mnt_bkt, 0, sizeof(*dc->mnt_bkt) << DC_MNT_HASH_BITS);
+#ifdef DC_TEST_MNT_CHECK_ONLINE
+	{
+		pthread_rwlockattr_t attr;
+
+		/* or the one that counts again never gets in */
+		pthread_rwlockattr_init(&attr);
+		pthread_rwlockattr_setkind_np(&attr,
+			PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+		pthread_rwlock_init(&dc->mnt_check_lock, &attr);
+		pthread_rwlockattr_destroy(&attr);
+	}
+#endif
+#endif
 
 	dc_qstr_init(&rootname, "");
 	dc->root = dentry_alloc(dc, NULL, &rootname, 0, 1, 1); /* root: dir, positive */
@@ -1622,6 +1698,13 @@ struct dcache *dc_create(unsigned int nbuckets)
 	return dc;
 }
 
+#ifdef DC_MOUNT_COUNT
+/* dcache_mount.h, which comes after what it uses. */
+static void mnt_destroy(struct dcache *dc);
+static inline int mnt_counted(const struct dentry *host);
+static inline int mnt_here(const struct dentry *host);
+static void mnt_wait(struct dcache *dc);
+#endif
 
 /* Quiescent teardown: recurse the child-hlist, free every node. */
 static void free_subtree(struct dentry *d)
@@ -1659,6 +1742,9 @@ void dc_destroy(struct dcache *dc)
 		"refolds=%lu evict-skips=%lu\n", DC_WALK_HOLDOFF,
 		dc_dbg_hold_raises, dc_dbg_hold_sleeps, dc_dbg_hold_refolds,
 		dc_dbg_hold_evict_skips);
+#endif
+#ifdef DC_MOUNT_COUNT
+	mnt_destroy(dc);
 #endif
 	free_subtree(dc->root);
 	free(dc->buckets);
@@ -2925,6 +3011,24 @@ int dc_delete(struct dcache *dc, const struct dc_path *path)
 			isdir_locked = host;
 			continue;
 		}
+#ifdef DC_MOUNT_COUNT
+		/* As dc_unlink(); dc_mount() sets the flag under this bucket. */
+		if (mnt_counted(host)) {
+			int here = mnt_here(host);
+
+			if (host->d_isdir)
+				bl_unlock2(bucket, &host->d_child_head);
+			else
+				bl_unlock(bucket);
+			if (here) {
+				ret = -EBUSY;
+				goto out;
+			}
+			isdir_locked = NULL;
+			mnt_wait(dc);
+			continue;
+		}
+#endif
 		if (host->d_isdir && !children_gone(host)) {
 			bl_unlock2(bucket, &host->d_child_head);
 			ret = -ENOTEMPTY;
@@ -3065,6 +3169,24 @@ int dc_unlink(struct dcache *dc, const struct dc_path *path)
 				continue;	/* re-find the current top */
 			}
 		}
+#if defined(DC_MOUNT_COUNT) && !defined(DC_TEST_MNT_UNLINK_NO_CHECK)
+		/*
+		 * A mountpoint stays.  A count without one is a directory
+		 * that a move with a count is about to land in, frozen so
+		 * that the move finds it where it read it: wait for the move.
+		 */
+		if (mnt_counted(host)) {
+			int here = mnt_here(host);
+
+			bl_unlock_n(heads, nheads);
+			if (here) {
+				ret = -EBUSY;
+				goto out;
+			}
+			mnt_wait(dc);
+			continue;
+		}
+#endif
 		if (!children_gone(host)) {	/* an add landed first */
 			bl_unlock_n(heads, nheads);
 			ret = -ENOTEMPTY;
@@ -3176,6 +3298,9 @@ static int cross_cycle_check(struct dcache *dc, struct dentry *host,
 	return 0;
 }
 
+#ifdef DC_MOUNT_COUNT
+#include "dcache_mount.h"	/* a count of mountpoints at or below a dentry */
+#endif
 
 /*
  * STACK one entry into an ALREADY-OPEN txn (records only -- no cycle check, no
@@ -3332,6 +3457,9 @@ static int stack_shell(struct dcache *dc,
 	struct dentry *lg = NULL;	/* what stays behind in @from_parent */
 	int lingers = 0;		/* @lg is in the list */
 #endif
+#ifdef DC_MOUNT_COUNT
+	struct mnt_shift ms = MNT_SHIFT_INIT;	/* the counts that go along */
+#endif
 
 	if (!shell)
 		return -ENOMEM;
@@ -3487,11 +3615,53 @@ static int stack_shell(struct dcache *dc,
 		}
 #endif
 
+#ifdef DC_MOUNT_COUNT
+		/*
+		 * A mountpoint at or below what moves: its count goes with it,
+		 * in this commit.  The flag is read under @from_parent's child
+		 * head, where mnt_freeze() sets it.  With it set, the commit
+		 * needs the buckets of the counts that change, and of @host's
+		 * own: taken here, last of all the locks, and what was worked
+		 * out with none held is looked at again under them.  If it
+		 * does not hold, or was not worked out for this host, all is
+		 * let go and it is worked out again.
+		 */
+		if (cross_parent && mnt_move_counted(host) &&
+		    (ms.for_a != host || !mnt_shift_lock(dc, &ms))) {
+			bl_unlock_n(heads, 4);
+			uatomic_and(&host->d_moving, ~1UL);
+			/* abandon(), not conflict(): see mnt_shift_enter() */
+#ifdef DC_TEST_MNT_KEEP_LANE
+			urcu_txn_conflict(&txn);
+#else
+			urcu_txn_abandon(&txn);
+#endif
+			urcu_txn_end(&txn);
+			dest_reclaim(dc, neg);	/* dropped for this attempt */
+			neg = NULL;
+			ret = mnt_move_begin(dc, &ms, host, from_parent,
+					     new_parent);
+			if (ret)
+				goto out_free;
+			continue;
+		}
+#endif
 		/* A move to another directory inserts into its child list. */
 		if (cross_parent)
 			scan_signal_locked(dc, new_parent, NULL);
 		if (cross_parent)
 			DC_TEST_SCAN_MOVE_HOOK(1);
+#ifdef DC_MOUNT_COUNT
+		if (ms.locked) {
+#ifdef DC_TEST_HOOKS
+			if (dc_test_mnt_locked_hook)
+				dc_test_mnt_locked_hook();
+#endif
+#ifndef DC_TEST_MNT_COUNT_AFTER
+			mnt_shift_record(&txn, &ms);
+#endif
+		}
+#endif
 		stack_one_prepare(&txn, top, host, new_parent, new_bucket,
 				  from_bucket, shell, cross_parent
 				  DC_LINGER_ARG(lingers ? lg : NULL));
@@ -3505,6 +3675,22 @@ static int stack_shell(struct dcache *dc,
 		DC_TS_COMMIT(DC_TS_STACK, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
+#ifdef DC_MOUNT_COUNT
+		if (ms.locked) {
+			if (st == URCU_TXN_STATUS_OK && (ms.c_a || ms.c_b)) {
+				DC_MNT_STAT_INC(dc, mnt_moves);
+#ifdef DC_TEST_HOOKS
+				if (dc_test_mnt_moved_hook)
+					dc_test_mnt_moved_hook();
+#endif
+#ifdef DC_TEST_MNT_COUNT_AFTER
+				(void) mnt_shift_commit(&ms);
+#endif
+				mnt_shift_drop(dc, &ms);  /* under the buckets */
+			}
+			mnt_shift_unlock(&ms);
+		}
+#endif
 		if (cross_parent)
 			uatomic_and(&host->d_moving, ~1UL);
 		if (st == URCU_TXN_STATUS_ABORT)
@@ -3515,6 +3701,9 @@ static int stack_shell(struct dcache *dc,
 		}
 		break;				/* committed: entry now named anew */
 	}
+#ifdef DC_MOUNT_COUNT
+	mnt_shift_end(dc, &ms);
+#endif
 	rcu_read_unlock();
 	dest_reclaim(dc, neg);
 #ifdef DC_SCAN_LINGER
@@ -3528,6 +3717,9 @@ static int stack_shell(struct dcache *dc,
 		*out_host = host;
 	return 0;
 out_free:
+#ifdef DC_MOUNT_COUNT
+	mnt_shift_end(dc, &ms);
+#endif
 	rcu_read_unlock();
 	dest_reclaim(dc, neg);		/* dropped before an OOM commit */
 	free(shell);
@@ -3747,6 +3939,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 	const struct qstr *na, *nb;
 	struct urcu_txn txn;
 	int cross, ret;
+#ifdef DC_MOUNT_COUNT
+	struct mnt_shift ms = MNT_SHIFT_INIT;	/* the counts that go along */
+#endif
 
 	if (ap->ndepth == 0 || bp->ndepth == 0)
 		return -EINVAL;
@@ -3928,6 +4123,23 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		sa->d_left = ua;
 		sb->d_left = ub;
 #endif
+#if defined(DC_MOUNT_COUNT) && !defined(DC_TEST_MNT_XCHG_PLAIN)
+		/* A count on either side goes with it: see stack_shell(). */
+		if (cross &&
+		    (mnt_move_counted(hosta) || mnt_move_counted(hostb)) &&
+		    (!(ms.for_a == hosta && ms.for_b == hostb) ||
+		     !mnt_shift_lock(dc, &ms))) {
+			bl_unlock_n(heads, 4);
+			uatomic_and(&hosta->d_moving, ~1UL);
+			uatomic_and(&hostb->d_moving, ~1UL);
+			urcu_txn_abandon(&txn);	/* not conflict(): as there */
+			urcu_txn_end(&txn);
+			ret = mnt_xchg_begin(dc, &ms, hosta, hostb, pa, pb);
+			if (ret)
+				goto out_free;
+			continue;
+		}
+#endif
 		/*
 		 * An exchange swaps two places in the child lists, within one
 		 * directory too: what a scan has yet to reach may land where it
@@ -3940,6 +4152,10 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		 * Record the four index replaces (sb takes topa's slot, sa takes
 		 * topb's), coalescing to a two-node replace when the tops share a head.
 		 */
+#ifdef DC_MOUNT_COUNT
+		if (ms.locked)
+			mnt_shift_record(&txn, &ms);
+#endif
 		if (bucket_a == bucket_b)
 			bl_sw_replace2(&txn, &topa->d_hash, &sb->d_hash,
 					&topb->d_hash, &sa->d_hash);
@@ -4001,6 +4217,15 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		DC_TS_COMMIT(DC_TS_XCHG, &txn, st);
 		bl_unlock_n(heads, 4);
 		urcu_txn_end(&txn);
+#ifdef DC_MOUNT_COUNT
+		if (ms.locked) {
+			if (st == URCU_TXN_STATUS_OK && (ms.c_a || ms.c_b))
+				DC_MNT_STAT_INC(dc, mnt_moves);
+			if (st == URCU_TXN_STATUS_OK)
+				mnt_shift_drop(dc, &ms);  /* under the buckets */
+			mnt_shift_unlock(&ms);
+		}
+#endif
 		if (cross) {
 			uatomic_and(&hosta->d_moving, ~1UL);
 			uatomic_and(&hostb->d_moving, ~1UL);
@@ -4013,6 +4238,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 		}
 		break;				/* swap committed */
 	}
+#ifdef DC_MOUNT_COUNT
+	mnt_shift_end(dc, &ms);
+#endif
 	rcu_read_unlock();
 #ifdef DC_STRESS_DEBUG
 	uatomic_add(&dc_dbg_renames, 2);
@@ -4030,6 +4258,9 @@ int dc_rename_exchange(struct dcache *dc, const struct dc_path *ap,
 #endif
 	return 0;
 out_free:
+#ifdef DC_MOUNT_COUNT
+	mnt_shift_end(dc, &ms);
+#endif
 	rcu_read_unlock();
 	free(sa);
 	free(sb);
@@ -4138,6 +4369,9 @@ static int lru_evict_settled(struct dcache *dc, struct dentry *d)
 	 * between the isolate and this acquire. */
 	(void) bl_hlist_resolve(rcu_dereference(d->d_hash.next), &marked);
 	if (marked || !children_empty(d) ||
+#ifdef DC_MOUNT_COUNT
+	    uatomic_load(&d->d_mnt, CMM_RELAXED) ||	/* a mountpoint, or frozen */
+#endif
 	    bl_read((void **) &d->d_top, DC_FWD_TAG)) {
 		bl_unlock_n(heads, 3);
 		return -EAGAIN;
@@ -4962,3 +5196,7 @@ int dc_dentry_path(struct dcache *dc, const struct dentry *d,
 	return 0;
 }
 
+#ifdef DC_MOUNT_COUNT
+#define DCACHE_MOUNT_OPS
+#include "dcache_mount.h"	/* the operations: after everything they use */
+#endif
